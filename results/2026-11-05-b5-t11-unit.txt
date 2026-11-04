@@ -1,0 +1,62 @@
+=== RUN   TestProtoFramingRoundTrip
+--- PASS: TestProtoFramingRoundTrip (0.00s)
+=== RUN   TestProtoRejectsOversize
+--- PASS: TestProtoRejectsOversize (0.05s)
+=== RUN   TestListBoardsShape
+--- PASS: TestListBoardsShape (0.26s)
+=== RUN   TestReplyIDPairingUnderConcurrency
+--- PASS: TestReplyIDPairingUnderConcurrency (0.25s)
+=== RUN   TestEvalRequiresLease
+--- PASS: TestEvalRequiresLease (0.00s)
+=== RUN   TestLeaseEvalValueFaceAndReleaseTeardown
+--- PASS: TestLeaseEvalValueFaceAndReleaseTeardown (0.26s)
+=== RUN   TestEvalBoardErrorClassPreserved
+--- PASS: TestEvalBoardErrorClassPreserved (0.25s)
+=== RUN   TestDisconnectMovesLeaseToGrace
+--- PASS: TestDisconnectMovesLeaseToGrace (0.01s)
+=== RUN   TestHolderAdoptAcrossConnections
+--- PASS: TestHolderAdoptAcrossConnections (0.25s)
+=== RUN   TestEvalForeignHolderRefused
+--- PASS: TestEvalForeignHolderRefused (0.00s)
+=== RUN   TestReleaseWrongHolder
+--- PASS: TestReleaseWrongHolder (0.00s)
+=== RUN   TestHolderConflictOnOneConnection
+--- PASS: TestHolderConflictOnOneConnection (0.00s)
+=== RUN   TestWatchEventsFanOut
+--- PASS: TestWatchEventsFanOut (0.61s)
+=== RUN   TestBoardStatusShape
+--- PASS: TestBoardStatusShape (0.26s)
+=== RUN   TestSelectorErrors
+--- PASS: TestSelectorErrors (0.00s)
+=== RUN   TestScriptStartCarriesLeaseSession
+--- PASS: TestScriptStartCarriesLeaseSession (0.25s)
+=== RUN   TestScriptStartRequiresLease
+--- PASS: TestScriptStartRequiresLease (0.00s)
+=== RUN   TestFsWriteCapAndFsRead
+--- PASS: TestFsWriteCapAndFsRead (0.25s)
+=== RUN   TestSubmitPassthrough
+--- PASS: TestSubmitPassthrough (0.25s)
+=== RUN   TestMultiBoardIndependentLeases
+--- PASS: TestMultiBoardIndependentLeases (0.25s)
+=== RUN   TestUnknownRequestType
+--- PASS: TestUnknownRequestType (0.00s)
+=== RUN   TestMalformedJSONFrame
+--- PASS: TestMalformedJSONFrame (0.00s)
+=== RUN   TestShutdownGraceful
+--- PASS: TestShutdownGraceful (0.00s)
+=== RUN   TestNewRefusesWhenSockAlive
+--- PASS: TestNewRefusesWhenSockAlive (0.00s)
+=== RUN   TestStaleSockFileRemoved
+--- PASS: TestStaleSockFileRemoved (0.00s)
+=== RUN   TestDefaultSockPath
+--- PASS: TestDefaultSockPath (0.00s)
+PASS
+ok  	xuansi/internal/server	4.267s
+# full suite + race (final)
+ok  	xuansi/cmd/xuansi	2.500s
+?   	xuansi/hil	[no test files]
+ok  	xuansi/internal/board	1.524s
+ok  	xuansi/internal/discover	1.034s
+ok  	xuansi/internal/lease	1.041s
+ok  	xuansi/internal/replclient	2.503s
+ok  	xuansi/internal/server	4.301s

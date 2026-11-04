@@ -94,19 +94,37 @@ type Registry struct {
 	mdns discoverFunc
 }
 
+// RegistryOption parameterizes NewRegistry; the source seams exist so
+// the daemon tests (and only they) inject canned discovery faces.
+type RegistryOption func(*Registry)
+
+// WithUSB replaces the USB discovery face (tests inject canned boards).
+func WithUSB(fn func(ctx context.Context) ([]Board, error)) RegistryOption {
+	return func(r *Registry) { r.usb = fn }
+}
+
+// WithMDNS replaces the mDNS browse face (tests inject canned boards).
+func WithMDNS(fn func(ctx context.Context) ([]Board, error)) RegistryOption {
+	return func(r *Registry) { r.mdns = fn }
+}
+
 // NewRegistry builds an empty registry; aliases (from LoadBoardsFile)
 // map mac6 → human name and fill Board.Alias on every refresh.
-func NewRegistry(aliases map[string]string) *Registry {
+func NewRegistry(aliases map[string]string, opts ...RegistryOption) *Registry {
 	a := make(map[string]string, len(aliases))
 	for k, v := range aliases {
 		a[k] = v
 	}
-	return &Registry{
+	r := &Registry{
 		aliases: a,
 		boards:  map[string]Board{},
 		usb:     DiscoverUSB,
 		mdns:    DiscoverMDNS,
 	}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 // Refresh runs one discovery sweep and merges it into the registry.

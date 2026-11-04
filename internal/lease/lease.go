@@ -267,24 +267,26 @@ func (m *Manager) OnAgentGone(holder string) {
 	m.mu.Lock()
 	now := m.clock.Now()
 	n := 0
-	var first *leaseEntry
+	var firstBoard string
+	var firstDL string
 	for _, e := range m.leases {
 		if e.holder == holder && e.state == stateLive {
 			e.state = stateGrace
 			e.deadline = now.Add(m.policy.GraceTTL)
-			n++
-			if first == nil || e.board < first.board {
-				first = e
+			if n == 0 || e.board < firstBoard {
+				firstBoard = e.board
+				firstDL = e.deadline.Format(time.RFC3339) // read under the lock: Adopt may rewrite it the moment we let go
 			}
+			n++
 		}
 	}
 	if n > 0 {
 		m.wakeLocked()
 	}
 	m.mu.Unlock()
-	if first != nil {
+	if n > 0 {
 		m.logf("lease: agent-gone holder=%s boards=%d grace_deadline=%s ttl=%s (board state kept)",
-			holder, n, first.deadline.Format(time.RFC3339), m.policy.GraceTTL)
+			holder, n, firstDL, m.policy.GraceTTL)
 	}
 }
 

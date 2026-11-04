@@ -10,7 +10,7 @@ import (
 // exits non-zero, and names every registered subcommand.
 func TestUsageListsAllSubcommands(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run(nil, &stdout, &stderr); code != exitUsage {
+	if code := run(strings.NewReader(""), &stdout, &stderr, nil); code != exitUsage {
 		t.Fatalf("run(nil) exit = %d, want %d", code, exitUsage)
 	}
 	if stdout.Len() != 0 {
@@ -27,7 +27,7 @@ func TestUsageListsAllSubcommands(t *testing.T) {
 func TestHelpExitsZero(t *testing.T) {
 	for _, arg := range []string{"-h", "-help", "--help", "help"} {
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{arg}, &stdout, &stderr); code != exitOK {
+		if code := run(strings.NewReader(""), &stdout, &stderr, []string{arg}); code != exitOK {
 			t.Errorf("run(%q) exit = %d, want %d", arg, code, exitOK)
 		}
 		if !strings.Contains(stdout.String(), "serve") {
@@ -39,7 +39,7 @@ func TestHelpExitsZero(t *testing.T) {
 // TestUnknownCommandFailsWithUsage: unknown commands exit non-zero and say so.
 func TestUnknownCommandFailsWithUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"nope"}, &stdout, &stderr); code != exitUsage {
+	if code := run(strings.NewReader(""), &stdout, &stderr, []string{"nope"}); code != exitUsage {
 		t.Fatalf("run([nope]) exit = %d, want %d", code, exitUsage)
 	}
 	if !strings.Contains(stderr.String(), `unknown command "nope"`) {
@@ -47,20 +47,33 @@ func TestUnknownCommandFailsWithUsage(t *testing.T) {
 	}
 }
 
-// TestStubCommandsReportStub: every registered command dispatches and
-// reports itself as a stub with its usage, exiting non-zero. This pins
-// the dispatch table until real implementations replace the stubs.
-func TestStubCommandsReportStub(t *testing.T) {
+// TestClientCommandsNeedTheirPositionals: every daemon-client command
+// (all but serve) rejects a bare invocation as a usage error on stderr —
+// the dispatch table stays honest now that the stubs are gone.
+func TestClientCommandsNeedTheirPositionals(t *testing.T) {
 	for _, c := range commands {
-		var stdout, stderr bytes.Buffer
-		if code := c.run(&stdout, &stderr, nil); code != exitStub {
-			t.Errorf("%s: exit = %d, want %d", c.name, code, exitStub)
+		if c.name == "serve" || c.name == "list" {
+			continue // no positional args required
 		}
-		if !strings.Contains(stdout.String(), "Usage: xuansi "+c.name) {
-			t.Errorf("%s: usage not printed", c.name)
+		var stdin, stdout, stderr bytes.Buffer
+		if code := c.run(&stdin, &stdout, &stderr, []string{"--sock", "/nonexistent/x.sock"}); code != exitUsage {
+			t.Errorf("%s: bare exit = %d, want %d (stderr %q)", c.name, code, exitUsage, stderr.String())
 		}
-		if !strings.Contains(stdout.String(), "stub") {
-			t.Errorf("%s: does not identify itself as a stub", c.name)
+		if stderr.Len() == 0 {
+			t.Errorf("%s: usage not on stderr", c.name)
+		}
+	}
+}
+
+// TestPerCommandHelpExitsZero: -h on each subcommand prints its usage.
+func TestPerCommandHelpExitsZero(t *testing.T) {
+	for _, c := range commands {
+		var stdin, stdout, stderr bytes.Buffer
+		if code := c.run(&stdin, &stdout, &stderr, []string{"-h"}); code != exitOK {
+			t.Errorf("%s -h: exit = %d, want %d (stderr %q)", c.name, code, exitOK, stderr.String())
+		}
+		if stdout.Len() == 0 && stderr.Len() == 0 {
+			t.Errorf("%s -h: no usage printed", c.name)
 		}
 	}
 }

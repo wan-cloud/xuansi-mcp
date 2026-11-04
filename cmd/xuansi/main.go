@@ -1,12 +1,11 @@
 // Command xuansi is the host-side daemon CLI of the xuansi hardware probe
 // (懸絲): it discovers boards (USB by-id + mDNS, joined by mac6), holds
 // exclusive per-board leases, and serves the internal unix-socket API that
-// agents talk to. The subcommand surface is fixed; this skeleton build only
-// dispatches — real logic lands task by task per the plan in README.md.
+// agents talk to. `xuansi serve` IS the daemon; every other subcommand is a
+// client of it over the socket (contract: internal/server/proto.go).
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,7 +16,7 @@ import (
 
 const (
 	exitOK    = 0
-	exitStub  = 1 // known command, not implemented in this skeleton build
+	exitError = 1 // runtime failure: daemon down, board error, refused lease
 	exitUsage = 2 // bad invocation: no args, unknown command, bad flags
 )
 
@@ -26,29 +25,29 @@ type command struct {
 	summary string
 	// run executes the command with the args after the command name and
 	// returns the process exit code.
-	run func(stdout, stderr io.Writer, args []string) int
+	run func(stdin io.Reader, stdout, stderr io.Writer, args []string) int
 }
 
 // commands is the subcommand table, in usage order. The internal/ layout
 // mirrors the layering replclient → discover → lease → server (see each
 // package's doc comment).
 var commands = []command{
-	{"serve", "run the daemon: discovery, leasing, unix-socket API", stub("serve")},
-	{"list", "list boards known to the daemon (USB + mDNS, mac6-joined)", stub("list")},
-	{"status", "show one board's live status", stub("status")},
-	{"lease", "take the exclusive lease on one board", stub("lease")},
-	{"release", "release a board lease", stub("release")},
-	{"eval", "evaluate one expression on a board and print the result", stub("eval")},
-	{"repl", "open an interactive REPL session with a board", stub("repl")},
+	{"serve", "run the daemon: discovery, leasing, unix-socket API", runServe},
+	{"list", "list boards known to the daemon (USB + mDNS, mac6-joined)", runList},
+	{"status", "show one board's live status", runStatus},
+	{"lease", "take the exclusive lease on one board", runLease},
+	{"release", "release a board lease", runRelease},
+	{"eval", "evaluate one expression on a board and print the result", runEval},
+	{"repl", "open a line-by-line REPL session with a board", runRepl},
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Stdin, os.Stdout, os.Stderr, os.Args[1:]))
 }
 
 // run dispatches argv (everything after the program name) and returns the
 // process exit code. Writers are parameters so tests can capture output.
-func run(argv []string, stdout, stderr io.Writer) int {
+func run(stdin io.Reader, stdout, stderr io.Writer, argv []string) int {
 	if len(argv) == 0 {
 		fmt.Fprint(stderr, usageText())
 		return exitUsage
@@ -60,7 +59,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	}
 	for _, c := range commands {
 		if c.name == argv[0] {
-			return c.run(stdout, stderr, argv[1:])
+			return c.run(stdin, stdout, stderr, argv[1:])
 		}
 	}
 	fmt.Fprintf(stderr, "xuansi: unknown command %q\n\n", argv[0])
@@ -85,6 +84,17 @@ Commands:
 		fmt.Fprintf(&b, "  %-8s %s\n", c.name, c.summary)
 	}
 	b.WriteString(`
+The daemon socket defaults to $XDG_RUNTIME_DIR/xuansi/daemon.sock
+(fallback /tmp/xuansi-daemon.sock); --sock overrides it everywhere.
+
+BOARD selectors are mac6 / alias (boards.conf) / hostname prefixes,
+resolved by the daemon; an ambiguous or unknown selector lists the
+candidate boards.
+
+Leases are holder-scoped: ` + "`xuansi lease B --holder H`" + ` binds the
+identity H; later commands re-supplying the same --holder adopt the
+lease back within the grace TTL after a disconnect.
+
 Flags:
 
   Every command accepts --verbose after the command name (slog debug
@@ -96,34 +106,27 @@ See README.md for build, layout and dependency policy.
 	return b.String()
 }
 
-// stub returns the placeholder runner shared by every command in this
-// skeleton build: it applies the repo-wide flag and logging conventions,
-// then reports the command as not yet implemented, with its usage.
-func stub(name string) func(stdout, stderr io.Writer, args []string) int {
-	return func(stdout, stderr io.Writer, args []string) int {
-		fs := flag.NewFlagSet(name, flag.ContinueOnError)
-		fs.SetOutput(stdout)
-		verbose := fs.Bool("verbose", false, "log at debug level (slog text handler)")
-		fs.Usage = func() {
-			fmt.Fprintf(fs.Output(), "Usage: xuansi %s [flags]\n", name)
-			fs.PrintDefaults()
-		}
-		if err := fs.Parse(args); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				return exitOK
-			}
-			return exitUsage
-		}
-		setupLogging(*verbose, stderr)
-		fmt.Fprintf(stdout, "xuansi %s: stub — implementation lands in a later task.\n\n", name)
-		fs.Usage()
-		return exitStub
-	}
+// fsVerbose reports whether --verbose was seen by the shared client
+// flag prelude (clientFlags); set just before setupLogging runs.
+var fsVerbose bool
+
+// clientFlags installs the flags every daemon-client subcommand takes:
+// --sock and --verbose.
+func clientFlags(fs *flag.FlagSet) *string {
+	sock := fs.String("sock", "", "daemon unix socket (default $XDG_RUNTIME_DIR/xuansi/daemon.sock, fallback /tmp/xuansi-daemon.sock)")
+	fs.BoolVar(&fsVerbose, "verbose", false, "log at debug level (slog text handler)")
+	return sock
+}
+
+// slogLogf adapts the daemon's printf-style trace seam onto slog.
+func slogLogf(format string, args ...any) {
+	slog.Info(fmt.Sprintf(format, args...))
 }
 
 // setupLogging installs the repo-wide logging convention: slog text
 // handler on stderr, info level by default, debug with --verbose.
 func setupLogging(verbose bool, w io.Writer) {
+	fsVerbose = verbose
 	level := slog.LevelInfo
 	if verbose {
 		level = slog.LevelDebug
