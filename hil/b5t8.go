@@ -43,16 +43,19 @@ const (
 )
 
 func main() {
-	scenario := flag.String("scenario", "", "usb | tcp")
+	scenario := flag.String("scenario", "", "usb | tcp | discover")
 	deadlink := flag.String("deadlink", "auto", "tcp keepalive path: auto | iptables | wifioff | all")
+	creds := flag.String("creds", "", "wifi credentials file for the b5t9 explicit-restore path (default: repo-relative incoming/wifi-wan-places.txt)")
 	flag.Parse()
 	switch *scenario {
 	case "usb":
 		os.Exit(runUSB())
 	case "tcp":
 		os.Exit(runTCP(*deadlink))
+	case "discover":
+		os.Exit(runDiscover(*creds))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp [-deadlink auto|iptables|wifioff|all]")
+		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover [-deadlink auto|iptables|wifioff|all] [-creds PATH]")
 		os.Exit(2)
 	}
 }

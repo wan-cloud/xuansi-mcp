@@ -1,0 +1,61 @@
+capture: results/2026-11-05-b5-t9-discover.log (2026-11-05T02:28:42+08:00)
+=== b5-t9 discovery HIL — 2026-11-05T02:28:43+08:00 ===
+device: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 (expect fw_build=b310378 protocol_ver=3)
+bench note: ONE physical board — multi-board merge/ambiguity paths are unit-covered (internal/discover/registry_test.go)
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  hello[settle]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[settle] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [note] phase A: net up (ip=10.1.51.205 ssid=Wan-Places)
+  [PASS] board wifi settled to up before discovery
+  boards.conf fixture: results/2026-11-05-b5-t9-boards.conf
+2026/11/05 02:28:52 WARN discover: boards.conf: skipping malformed line file=results/2026-11-05-b5-t9-boards.conf line=3 text="this-line-has-no-separator   <- malformed: skipped with a warning"
+  [PASS] LoadBoardsFile: aliases=map[d75884:bench] (malformed line skipped+warned above, err=<nil>)
+  [PASS] Refresh dual-source (err=<nil>, mdnsErr="")
+  [note] refresh took 3.005s (usb sweep + 3s mdns browse window)
+  board: mac6=d75884 alias="bench" sources=[usb+mdns] usb=/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 host=xuansi-d75884.local port=7777 txt=map[api:1 ver:3] hello=nil
+  [PASS] exactly one board discovered (got 1)
+  [PASS] mac6=d75884 (want d75884 — by-id MAC tail = mDNS hostname tail)
+  [PASS] sources=[usb mdns] (one entry, both faces)
+  [PASS] USBPath is the by-id path (/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00)
+  [PASS] mdns face host=xuansi-d75884.local port=7777
+  [PASS] TXT ver=3 api=1 (§14, same source as hello protocol_ver)
+  [PASS] alias from boards.conf = "bench"
+  [PASS] Hello nil before any dial (lazy enrichment)
+  [PASS] Resolve("d75884") — mac6 exact
+  [PASS] Resolve("d7") — mac6 unique prefix
+  [PASS] Resolve("bench") — boards.conf alias
+  [PASS] Resolve("xuansi-d7") — hostname prefix
+  [PASS] Resolve("zzzz") errors listing candidates (never guess): discover: no board matches "zzzz" — candidates: d75884 (bench) xuansi-d75884.local [usb+mdns]
+  [note] ambiguity errors need ≥2 boards — single-board bench; unit-covered (TestResolveAmbiguousListsCandidates)
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  hello[enrich]: protocol_ver=3 fw_build=b310378 role=observer reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[enrich] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [PASS] enrich hello role=observer (observer requested and granted)
+  [PASS] Enrich recorded: mac6=d75884 alias="bench" sources=[usb+mdns] usb=/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 host=xuansi-d75884.local port=7777 txt=map[api:1 ver:3] hello{protocol_ver=3 fw_build=b310378}
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  hello[wifioff]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[wifioff] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [note] phase B: net up (ip=10.1.51.205 ssid=Wan-Places)
+  [PASS] wifi up before wifi.off (fresh reboot association)
+  [PASS] wifi.off from USB controller (err=<nil>)
+  [note] wifi.off reply: map[ssid:Wan-Places state:off] (NVS creds kept — §14)
+  [PASS] Refresh after wifi.off (err=<nil>, mdnsErr="")
+  board: mac6=d75884 alias="bench" sources=[usb] usb=/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 host=xuansi-d75884.local port=7777 txt=map[api:1 ver:3] hello{protocol_ver=3 fw_build=b310378}
+  [PASS] still exactly one entry (got 1)
+  [PASS] mdns source downgraded away (sources=[usb]) — service withdrawn at net-down (§14)
+  [PASS] usb face still live
+  [PASS] last-known mdns face kept (host=xuansi-d75884.local port=7777 txt=map[api:1 ver:3]) — honest stale-marking, no hard delete
+  [PASS] enriched identity survived the downgrade
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  hello[restore]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[restore] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [note] phase C: net up (ip=10.1.51.205 ssid=Wan-Places)
+  [PASS] wifi restored (auto-reconnect after reboot; explicit setup only if parked)
+  [PASS] final Refresh (err=<nil>, mdnsErr="")
+  board: mac6=d75884 alias="bench" sources=[usb+mdns] usb=/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 host=xuansi-d75884.local port=7777 txt=map[api:1 ver:3] hello{protocol_ver=3 fw_build=b310378}
+  [PASS] dual-source restored after wifi recovery (sources=[usb mdns])
+=== discover: 33 pass, 0 fail ===
