@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -722,7 +723,7 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 	}
 	args := map[string]any{"code": req.Code}
 	if req.Args != nil {
-		args["args"] = req.Args
+		args["args"] = normalizeNumbers(req.Args)
 	}
 	op := "eval"
 	if async {
@@ -741,6 +742,36 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 		out["value"] = v
 	}
 	return out, nil
+}
+
+// normalizeNumbers repairs the JSON→msgpack number shape mismatch for
+// eval/submit args: every JSON number decodes to float64, but the board's
+// args bridge (v3, §4) accepts integers — a float64-encoded 7 is rejected
+// ("protocol: args: malformed") where a native Go client sending int64(7)
+// passes. Integral float64s (the only way an integer can arrive over
+// JSON) are converted back to int64 recursively; genuine fractions pass
+// through untouched (the board's verdict on those is preserved verbatim).
+// Found by the b5-full HIL (S3 ARGS round-trip through the daemon).
+func normalizeNumbers(v any) any {
+	switch x := v.(type) {
+	case float64:
+		if x == math.Trunc(x) && math.Abs(x) < 1<<53 {
+			return int64(x)
+		}
+		return x
+	case map[string]any:
+		for k, e := range x {
+			x[k] = normalizeNumbers(e)
+		}
+		return x
+	case []any:
+		for i, e := range x {
+			x[i] = normalizeNumbers(e)
+		}
+		return x
+	default:
+		return v
+	}
 }
 
 func (s *Server) hScriptStart(ctx context.Context, cc *clientConn, req *Request) (any, error) {

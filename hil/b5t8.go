@@ -43,9 +43,12 @@ const (
 )
 
 func main() {
-	scenario := flag.String("scenario", "", "usb | tcp | discover | lease")
+	scenario := flag.String("scenario", "", "usb | tcp | discover | lease | full")
 	deadlink := flag.String("deadlink", "auto", "tcp keepalive path: auto | iptables | wifioff | all")
 	creds := flag.String("creds", "", "wifi credentials file for the b5t9 explicit-restore path (default: repo-relative incoming/wifi-wan-places.txt)")
+	attempt := flag.Int("attempt", 1, "full: honest attempt number recorded in the capture header")
+	daemonBin := flag.String("daemon", "bin/xuansi-linux-amd64", "full: daemon binary the orchestration drives as a subprocess")
+	runDir := flag.String("run", "/tmp/opencode/b5-full", "full: scratch dir for the daemon sock + boards.conf")
 	flag.Parse()
 	switch *scenario {
 	case "usb":
@@ -56,8 +59,10 @@ func main() {
 		os.Exit(runDiscover(*creds))
 	case "lease":
 		os.Exit(runLease())
+	case "full":
+		os.Exit(runFull(*attempt, *daemonBin, *runDir))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease [-deadlink auto|iptables|wifioff|all] [-creds PATH]")
+		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR]")
 		os.Exit(2)
 	}
 }

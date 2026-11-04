@@ -997,6 +997,54 @@ func TestSubmitPassthrough(t *testing.T) {
 	}
 }
 
+// TestEvalArgsNumbersNormalizedToIntegers: JSON decodes every number to
+// float64, but the board's v3 args bridge accepts integers — a raw
+// pass-through would reach the fw as msgpack floats and be rejected
+// ("protocol: args: malformed", found by the b5-full HIL S3). The daemon
+// must convert integral float64s (the only way an integer can arrive over
+// JSON) back to int64; genuine fractions pass through untouched.
+func TestEvalArgsNumbersNormalizedToIntegers(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "n"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	var got map[string]any
+	var gotArr []any
+	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		got, _ = args["args"].(map[string]any)
+		gotArr, _ = args["args"].(map[string]any)["arr"].([]any)
+		return map[string]any{"out": ""}, nil
+	})
+	rep, _ = c.call(2, map[string]any{
+		"type": "eval", "board": "d75884", "code": "return ARGS",
+		"args": map[string]any{"n": float64(7), "f": 2.5, "arr": []any{float64(1), float64(-2)}},
+	})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	if got == nil {
+		t.Fatalf("args not captured")
+	}
+	if v, ok := got["n"].(int64); !ok || v != 7 {
+		t.Fatalf("integral float64 7 must cross as int64, got %#v", got["n"])
+	}
+	if _, ok := got["f"].(float64); !ok {
+		t.Fatalf("fraction 2.5 must stay float64, got %#v", got["f"])
+	}
+	if len(gotArr) != 2 {
+		t.Fatalf("array args = %#v", got["arr"])
+	}
+	if v, ok := gotArr[0].(int64); !ok || v != 1 {
+		t.Fatalf("array integral 1 must cross as int64, got %#v", gotArr[0])
+	}
+	if v, ok := gotArr[1].(int64); !ok || v != -2 {
+		t.Fatalf("array integral -2 must cross as int64, got %#v", gotArr[1])
+	}
+}
+
 // TestMultiBoardIndependentLeases: one connection, two boards — each
 // board gets its own lease and its own controller connection.
 func TestMultiBoardIndependentLeases(t *testing.T) {

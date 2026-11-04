@@ -1,0 +1,217 @@
+capture: results/2026-11-05-b5-full.log (2026-11-05T05:11:32+08:00)
+repo HEAD: 8f2ca62 — dirty files: 6
+daemon binary: built fresh from this tree (make build)
+mkdir -p bin
+GOOS=linux GOARCH=amd64 go build -trimpath -o bin/xuansi-linux-amd64 ./cmd/xuansi
+GOOS=linux GOARCH=arm64 go build -trimpath -o bin/xuansi-linux-arm64 ./cmd/xuansi
+=== b5 task-12 FULL daemon HIL — 2026-11-05T05:11:34+08:00 ===
+attempt: 3 (honest count — any failure is fixed and the WHOLE capture rerun)
+board: xuansi-d75884 (bench GPIO1<->GPIO2 wired; WiFi creds in NVS)
+expected: fw_build=b310378 protocol_ver=3 (every hello binds in-log; mismatch aborts)
+single-board bench: multi-board merge/ambiguity paths are unit-covered (internal/discover/registry_test.go)
+daemon: bin/xuansi-linux-amd64 serve --sock /tmp/opencode/b5-full/daemon.sock --grace-ttl 15s --boards-file /tmp/opencode/b5-full/boards.conf (REAL subprocess, fresh-built at HEAD)
+grace-ttl: 15s — a real second-scale window, waited out honestly (S7 adopt + S8 expiry)
+sudo/iptables: available (S9 silent hole on the daemon<->board 4-tuple)
+budget note: the daemon API has no budget knob — driver-direct out-of-band budget.set eval_ms=4000
+  in S0 (fw cap 0..4000, VM-global, RAM-only: S11's restore reboot resets it; needed for the 3.5s jobs)
+capture: results/2026-11-05-b5-full.log — the ONE file, S1..S12 inside
+
+— S0: prelude (driver-direct, labeled): headless reboot + settle + budget —
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  [note] board rebooted headless (no hello — controller slot free, script table clean)
+  [PASS] board TCP face up after reboot (tcp face up)
+[dial] tcp: connected 10.1.50.200:38798 → 10.1.51.205:7777 (no reboot, no drain window — §13; keepalive 3s/1s×3 ≈6s verdict)
+  hello[s0]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip:10.1.51.205 port:7777 ssid:Wan-Places state:up]
+  [PASS] hello[s0] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [PASS] [driver-direct] out-of-band budget.set eval_ms=4000 (reply=map[eval_ms:4000 event_ms:50] err=<nil> — daemon API has no budget knob)
+
+— S1: daemon serve up (subprocess) —
+  [note] boards.conf fixture: /tmp/opencode/b5-full/boards.conf (alias bench=d75884)
+  [daemon] started pid=104783 argv=["bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/b5-full/daemon.sock" "--grace-ttl" "15s" "--boards-file" "/tmp/opencode/b5-full/boards.conf"]
+  [daemon] xuansi daemon serving /tmp/opencode/b5-full/daemon.sock (grace-ttl 15s, Ctrl-C to stop)
+  [daemon] time=2026-11-05T05:11:46.342+08:00 level=INFO msg="server: serving /tmp/opencode/b5-full/daemon.sock (grace_ttl=15s)"
+  [PASS] daemon sock bound at /tmp/opencode/b5-full/daemon.sock (sock dialable)
+  [PASS] daemon reports serving (grace-ttl 15s)
+  [daemon] time=2026-11-05T05:11:46.638+08:00 level=INFO msg="server: conn dropped (holder=conn-1)"
+  [daemon] time=2026-11-05T05:11:49.347+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
+  [daemon] time=2026-11-05T05:11:49.605+08:00 level=INFO msg="tcp: connected 10.1.50.200:55018 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [daemon] time=2026-11-05T05:11:49.625+08:00 level=INFO msg="board d75884: controller warm connection up (fw=b310378 protocol_ver=3)"
+  [PASS] initial discovery sweep found 1 board (sweep line)
+
+— S2: discovery — list shows d75884 dual-source, fw-enriched; TXT ver=3 —
+  [daemon] time=2026-11-05T05:11:49.718+08:00 level=INFO msg="board d75884: resync scripts=[] survived=[] started=[] gone=[] pins=0 (cold=true) wifi_state=up [diag.pins raw 1306B]"
+  [daemon] time=2026-11-05T05:11:49.718+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[] pins=0 wifi_state=up (orphans listed, not killed)"
+  [PASS] list_boards shows d75884 with fw populated (fw=b310378 (startup audit hello-enriched))
+  [PASS] dual-source [usb mdns] (got [usb mdns])
+  [PASS] mdns face host=xuansi-d75884.local port=7777
+  [PASS] usb_path is the by-id path (/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00)
+  [PASS] fw=b310378 (hello-enriched, binds the expected build)
+  [PASS] alias from boards.conf = "bench"
+  [PASS] mdns face healthy (mdns_error="")
+  [PASS] startup orphan audit ran (report-only)
+  [PASS] audit reported the clean board (cold=true scripts=[] pins=0, nothing killed)
+  [PASS] [driver-side browse] mDNS TXT ver=3 api=1 (TXT=map[api:1 ver:3], err=<nil>) — same single source as hello protocol_ver (§14)
+
+— S3: lease (holder=h1, via alias) + structured eval —
+  [daemon] time=2026-11-05T05:11:53.647+08:00 level=INFO msg="lease: grant board=d75884 holder=h1 session=1793826707"
+  [PASS] lease via ALIAS "bench" resolves to board=d75884 holder=h1 session=1.793826707e+09 (rerr=<nil>)
+  [PASS] eval return 6*7 -> value=42 out="42" (rerr=<nil>)
+  [PASS] eval return ARGS round-trip deep-equal (value=map[arr:[1 2 3] b:true n:7 s:xuansi], rerr=<nil>)
+  [PASS] eval depth-8 table via the value bridge (rerr=<nil>)
+  [PASS] eval from a third holder while leased: refused held by h1 (class=held holder=h1)
+
+— S4: fs 16KB write/read sha256-exact + daemon-side cap —
+  [daemon] time=2026-11-05T05:11:53.719+08:00 level=INFO msg="server: conn dropped (holder=stranger)"
+  [PASS] fs_write 16384B /lua/b5full.tmp (rerr=<nil>)
+  [PASS] fs_read byte-exact (16384B, rerr=<nil>)
+  [note] sha256 write=8c8dea54c86fe3a4229ada948870a6141ac438690db5e961969d0b67e711b524
+  [note] sha256 read =8c8dea54c86fe3a4229ada948870a6141ac438690db5e961969d0b67e711b524
+  [PASS] fs_write 16385B refused DAEMON-SIDE at the cap (class=api msg=fs_write /lua/b5full.tmp: 16385 bytes exceeds the 16384B single-file cap (refuse)
+  [note] the 16KB temp file is kept as the fs_read health probe for S9/S11 (overwritten every run)
+
+— S5: submit 3.5s job — ack immediate, API live during, event carries value —
+  [PASS] h1 watch_events (job results fan to watchers; rerr=<nil>)
+  [PASS] submit ack immediate: {b5job queued=true} in 17ms (rerr=<nil>)
+  [PASS] list_boards DURING the job answered in 1ms (daemon loop never stalls)
+  [PASS] fs_read (board conn-task ro op) during the job answered in 196ms (rerr=<nil>)
+  [note] sync eval during a VM job queues in VM order by design (§6) — the async submit IS the no-stall remedy (protocol diff #7)
+  [PASS] job event delivered: tag=b5job ok=true value=b5job-value (waited 3.516s)
+
+— S6: gpio events — claim via eval, watcher on a second conn, edges through the daemon —
+  [PASS] claim GPIO1 out / GPIO2 in via eval (rerr=<nil>)
+  [PASS] watcher conn watch_events source=gpio.2 (daemon subscribes board-side; rerr=<nil>)
+  [PASS] drive GPIO1 edges via eval (rerr=<nil>)
+  [note] watcher saw gpio.2 edge=rising level=1
+  [note] watcher saw gpio.2 edge=falling level=0
+  [PASS] gpio.2 events pushed through the daemon to the WATCHING conn: [rising falling] (want rising then falling)
+
+— S7: grace ADOPT — holder drop mid-job, SAME holder back within TTL —
+  [daemon] time=2026-11-05T05:11:57.579+08:00 level=INFO msg="server: conn dropped (holder=conn-5)"
+  [PASS] script_start b5keep (resident counter, lease session ns; rerr=<nil>)
+  [PASS] submit b5adj (in flight across the drop; rerr=<nil>)
+  [note] h1 conn CLOSED mid-job (b5adj 212ms in, b5keep counting) — grace window open
+  [daemon] time=2026-11-05T05:11:59.139+08:00 level=INFO msg="lease: agent-gone holder=h1 boards=1 grace_deadline=2026-11-05T05:12:14+08:00 ttl=15s (board state kept)"
+  [daemon] time=2026-11-05T05:11:59.139+08:00 level=INFO msg="server: conn dropped (holder=h1)"
+  [PASS] third-party lease during grace refused: class=held holder=h1 grace_expiry=2026-11-05T05:12:14+08:00
+  [daemon] time=2026-11-05T05:11:59.640+08:00 level=INFO msg="server: conn dropped (holder=h2)"
+  [PASS] reconnected conn watch_events BEFORE the adopt (rerr=<nil>)
+  [daemon] time=2026-11-05T05:11:59.641+08:00 level=INFO msg="lease: adopt board=d75884 holder=h1 session=1793826707 (board state kept - no reset)"
+  [daemon] time=2026-11-05T05:11:59.641+08:00 level=INFO msg="server: holder h1 adopted board d75884 back live"
+  [PASS] SAME holder reconnects within TTL: eval adopted the lease live (rerr=<nil>)
+  [PASS] b5keep RAN THROUGH grace and the adopt (counter 13 -> 45 — no reset)
+  [PASS] daemon log: holder adopted back live (adopt, not re-acquire)
+  [PASS] grace adopt touched nothing (no expiry teardown so far)
+  [PASS] in-flight job's event delivered to the RECONNECTED watcher: tag=b5adj value=b5adj-value (job survived the agent disconnect; the daemon<->board link never dropped, so no orphan)
+  [PASS] board_status: lease live again holder=h1 grace_deadline=<nil>
+  [PASS] board_status scripts=[b5keep]
+
+— S8: grace EXPIRY — drop again, wait out the 15s TTL, teardown exactly once —
+  [PASS] holder eval-claims GPIO1 (pin state for the safe-state proof; rerr=<nil>)
+  [note] h1 conn CLOSED again — grace window 15s starts
+  [daemon] time=2026-11-05T05:12:02.525+08:00 level=INFO msg="lease: agent-gone holder=h1 boards=1 grace_deadline=2026-11-05T05:12:17+08:00 ttl=15s (board state kept)"
+  [daemon] time=2026-11-05T05:12:02.525+08:00 level=INFO msg="server: conn dropped (holder=h1)"
+  [PASS] during grace: lease kept holder=h1 grace_deadline=2026-11-05T05:12:17+08:00 (board state KEPT)
+  [PASS] during grace: script STILL listed [b5keep]
+  [daemon] time=2026-11-05T05:12:17.655+08:00 level=INFO msg="board d75884: session.reset(1793826707) stopped=1"
+  [daemon] time=2026-11-05T05:12:17.673+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+  [daemon] time=2026-11-05T05:12:17.673+08:00 level=INFO msg="lease: teardown reason=expired board=d75884 holder=h1 session=1793826707 sessions=[1793826707 0] err=<nil> took=148ms"
+  [PASS] grace TTL expired and the lease is gone (waited 13.119s; lease gone from board_status)
+  [PASS] expiry teardown ran EXACTLY ONCE in the whole capture (count=1)
+  [PASS] post-expiry script.list empty (got [] — b5keep torn down)
+  [PASS] post-expiry op as the old holder: not_held (class=not_held msg=no lease on board d75884 — lease it first (holder h1))
+  [daemon] time=2026-11-05T05:12:17.692+08:00 level=INFO msg="server: conn dropped (holder=h1)"
+  [daemon] time=2026-11-05T05:12:17.692+08:00 level=INFO msg="lease: grant board=d75884 holder=h2b session=1793826708"
+  [PASS] post-expiry pins SAFE: GPIO1 write rejected (class=rt msg=eval:1: pin 1 not configured as output (call bench.gpio.mode(pin,"out")
+  [note] diag.pins is an HIL-only op not exposed by the daemon API — safe-state proven by the write-reject probe (T10 house style)
+  [daemon] time=2026-11-05T05:12:17.716+08:00 level=INFO msg="board d75884: session.reset(1793826708) stopped=0"
+  [daemon] time=2026-11-05T05:12:17.723+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+  [daemon] time=2026-11-05T05:12:17.723+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=h2b session=1793826708 sessions=[1793826708 0] err=<nil> took=13ms"
+  [PASS] h2b release (bench back to free; rerr=<nil>)
+
+— S9: link-loss resync — silent 4-tuple hole, no-reboot recovery, in-flight job fate —
+  [daemon] time=2026-11-05T05:12:17.724+08:00 level=INFO msg="server: conn dropped (holder=h2b)"
+  [daemon] time=2026-11-05T05:12:17.724+08:00 level=INFO msg="lease: grant board=d75884 holder=h1 session=1793826709"
+  [PASS] fresh lease holder=h1 after the expiry round (rerr=<nil>)
+  [PASS] script_start b5resync BEFORE the hole (rerr=<nil>)
+  [PASS] h1n watch_events before the hole (any late job delivery would land here; rerr=<nil>)
+  [note] counter before the hole: 8 (script running)
+  [PASS] submit b5orphan — in flight when the link holes (rerr=<nil>)
+  [PASS] resolved daemon<->board 4-tuple 55018:10.1.51.205 <-> 10.1.51.205:7777 (the daemon's warm controller conn — the only ESTAB)
+  [note] silent hole open (BOTH directions dropped) — board blind, host keepalive must verdict
+  [PASS] daemon's board link declared dead after a traffic-free window (observed at 8.008s; host keepalive 3s idle + 3x1s probes ~= 6s — the EOF-miss dead-link shape, <=6s class; connected=false)
+  [note] EOF-miss intermittent -> dead-link <=6s (focus note): the silent hole IS the keepalive-verdict path — traffic-free window 8.008s, verdict fires at ~6s into it (T8 measured 6.1s with local Dead polling)
+  [note] rules out — the daemon redials on the next board op (boardOp path); its supervisor re-hellos through the board-side keepalive self-release (T10 fix1)
+  [daemon] time=2026-11-05T05:12:27.084+08:00 level=INFO msg="tcp: connected 10.1.50.200:59822 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [daemon] time=2026-11-05T05:12:27.608+08:00 level=INFO msg="board d75884: hello forced observer (old slot not yet released) - re-helloing through the board's keepalive window (self-release ~17s, -12; budget 25s)"
+  [daemon] time=2026-11-05T05:12:29.100+08:00 level=INFO msg="board d75884: controller taken on re-hello 4 after 1.5s of the 25s window (slot self-released - board keepalive, -12)"
+  [daemon] time=2026-11-05T05:12:29.100+08:00 level=INFO msg="board d75884: controller warm connection up (fw=b310378 protocol_ver=3)"
+  [PASS] board path RECOVERED over TCP after the hole (fs_read probe, 2.134s; fs_read ok (16384B))
+  [PASS] recovered fs_read still byte-exact (same file across the link loss)
+  [PASS] daemon re-took the controller over TCP after the hole (re-hello/warm-connection lines present, NO USB fallback dial, NO reboot)
+  [note] arbitration shape: forced observer -> controller taken on re-hello (the daemon rode out the board-side keepalive self-release — T10 fix1 shape)
+  [PASS] post-recovery board_status: connected=true scripts=[b5resync] (b5resync SURVIVED the link loss)
+  [PASS] script RAN THROUGH the hole and the recovery (counter 8 -> 111 — no reboot happened)
+  [note] the ResyncReport diff shape is a supervisor-internal (T10 driver-level); through the API the survival evidence is scripts+counter + the daemon's own arbitration log
+  [PASS] in-flight job BODY ran to completion through the link loss (_G.b5orphan_done=true)
+  [note] no b5orphan result event within 5s of recovery — the frame died with the keepalive-aborted socket (expected shape; body ran, result lost)
+[dial] tcp: connected 10.1.50.200:59826 → 10.1.51.205:7777 (no reboot, no drain window — §13; keepalive 3s/1s×3 ≈6s verdict)
+  hello[orphan-diag]: protocol_ver=3 fw_build=b310378 role=observer reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip:10.1.51.205 port:7777 ssid:Wan-Places state:up]
+  [PASS] hello[orphan-diag] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [PASS] orphan-diag hello role=observer (observer — proof the DAEMON re-took the controller slot)
+  [PASS] [driver-direct] diag.stats job_orphans=0 (err=<nil>) — the submitter conn was still established board-side at completion, so the fw queued (not orphaned) the frame; its LOSS happened host-side at the keepalive abort (honestly recorded above)
+  [note] [driver-direct] log.read: no orphan line (consistent with job_orphans=0; the fw-layer orphan lifecycle is proven by b4-T7 with direct conns)
+
+— S10: release — polite release tears the board side down —
+  [daemon] time=2026-11-05T05:12:34.313+08:00 level=INFO msg="board d75884: session.reset(1793826709) stopped=1"
+  [daemon] time=2026-11-05T05:12:34.327+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+  [daemon] time=2026-11-05T05:12:34.327+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=h1 session=1793826709 sessions=[1793826709 0] err=<nil> took=28ms"
+  [PASS] release holder=h1 (rerr=<nil>)
+  [PASS] daemon log: teardown reason=released (count=2)
+  [PASS] post-release: scripts=[] lease=map[] (board torn down, free)
+
+— S11: mDNS-degraded — wifi.off (driver-direct USB, REBOOT labeled), usb-only list, restore —
+  [label] this dedicated phase runs LAST: the USB open REBOOTS the board (kills nothing — everything is released)
+  [daemon] time=2026-11-05T05:12:34.341+08:00 level=INFO msg="server: conn dropped (holder=h1)"
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  hello[degraded]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[degraded] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [note] degraded: net up (ip=10.1.51.205 ssid=Wan-Places)
+  [PASS] board wifi up before wifi.off
+  [PASS] [driver-direct] wifi.off from the USB controller (reply=map[ssid:Wan-Places state:off] err=<nil>)
+  [PASS] TCP face gone after wifi.off (dial err=dial tcp 10.1.51.205:7777: i/o timeout — expected)
+  [PASS] daemon's board link dead after net-down (connected=false — EOF fast path or keepalive, §13 best-effort)
+  [PASS] list degraded to usb-only after wifi.off (usb-only — mdns service withdrawn at net-down, §14)
+  [PASS] last-known mdns face kept host=xuansi-d75884.local (honest stale-marking, no hard delete)
+  [PASS] usb source still live (/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00)
+  [PASS] board_status still resolves + answers over the usb-only entry (no dial, lease null)
+  [daemon] time=2026-11-05T05:12:56.063+08:00 level=INFO msg="board d75884: dial failed: replclient: dial tcp xuansi-d75884.local:7777: dial tcp 10.1.51.205:7777: i/o timeout"
+  [PASS] board op through the daemon with TCP down: class=unreachable after 1m2.009s (the daemon never dials USB — owner ruling: USB fallback is the caller's explicit last resort; recorded honestly)
+  [PASS] [driver-direct] USB transport itself ALIVE with wifi down (eval value=usb-ok err=<nil>)
+  [note] restore: close + reopen CDC (board reboots, killing nothing) -> NVS auto-connect -> mDNS back
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  hello[restore]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[restore] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [note] restore: net up (ip=10.1.51.205 ssid=Wan-Places)
+  [PASS] wifi auto-recovered after the restore reboot (NVS creds; explicit setup only if parked)
+  [PASS] restore USB controller yields the slot (re-hello observer, §12; role=observer err=<nil>)
+  [note] the restore reboot also reset the out-of-band eval_ms budget to fw defaults (RAM-only state)
+  [PASS] dual-source restored after wifi recovery (dual-source; fw=b310378)
+  [daemon] time=2026-11-05T05:14:21.268+08:00 level=INFO msg="tcp: connected 10.1.50.200:46216 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [daemon] time=2026-11-05T05:14:21.282+08:00 level=INFO msg="board d75884: controller warm connection up (fw=b310378 protocol_ver=3)"
+  [PASS] daemon RE-HEALED the board path after wifi restore (fs_read byte-exact, 121ms; 16384B)
+
+— S12: clean shutdown — SIGINT, exit 0, sock removed —
+  [note] order: the dedicated degraded phase (S11) ran before shutdown so its reboot poisoned nothing (plan instruction)
+  [daemon] time=2026-11-05T05:14:21.339+08:00 level=INFO msg="server: conn dropped (holder=conn-2)"
+  [daemon] xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)
+  [daemon] xuansi: shutdown complete
+  [PASS] daemon exited clean (code=0 waitErr=<nil>)
+  [PASS] daemon's own final log line: 'shutdown complete'
+  [PASS] sock file removed at exit (stat err=stat /tmp/opencode/b5-full/daemon.sock: no such file or directory)
+  [note] no-goroutine-leak bar for a SUBPROCESS: exit 0 requires srv.Done() — the daemon joins every server goroutine before printing
+  [note] 'shutdown complete' and exiting 0 IS the in-process runtime.NumGoroutine reconciliation made observable
+=== b5-full: 90 pass, 0 fail ===
+=== ALL PASS — task-12 single-capture evidence complete (attempt 3, S1..S12) ===
