@@ -121,9 +121,9 @@ func (c *Client) Op(ctx context.Context, op string, args map[string]any) (map[st
 		return nil, fmt.Errorf("replclient: %s: %w", op, err)
 	}
 
-	ch := c.rt.register(id) // before the write: the reply can race it
+	ch := c.rt.register(id)   // before the write: the reply can race it
+	defer c.rt.unregister(id) // oracle's `finally: del replies[k]`: every exit releases the slot
 	if _, err := c.write(f); err != nil {
-		c.rt.unregister(id)
 		c.markDead("link write failed: " + err.Error())
 		return nil, fmt.Errorf("%w: write %s: %v", ErrDead, op, err)
 	}
@@ -134,7 +134,6 @@ func (c *Client) Op(ctx context.Context, op string, args map[string]any) (map[st
 	case msg := <-ch:
 		return replyResult(op, msg)
 	case <-timer.C:
-		c.rt.unregister(id)
 		select { // the reply may have landed as the timer fired
 		case msg := <-ch:
 			return replyResult(op, msg)
@@ -142,10 +141,8 @@ func (c *Client) Op(ctx context.Context, op string, args map[string]any) (map[st
 		}
 		return nil, fmt.Errorf("replclient: timeout waiting reply for %s id=%d: %w", op, id, context.DeadlineExceeded)
 	case <-ctx.Done():
-		c.rt.unregister(id)
 		return nil, fmt.Errorf("replclient: %s: %w", op, ctx.Err())
 	case <-c.deadCh:
-		c.rt.unregister(id)
 		return nil, c.deadErr(op)
 	}
 }

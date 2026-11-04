@@ -49,8 +49,9 @@ func frame(payload []byte) ([]byte, error) {
 // decided at the 4-byte header boundary and skipped without losing sync
 // (§1); a length above maxFrame or a type byte ≠ 0x01 is fatal (§7).
 type frameReader struct {
-	r   io.Reader
-	buf []byte
+	r    io.Reader
+	buf  []byte
+	rerr error // sticky read error, held back until buffered frames are delivered
 }
 
 func newFrameReader(r io.Reader) *frameReader {
@@ -58,8 +59,11 @@ func newFrameReader(r io.Reader) *frameReader {
 }
 
 // next blocks until one complete frame payload is available and returns
-// a private copy of it. Fatal frame errors and read errors (io.EOF,
-// link failure) end the stream.
+// a private copy of it. A Read may legally return bytes together with
+// an error (the io.Reader contract — e.g. the final chunk of a reply
+// frame arriving with io.EOF), so read errors are held back until every
+// complete frame in the already-buffered bytes has been delivered, and
+// only then end the stream. Fatal frame errors end it immediately.
 func (fr *frameReader) next() ([]byte, error) {
 	for {
 		if len(fr.buf) >= 4 {
@@ -81,13 +85,16 @@ func (fr *frameReader) next() ([]byte, error) {
 				return payload, nil
 			}
 		}
+		if fr.rerr != nil {
+			return nil, fr.rerr // stream ended; nothing more can complete
+		}
 		var chunk [4096]byte
 		n, err := fr.r.Read(chunk[:])
 		if n > 0 {
 			fr.buf = append(fr.buf, chunk[:n]...)
 		}
 		if err != nil {
-			return nil, err
+			fr.rerr = err // deliver the buffered frames first; surface on a later pass
 		}
 	}
 }

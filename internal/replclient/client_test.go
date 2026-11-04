@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -507,6 +509,144 @@ func TestBoardCloseFailsPendingOps(t *testing.T) {
 	waitFor(t, c.Dead)
 }
 
+// TestReplySlotsReleased (I-1 regression): every Op exit — success,
+// timeout, context cancellation — releases its reply slot; the Python
+// oracle does this with `finally: del replies[k]` on all paths. 50
+// sequential successful ops plus one timed-out and one cancelled op
+// must leave the router's table empty (ids are monotonic, so a leaked
+// slot is a permanent leak).
+func TestReplySlotsReleased(t *testing.T) {
+	c, b := newTestClient(t)
+	for i := 0; i < 50; i++ {
+		if _, err := c.Op(context.Background(), "ping", nil); err != nil {
+			t.Fatalf("ping %d: %v", i, err)
+		}
+	}
+
+	// timeout exit
+	old := OpTimeouts["ping"]
+	OpTimeouts["ping"] = 50 * time.Millisecond
+	b.muteAll(true)
+	if _, err := c.Op(context.Background(), "ping", nil); !errors.Is(err, context.DeadlineExceeded) {
+		b.muteAll(false)
+		OpTimeouts["ping"] = old
+		t.Fatalf("muted ping err = %v, want context.DeadlineExceeded", err)
+	}
+	b.muteAll(false)
+	OpTimeouts["ping"] = old
+
+	// context-cancel exit (slot registered, then cancelled mid-wait)
+	b.muteAll(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := c.Op(ctx, "ping", nil); !errors.Is(err, context.Canceled) {
+		b.muteAll(false)
+		t.Fatalf("cancelled ping err = %v, want context.Canceled", err)
+	}
+	b.muteAll(false)
+
+	c.rt.mu.Lock()
+	n := len(c.rt.replies)
+	c.rt.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d reply slots leaked across op exits", n)
+	}
+}
+
+// eofLink is a Link whose Read can deliver the final bytes together
+// with io.EOF — the io.Reader-legal shape a transport hit at unplug
+// time may produce.
+type eofLink struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	buf  []byte
+	eof  bool
+}
+
+func newEOFLink() *eofLink {
+	l := &eofLink{}
+	l.cond = sync.NewCond(&l.mu)
+	return l
+}
+
+// feed queues bytes for delivery; eofAtEnd makes the read that drains
+// the last queued byte return io.EOF together with the data.
+func (l *eofLink) feed(p []byte, eofAtEnd bool) {
+	l.mu.Lock()
+	l.buf = append(l.buf, p...)
+	l.eof = eofAtEnd
+	l.cond.Broadcast()
+	l.mu.Unlock()
+}
+
+func (l *eofLink) Read(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for len(l.buf) == 0 && !l.eof {
+		l.cond.Wait()
+	}
+	n := copy(p, l.buf)
+	l.buf = l.buf[n:]
+	var err error
+	if len(l.buf) == 0 && l.eof {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func (l *eofLink) Write(p []byte) (int, error) { return len(p), nil }
+
+func (l *eofLink) Close() error {
+	l.mu.Lock()
+	l.eof = true
+	l.cond.Broadcast()
+	l.mu.Unlock()
+	return nil
+}
+
+func (l *eofLink) Kind() string { return "tcp" }
+
+// TestReaderContractFinalChunkWithError (I-2 regression): a Read
+// returning (n>0, io.EOF) — legal per the io.Reader contract — must not
+// lose the bytes it carried: a complete reply frame arriving in that
+// final chunk is delivered to its waiter, and only after the buffered
+// frames are exhausted does the connection die of EOF.
+func TestReaderContractFinalChunkWithError(t *testing.T) {
+	l := newEOFLink()
+	c := NewClient(l)
+	t.Cleanup(func() { c.Close() })
+
+	payload, err := encodeMessage(map[string]any{
+		"op":     "reply",
+		"id":     int64(1),
+		"result": map[string]any{"uptime_us": int64(1)},
+	})
+	if err != nil {
+		t.Fatalf("encodeMessage: %v", err)
+	}
+	f, err := frame(payload)
+	if err != nil {
+		t.Fatalf("frame: %v", err)
+	}
+	l.feed(f, true) // the whole reply frame in one (n>0, io.EOF) read
+
+	res, err := c.Op(context.Background(), "ping", nil) // first op → id 1
+	if err != nil {
+		t.Fatalf("op: %v — reply lost to a (n>0, EOF) read", err)
+	}
+	if res["uptime_us"] != int64(1) {
+		t.Fatalf("reply result = %#v", res)
+	}
+	waitFor(t, c.Dead)
+	if reason := c.DeadReason(); !strings.Contains(reason, "closed") && !strings.Contains(reason, "EOF") {
+		t.Fatalf("dead reason = %q, want it to name the EOF/close", reason)
+	}
+}
+
+// marks the client dead as locally closed, and is safe to repeat.
 // TestCloseIsCleanAndIdempotent: Close stops the router goroutine,
 // marks the client dead as locally closed, and is safe to repeat.
 func TestCloseIsCleanAndIdempotent(t *testing.T) {
