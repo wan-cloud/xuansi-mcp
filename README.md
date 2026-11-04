@@ -6,8 +6,9 @@ boards over the wire REPL protocol. The daemon discovers boards (USB by-id +
 mDNS, merged by the board's 6-byte MAC), holds an exclusive per-board lease
 with grace-TTL teardown when an agent drops, and serves the internal API to
 agents over a unix socket; the `xuansi` CLI drives all of it. Layering
-bottom-up: `internal/replclient` → `internal/discover` → `internal/lease` →
-`internal/server`, fronted by `cmd/xuansi`.
+bottom-up: `internal/replclient` → `internal/discover` → `internal/lease`
+(pure lease/teardown policy) + `internal/board` (per-board controller
+connection + resync) → `internal/server`, fronted by `cmd/xuansi`.
 
 ## Build
 
@@ -39,10 +40,15 @@ text handler on stderr, `--verbose` for debug level.
                          (repl.py protocol knowledge, Go port)
     internal/discover/   USB by-id + mDNS browse → mac6-joined board registry
     internal/lease/      exclusive per-board lease + grace-TTL teardown
+                         (clock-injected policy: adopt-within-TTL, expiry
+                         session.reset exactly-once, eval-namespace sweep)
+    internal/board/      per-board supervisor: warm TCP controller route,
+                         USB fallback (reboot, on demand), link-loss resync
     internal/server/     unix socket internal API (length-prefixed JSON:
                          request / reply / event)
     hil/                 live-board HIL runners (b5t8.go: -scenario usb|tcp;
-                         b5t9.go: -scenario discover) + capture scripts → results/
+                         b5t9.go: -scenario discover; b5t10.go: -scenario lease)
+                         + capture scripts → results/
     results/             committed evidence (ASCII filenames)
 
 ## Docs (mgmt repo)

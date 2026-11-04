@@ -1,0 +1,9 @@
+    supervisor_test.go:344: LeaseTeardown: board: unimplemented
+--- FAIL: TestConnectWaitsForControllerRole (0.00s)
+    supervisor_test.go:374: connect: board: unimplemented
+--- FAIL: TestDiagPinsTerminatesOnHeaderCount (0.00s)
+    supervisor_test.go:417: raw="" claims=[]
+FAIL
+FAIL	xuansi/internal/board	0.024s
+FAIL
+28
