@@ -64,9 +64,25 @@ type mockBoard struct {
 func newMockBoard(t *testing.T) *mockBoard {
 	t.Helper()
 	a, b := net.Pipe()
+	mb := startMockBoard(t, b)
+	mb.Link = pipeLink{a}
+	return mb
+}
+
+// serveMockBoardOver runs the mock board protocol over an arbitrary
+// connection (e.g. a TCP conn accepted by a test listener, so transport
+// dialers can be exercised end-to-end). The caller owns the client end.
+func serveMockBoardOver(t *testing.T, conn net.Conn) *mockBoard {
+	t.Helper()
+	return startMockBoard(t, conn)
+}
+
+// startMockBoard wires the default script around one end of a
+// connection and serves until cleanup.
+func startMockBoard(t *testing.T, conn net.Conn) *mockBoard {
+	t.Helper()
 	mb := &mockBoard{
-		conn:     b,
-		Link:     pipeLink{a},
+		conn:     conn,
 		handlers: map[string]func(args map[string]any) (map[string]any, *boardError){},
 		hello:    defaultHello(),
 	}

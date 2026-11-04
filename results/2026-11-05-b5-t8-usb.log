@@ -1,0 +1,47 @@
+capture: results/2026-11-05-b5-t8-usb.log (2026-11-05T01:57:35+08:00)
+=== b5-t8 USB HIL — 2026-11-05T01:57:35+08:00 ===
+device: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 (expect fw_build=b310378 protocol_ver=3)
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+  hello[usb]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[usb] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [PASS] fresh CDC session role=controller (want controller)
+  [PASS] eval return 6*7 → value=42 out="42" err=<nil>
+  [PASS] eval return ARGS round-trip byte-shaped equal (err=<nil>)
+  [PASS] eval depth-8 table via value bridge (err=<nil>)
+  [note] wifi settling: state=connecting (boot auto-connect in progress)
+  [note] net up before heavy traffic: ip=10.1.51.205 ssid=Wan-Places
+  [PASS] board wifi settled to up before the 16KB transfer
+  [PASS] fs.write 16384B /lua/t8buf.tmp (err=<nil>)
+  [PASS] fs.read byte-exact (16384 bytes, err=<nil>)
+  [note] sha256 write=4d2956b4cb3855ed49e4c79364b69aa5dbb17d964e25d2c8e763ad315de61b04
+  [note] sha256 read =4d2956b4cb3855ed49e4c79364b69aa5dbb17d964e25d2c8e763ad315de61b04
+  [PASS] sha256(write) == sha256(read)
+  [PASS] fs.write 16385B refused client-side at the 16384B cap (err=replclient: fs.write /lua/t8big.tmp: 16385 bytes exceeds the 16384B single-file cap)
+  [PASS] fs.rm /lua/t8buf.tmp cleanup (err=<nil>)
+  [PASS] fs.read after rm → board api error (err=fs.read: error api: '/lua/t8buf.tmp' not found (No such file or directory))
+  [PASS] budget.set eval_ms=4000 for the 4s job (err=<nil>)
+  [PASS] submit ack in 1.440615ms (err=<nil>) — immediate, job queued
+  [PASS] ping during 4s job answered in 3.022582ms (err=<nil>) — zero-stall
+  [PASS] job event data ok/tag/value (latency 4.013888553s): map[string]interface {}{"ok":true, "out":"job4s-value", "tag":"t8job", "value":"job4s-value"}
+  [note] budget restored to eval_ms=200 (err=<nil>)
+  [PASS] claim GPIO1 out / GPIO2 in (err=<nil>)
+  [PASS] events.subscribe gpio.2 (err=<nil>)
+  [PASS] drive GPIO1 edges (err=<nil>)
+  [note] event gpio.2 edge=rising level=1
+  [note] event gpio.2 edge=falling level=0
+  [PASS] gpio.2 events observed [rising falling] (want rising then falling)
+  [note] events.unsubscribe gpio.2 (err=<nil>)
+  [PASS] sendraw type=0x02 frame (err=<nil>)
+  [PASS] Dead() within 3s of the desync frame (took 20.284721ms)
+  [note] dead reason: fatal protocol error: frame type 0x02 (only 0x01 implemented)
+  [PASS] post-desync op fast-fails ErrDead (err=replclient: connection dead (fatal protocol error: frame type 0x02 (only 0x01 implemented)): ping)
+[dial] usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)
+[dial] usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)
+[dial] reconnect: hello ok (role controller, 0 failed attempt(s) before)
+  [note] reconnect took 5.002708337s (close→reopen→reboot→drain→hello)
+  hello[reconnect]: protocol_ver=3 fw_build=b310378 role=controller reset=usb fw="xuansi-fw v0.1.0" idf=v5.5.5 chip=ESP32-S3 lua=Lua 5.4.9 fs=true net=map[ip: port:7777 ssid:Wan-Places state:connecting]
+  [PASS] hello[reconnect] binds protocol_ver=3 fw_build=b310378 (want 3/b310378)
+  [PASS] post-reconnect role=controller (fresh session re-took controller)
+  [PASS] reconnected client evaluates (value=recovered err=<nil>)
+=== usb: 26 pass, 0 fail ===

@@ -67,6 +67,8 @@ func (c *Client) Hello(observer bool, clientName string) (*HelloInfo, error) {
 	h := parseHello(res)
 	c.mu.Lock()
 	c.caps = h.Caps
+	c.helloWant = observer
+	c.helloName = clientName
 	c.mu.Unlock()
 	return h, nil
 }

@@ -58,11 +58,12 @@ func opTimeout(op string) time.Duration {
 	return defaultOpTimeout
 }
 
-// Client is one frame-protocol connection to a board over a Link. It is
-// deliberately single-shot: no reconnect and no transport of its own
-// (both are task 8). When the connection dies — a fatal frame error
-// (§7), the board's nil-id protocol frame, a link failure, or Close —
-// Dead reports it and the caller rebuilds on a fresh Link.
+// Client is one frame-protocol connection to a board over a Link.
+// Transports come from DialUSB/DialTCP and carry a redial route, so a
+// dead client has a Reconnect path back to a live one. When the
+// connection dies — a fatal frame error (§7), the board's nil-id
+// protocol frame, a link failure, or Close — Dead reports it and the
+// caller rebuilds (Reconnect, or a fresh dial).
 //
 // Concurrency: Op/Eval/Submit/Hello may be called from multiple
 // goroutines; frame writes are serialized and replies are paired by id,
@@ -82,6 +83,10 @@ type Client struct {
 	deadReason string
 	nextID     int64
 	caps       map[string]any // cached by Hello (§2: hello.caps == caps op dict)
+
+	redial    redialRoute // set by DialUSB/DialTCP; Reconnect's route to a successor
+	helloWant bool        // last Hello's requested role, echoed on Reconnect
+	helloName string      // last Hello's client name, echoed on Reconnect
 }
 
 // NewClient wraps a Link and starts the background read router.
@@ -224,6 +229,22 @@ func (c *Client) DeadReason() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.deadReason
+}
+
+// SendRaw writes raw bytes to the link outside the frame writer. It
+// exists for protocol-fault HIL: the §7 desync probe injects a frame
+// header with the reserved 0x02 type byte ([0 0 0 1 0x02]) and watches
+// the board's fatal nil-id reply kill the client. The daemon never
+// calls it.
+func (c *Client) SendRaw(p []byte) error {
+	if err := c.deadErr("sendraw"); err != nil {
+		return err
+	}
+	if _, err := c.write(p); err != nil {
+		c.markDead("link write failed: " + err.Error())
+		return fmt.Errorf("%w: sendraw: %v", ErrDead, err)
+	}
+	return nil
 }
 
 // Close shuts down the read router and the link, waking every pending

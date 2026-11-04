@@ -41,6 +41,8 @@ text handler on stderr, `--verbose` for debug level.
     internal/lease/      exclusive per-board lease + grace-TTL teardown
     internal/server/     unix socket internal API (length-prefixed JSON:
                          request / reply / event)
+    hil/                 live-board HIL runners (b5t8.go: -scenario usb|tcp)
+                         + capture scripts → results/
     results/             committed evidence (ASCII filenames)
 
 ## Docs (mgmt repo)
