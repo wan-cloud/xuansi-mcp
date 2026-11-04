@@ -3,3 +3,6 @@
 
 # transient logs (repo root only — evidence under results/ stays committed)
 /*.log
+
+# codegraph local index
+.codegraph/
