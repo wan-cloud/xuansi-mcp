@@ -43,6 +43,13 @@ const (
 // errUnreachable wraps dial/hello failures for the error taxonomy.
 var errUnreachable = errors.New("board unreachable")
 
+// USBRebootWarning is the honest label the deliberate USB-transport
+// lease route must state everywhere it succeeds — in the API reply's
+// result (key "warning"), in the daemon log, and on the CLI's stdout
+// (T10 ruling: USB is the WiFi-dead bench's LAST resort; opening the
+// CDC port reboots the board, §2, killing every running script).
+const USBRebootWarning = "USB transport: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)"
+
 // DefaultSockPath is the daemon socket: $XDG_RUNTIME_DIR/xuansi/daemon.sock,
 // falling back to /tmp/xuansi-daemon.sock when XDG_RUNTIME_DIR is unset
 // (e.g. a systemd unit without the env, or a manual run).
@@ -498,7 +505,7 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 	case "board_status":
 		result, err = s.hBoardStatus(ctx, req)
 	case "lease":
-		result, err = s.hLease(cc, req)
+		result, err = s.hLease(ctx, cc, req)
 	case "release":
 		result, err = s.hRelease(cc, req)
 	case "eval":
@@ -639,7 +646,26 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 	return res, nil
 }
 
-func (s *Server) hLease(cc *clientConn, req *Request) (any, error) {
+// hLease serves lease. The default route never touches the board: the
+// lease is host-side state and the first op dials the warm TCP
+// controller. transport:"usb" is the DELIBERATE fallback (proto.go's
+// transport contract): the refusal checks run first (a board leased
+// by someone else must not be rebooted), then the controller is
+// established over USB — opening the CDC port REBOOTS the board —
+// and both the reply result and the daemon log carry
+// USBRebootWarning. A USB open that fails leaves the lease held
+// host-side (same as a TCP lease on an unreachable board: release or
+// retry; the next op redials per its own transport rules). Never a
+// silent fallback: a failed TCP dial stays unreachable — USB only
+// ever happens through this explicit field.
+func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any, error) {
+	switch req.Transport {
+	case "", "tcp": // the default warm route
+	case "usb":
+	default:
+		return nil, &RPCError{Class: "server",
+			Msg: fmt.Sprintf("unknown transport %q (lease accepts \"usb\"; default is tcp and never falls back)", req.Transport)}
+	}
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
 		return nil, rerr
@@ -649,7 +675,21 @@ func (s *Server) hLease(cc *clientConn, req *Request) (any, error) {
 		return nil, err
 	}
 	sess, _ := s.leases.Session(b.MAC6)
-	return map[string]any{"board": b.MAC6, "holder": holder, "session": sess}, nil
+	res := map[string]any{"board": b.MAC6, "holder": holder, "session": sess}
+	if req.Transport == "usb" {
+		db := s.supervisor(b)
+		db.connectMu.Lock()
+		ctl, cerr := db.sup.ConnectUSB(ctx)
+		db.connectMu.Unlock()
+		if cerr != nil {
+			return nil, fmt.Errorf("%w: usb lease: %v", errUnreachable, cerr)
+		}
+		s.tap(b.MAC6, db, ctl)
+		res["transport"] = "usb"
+		res["warning"] = USBRebootWarning
+		s.logf("server: board %s leased over USB by holder %s — %s", b.MAC6, holder, USBRebootWarning)
+	}
+	return res, nil
 }
 
 func (s *Server) hRelease(cc *clientConn, req *Request) (any, error) {

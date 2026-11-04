@@ -646,7 +646,6 @@ func TestReaderContractFinalChunkWithError(t *testing.T) {
 	}
 }
 
-// marks the client dead as locally closed, and is safe to repeat.
 // TestCloseIsCleanAndIdempotent: Close stops the router goroutine,
 // marks the client dead as locally closed, and is safe to repeat.
 func TestCloseIsCleanAndIdempotent(t *testing.T) {

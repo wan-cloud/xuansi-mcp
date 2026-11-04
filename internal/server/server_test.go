@@ -197,11 +197,29 @@ func (f *fakeCtl) OnEvent(sourcePrefix string, fn func(replclient.Event)) (cance
 // ---------------------------------------------------------------------------
 
 type env struct {
-	t      *testing.T
-	srv    *Server
-	sock   string
-	fakes  map[string]*fakeCtl
-	dialed map[string]int
+	t         *testing.T
+	srv       *Server
+	sock      string
+	fakes     map[string]*fakeCtl
+	dialed    map[string]int
+	usbFakes  map[string]*fakeCtl
+	usbDialed map[string]int
+
+	// dmu guards the dial counters (daemon goroutines write them).
+	dmu sync.Mutex
+}
+
+// dialedTCP / dialedUSB read the dial counters race-free.
+func (e *env) dialedTCP(mac6 string) int {
+	e.dmu.Lock()
+	defer e.dmu.Unlock()
+	return e.dialed[mac6]
+}
+
+func (e *env) dialedUSB(mac6 string) int {
+	e.dmu.Lock()
+	defer e.dmu.Unlock()
+	return e.usbDialed[mac6]
 }
 
 // newEnv builds a serving Server over boards (usb+mdns merged view) with
@@ -216,14 +234,16 @@ func newEnv(t *testing.T, aliases map[string]string, boards ...discover.Board) *
 func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, boards ...discover.Board) *env {
 	t.Helper()
 	e := &env{
-		t:      t,
-		fakes:  map[string]*fakeCtl{},
-		dialed: map[string]int{},
+		t:         t,
+		fakes:     map[string]*fakeCtl{},
+		dialed:    map[string]int{},
+		usbFakes:  map[string]*fakeCtl{},
+		usbDialed: map[string]int{},
 	}
 	for _, b := range boards {
 		e.fakes[b.MAC6] = newFakeCtl()
+		e.usbFakes[b.MAC6] = newFakeCtl()
 	}
-	var dmu sync.Mutex
 	reg := discover.NewRegistry(aliases,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			return boards, nil
@@ -243,12 +263,22 @@ func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, board
 			return board.NewSupervisor(ref, board.SupOpts{
 				Log: func(format string, args ...any) { t.Logf("sup: "+format, args...) },
 				DialTCP: func() (board.Controller, error) {
-					dmu.Lock()
+					e.dmu.Lock()
 					e.dialed[ref.MAC6]++
 					f := e.fakes[ref.MAC6]
-					dmu.Unlock()
+					e.dmu.Unlock()
 					if f == nil {
 						return nil, fmt.Errorf("no fake for %s", ref.MAC6)
+					}
+					return f, nil
+				},
+				DialUSB: func() (board.Controller, error) {
+					e.dmu.Lock()
+					e.usbDialed[ref.MAC6]++
+					f := e.usbFakes[ref.MAC6]
+					e.dmu.Unlock()
+					if f == nil {
+						return nil, fmt.Errorf("no usb fake for %s", ref.MAC6)
 					}
 					return f, nil
 				},
@@ -636,6 +666,183 @@ func TestLeaseEvalValueFaceAndReleaseTeardown(t *testing.T) {
 	}
 	if len(resets) != 2 || resets[0] != sess || resets[1] != 0 {
 		t.Fatalf("session.reset calls = %v, want [%d 0]", resets, sess)
+	}
+}
+
+// TestLeaseUSBTransport: lease{transport:"usb"} is the deliberate USB
+// route (I-1): it reaches Supervisor.ConnectUSB (the DialUSB seam),
+// the reply carries transport:"usb" plus the exact USBRebootWarning,
+// the TCP seam is NOT touched by the lease itself, and subsequent ops
+// ride the warm USB controller.
+func TestLeaseUSBTransport(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	// let the startup audit's TCP dial settle so the before/after
+	// counts below are stable
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && e.dialedTCP("d75884") == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	tcpBefore := e.dialedTCP("d75884")
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "u1", "transport": "usb"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease usb: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	if asInt(res["session"]) <= 0 {
+		t.Fatalf("session = %#v", res)
+	}
+	if asStr(res["transport"]) != "usb" {
+		t.Fatalf("transport = %#v, want usb", res)
+	}
+	if asStr(res["warning"]) != USBRebootWarning {
+		t.Fatalf("warning = %#v\nwant  %q", res, USBRebootWarning)
+	}
+
+	// the deliberate route hit the USB seam exactly once…
+	if n := e.dialedUSB("d75884"); n != 1 {
+		t.Fatalf("usb dials = %d, want 1", n)
+	}
+	// …and ConnectUSB said hello on the USB controller
+	usbHellos := 0
+	for _, call := range e.usbFakes["d75884"].got() {
+		if call.op == "hello" {
+			usbHellos++
+		}
+	}
+	if usbHellos == 0 {
+		t.Fatal("ConnectUSB never said hello on the USB controller")
+	}
+
+	// the lease itself dialed no TCP, and a later eval reuses the warm
+	// USB controller (no new dial of either seam)
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "u1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval over usb controller: %#v", rep)
+	}
+	if n := e.dialedTCP("d75884"); n != tcpBefore {
+		t.Fatalf("tcp dials %d → %d during usb lease + eval: the USB route must not ride TCP", tcpBefore, n)
+	}
+	if n := e.dialedUSB("d75884"); n != 1 {
+		t.Fatalf("usb dials = %d after eval, want still 1 (warm reuse)", n)
+	}
+}
+
+// TestLeaseDefaultPathUnchanged: a plain lease (no transport) keeps the
+// default TCP semantics — no warning keys in the reply, the USB seam
+// never touched, the first op dials the warm TCP route.
+func TestLeaseDefaultPathUnchanged(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "d1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	if _, ok := res["transport"]; ok {
+		t.Fatalf("default lease reply carries transport: %#v", res)
+	}
+	if _, ok := res["warning"]; ok {
+		t.Fatalf("default lease reply carries warning: %#v", res)
+	}
+	if n := e.dialedUSB("d75884"); n != 0 {
+		t.Fatalf("usb dials = %d after plain lease, want 0", n)
+	}
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "d1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	if n := e.dialedUSB("d75884"); n != 0 {
+		t.Fatalf("usb dials = %d after plain lease + eval, want 0 — no silent fallback", n)
+	}
+}
+
+// TestLeaseUnknownTransport: a bogus transport value is a structured
+// server-class error, not a silent default.
+func TestLeaseUnknownTransport(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "transport": "can"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "server" {
+		t.Fatalf("class = %q, want server (%#v)", er["class"], er)
+	}
+	if !strings.Contains(asStr(er["msg"]), "transport") {
+		t.Fatalf("msg = %q, want it to name the transport", asStr(er["msg"]))
+	}
+	if n := e.dialedUSB("d75884"); n != 0 {
+		t.Fatalf("usb dials = %d, want 0", n)
+	}
+}
+
+// TestFailedTCPDialNeverFallsBackToUSB: the never-auto-fallback rule —
+// a board whose TCP dial fails answers unreachable and the USB seam
+// stays untouched (USB happens ONLY through lease transport:"usb").
+func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
+	var mu sync.Mutex
+	usbDials := 0
+	usbFake := newFakeCtl()
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
+			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
+		}),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
+		}),
+	)
+	sock := filepath.Join(t.TempDir(), "d.sock")
+	srv, err := New(Opts{
+		SockPath:        sock,
+		Registry:        reg,
+		GraceTTL:        10 * time.Second,
+		RefreshInterval: -1,
+		RequestTimeout:  400 * time.Millisecond, // bound the dial retry loop
+		AuditTimeout:    200 * time.Millisecond, // the audit's dead-TCP retries must not pin connectMu
+		Log:             func(format string, args ...any) { t.Logf("srv: "+format, args...) },
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			return board.NewSupervisor(ref, board.SupOpts{
+				Log: func(format string, args ...any) { t.Logf("sup: "+format, args...) },
+				DialTCP: func() (board.Controller, error) {
+					return nil, fmt.Errorf("wifi-dead bench: tcp dial refused")
+				},
+				DialUSB: func() (board.Controller, error) {
+					mu.Lock()
+					usbDials++
+					mu.Unlock()
+					return usbFake, nil
+				},
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	c := dialSock(t, sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease (host-side, default route): %#v", rep)
+	}
+	// the first board-touching op rides the dead TCP route → unreachable
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "w1"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "unreachable" {
+		t.Fatalf("class = %q, want unreachable (%#v)", er["class"], er)
+	}
+	mu.Lock()
+	n := usbDials
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("usb dials = %d after a failed TCP route, want 0 — no silent fallback, ever", n)
 	}
 }
 

@@ -5,7 +5,6 @@
 package lease
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"time"
@@ -70,7 +69,3 @@ func (m *Manager) expireDueLocked(now time.Time) []teardownAction {
 	sort.Slice(acts, func(i, j int) bool { return acts[i].entry.board < acts[j].entry.board })
 	return acts
 }
-
-// ensureCtx is the context teardown callbacks run under (canceled by
-// Close so a shutting-down daemon does not hang on board I/O).
-func (m *Manager) ensureCtx() context.Context { return m.opCtx }

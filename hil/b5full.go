@@ -4,55 +4,55 @@
 // is exercised through its unix-socket API by this Go driver (house
 // style from b5t8/t9/t10):
 //
-//	S1  serve up          — subprocess, sock bound, initial discovery sweep
-//	                         + startup orphan audit (report-only)
-//	S2  discovery         — list shows d75884 dual-source usb+mdns, fw
-//	                         hello-enriched; TXT ver=3 proven by a
-//	                         driver-side registry browse (the daemon's list
-//	                         view surfaces fw, not TXT)
-//	S3  lease + eval      — holder=h1 lease via the boards.conf alias;
-//	                         structured eval (ARGS round-trip, depth-8
-//	                         table through the value bridge)
-//	S4  fs 16KB           — write/read byte-exact, sha256 both sides,
-//	                         daemon-side 16385B cap refusal
-//	S5  submit long job   — 3.5s job: ack immediate, API answered while
-//	                         the job runs (no stall), job event carries
-//	                         the bridged value
-//	S6  gpio events       — claim the wired pair via eval, watch_events on
-//	                         a SECOND connection, edges driven through the
-//	                         daemon to the watcher
-//	S7  grace ADOPT       — holder conn dropped mid-job -> third party
-//	                         refused (grace-expiring) -> SAME holder
-//	                         reconnects within the TTL -> adopt, script
-//                         survived, the in-flight job's event delivered
-//	                         to the reconnected watcher (continuity focus)
-//	S8  grace EXPIRY      — drop again, wait out the 15s TTL -> script
-//	                         gone, pins safe (write-reject probe), next op
-//	                         not_held, expiry teardown exactly once
-//	S9  link-loss resync  — silent bidirectional iptables hole on the
-//	                         daemon<->board 4-tuple -> traffic-free window
-//	                         lets the host keepalive verdict (~6s class:
-//	                         the EOF-miss dead-link shape) -> rules out ->
-//	                         daemon re-takes the controller over TCP (T10
-//	                         fix1: rides out the board-side keepalive
-//	                         self-release, no reboot) -> script survived
-//	                         AND ran through the hole; the in-flight job's
-//	                         body proven complete board-side while its
-//	                         result frame died with the aborted socket
-//	                         (diag.stats/log.read read driver-direct,
-//	                         honestly labeled — the daemon API has no diag)
-//	S10 release           — polite release tears the board side down
-//	S11 mDNS-degraded     — wifi.off from a driver-direct USB controller
-//	                         (LAST, dedicated phase: the USB open reboots
-//	                         the board): daemon list degrades to usb-only
-//	                         (mdns face withdrawn, last-known kept), ops
-//	                         through the daemon fail unreachable, the USB
-//	                         transport itself proven alive; restore by CDC
-//	                         reboot + NVS auto-connect, dual-source back,
-//	                         daemon re-heals
-//	S12 clean shutdown    — SIGINT -> exit 0 (srv.Done waits for every
-//	                         server goroutine — the honest no-leak bar for
-//	                         a subprocess), sock removed, shutdown-complete
+//		S1  serve up          — subprocess, sock bound, initial discovery sweep
+//		                         + startup orphan audit (report-only)
+//		S2  discovery         — list shows d75884 dual-source usb+mdns, fw
+//		                         hello-enriched; TXT ver=3 proven by a
+//		                         driver-side registry browse (the daemon's list
+//		                         view surfaces fw, not TXT)
+//		S3  lease + eval      — holder=h1 lease via the boards.conf alias;
+//		                         structured eval (ARGS round-trip, depth-8
+//		                         table through the value bridge)
+//		S4  fs 16KB           — write/read byte-exact, sha256 both sides,
+//		                         daemon-side 16385B cap refusal
+//		S5  submit long job   — 3.5s job: ack immediate, API answered while
+//		                         the job runs (no stall), job event carries
+//		                         the bridged value
+//		S6  gpio events       — claim the wired pair via eval, watch_events on
+//		                         a SECOND connection, edges driven through the
+//		                         daemon to the watcher
+//		S7  grace ADOPT       — holder conn dropped mid-job -> third party
+//		                         refused (grace-expiring) -> SAME holder
+//		                         reconnects within the TTL -> adopt, script
+//	                        survived, the in-flight job's event delivered
+//		                         to the reconnected watcher (continuity focus)
+//		S8  grace EXPIRY      — drop again, wait out the 15s TTL -> script
+//		                         gone, pins safe (write-reject probe), next op
+//		                         not_held, expiry teardown exactly once
+//		S9  link-loss resync  — silent bidirectional iptables hole on the
+//		                         daemon<->board 4-tuple -> traffic-free window
+//		                         lets the host keepalive verdict (~6s class:
+//		                         the EOF-miss dead-link shape) -> rules out ->
+//		                         daemon re-takes the controller over TCP (T10
+//		                         fix1: rides out the board-side keepalive
+//		                         self-release, no reboot) -> script survived
+//		                         AND ran through the hole; the in-flight job's
+//		                         body proven complete board-side while its
+//		                         result frame died with the aborted socket
+//		                         (diag.stats/log.read read driver-direct,
+//		                         honestly labeled — the daemon API has no diag)
+//		S10 release           — polite release tears the board side down
+//		S11 mDNS-degraded     — wifi.off from a driver-direct USB controller
+//		                         (LAST, dedicated phase: the USB open reboots
+//		                         the board): daemon list degrades to usb-only
+//		                         (mdns face withdrawn, last-known kept), ops
+//		                         through the daemon fail unreachable, the USB
+//		                         transport itself proven alive; restore by CDC
+//		                         reboot + NVS auto-connect, dual-source back,
+//		                         daemon re-heals
+//		S12 clean shutdown    — SIGINT -> exit 0 (srv.Done waits for every
+//		                         server goroutine — the honest no-leak bar for
+//		                         a subprocess), sock removed, shutdown-complete
 //
 // The 15s grace TTL is a REAL second-scale window waited out honestly in
 // S7/S8. sudo/iptables drives the S9 hole; S11 uses the wifi.off variant
@@ -520,7 +520,7 @@ func runFull(attempt int, daemonBin, runDir string) int {
 	res, err := bc.Op(ctx, "budget.set", map[string]any{"eval_ms": 4000})
 	h.check(err == nil && numEq(res["eval_ms"], 4000),
 		fmt.Sprintf("[driver-direct] out-of-band budget.set eval_ms=4000 (reply=%v err=%v — daemon API has no budget knob)", res, err))
-	bc.Close() // TCP close releases the controller slot (§12) — daemon starts clean
+	bc.Close()              // TCP close releases the controller slot (§12) — daemon starts clean
 	time.Sleep(time.Second) // mDNS registers right after net-up (t9 grace idiom)
 
 	// ——— S1: serve up ———

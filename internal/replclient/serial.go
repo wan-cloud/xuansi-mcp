@@ -30,7 +30,8 @@ const usbDrainDefault = 4500 * time.Millisecond
 var byIDDir = "/dev/serial/by-id"
 
 // DialOpts parameterize the dialers. The zero value is the CDC default:
-// a 3.5s drain window. NoDrain suppresses the window entirely — the TCP
+// a 4.5s drain window (usbDrainDefault — past the fw's repl-up, see its
+// calibration comment). NoDrain suppresses the window entirely — the TCP
 // dialer never drains (§13: no reboot, no boot prefix, the first frame
 // may be hello) and behaves as if NoDrain were set. Log, when non-nil,
 // receives human-readable transport lines for HIL transcripts.

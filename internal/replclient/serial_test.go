@@ -117,7 +117,7 @@ func TestResolveUSBDevice(t *testing.T) {
 	}
 }
 
-// TestDialOptsDrainWindow: zero Drain → the 3.5s CDC default; explicit
+// TestDialOptsDrainWindow: zero Drain → the 4.5s CDC default; explicit
 // Drain honored; NoDrain suppresses.
 func TestDialOptsDrainWindow(t *testing.T) {
 	for _, tc := range []struct {

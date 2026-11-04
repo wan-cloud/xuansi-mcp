@@ -26,7 +26,7 @@
 //
 //	list_boards    {}                          → {boards:[{mac6,alias,sources,host,port,usb_path,fw}],mdns_error}
 //	board_status   {board}                      → {board:{...}, connected, lease:{holder,since,session,grace_deadline}?|null, scripts?, scripts_error?}
-//	lease          {board, holder?}             → {board, holder, session}
+//	lease          {board, holder?, transport?} → {board, holder, session, transport?, warning?}
 //	release        {board, holder?}             → {board, holder}
 //	eval           {board, code, args?, holder?} → {out, value?}   (lease required)
 //	submit         {board, code, tag, args?, holder?} → board ack {tag, queued}  (lease required)
@@ -39,6 +39,29 @@
 // BOARD selectors are mac6 / alias / hostname prefixes resolved by the
 // discovery registry (T9 Resolve): unique prefix hits, ambiguity or no
 // match is a structured error listing candidates.
+//
+// # Transport (the lease request's deliberate USB route)
+//
+// lease's optional "transport" field selects the controller route:
+//
+//	"" (absent) | "tcp"  the warm TCP route — the default everywhere;
+//	                       a plain lease never touches the board
+//	"usb"                  the DELIBERATE USB fallback (T10 ruling:
+//	                       WiFi 不可達時的後備). Opening the CDC port
+//	                       REBOOTS the board — running scripts are
+//	                       killed. The success reply carries
+//	                       transport:"usb" plus a "warning" stating
+//	                       exactly that, and the daemon log records the
+//	                       same line.
+//
+// USB is reached ONLY through this explicit field (CLI: `xuansi lease
+// BOARD --usb`). There is NEVER a silent fallback: a failed TCP dial
+// reports unreachable and does NOT auto-try USB — the caller decides
+// whether a reboot is acceptable. The held/refusal checks run BEFORE
+// the USB open (a lease held by someone else must not reboot the
+// board); a lease whose USB open then fails stays held host-side
+// (same as a TCP lease on an unreachable board — release or retry).
+// An unknown transport value is a "server" class error.
 //
 // # Holder semantics (the lease identity — read this twice)
 //
@@ -65,9 +88,10 @@
 // classes: held (fields holder/since/grace_expiry present), not_held,
 // teardown (retry shortly), no_board, ambiguous, holder (connection
 // bound to a different holder), unreachable (dial/hello failed),
-// slot_held (controller arbitration window exhausted — USB reboot is
-// the caller's explicit last resort), server (malformed request,
-// unknown type, bad params).
+// slot_held (controller arbitration window exhausted — the deliberate
+// USB reboot lease is the caller's explicit last resort), api
+// (daemon-side fs_write cap refusal mirrors the board's class), server
+// (malformed request, unknown type, bad params, bad transport).
 package server
 
 import (
@@ -87,13 +111,18 @@ type Request struct {
 	ID     int64  `json:"id"`
 	Board  string `json:"board,omitempty"`
 	Holder string `json:"holder,omitempty"`
-	Code   string `json:"code,omitempty"`
-	Tag    string `json:"tag,omitempty"`
-	Name   string `json:"name,omitempty"`
-	Path   string `json:"path,omitempty"`
-	Data   []byte `json:"data,omitempty"` // JSON base64 ↔ board bin
-	Source string `json:"source,omitempty"`
-	Args   any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS
+	// Transport selects the lease route: "" (default) = warm TCP,
+	// "usb" = the deliberate fallback whose open reboots the board.
+	// Lease only; see the transport contract above. Unknown values
+	// are a "server" class error.
+	Transport string `json:"transport,omitempty"`
+	Code      string `json:"code,omitempty"`
+	Tag       string `json:"tag,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Path      string `json:"path,omitempty"`
+	Data      []byte `json:"data,omitempty"` // JSON base64 ↔ board bin
+	Source    string `json:"source,omitempty"`
+	Args      any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS
 }
 
 // RPCError is the structured error half of a reply.
