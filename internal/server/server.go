@@ -675,7 +675,12 @@ func connHolder(cc *clientConn, req *Request) string {
 
 // ensureLiveLease is the holder gate for mutating board ops: the board
 // must be leased by THIS holder — a grace lease of the same holder is
-// adopted back live first (the adopt-within-TTL rule, proto.go).
+// adopted back live first (the adopt-within-TTL rule, proto.go). At the
+// grace-expiry boundary the adopt itself can fail (the manager expires
+// the due lease and runs the teardown synchronously inside Adopt) —
+// that MUST refuse, not proceed (review I-1); a mid-teardown entry
+// (visible in Snapshot without a grace deadline) refuses the same way,
+// probed via Session (the only tearing-visible API).
 func (s *Server) ensureLiveLease(cc *clientConn, req *Request, mac6 string) error {
 	h := connHolder(cc, req)
 	for _, ls := range s.leases.Snapshot() {
@@ -690,8 +695,15 @@ func (s *Server) ensureLiveLease(cc *clientConn, req *Request, mac6 string) erro
 			return err
 		}
 		if !ls.GraceDeadline.IsZero() {
-			s.leases.Adopt(h)
+			if !s.leases.Adopt(h) {
+				return &RPCError{Class: "not_held",
+					Msg: fmt.Sprintf("grace TTL expired on board %s (holder %s) — the lease was torn down at adopt; lease it fresh", mac6, h)}
+			}
 			s.logf("server: holder %s adopted board %s back live", h, mac6)
+		}
+		if _, ok := s.leases.Session(mac6); !ok {
+			return &RPCError{Class: "not_held",
+				Msg: fmt.Sprintf("lease on board %s is mid-teardown (holder %s) — retry shortly or lease it fresh", mac6, h)}
 		}
 		return nil
 	}

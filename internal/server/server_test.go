@@ -24,6 +24,7 @@ import (
 
 	"xuansi/internal/board"
 	"xuansi/internal/discover"
+	"xuansi/internal/lease"
 	"xuansi/internal/replclient"
 )
 
@@ -207,6 +208,12 @@ type env struct {
 // one shared fake controller per board. The daemon lifecycle (initial
 // refresh + startup audit) runs for real.
 func newEnv(t *testing.T, aliases map[string]string, boards ...discover.Board) *env {
+	return newEnvTTL(t, 10*time.Second, aliases, boards...)
+}
+
+// newEnvTTL is newEnv with a custom lease grace TTL (the boundary tests
+// run the real expiry path with a short window).
+func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, boards ...discover.Board) *env {
 	t.Helper()
 	e := &env{
 		t:      t,
@@ -229,8 +236,8 @@ func newEnv(t *testing.T, aliases map[string]string, boards ...discover.Board) *
 	srv, err := New(Opts{
 		SockPath:        e.sock,
 		Registry:        reg,
-		GraceTTL:        10 * time.Second, // HIL-short; no test waits it out
-		RefreshInterval: -1,               // no background loop; the initial sweep still runs
+		GraceTTL:        ttl, // HIL-short by default; no test waits it out
+		RefreshInterval: -1,  // no background loop; the initial sweep still runs
 		Log:             func(format string, args ...any) { t.Logf("srv: "+format, args...) },
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
@@ -1143,4 +1150,201 @@ func TestDefaultSockPath(t *testing.T) {
 	if !strings.HasSuffix(DefaultSockPath(), ".sock") {
 		t.Fatalf("DefaultSockPath = %q", DefaultSockPath())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// grace-expiry boundary (review I-1): the gate must refuse, never
+// proceed ungated, when the adopt fails.
+// ---------------------------------------------------------------------------
+
+// schedClock is a clock whose Now() returns a scripted sequence (last
+// value repeats) once armed; before arming it returns a stable epoch.
+// After(d) never fires. With the manager's reaper closed, the read
+// sequence is deterministic — this pins the exact Snapshot-not-due →
+// Adopt-due window.
+type schedClock struct {
+	mu   sync.Mutex
+	arm  bool
+	plan []time.Time
+	i    int
+}
+
+func (c *schedClock) Arm(plan []time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.plan, c.i, c.arm = plan, 0, true
+}
+
+func (c *schedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.arm || len(c.plan) == 0 {
+		return time.Unix(1700000000, 0)
+	}
+	t := c.plan[c.i]
+	if c.i < len(c.plan)-1 {
+		c.i++
+	}
+	return t
+}
+
+func (c *schedClock) After(d time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+// TestEnsureLiveLeaseAdoptFalseGatesOps: at the grace-expiry boundary
+// the Snapshot shows a still-adoptable grace lease, the clock crosses
+// the deadline, and Adopt() lazily expires + tears down and returns
+// false — the gate must treat that as not_held instead of letting the
+// op proceed ungated (review I-1).
+func TestEnsureLiveLeaseAdoptFalseGatesOps(t *testing.T) {
+	clk := &schedClock{}
+	m := lease.NewManager(lease.Policy{GraceTTL: 100 * time.Millisecond, Clock: clk})
+	m.Close() // reaper out: the read sequence is ours alone
+
+	s := &Server{leases: m, logf: func(format string, args ...any) { t.Logf("srv: "+format, args...) }}
+	if err := m.Acquire("d75884", "edge"); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	m.OnAgentGone("edge") // grace, deadline = T0+100ms
+
+	// post-arm reads: gate's Snapshot → T0 (grace, not due, entry shown),
+	// then Adopt's lazy-expiry check → T0+150ms (deadline T0+100ms
+	// crossed: the manager CAS's the entry to tearing and runs the
+	// teardown synchronously INSIDE Adopt, then reports false)
+	T0 := time.Unix(1700000000, 0)
+	clk.Arm([]time.Time{T0, T0.Add(150 * time.Millisecond)})
+
+	err := s.ensureLiveLease(nil, &Request{Holder: "edge"}, "d75884")
+	if err == nil {
+		t.Fatalf("gate passed an op whose adopt failed at the expiry boundary — ungated proceed (review I-1)")
+	}
+	rerr, ok := err.(*RPCError)
+	if !ok {
+		t.Fatalf("error type = %T, want *RPCError", err)
+	}
+	if rerr.Class != "not_held" {
+		t.Fatalf("class = %q, want not_held", rerr.Class)
+	}
+	// pins the adopt-false branch specifically (the fall-through path
+	// says "no lease on board ... lease it first")
+	if !strings.Contains(rerr.Msg, "grace TTL expired") {
+		t.Fatalf("msg = %q, want the grace-expired adopt refusal", rerr.Msg)
+	}
+	// the lease is gone either way — a fresh lease is required
+	if got := m.Snapshot(); len(got) != 0 {
+		t.Fatalf("leases after boundary = %+v, want none", got)
+	}
+}
+
+// TestEvalAfterGraceExpiryRefused: end-to-end over the socket with a
+// short real TTL — once the grace expired (and the teardown ran), a
+// re-supplied holder gets not_held, never a silent proceed.
+func TestEvalAfterGraceExpiryRefused(t *testing.T) {
+	e := newEnvTTL(t, 60*time.Millisecond, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c1 := dialSock(t, e.sock)
+	rep, _ := c1.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "gone-e2e"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	c1.conn.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(e.srv.Leases().Snapshot()) == 0 {
+			break // expired + torn down
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := e.srv.Leases().Snapshot(); len(got) != 0 {
+		t.Fatalf("lease never expired: %+v", got)
+	}
+
+	c2 := dialSock(t, e.sock)
+	rep, _ = c2.call(2, map[string]any{"type": "eval", "board": "d75884", "holder": "gone-e2e", "code": "return 1"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "not_held" {
+		t.Fatalf("class = %q, want not_held (%#v)", er["class"], er)
+	}
+}
+
+// stepClock is a manually-advanced frozen clock whose After always
+// returns one shared channel — the test fires it to drive the reaper.
+type stepClock struct {
+	mu   sync.Mutex
+	now  time.Time
+	fire chan time.Time
+}
+
+func (c *stepClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *stepClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+func (c *stepClock) After(d time.Duration) <-chan time.Time { return c.fire }
+
+// TestEnsureLiveLeaseTeardownWindowGated: while the expiry teardown is
+// on the wire the entry is still visible in Snapshot but carries NO
+// grace deadline — it must not pass the gate as a live lease (the
+// sibling of the I-1 window; Manager.Session is the tearing probe).
+func TestEnsureLiveLeaseTeardownWindowGated(t *testing.T) {
+	clk := &stepClock{now: time.Unix(1700000000, 0), fire: make(chan time.Time, 1)}
+	blocked := make(chan struct{})
+	unblock := make(chan struct{})
+	m := lease.NewManager(lease.Policy{
+		GraceTTL: 10 * time.Second, Clock: clk,
+		OnExpiry: func(ctx context.Context, board, holder string, sessions []int) error {
+			close(blocked)
+			<-unblock // hold the teardown: the entry sits mid-teardown
+			return nil
+		},
+	})
+	t.Cleanup(func() {
+		select {
+		case <-unblock:
+		default:
+			close(unblock)
+		}
+		m.Close()
+	})
+
+	s := &Server{leases: m, logf: func(format string, args ...any) { t.Logf("srv: "+format, args...) }}
+	if err := m.Acquire("d75884", "t1"); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	m.OnAgentGone("t1")
+
+	clk.Advance(11 * time.Second) // past the deadline
+	clk.fire <- time.Time{}       // wake the reaper → expiry teardown
+	select {
+	case <-blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("teardown never started")
+	}
+
+	// mid-teardown: Snapshot still lists the entry (no grace deadline),
+	// but the gate must refuse.
+	err := s.ensureLiveLease(nil, &Request{Holder: "t1"}, "d75884")
+	if err == nil {
+		t.Fatalf("gate passed a mid-teardown lease as live — ungated proceed")
+	}
+	rerr, ok := err.(*RPCError)
+	if !ok || rerr.Class != "not_held" {
+		t.Fatalf("err = %#v, want not_held RPCError", err)
+	}
+
+	close(unblock)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(m.Snapshot()) == 0 {
+			return // teardown completed, entry removed
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("entry never removed after teardown: %+v", m.Snapshot())
 }
