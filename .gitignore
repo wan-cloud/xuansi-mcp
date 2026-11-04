@@ -1,0 +1,5 @@
+# build output
+/bin/
+
+# transient logs (repo root only — evidence under results/ stays committed)
+/*.log

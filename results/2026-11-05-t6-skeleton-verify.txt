@@ -1,0 +1,39 @@
+# task 6 skeleton verify — 2026-11-05 (code/xuansi-daemon)
+
+## go version
+go version go1.27.3 linux/amd64
+
+## gofmt -l . (want: no output)
+(empty)
+
+## go vet ./... (want: clean)
+(clean)
+
+## go test ./...
+ok  	xuansi/cmd/xuansi	(cached)
+?   	xuansi/internal/discover	[no test files]
+?   	xuansi/internal/lease	[no test files]
+?   	xuansi/internal/replclient	[no test files]
+?   	xuansi/internal/server	[no test files]
+
+## make build + file bin/*
+mkdir -p bin
+GOOS=linux GOARCH=amd64 go build -trimpath -o bin/xuansi-linux-amd64 ./cmd/xuansi
+GOOS=linux GOARCH=arm64 go build -trimpath -o bin/xuansi-linux-arm64 ./cmd/xuansi
+bin/xuansi-linux-amd64: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=4WcIxv5hPoB7NZjE2JmN/nb2E8Dzxe3CFMRdbxKSN/2uwn8lejgRuXT-bVtM7V/Bxyw1I36-oPfv28MmcQC, BuildID[sha1]=d0d5a5f413d5ee980ced8e990e5f0ee78b03732a, with debug_info, not stripped
+bin/xuansi-linux-arm64: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, Go BuildID=LPsr-nBdqx-olHwhVZNn/Y12UlPcTt6hYtyyAv1z7/1rF_eWo5IahLonprhDUQ/BUCq15GIIEYRPGs43Wy-, BuildID[sha1]=e94d7b5325cf51f12eb6334e36eb157b1c045cac, with debug_info, not stripped
+
+## CLI behavior
+-- bare (want usage on stderr, exit 2)
+exit=2
+-- help (want exit 0)
+exit=0
+-- serve stub (want usage, exit 1)
+xuansi serve: stub — implementation lands in a later task.
+exit=1
+-- unknown (want exit 2)
+xuansi: unknown command "bogus"
+exit=2
+
+## make clean
+rm -rf bin
