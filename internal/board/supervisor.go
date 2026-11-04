@@ -17,16 +17,20 @@ import (
 )
 
 // ErrControllerSlotHeld: a fresh TCP connection could not take the
-// controller role — the board still holds the old slot because it never
-// saw the old connection die (a silent bidirectional black-hole kills
-// only the host side; the board's TCP is blind — §12 frees the slot only
-// on a disconnect it observes, and the board runs no keepalive of its
-// own; measured live 2026-11-05, results/2026-11-05-b5-t10-*.log).
-// Recovery is the owner's on-demand USB fallback: ConnectUSB reboots
-// the board (§2) into a clean arbitration table. The daemon does NOT
-// reboot implicitly — the caller decides (a reboot kills board-side
-// scripts; the resync after it reports that honestly).
-var ErrControllerSlotHeld = errors.New("controller slot held by a connection the board cannot see dead")
+// controller role within the full arbitration window (ArbitrationWait,
+// default 25s). A plain silent dead link does NOT cause this: the board
+// runs its own keepalive on every REPL connection (10s idle + 2s×3
+// probes — §12 frozen values; half-open slot self-release measured
+// 16.5–17.0s live, batch 4 + task 10 fix1), so the supervisor's
+// persistent re-hellos ride out that window and take the slot as soon
+// as the board releases it. Reaching this error means something beyond
+// a silent dead link (fw without board-side keepalive, or a genuinely
+// live connection still holding the slot). LAST RESORT only:
+// ConnectUSB reboots the board (§2) into a clean arbitration table —
+// the reboot KILLS every board-side script, inverting the 斷鏈-resync
+// ruling (scripts survive link loss and must be reported, not killed);
+// the caller owns that trade-off.
+var ErrControllerSlotHeld = errors.New("controller slot not freed within the arbitration window (board keepalive self-release ~17s, §12) — last resort is the deliberate USB fallback, which reboots the board and kills surviving scripts")
 
 // BoardRef identifies one dialable board (from the discover registry).
 type BoardRef struct {
@@ -67,7 +71,17 @@ type SupOpts struct {
 	ClientName string // hello client name (default "xuansi-daemon")
 	Log        func(format string, args ...any)
 	Quiet      time.Duration // diag.pins fallback quiet window (default 250ms)
-	RetryWait  time.Duration // connect/arbitration retry spacing (default 500ms; 0 legal for tests)
+	RetryWait  time.Duration // arbitration/dial retry spacing (default 500ms; 0 legal with an injected Wait)
+	// ArbitrationWait is the total re-hello budget after a dead link:
+	// it MUST cover the board's own keepalive slot self-release (10s
+	// idle + 2s×3 probes, §12 frozen; measured 16.5–17.0s) plus margin
+	// — default 25s. Only after this full window may Connect report
+	// ErrControllerSlotHeld (USB reboot = explicit last resort).
+	ArbitrationWait time.Duration
+	// Wait is the sleep seam for the retry loops; tests inject a
+	// virtual clock (advances instantly) so the ≥25s schedule is
+	// proven without real waiting. Nil = real context-aware sleep.
+	Wait func(d time.Duration) error
 }
 
 // Supervisor owns one board's controller connection and the resync
@@ -100,13 +114,13 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 	if opts.Quiet <= 0 {
 		opts.Quiet = 250 * time.Millisecond
 	}
-	if opts.RetryWait <= 0 {
-		// 0 stays 0 only when explicitly meaningful? No: default the
-		// spacing; tests that want zero set it AFTER construction via
-		// the exported opts copy. Keep the struct field honest.
-		if opts.RetryWait < 0 {
-			opts.RetryWait = 500 * time.Millisecond
-		}
+	if opts.RetryWait <= 0 && opts.Wait == nil {
+		opts.RetryWait = 500 * time.Millisecond
+	}
+	if opts.ArbitrationWait <= 0 {
+		// covers the board's own keepalive slot self-release (16.5–17.0s
+		// measured, §12) with margin — see ErrControllerSlotHeld
+		opts.ArbitrationWait = 25 * time.Second
 	}
 	s := &Supervisor{ref: ref, opts: opts}
 	addr := ref.TCPAddr()
@@ -138,6 +152,11 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 	return s
 }
 
+// Opts returns the Supervisor's live options — the seams (dial funcs,
+// wait budget) may be re-wired at runtime, e.g. a USB-dial tripwire in
+// the HIL proving the §12-faithful TCP recovery never touches USB.
+func (s *Supervisor) Opts() *SupOpts { return &s.opts }
+
 // name resolves the hello client name.
 func (s *Supervisor) name() string { return s.opts.ClientName }
 
@@ -151,9 +170,14 @@ func (s *Supervisor) logf(format string, args ...any) {
 // Connect ensures a live warm TCP controller connection: an existing
 // live one is reused; otherwise it dials (spaced retries bounded by
 // ctx), says hello as the daemon, and — when the board still holds the
-// old controller slot (a dead link's FIN may lag) — re-hellos until the
-// controller role is granted (§5/§12: re-hello switches identity on the
-// same connection). The daemon is the sole controller: never observer.
+// old controller slot — keeps re-helloing for the whole ArbitrationWait
+// window (default 25s): a silently dead old link self-releases the slot
+// via the BOARD's own keepalive (10s idle + 2s×3 probes, §12; measured
+// 16.5–17.0s), and the persistent re-hellos take the slot the moment it
+// frees — no reboot, surviving scripts untouched. The daemon is the
+// sole controller: never observer. ErrControllerSlotHeld (after the
+// FULL window) is the caller's signal that the last-resort USB fallback
+// is on the table.
 func (s *Supervisor) Connect(ctx context.Context) (Controller, error) {
 	s.mu.Lock()
 	ctl := s.ctl
@@ -162,7 +186,8 @@ func (s *Supervisor) Connect(ctx context.Context) (Controller, error) {
 		return ctl, nil
 	}
 	if ctl != nil {
-		ctl.Close() // release the corpse (TCP close frees the board slot)
+		ctl.Close() // release the corpse; with the link merely half-open
+		// this FIN/RST also nudges the board's slot release (§12)
 	}
 
 	ctl, err := s.dialLoop(ctx, s.opts.DialTCP)
@@ -170,34 +195,58 @@ func (s *Supervisor) Connect(ctx context.Context) (Controller, error) {
 		return nil, err
 	}
 	// Take the controller role: a lingering old slot forces the first
-	// hello to observer; re-hello (same connection, §5) until granted.
-	var last *replclient.HelloInfo
-	for i := 0; i < 8; i++ {
-		if i > 0 {
-			if err := sleepCtx(ctx, s.opts.RetryWait); err != nil {
-				ctl.Close()
-				return nil, err
-			}
-		}
+	// hellos to observer; re-hello (same connection, §5) and wait out
+	// the board's keepalive self-release window.
+	slept := time.Duration(0)
+	attempt := 0
+	for {
+		attempt++
 		info, herr := ctl.Hello(false, s.name())
 		if herr != nil {
 			ctl.Close()
 			return nil, fmt.Errorf("board %s: hello: %w", s.ref.MAC6, herr)
 		}
-		last = info
 		if info.Role == "controller" {
 			s.mu.Lock()
 			s.ctl = ctl
 			s.mu.Unlock()
+			if attempt > 1 {
+				s.logf("board %s: controller taken on re-hello %d after %v of the %v window (slot self-released — board keepalive, §12)",
+					s.ref.MAC6, attempt, slept.Round(time.Millisecond), s.opts.ArbitrationWait)
+			}
 			s.logf("board %s: controller warm connection up (fw=%s protocol_ver=%d)",
 				s.ref.MAC6, info.FwBuild, info.ProtocolVer)
 			return ctl, nil
 		}
-		s.logf("board %s: hello forced observer (old slot lingering) — re-hello attempt %d", s.ref.MAC6, i+1)
+		if slept >= s.opts.ArbitrationWait {
+			break
+		}
+		d := s.opts.RetryWait
+		if d <= 0 || d > s.opts.ArbitrationWait-slept {
+			d = s.opts.ArbitrationWait - slept
+		}
+		if err := s.waitCtx(ctx, d); err != nil {
+			ctl.Close()
+			return nil, err
+		}
+		slept += d
+		if attempt == 1 {
+			s.logf("board %s: hello forced observer (old slot not yet released) — re-helloing through the board's keepalive window (self-release ~17s, §12; budget %v)",
+				s.ref.MAC6, s.opts.ArbitrationWait)
+		}
 	}
 	ctl.Close()
-	return nil, fmt.Errorf("board %s: %w (last role=%q; recover via the deliberate USB fallback — ConnectUSB)",
-		s.ref.MAC6, ErrControllerSlotHeld, last.Role)
+	return nil, fmt.Errorf("board %s: %w (waited %v over %d re-hello attempts)",
+		s.ref.MAC6, ErrControllerSlotHeld, slept.Round(time.Millisecond), attempt)
+}
+
+// waitCtx sleeps d through the Wait seam when injected (virtual-clock
+// tests), else for real, aborting early when ctx ends.
+func (s *Supervisor) waitCtx(ctx context.Context, d time.Duration) error {
+	if s.opts.Wait != nil {
+		return s.opts.Wait(d)
+	}
+	return sleepCtx(ctx, d)
 }
 
 // dialLoop retries the dial seam until success or ctx ends.
@@ -213,7 +262,7 @@ func (s *Supervisor) dialLoop(ctx context.Context, dial func() (Controller, erro
 		if i == 0 {
 			s.logf("board %s: dial failed: %v", s.ref.MAC6, err)
 		}
-		if err := sleepCtx(ctx, s.opts.RetryWait); err != nil {
+		if err := s.waitCtx(ctx, s.opts.RetryWait); err != nil {
 			return nil, fmt.Errorf("board %s: dial abandoned: %w", s.ref.MAC6, err)
 		}
 	}

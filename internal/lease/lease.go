@@ -80,16 +80,17 @@ func (e *ErrHeld) Error() string {
 // by the next resync instead of pinning the lease forever.
 type TeardownFunc func(ctx context.Context, board, holder string, sessions []int) error
 
-// Policy parameterizes a Manager. The zero value is not usable —
-// NewManager fills the defaults: GraceTTL=DefaultGraceTTL (ruling),
-// ResetOnExpiry=true (the daemon actively session.resets on expiry),
-// Clock=RealClock.
+// Policy parameterizes a Manager. NewManager fills the defaults:
+// GraceTTL=DefaultGraceTTL (ruling) and Clock=RealClock. The expiry
+// teardown is UNCONDITIONAL — the owner's 2026-11-04 ruling pins
+// reset-on-expiry (daemon 主動 session.reset＋lease 釋放), so batch 5
+// exposes no knob for it; a zero-value Policy{Clock:…, OnExpiry:…}
+// tears down on expiry exactly like a fully-specified one.
 type Policy struct {
-	GraceTTL      time.Duration                    // grace window after agent-gone (default 300s)
-	ResetOnExpiry bool                             // run the board-side teardown on TTL expiry (default true)
-	Clock         Clock                            // time seam (default RealClock)
-	Log           func(format string, args ...any) // ring-log trace seam
-	OnExpiry      TeardownFunc                     // board-side teardown executor
+	GraceTTL time.Duration                    // grace window after agent-gone (default 300s)
+	Clock    Clock                            // time seam (default RealClock)
+	Log      func(format string, args ...any) // ring-log trace seam
+	OnExpiry TeardownFunc                     // board-side teardown executor
 }
 
 // leaseState is the lifecycle of one lease entry.

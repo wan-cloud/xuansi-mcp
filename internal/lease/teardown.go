@@ -29,18 +29,18 @@ func teardownTrace(reason, board, holder string, session int, sessions []int, er
 }
 
 // runTeardown executes actions outside Manager.mu: for each, the
-// board-side TeardownFunc (ResetOnExpiry gates the EXPIRY path; a
-// deliberate Release always tears down — the design doc's teardown
-// section lists agent-drop, TTL and release as one teardown semantic),
-// then the entry is removed and the reaper nudged. A TeardownFunc error
-// never resurrects the lease.
+// board-side TeardownFunc (unconditionally — the ruling pins
+// reset-on-expiry and release is a deliberate teardown path of the same
+// shape; a caller that wants pure host-side leasing simply leaves
+// OnExpiry nil), then the entry is removed and the reaper nudged. A
+// TeardownFunc error never resurrects the lease.
 func (m *Manager) runTeardown(acts []teardownAction) {
 	for _, act := range acts {
 		e := act.entry
 		sessions := teardownNamespaces(e.session)
 		start := m.clock.Now()
 		var err error
-		if fn := m.policy.OnExpiry; fn != nil && (act.reason == "released" || m.policy.ResetOnExpiry) {
+		if fn := m.policy.OnExpiry; fn != nil {
 			err = fn(m.opCtx, e.board, e.holder, sessions)
 		}
 		m.logf("%s", teardownTrace(act.reason, e.board, e.holder, e.session, sessions, err, m.clock.Now().Sub(start)))

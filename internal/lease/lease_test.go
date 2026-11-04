@@ -151,10 +151,9 @@ func waitFor(t *testing.T, cond func() bool) {
 func newTestManager(ttl time.Duration, rec *recorder) (*Manager, *fakeClock) {
 	fc := newFakeClock()
 	m := NewManager(Policy{
-		GraceTTL:      ttl,
-		ResetOnExpiry: true,
-		Clock:         fc,
-		OnExpiry:      rec.fn,
+		GraceTTL: ttl,
+		Clock:    fc,
+		OnExpiry: rec.fn,
 		Log: func(format string, args ...any) {
 			fmt.Printf("    [lease-log] "+format+"\n", args...)
 		},
@@ -406,20 +405,28 @@ func TestExpiryExactlyOnceLazyAndReaper(t *testing.T) {
 	}
 }
 
-func TestResetOnExpiryFalseReleasesWithoutBoardAction(t *testing.T) {
+func TestPolicyZeroValueStillTearsDownOnExpiry(t *testing.T) {
+	// The owner ruling pins reset-on-expiry: a zero-value Policy (only
+	// the test seams filled — no GraceTTL, no flags) must still run the
+	// board teardown when the TTL passes. The knob does not exist.
 	rec := newRecorder()
 	fc := newFakeClock()
-	m := NewManager(Policy{GraceTTL: 10 * time.Second, ResetOnExpiry: false, Clock: fc, OnExpiry: rec.fn})
+	m := NewManager(Policy{Clock: fc, OnExpiry: rec.fn})
 	defer m.Close()
-	m.Acquire("d75884", "agent-a")
-	m.OnAgentGone("agent-a")
-	fc.Advance(11 * time.Second)
-	waitFor(t, func() bool { return len(m.Snapshot()) == 0 })
-	if rec.count() != 0 {
-		t.Fatalf("ResetOnExpiry=false must not touch the board (calls=%d)", rec.count())
+	if err := m.Acquire("d75884", "agent-a"); err != nil {
+		t.Fatal(err)
 	}
-	if err := m.Acquire("d75884", "agent-b"); err != nil {
-		t.Fatalf("board free after passive expiry: %v", err)
+	// GraceTTL defaulted to DefaultGraceTTL (300s)
+	snap := m.Snapshot()
+	m.OnAgentGone("agent-a")
+	snap = m.Snapshot()
+	if len(snap) != 1 || !snap[0].GraceDeadline.Equal(fc.Now().Add(DefaultGraceTTL)) {
+		t.Fatalf("zero-value Policy must default GraceTTL to %v: %+v", DefaultGraceTTL, snap)
+	}
+	fc.Advance(DefaultGraceTTL + time.Second)
+	waitFor(t, func() bool { return rec.count() == 1 && len(m.Snapshot()) == 0 })
+	if got := rec.sessions(); len(got) != 2 || got[0] <= 0 || got[1] != 0 {
+		t.Fatalf("zero-value Policy teardown namespaces = %v, want [holderSession, 0]", got)
 	}
 }
 

@@ -4,11 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"xuansi/internal/replclient"
 )
+
+// virtualClock is the injected Wait seam: sleep(d) advances the
+// timeline instantly and returns — the ≥25s arbitration schedule is
+// proven with zero real waiting.
+type virtualClock struct {
+	mu sync.Mutex
+	el time.Duration
+}
+
+func (v *virtualClock) sleep(d time.Duration) error {
+	v.mu.Lock()
+	v.el += d
+	v.mu.Unlock()
+	return nil
+}
+
+func (v *virtualClock) elapsed() time.Duration {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.el
+}
 
 // fakeCtl is a scripted Controller: ops are recorded; canned behavior
 // per op; stdout events fire synchronously when diag.pins is issued.
@@ -27,6 +50,12 @@ type fakeCtl struct {
 	wifi       map[string]any
 	helloSeq   []string // roles granted per hello call, cycling on exhaustion
 	helloN     int
+
+	// board-side keepalive simulation: when virt is set, Hello answers
+	// observer until the virtual clock passes releaseAfter (the §12
+	// slot self-release), controller afterwards.
+	virt         *virtualClock
+	releaseAfter time.Duration
 
 	opErr map[string]error
 }
@@ -120,7 +149,14 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	role := "controller"
-	if f.helloN < len(f.helloSeq) {
+	if f.virt != nil {
+		// §12 simulation: the old slot self-releases via the board's
+		// keepalive at releaseAfter; hellos before that are forced
+		// observer, hellos after take the freed slot
+		if f.virt.elapsed() < f.releaseAfter {
+			role = "observer"
+		}
+	} else if f.helloN < len(f.helloSeq) {
 		role = f.helloSeq[f.helloN]
 	}
 	f.helloN++
@@ -244,7 +280,7 @@ func TestLeaseTeardownAbortsOnError(t *testing.T) {
 	}
 }
 
-func TestConnectWaitsForControllerRole(t *testing.T) {
+func TestConnectRehelloTakesFreedSlotAndWarmReuse(t *testing.T) {
 	// first hello is forced observer (old dead-link slot lingers on the
 	// board), the re-hello takes the freed slot (§5/§12)
 	ctl := newFakeCtl()
@@ -276,6 +312,85 @@ func TestConnectWaitsForControllerRole(t *testing.T) {
 	ctl.mu.Unlock()
 	if hellos != 2 {
 		t.Fatalf("hello calls = %d — warm connection must be reused (2 hellos: observer-forced + controller re-hello)", hellos)
+	}
+}
+
+func TestConnectWaitsOutBoardKeepaliveSelfRelease(t *testing.T) {
+	// §12: a silently dead old link does NOT wedge the slot — the
+	// board's own keepalive (10s idle + 2s×3, measured 16.5–17.0s)
+	// self-releases it. Connect must keep re-helloing THROUGH that
+	// window (ArbitrationWait default 25s ≥ 17s lower bound) and take
+	// the controller over TCP — no USB, no reboot, scripts untouched.
+	ctl := newFakeCtl()
+	virt := &virtualClock{}
+	ctl.virt = virt
+	ctl.releaseAfter = 17 * time.Second // the measured self-release point
+	usbDials := 0
+	s := NewSupervisor(BoardRef{MAC6: "d75884", Host: "x", Port: 1}, SupOpts{
+		DialTCP: func() (Controller, error) { return ctl, nil },
+		DialUSB: func() (Controller, error) {
+			usbDials++
+			return newFakeCtl(), nil
+		},
+		RetryWait: 500 * time.Millisecond,
+		Wait:      virt.sleep,
+	})
+	defer s.Close()
+
+	got, err := s.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("connect must ride out the self-release window: %v", err)
+	}
+	if got == nil {
+		t.Fatal("no controller returned")
+	}
+	if e := virt.elapsed(); e < 17*time.Second {
+		t.Fatalf("gave up the re-hello schedule at %v — the board self-release lower bound (16.5–17.0s) was never covered", e)
+	}
+	if usbDials != 0 {
+		t.Fatalf("USB fallback dialed %d time(s) — the §12-faithful recovery is TCP-only", usbDials)
+	}
+	ctl.mu.Lock()
+	hellos := 0
+	for _, r := range ctl.ops {
+		if r.op == "hello" {
+			hellos++
+		}
+	}
+	ctl.mu.Unlock()
+	if hellos < 34 { // 17s / 500ms — the schedule persisted attempt after attempt
+		t.Fatalf("only %d re-hello attempts — schedule did not persist through the window", hellos)
+	}
+}
+
+func TestConnectWedgeErrorAfterFullWindow(t *testing.T) {
+	// The wedge verdict may only come after the FULL arbitration window
+	// (default 25s ≥ the 17s board self-release lower bound), and the
+	// error must state the last-resort USB trade-off (reboot kills
+	// surviving scripts).
+	ctl := newFakeCtl()
+	virt := &virtualClock{}
+	ctl.virt = virt
+	ctl.releaseAfter = time.Duration(1<<62 - 1) // never releases
+	s := NewSupervisor(BoardRef{MAC6: "d75884", Host: "x", Port: 1}, SupOpts{
+		DialTCP:   func() (Controller, error) { return ctl, nil },
+		RetryWait: 500 * time.Millisecond,
+		Wait:      virt.sleep,
+	})
+	defer s.Close()
+
+	_, err := s.Connect(context.Background())
+	if !errors.Is(err, ErrControllerSlotHeld) {
+		t.Fatalf("want ErrControllerSlotHeld, got %v", err)
+	}
+	if e := virt.elapsed(); e < 25*time.Second {
+		t.Fatalf("wedge reported after only %v — must wait out the full window (25s) first", e)
+	}
+	msg := err.Error()
+	for _, want := range []string{"last resort", "kills", "keepalive"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error text %q missing %q (the USB trade-off must be stated)", msg, want)
+		}
 	}
 }
 

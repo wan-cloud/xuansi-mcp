@@ -19,12 +19,23 @@
 //	     party refused → Adopt WITHIN the TTL (board state kept — the
 //	     script's counter kept counting through grace) → polite
 //	     Release tears down the same way.
-//	  R3 link-loss resync: script running → iptables black-hole of the
-//	     daemon↔board 4-tuple (board untouched — scripts keep running;
-//	     wifi.off would need a USB controller whose open REBOOTS the
-//	     board and kill the scripts, so it is the wrong dead-link tool
-//	     here) → keepalive verdict → rules out → Resync reconnects and
-//	     reports the survived script honestly.
+//	  R3 link-loss resync (board-visible shape): script running →
+//	     one-way iptables hole (board→host dropped) + our FIN reaches
+//	     the board → board observes the disconnect, frees the §12 slot,
+//	     scripts keep running → Resync reports the survivor honestly.
+//	     (wifi.off is the wrong dead-link tool here: it needs a USB
+//	     controller whose open REBOOTS the board and kills the scripts.)
+//	  R4 link-loss SILENT shape (§12-faithful recovery): bidirectional
+//	     black-hole → host keepalive verdict ~6s while the board sees
+//	     nothing — but the board runs its OWN keepalive (10s/2s×3, §12;
+//	     self-release measured 16.5–17.0s), so the supervisor's
+//	     persistent re-hellos (ArbitrationWait=25s) wait out the window
+//	     and re-take controller over TCP — NO reboot, the script
+//	     survives the whole hole+recovery (counter proves it).
+//	  R5 USB fallback route sanity: the deliberate last resort
+//	     (ConnectUSB reboots, §2) proven post-cleanup when it kills
+//	     nothing; the full wedge→reboot→resync chain is in the pre-fix
+//	     run's R4 (results/2026-11-05-b5-t10-teardown.log).
 //
 // Every hello binds protocol_ver=3/fw b310378 in-log (evidence binding);
 // a mismatch aborts the scenario.
@@ -151,11 +162,10 @@ func runLease() int {
 
 	// ——— the lease manager over the supervisor (short HIL TTL) ———
 	mgr := lease.NewManager(lease.Policy{
-		GraceTTL:      10 * time.Second,
-		ResetOnExpiry: true,
-		Clock:         lease.RealClock{},
-		OnExpiry:      sup.LeaseTeardown,
-		Log:           tee.logf,
+		GraceTTL: 10 * time.Second,
+		Clock:    lease.RealClock{},
+		OnExpiry: sup.LeaseTeardown,
+		Log:      tee.logf,
 	})
 	defer mgr.Close()
 
@@ -276,10 +286,14 @@ func runLease() int {
 	// (a) board-visible disconnect: one-way INPUT hole + our FIN (outbound
 	//     alive) — the board observes the disconnect, frees the §12 slot,
 	//     keeps its scripts running: the survive-and-resync shape.
-	// (b) silent bidirectional hole: the host keepalive verdicts, the
-	//     board sees NOTHING — the controller slot wedges (§12 frees only
-	//     on an observed disconnect; the board runs no keepalive). The
-	//     deliberate USB fallback (reboot) is the recovery. R4 proves it.
+	// (b) silent bidirectional hole (R4): the host keepalive verdicts at
+	//     ~6s while the board sees nothing — BUT the board runs its OWN
+	//     keepalive (10s idle + 2s×3 probes, §12 frozen; self-release
+	//     measured 16.5–17.0s), so the slot is NOT permanently wedged:
+	//     the supervisor's persistent re-hellos (ArbitrationWait=25s)
+	//     ride out the window and take the slot over TCP — no reboot,
+	//     surviving scripts untouched. The USB fallback (reboot) is the
+	//     explicitly-labeled LAST RESORT only after the full window.
 	deadlink := "oneway-fin"
 	if !sudoAvailable() {
 		deadlink = "local-close"
@@ -310,48 +324,46 @@ func runLease() int {
 	_, nFinal, _ := supEval(ctx, sup, `return _G.t10n`)
 	h.note("script kept running through the dead-link window (counter now %v)", nFinal)
 
-	// ——— R4: silent bidirectional hole → controller wedge → USB fallback ———
-	fmt.Println("  — R4: silent black-hole → wedged controller slot → deliberate USB fallback —")
+	// ——— R4: silent bidirectional hole → wait out the board's keepalive
+	// self-release → re-take controller over TCP (§12-faithful recovery,
+	// NO reboot — scripts must survive) ———
+	fmt.Println("  — R4: silent black-hole → board keepalive self-release → TCP re-take (no reboot) —")
 	if sudoAvailable() {
-		wedged := silentHoleUntilVerdict(h, sup)
-		if wedged {
-			// TCP reconnect attempts the re-hello loop and fails with the
-			// wedge marker — the daemon's signal to fall back to USB
-			rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		// read the counter while the link is still alive — the
+		// post-recovery read below proves the script straddled everything
+		_, nBeforeRecovery, _ := supEval(ctx, sup, `return _G.t10n`)
+		h.note("counter before the silent hole: %v (script running)", nBeforeRecovery)
+		if silentHoleUntilVerdict(h, sup) {
+			// The reconnect now PERSISTS: re-hellos across the board's
+			// self-release window (budget 25s ≥ 17s lower bound). The
+			// t10resync script keeps running throughout — the counter
+			// below proves it straddled the whole dead-link + recovery.
+			origUSB := sup.Opts().DialUSB
+			usbDials := 0
+			sup.Opts().DialUSB = func() (board.Controller, error) { // tripwire: the §12-faithful path must not touch USB
+				usbDials++
+				return nil, fmt.Errorf("tripwire: unexpected USB fallback in the §12-faithful recovery")
+			}
+			rctx, cancel := context.WithTimeout(ctx, 40*time.Second)
 			_, cerr := sup.Connect(rctx)
 			cancel()
-			h.check(errors.Is(cerr, board.ErrControllerSlotHeld),
-				fmt.Sprintf("TCP reconnect after silent hole refuses with ErrControllerSlotHeld (%v)", cerr))
+			sup.Opts().DialUSB = origUSB // restore for the R5 fallback sanity
+			h.check(cerr == nil && usbDials == 0,
+				fmt.Sprintf("controller re-taken over TCP after the self-release window (err=%v, usbDials=%d)", cerr, usbDials))
 
-			uctx, cancel2 := context.WithTimeout(ctx, 45*time.Second)
-			_, uerr := sup.ConnectUSB(uctx) // deliberate reboot (§2)
-			cancel2()
-			h.check(uerr == nil, fmt.Sprintf("USB fallback connects (board REBOOTED — scripts died, reported below; err=%v)", uerr))
 			rep3, rerr := sup.Resync(ctx)
-			h.check(rerr == nil, fmt.Sprintf("post-reboot resync (err=%v)", rerr))
+			h.check(rerr == nil, fmt.Sprintf("resync after silent-hole recovery (err=%v)", rerr))
 			fmt.Printf("  [resync] scripts=%v survived=%v started=%v gone=%v pins=%d wifi_state=%v\n",
 				rep3.Scripts, rep3.Survived, rep3.Started, rep3.Gone, len(rep3.Pins), rep3.Wifi["state"])
-			h.check(len(rep3.Survived) == 0 && len(rep3.Gone) == 1 && rep3.Gone[0] == "t10resync",
-				fmt.Sprintf("reboot recovery is honest: nothing survived (survived=%v gone=%v)", rep3.Survived, rep3.Gone))
-
-			// migrate back to the warm TCP route once the wifi is back
-			// up: yield the CDC controller slot (§12 voluntary yield —
-			// CDC has no host-disconnect signal), then dial TCP
-			if settleNetCtl(h, sup.Client(), "R4 wifi") {
-				if _, yerr := sup.Client().Hello(true, "xuansi-daemon"); yerr == nil {
-					h.note("CDC controller yielded the slot (§12) — migrating to TCP")
-				}
-				sup.Close()
-				tctx, cancel3 := context.WithTimeout(ctx, 30*time.Second)
-				_, terr := sup.Connect(tctx)
-				cancel3()
-				h.check(terr == nil, fmt.Sprintf("migrated back to the TCP warm route after recovery (err=%v)", terr))
-			} else {
-				h.check(false, "wifi did not settle back up after the reboot")
-			}
+			h.check(len(rep3.Survived) == 1 && rep3.Survived[0] == "t10resync" && len(rep3.Gone) == 0,
+				fmt.Sprintf("script SURVIVED the silent hole AND the no-reboot recovery (survived=%v gone=%v)", rep3.Survived, rep3.Gone))
+			_, nAfterRecovery, _ := supEval(ctx, sup, `return _G.t10n`)
+			h.check(numGt(nAfterRecovery, nBeforeRecovery),
+				fmt.Sprintf("counter %v → %v — the script ran through the entire silent-hole + recovery window", nBeforeRecovery, nAfterRecovery))
+			h.note("full USB-fallback chain (wedge error → deliberate reboot → honest nothing-survived resync → TCP migration) is proven by the pre-fix run's R4: results/2026-11-05-b5-t10-teardown.log")
 		}
 	} else {
-		h.note("no sudo — R4 silent-hole wedge path skipped (unit + code document the policy; wedge error is board-measured in the sudo runs)")
+		h.note("no sudo — R4 silent-hole self-release path skipped (unit tests pin the ≥25s schedule; the window is board-measured 16.5–17.0s, batch 4)")
 	}
 
 	// final cleanup: release tears everything down
@@ -363,6 +375,23 @@ func runLease() int {
 	fmt.Printf("  [diag.pins final]\n%s", indentDump(raw))
 	h.check(len(pins) == 0, fmt.Sprintf("final pins safe state (parsed=%+v)", pins))
 	mgr.Close()
+
+	// ——— R5: USB fallback route sanity ———
+	// The LAST-RESORT route stays proven on the current code: nothing is
+	// running anymore (the release above tore everything down), so the
+	// deliberate reboot kills nothing. The full fallback chain (wedge
+	// error → reboot → honest nothing-survived resync → TCP migration)
+	// lives in the pre-fix run's R4: results/2026-11-05-b5-t10-teardown.log.
+	fmt.Println("  — R5: USB fallback route sanity (post-cleanup; the reboot kills nothing now —")
+	uctx, cancelU := context.WithTimeout(ctx, 45*time.Second)
+	_, uerr := sup.ConnectUSB(uctx)
+	cancelU()
+	h.check(uerr == nil, fmt.Sprintf("ConnectUSB fallback route works (board REBOOTED, §2; err=%v)", uerr))
+	names, _ = sup.ScriptList(ctx)
+	h.check(len(names) == 0, fmt.Sprintf("post-reboot script.list empty (got %v)", names))
+	rawF, pinsF, _ := sup.DiagPins(ctx)
+	fmt.Printf("  [diag.pins post-usb-fallback]\n%s", indentDump(rawF))
+	h.check(len(pinsF) == 0, fmt.Sprintf("post-reboot pins safe (parsed=%+v)", pinsF))
 
 	return h.finish("lease")
 }
@@ -513,24 +542,6 @@ func silentHoleUntilVerdict(h *harness, sup *board.Supervisor) bool {
 		h.check(false, "no keepalive verdict within 15s of the silent hole")
 	}
 	return verdict
-}
-
-// settleNetCtl polls wifi.status until state=up over a Controller (the
-// b5t9 settle idiom, T8 lesson: association ~3s after boot).
-func settleNetCtl(h *harness, c board.Controller, tag string) bool {
-	if c == nil {
-		return false
-	}
-	for i := 0; i < 40; i++ {
-		if st, err := c.Op(context.Background(), "wifi.status", nil); err == nil {
-			if s, _ := st["state"].(string); s == "up" {
-				h.note("%s: net up (ip=%v ssid=%v)", tag, st["ip"], st["ssid"])
-				return true
-			}
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	return false
 }
 
 // indentDump prefixes each dump line for the transcript.
