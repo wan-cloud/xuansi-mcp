@@ -185,3 +185,82 @@ and later TCP hellos are forced observer past the 25s arbitration window
 idiom), after which the daemon takes the TCP controller again: connected=yes,
 wifi_state=up (S6d). Matches ErrControllerSlotHeld's guidance (USB reboot is
 the last resort); flagged for the fw backlog.
+
+================================================================
+--- yield-wave smoke — 2026-11-05T06:11:29+08:00 (§12 讓位: release yields, no headless ritual) ---
+time=2026-11-05T06:11:29.278+08:00 level=INFO msg="server: serving /tmp/opencode/fixwave.sock (grace_ttl=5m0s)"
+xuansi daemon serving /tmp/opencode/fixwave.sock (grace-ttl 5m0s, Ctrl-C to stop)
+time=2026-11-05T06:11:32.284+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
+time=2026-11-05T06:11:32.332+08:00 level=INFO msg="tcp: connected 10.1.50.200:57486 → 10.1.51.205:7777 (no reboot, no drain window — §13; keepalive 3s/1s×3 ≈6s verdict)"
+time=2026-11-05T06:11:32.344+08:00 level=INFO msg="board d75884: controller warm connection up (fw=b310378 protocol_ver=3)"
+time=2026-11-05T06:11:32.431+08:00 level=INFO msg="board d75884: resync scripts=[] survived=[] started=[] gone=[] pins=0 (cold=true) wifi_state=up [diag.pins raw 10B]"
+time=2026-11-05T06:11:32.431+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[] pins=0 wifi_state=up (orphans listed, not killed)"
+
+--- Y1: lease --usb (deliberate reboot route) ---
+time=2026-11-05T06:11:35.283+08:00 level=INFO msg="lease: grant board=d75884 holder=y1 session=1793830290"
+time=2026-11-05T06:11:35.284+08:00 level=INFO msg="usb: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00 → /dev/ttyACM0 (mac6 d75884)"
+time=2026-11-05T06:11:40.143+08:00 level=INFO msg="usb: RTS pulse rebooted the board; 4.5s drain absorbed 3781 bytes (ROM prefix ≈2.6KB + IDF boot lines, §2)"
+time=2026-11-05T06:11:40.195+08:00 level=INFO msg="board d75884: USB fallback connection up (board REBOOTED, §2; fw=b310378)"
+time=2026-11-05T06:11:40.241+08:00 level=INFO msg="server: board d75884 leased over USB by holder y1 — USB transport: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)"
+leased d75884 holder=y1 session=1793830290 transport=usb
+WARNING: USB transport: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)
+time=2026-11-05T06:11:40.241+08:00 level=INFO msg="lease: agent-gone holder=y1 boards=1 grace_deadline=2026-11-05T06:16:40+08:00 ttl=5m0s (board state kept)"
+time=2026-11-05T06:11:40.241+08:00 level=INFO msg="server: conn dropped (holder=y1)"
+
+--- Y2: eval over USB ---
+time=2026-11-05T06:11:40.247+08:00 level=INFO msg="lease: adopt board=d75884 holder=y1 session=1793830290 (board state kept — no reset)"
+time=2026-11-05T06:11:40.247+08:00 level=INFO msg="server: holder y1 adopted board d75884 back live"
+7
+value: 7
+time=2026-11-05T06:11:40.274+08:00 level=INFO msg="lease: agent-gone holder=y1 boards=1 grace_deadline=2026-11-05T06:16:40+08:00 ttl=5m0s (board state kept)"
+time=2026-11-05T06:11:40.274+08:00 level=INFO msg="server: conn dropped (holder=y1)"
+
+--- Y3: release — must YIELD the §12 slot before closing CDC ---
+time=2026-11-05T06:11:40.302+08:00 level=INFO msg="board d75884: session.reset(1793830290) stopped=0"
+time=2026-11-05T06:11:40.319+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+time=2026-11-05T06:11:40.319+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=y1 session=1793830290 sessions=[1793830290 0] err=<nil> took=39ms"
+time=2026-11-05T06:11:40.366+08:00 level=INFO msg="board d75884: USB controller yielded the §12 slot (observer hello) before USB lease release"
+time=2026-11-05T06:11:40.459+08:00 level=INFO msg="server: board d75884: USB controller yielded on release (§12 讓位) — next lease dials TCP"
+released d75884 (holder=y1; board session reset to safe state)
+time=2026-11-05T06:11:40.459+08:00 level=INFO msg="server: conn dropped (holder=y1)"
+
+--- Y4: immediate plain (TCP) lease + eval — controller must be taken, no ritual ---
+time=2026-11-05T06:11:40.465+08:00 level=INFO msg="lease: grant board=d75884 holder=y2 session=1793830291"
+leased d75884 holder=y2 session=1793830291
+time=2026-11-05T06:11:40.465+08:00 level=INFO msg="lease: agent-gone holder=y2 boards=1 grace_deadline=2026-11-05T06:16:40+08:00 ttl=5m0s (board state kept)"
+time=2026-11-05T06:11:40.465+08:00 level=INFO msg="server: conn dropped (holder=y2)"
+time=2026-11-05T06:11:40.470+08:00 level=INFO msg="lease: adopt board=d75884 holder=y2 session=1793830291 (board state kept — no reset)"
+time=2026-11-05T06:11:40.470+08:00 level=INFO msg="server: holder y2 adopted board d75884 back live"
+time=2026-11-05T06:11:44.577+08:00 level=INFO msg="board d75884: dial failed: replclient: dial tcp xuansi-d75884.local:7777: dial tcp 10.1.51.205:7777: connect: no route to host"
+time=2026-11-05T06:11:45.470+08:00 level=INFO msg="tcp: connected 10.1.50.200:50942 → 10.1.51.205:7777 (no reboot, no drain window — §13; keepalive 3s/1s×3 ≈6s verdict)"
+time=2026-11-05T06:11:45.480+08:00 level=INFO msg="board d75884: controller warm connection up (fw=b310378 protocol_ver=3)"
+8
+value: 8
+time=2026-11-05T06:11:45.519+08:00 level=INFO msg="lease: agent-gone holder=y2 boards=1 grace_deadline=2026-11-05T06:16:45+08:00 ttl=5m0s (board state kept)"
+time=2026-11-05T06:11:45.519+08:00 level=INFO msg="server: conn dropped (holder=y2)"
+
+real	0m5.054s
+user	0m0.003s
+sys	0m0.004s
+board:     d75884
+sources:   usb+mdns
+tcp:       xuansi-d75884.local:7777
+usb:       /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00
+fw:        b310378
+connected: yes
+lease:     holder=y2 session=1793830291 since=2026-11-05T06:11:40+08:00 — holder gone, grace-expiring at 2026-11-05T06:16:45+08:00 (re-supply --holder y2 to adopt)
+time=2026-11-05T06:11:45.540+08:00 level=INFO msg="server: conn dropped (holder=conn-6)"
+xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running — the next start's audit lists them)
+xuansi: shutdown complete
+--- yield smoke done — 2026-11-05T06:11:45+08:00 ---
+
+--- yield-wave verdict (§12 讓位) ---
+PASS — release of a USB-transport lease now yields the controller slot:
+  Y3  "USB controller yielded the §12 slot (observer hello) before USB
+      lease release" — yield lands BEFORE the CDC close (teardown first,
+      then yield, then close)
+  Y4  immediate plain TCP lease: first hello takes CONTROLLER ("controller
+      warm connection up" 06:11:45.480) — no 25s observer window, no
+      headless-reopen ritual. The 5.0s eval time is one dial retry while
+      the board's WiFi finished re-associating after the USB-route reboot
+      (reboot 06:11:35, WiFi back ~06:11:45 — board-side, not arbitration).

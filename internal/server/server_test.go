@@ -846,6 +846,138 @@ func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 	}
 }
 
+// sawObserverYield reports whether the fake saw a hello with
+// observer=true — and (ordered proof) that it ANSWERED: fakeCtl.Op
+// refuses ops on a closed link, so a recorded yield hello must have
+// landed before Close.
+func sawObserverYield(f *fakeCtl) bool {
+	for _, call := range f.got() {
+		if call.op == "hello" {
+			if ob, _ := call.args["observer"].(bool); ob {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestReleaseUSBLeaseYieldsThenTCPLeaseTakesOver (§12 讓位): releasing
+// a USB-transport lease yields the controller slot (observer hello)
+// BEFORE closing the CDC link — the board cannot see a CDC close — so
+// the USB controller is dropped and the very next (default TCP) lease
+// takes the controller with no headless-reopen ritual.
+func TestReleaseUSBLeaseYieldsThenTCPLeaseTakesOver(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "u1", "transport": "usb"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease usb: %#v", rep)
+	}
+	tcpDuringUSB := e.dialedTCP("d75884")
+
+	rep, _ = c.call(2, map[string]any{"type": "release", "board": "d75884", "holder": "u1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("release: %#v", rep)
+	}
+
+	// yield-then-close on the USB controller, in that order
+	if !sawObserverYield(e.usbFakes["d75884"]) {
+		t.Fatal("release performed no §12 observer yield before closing the USB link")
+	}
+	if !e.usbFakes["d75884"].Dead() {
+		t.Fatal("release must drop the USB controller (the next touch dials TCP)")
+	}
+
+	// the USB lease's swap closed the old TCP link (§12 close); a real
+	// redial opens a FRESH socket — model that with a fresh fake
+	e.dmu.Lock()
+	e.fakes["d75884"] = newFakeCtl()
+	e.dmu.Unlock()
+
+	// the next lease — default transport, from a FRESH client — rides
+	// TCP into the freed slot and answers immediately
+	c2 := dialSock(t, e.sock)
+	rep, _ = c2.call(3, map[string]any{"type": "lease", "board": "d75884", "holder": "u2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("tcp lease after usb release: %#v", rep)
+	}
+	rep, _ = c2.call(4, map[string]any{"type": "eval", "board": "d75884", "code": "return 2", "holder": "u2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval over tcp: %#v", rep)
+	}
+	if n := e.dialedTCP("d75884"); n <= tcpDuringUSB {
+		t.Fatalf("tcp dials %d → %d — the post-release lease must dial TCP", tcpDuringUSB, n)
+	}
+	if !e.usbFakes["d75884"].Dead() {
+		t.Fatal("the USB controller must stay dropped")
+	}
+}
+
+// TestReleaseTCPLeaseUnchanged: the TCP release path gains NOTHING —
+// no observer yield (§12: a TCP close releases the slot by itself) and
+// the warm TCP controller stays connected across release.
+func TestReleaseTCPLeaseUnchanged(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "d1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "d1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	tcpDialed := e.dialedTCP("d75884")
+
+	rep, _ = c.call(3, map[string]any{"type": "release", "board": "d75884", "holder": "d1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("release: %#v", rep)
+	}
+	if sawObserverYield(e.fakes["d75884"]) {
+		t.Fatal("TCP release performed a pointless yield — §12 frees the slot on close alone")
+	}
+	if e.fakes["d75884"].Dead() {
+		t.Fatal("TCP release must keep the warm controller (current behavior)")
+	}
+
+	// re-lease + eval reuses the warm TCP link: no new dial (same
+	// holder — the connection is bound to it)
+	rep, _ = c.call(4, map[string]any{"type": "lease", "board": "d75884", "holder": "d1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("re-lease: %#v", rep)
+	}
+	rep, _ = c.call(5, map[string]any{"type": "eval", "board": "d75884", "code": "return 2", "holder": "d1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval after re-lease: %#v", rep)
+	}
+	if n := e.dialedTCP("d75884"); n != tcpDialed {
+		t.Fatalf("tcp dials %d → %d — the warm TCP controller must be reused across release", tcpDialed, n)
+	}
+}
+
+// TestShutdownYieldsUSBController: daemon shutdown while holding a live
+// USB controller yields the §12 slot before closing the CDC link
+// (srv.Close → supervisor.Close → yieldAndClose).
+func TestShutdownYieldsUSBController(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "u1", "transport": "usb"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease usb: %#v", rep)
+	}
+	e.srv.Close() // idempotent with the cleanup's Close
+
+	if !sawObserverYield(e.usbFakes["d75884"]) {
+		t.Fatal("shutdown performed no §12 observer yield before closing the USB link")
+	}
+	if !e.usbFakes["d75884"].Dead() {
+		t.Fatal("shutdown must close the USB controller")
+	}
+}
+
 // TestEvalBoardErrorClassPreserved: a board error reply crosses the API
 // with its fw class and msg verbatim (including ` at byte N`).
 func TestEvalBoardErrorClassPreserved(t *testing.T) {

@@ -145,7 +145,12 @@ func (f *fakeCtl) Op(ctx context.Context, op string, args map[string]any) (map[s
 }
 
 func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, error) {
-	f.record("hello", map[string]any{"client": name, "observer": observer})
+	// "closed" in the record proves hello-vs-Close ordering (the §12
+	// yield must land while the link is still open)
+	f.mu.Lock()
+	closed := f.closed
+	f.mu.Unlock()
+	f.record("hello", map[string]any{"client": name, "observer": observer, "closed": closed})
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	role := "controller"
@@ -416,6 +421,86 @@ func TestDiagPinsTerminatesOnHeaderCount(t *testing.T) {
 	}
 	if !ctl.hasOp("events.subscribe") {
 		t.Fatal("DiagPins must open the stdout subscription gate before triggering")
+	}
+}
+
+// lastYield digs the last hello record's observer/closed flags.
+func lastYield(f *fakeCtl) (observer, closed bool, found bool) {
+	for _, r := range f.opsSnapshot() {
+		if r.op == "hello" {
+			observer, _ = r.args["observer"].(bool)
+			closed, _ = r.args["closed"].(bool)
+			found = true
+		}
+	}
+	return observer, closed, found
+}
+
+// TestUSBControllerYieldsSlotOnReleaseAndClose (§12 讓位): closing a
+// live USB controller link — lease release (YieldUSBController) and
+// supervisor Close — must re-hello as OBSERVER first and only then
+// close (the board cannot see a CDC close; without the yield the slot
+// wedges past the arbitration window). A TCP controller close performs
+// NO yield (§12 releases its slot on close by itself).
+func TestUSBControllerYieldsSlotOnReleaseAndClose(t *testing.T) {
+	tcp, usb := newFakeCtl(), newFakeCtl()
+	s := NewSupervisor(BoardRef{MAC6: "d75884", Host: "x", Port: 1}, SupOpts{
+		DialTCP:   func() (Controller, error) { return tcp, nil },
+		DialUSB:   func() (Controller, error) { return usb, nil },
+		RetryWait: 0,
+	})
+	defer s.Close()
+
+	// warm TCP controller up (controller hello, observer=false)
+	if _, err := s.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// USB fallback: swaps the live TCP link out (no yield needed for
+	// TCP — §12 close releases it) and takes the controller over USB
+	if _, err := s.ConnectUSB(context.Background()); err != nil {
+		t.Fatalf("ConnectUSB: %v", err)
+	}
+	if ob, _, found := lastYield(tcp); found && ob {
+		t.Fatalf("TCP close performed a pointless yield: observer=%v", ob)
+	}
+	usb.resetCalls() // drop the connect-time hellos
+
+	// release: yield-then-close on the USB link, in that order
+	if !s.YieldUSBController() {
+		t.Fatal("YieldUSBController must report true while a USB controller is held")
+	}
+	ob, cl, found := lastYield(usb)
+	if !found || !ob {
+		t.Fatalf("last usb hello: found=%v observer=%v — the §12 yield (observer hello) is missing", found, ob)
+	}
+	if cl {
+		t.Fatal("the yield hello landed AFTER the link was closed — order must be yield, then close")
+	}
+	if s.Client() != nil {
+		t.Fatal("yield must drop the controller (next touch dials TCP)")
+	}
+
+	// next touch rides TCP again, no USB dial
+	if _, err := s.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect after yield: %v", err)
+	}
+
+	// supervisor Close on a live USB link yields too (daemon shutdown)
+	usb2 := newFakeCtl()
+	s.opts.DialUSB = func() (Controller, error) { return usb2, nil }
+	if _, err := s.ConnectUSB(context.Background()); err != nil {
+		t.Fatalf("ConnectUSB (shutdown leg): %v", err)
+	}
+	s.Close()
+	ob, cl, found = lastYield(usb2)
+	if !found || !ob || cl {
+		t.Fatalf("shutdown yield: found=%v observer=%v closed-at-hello=%v — want the §12 yield before close", found, ob, cl)
+	}
+
+	// a SECOND YieldUSBController with nothing held is a clean no-op
+	if s.YieldUSBController() {
+		t.Fatal("YieldUSBController must report false with nothing held")
 	}
 }
 

@@ -94,9 +94,16 @@ type Supervisor struct {
 
 	mu       sync.Mutex
 	ctl      Controller
-	base     baseline
+	ctlUSB   bool // ctl is the USB fallback link (yield-before-close, §12)
 	haveBase bool
+	base     baseline
 }
+
+// usbYieldBound bounds the voluntary §12 yield hello sent before
+// closing a live USB controller link. The hello is an immediate op
+// (§6; the client's own op bound is 5s) — 2s is generous, and a yield
+// that misses it must never delay the close.
+const usbYieldBound = 2 * time.Second
 
 // baseline is the last observed board-side listing Resync diffs against.
 type baseline struct {
@@ -209,6 +216,7 @@ func (s *Supervisor) Connect(ctx context.Context) (Controller, error) {
 		if info.Role == "controller" {
 			s.mu.Lock()
 			s.ctl = ctl
+			s.ctlUSB = false
 			s.mu.Unlock()
 			if attempt > 1 {
 				s.logf("board %s: controller taken on re-hello %d after %v of the %v window (slot self-released — board keepalive, §12)",
@@ -282,13 +290,73 @@ func (s *Supervisor) ConnectUSB(ctx context.Context) (Controller, error) {
 		return nil, fmt.Errorf("board %s: usb hello: %w", s.ref.MAC6, herr)
 	}
 	s.mu.Lock()
-	if s.ctl != nil {
-		s.ctl.Close()
-	}
+	old := s.ctl
+	oldUSB := s.ctlUSB
 	s.ctl = ctl
+	s.ctlUSB = true
 	s.mu.Unlock()
+	if old != nil && old != ctl {
+		s.yieldAndClose(old, oldUSB, "USB fallback swap")
+	}
 	s.logf("board %s: USB fallback connection up (board REBOOTED, §2; fw=%s)", s.ref.MAC6, info.FwBuild)
 	return ctl, nil
+}
+
+// YieldUSBController voluntarily gives up a live USB controller link:
+// the §12 observer yield, then close, leaving the supervisor with
+// nothing connected so the next touch dials the default TCP route into
+// a free slot. Reports whether a USB controller was dropped. A TCP
+// controller is left warm exactly as before — §12 releases its slot on
+// close by itself, so there is nothing to yield and no reason to drop
+// the warm route. Serves USB-transport lease release.
+func (s *Supervisor) YieldUSBController() bool {
+	s.mu.Lock()
+	ctl := s.ctl
+	if ctl == nil || !s.ctlUSB {
+		s.mu.Unlock()
+		return false
+	}
+	s.ctl = nil
+	s.ctlUSB = false
+	s.mu.Unlock()
+	s.yieldAndClose(ctl, true, "USB lease release")
+	return true
+}
+
+// yieldAndClose closes one controller link — voluntarily yielding the
+// §12 controller slot FIRST when the link is a live USB connection: a
+// TCP close is visible to the board (FIN/RST → slot release, §12), but
+// a closed CDC port is INVISIBLE to the board (no FIN analogue; the
+// board's keepalive probes cannot fail against a detached CDC), so
+// without the observer re-hello the USB session's slot stays wedged
+// past the whole 25s arbitration window and every later TCP lease
+// needs the headless-reopen ritual (measured live, fixwave smoke
+// S6b–S6d). Best-effort and short-bounded (hello is an immediate op,
+// §6): a failed or slow yield is logged honestly and never blocks the
+// close — at worst the slot wedges as before, cleared by the next
+// board reboot.
+func (s *Supervisor) yieldAndClose(ctl Controller, usb bool, why string) {
+	if ctl == nil {
+		return
+	}
+	if usb && !ctl.Dead() {
+		done := make(chan error, 1)
+		go func() {
+			_, err := ctl.Hello(true, s.name()+"-yield")
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				s.logf("board %s: USB controller yielded the §12 slot (observer hello) before %s", s.ref.MAC6, why)
+			} else {
+				s.logf("board %s: USB yield before %s failed (%v) — closing anyway", s.ref.MAC6, why, err)
+			}
+		case <-time.After(usbYieldBound):
+			s.logf("board %s: USB yield before %s did not answer within %v — closing anyway", s.ref.MAC6, why, usbYieldBound)
+		}
+	}
+	ctl.Close()
 }
 
 // Client returns the live controller, or nil when not connected.
@@ -357,14 +425,17 @@ func (s *Supervisor) LeaseTeardown(ctx context.Context, boardMAC6, holder string
 }
 
 // Close drops the warm connection (TCP close releases the board's
-// controller slot, §12).
+// controller slot, §12). A live USB controller link yields the §12
+// slot first — the board cannot see a CDC close (yieldAndClose).
 func (s *Supervisor) Close() {
 	s.mu.Lock()
 	ctl := s.ctl
+	usb := s.ctlUSB
 	s.ctl = nil
+	s.ctlUSB = false
 	s.mu.Unlock()
 	if ctl != nil {
-		ctl.Close()
+		s.yieldAndClose(ctl, usb, "supervisor close")
 	}
 }
 

@@ -701,6 +701,19 @@ func (s *Server) hRelease(cc *clientConn, req *Request) (any, error) {
 	if err := s.leases.Release(b.MAC6, holder); err != nil {
 		return nil, err
 	}
+	// a USB-transport lease leaves a USB controller warm; the board
+	// cannot see a CDC close, so releasing yields the §12 slot
+	// (observer hello) and drops the link — the next lease dials TCP
+	// into a free slot, no headless-reopen ritual. A TCP controller is
+	// left warm exactly as before (§12: its close releases the slot by
+	// itself — nothing to yield).
+	db := s.supervisor(b)
+	db.connectMu.Lock()
+	yielded := db.sup.YieldUSBController()
+	db.connectMu.Unlock()
+	if yielded {
+		s.logf("server: board %s: USB controller yielded on release (§12 讓位) — next lease dials TCP", b.MAC6)
+	}
 	return map[string]any{"board": b.MAC6, "holder": holder}, nil
 }
 

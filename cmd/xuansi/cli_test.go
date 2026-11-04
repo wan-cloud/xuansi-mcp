@@ -38,6 +38,12 @@ func (f *cmdFake) Op(ctx context.Context, op string, args map[string]any) (map[s
 		if code, _ := args["code"].(string); code == "return {ok=1}" {
 			return map[string]any{"out": "hello\n", "value": map[string]any{"ok": int64(1)}}, nil
 		}
+		// deterministic bridge for the repl test's first line — its
+		// "2" assertion previously passed only by accident, matching
+		// the epoch-based session id in the banner (pre-existing flake)
+		if code, _ := args["code"].(string); code == "return 1+1" {
+			return map[string]any{"value": int64(2)}, nil
+		}
 		return map[string]any{"out": "ok"}, nil
 	case "script.list":
 		return map[string]any{"out": "scripts (0):"}, nil

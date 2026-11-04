@@ -61,7 +61,12 @@
 // the USB open (a lease held by someone else must not reboot the
 // board); a lease whose USB open then fails stays held host-side
 // (same as a TCP lease on an unreachable board — release or retry).
-// An unknown transport value is a "server" class error.
+// An unknown transport value is a "server" class error. Releasing a
+// USB-transport lease (and daemon shutdown on a live USB controller)
+// voluntarily YIELDS the controller slot first (§12 讓位 — observer
+// hello, then close): the board cannot see a CDC close, so this is
+// what lets the next TCP lease take controller without any reboot
+// ritual.
 //
 // # Holder semantics (the lease identity — read this twice)
 //
