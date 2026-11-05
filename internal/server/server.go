@@ -1112,7 +1112,17 @@ func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, er
 		}
 		args = v.(map[string]any)
 	}
-	return s.boardOp(ctx, b, req.Op, args)
+	// budget.get has no wire op of its own: the frozen §4 contract makes
+	// budget.set with NO keys the getter (missing keys keep the current
+	// values; the reply carries the applied pair), and the board's op
+	// table has exactly that one budget op. Translate here so the ops
+	// face's documented budget.get works against the real board (found
+	// by the b6 full HIL — the unit fake accepted the raw name).
+	wireOp, wireArgs := req.Op, args
+	if req.Op == "budget.get" {
+		wireOp, wireArgs = "budget.set", nil
+	}
+	return s.boardOp(ctx, b, wireOp, wireArgs)
 }
 
 func (s *Server) hScriptStart(ctx context.Context, cc *clientConn, req *Request) (any, error) {

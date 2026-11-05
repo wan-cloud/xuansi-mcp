@@ -1615,6 +1615,49 @@ func TestOpPassthroughAllowlist(t *testing.T) {
 	}
 }
 
+// TestOpBudgetGetTranslation: budget.get crosses to the board as
+// budget.set with NO keys — the frozen §4 getter form (missing keys
+// keep the current values; the reply carries the applied pair) — so
+// the ops face's documented budget.get works against the real board,
+// whose op table carries only budget.set (b6 full-HIL finding: the
+// unit fake used to accept the raw name the daemon sent).
+func TestOpBudgetGetTranslation(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "opg"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	e.fakes["d75884"].on("budget.set", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"eval_ms": 3000, "event_ms": 50}, nil
+	})
+	rep, _ = c.call(2, map[string]any{"type": "op", "board": "d75884", "op": "budget.get"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op budget.get: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	if asInt(res["eval_ms"]) != 3000 || asInt(res["event_ms"]) != 50 {
+		t.Fatalf("budget.get result = %#v, want the applied pair", rep["result"])
+	}
+	sent := false
+	for _, call := range e.fakes["d75884"].got() {
+		if call.op == "budget.get" {
+			t.Fatal("budget.get crossed to the board verbatim — the wire has no such op")
+		}
+		if call.op == "budget.set" {
+			sent = true
+			if len(call.args) != 0 {
+				t.Fatalf("forwarded args = %#v, want the no-keys getter form", call.args)
+			}
+		}
+	}
+	if !sent {
+		t.Fatal("the translated budget.set never reached the board")
+	}
+}
+
 // TestOpArgsValidation: op args run through the SAME numeric walk as
 // eval/submit (controller ruling — the motivating case: op budget.set
 // {"eval_ms":3000} would otherwise encode 3000 as a msgpack float the
