@@ -295,7 +295,28 @@ func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, board
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { srv.Close() })
+	awaitSweep(t, srv.reg, len(boards))
 	return e
+}
+
+// awaitSweep waits bounded for the initial discovery sweep to land its
+// boards. The sweep runs ASYNC inside Start (the startupAudit
+// goroutine — the production shape, deliberately untouched): a test's
+// first resolve racing it reads an EMPTY registry — the no_board
+// "(none known)" startup lottery (~1/3 full-suite runs under load,
+// hitting a different first-lease test each time). Every env helper
+// waits here instead; want 0 (a zero-board env, empty by design)
+// returns immediately, and a sweep that genuinely cannot land its
+// boards inside the bound fails loudly instead of flaking downstream.
+func awaitSweep(t *testing.T, reg *discover.Registry, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(reg.Snapshot()) < want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(reg.Snapshot()); got < want {
+		t.Fatalf("initial discovery sweep never landed its board(s): registry has %d of %d after 2s", got, want)
+	}
 }
 
 // mkBoard builds a TCP-dialable discovered board view.
@@ -915,6 +936,7 @@ func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { srv.Close() })
+	awaitSweep(t, reg, 1) // the sweep races this test's first lease — wait it out
 
 	c := dialSock(t, sock)
 	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
