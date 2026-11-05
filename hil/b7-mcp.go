@@ -90,7 +90,12 @@ const (
 	b7Holder   = "b7-hil"  // custom lease holder for this run
 	b7TCPEndp  = "xuansi-d75884.local:7777"
 	b7Resource = "xuansi://boards/" + b7Board + "/events"
-	b7GraceTTL = 30 * time.Second
+	// B8 item 2: the b7GraceTTL dead constant is GONE. This harness
+	// deliberately rides b6's shared serve launcher, which passes
+	// --grace-ttl b6GraceTTL (30s) — the S0 check below prints that
+	// same b6GraceTTL, so the b7-local copy was never wired to
+	// anything (a vestige of the copy-paste, deleted rather than
+	// half-wired).
 )
 
 // ------------------------------------------------------------- driver sha --

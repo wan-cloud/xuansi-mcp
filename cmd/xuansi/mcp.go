@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -67,7 +68,13 @@ func runMCP(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	// subscription handlers the event face's per-board resources need
 	// (internal/mcp.NewServer documents the wiring).
 	srv := xumcp.NewServer(&mcp.Implementation{Name: "xuansi", Version: daemonVersion})
-	stopTools := xumcp.RegisterTools(srv, c, xumcp.Options{Refresh: xumcp.DynRefreshDefault})
+	stopTools := xumcp.RegisterTools(srv, c, xumcp.Options{
+		Refresh: xumcp.DynRefreshDefault,
+		// the refresh loop's operational notes (e.g. alias truncation,
+		// B8 item 4) ride the same slog-on-stderr seam as every other
+		// log line — stdout stays pure MCP traffic.
+		Logf: func(format string, args ...any) { slog.Warn(fmt.Sprintf(format, args...)) },
+	})
 	defer stopTools()
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(stderr, "xuansi mcp: %v\n", err)

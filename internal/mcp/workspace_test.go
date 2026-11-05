@@ -14,13 +14,18 @@ package mcp
 // environment.
 
 import (
+	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -222,6 +227,66 @@ func TestManifestLoadWriteRoundTrip(t *testing.T) {
 	}
 	if _, err := loadManifest(path); err == nil {
 		t.Errorf("loadManifest(corrupt) succeeded, want a refusal")
+	}
+}
+
+// TestWriteDurableFileNeverTorn (B8 item 5 red unit): the atomic
+// (temp+Sync+rename+dir-fsync) write means the final path is always
+// absent-or-COMPLETE under concurrent readers — a reader loop hammering
+// the file while a writer alternates two payloads never observes a
+// partial file (the pre-B8 in-place O_TRUNC write was durable but
+// tearable mid-write, leaving the manifest's old sha disagreeing with
+// the half-written driver until a push re-verified). The crash half of
+// the story — the rename itself surviving power loss — stays
+// code-review-only: it cannot be unit-proven without crash simulation.
+func TestWriteDurableFileNeverTorn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "driver.lua")
+	a := bytes.Repeat([]byte("A"), 4<<20)
+	b := bytes.Repeat([]byte("b"), 4<<20)
+	if err := writeDurableFile(path, a, 0o644); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	var torn atomic.Int64
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				got, err := os.ReadFile(path)
+				if errors.Is(err, fs.ErrNotExist) {
+					continue // absent is legal (absent-or-complete)
+				}
+				if err != nil {
+					t.Errorf("reader: %v", err)
+					return
+				}
+				if !bytes.Equal(got, a) && !bytes.Equal(got, b) {
+					torn.Add(1) // a prefix/fragment — the torn state
+				}
+			}
+		}()
+	}
+	for i := 0; i < 50; i++ {
+		if err := writeDurableFile(path, a, 0o644); err != nil {
+			t.Fatalf("write A: %v", err)
+		}
+		if err := writeDurableFile(path, b, 0o644); err != nil {
+			t.Fatalf("write b: %v", err)
+		}
+	}
+	close(stop)
+	readers.Wait()
+	if n := torn.Load(); n != 0 {
+		t.Fatalf("readers observed %d torn reads — the final path must always be absent-or-complete", n)
 	}
 }
 

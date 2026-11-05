@@ -48,6 +48,14 @@ type Options struct {
 	// convention). Tests inject a temp root here — never by mutating
 	// the environment.
 	WorkspaceRoot string
+
+	// Logf, when set, receives the refresh loop's one-line operational
+	// notes (B8 item 4: e.g. a >64-char alias truncated to a tool-name
+	// base — the operator's only way to discover WHY a board's tools
+	// are named from a 64-char prefix). Nil falls back to the stdlib
+	// log package (stderr — the mcp face keeps stdout for MCP
+	// traffic). `xuansi mcp` injects its slog-backed seam.
+	Logf func(format string, args ...any)
 }
 
 // NewServer builds the MCP server the `xuansi mcp` face needs: the
@@ -82,7 +90,7 @@ func NewServer(impl *mcpsdk.Implementation) *mcpsdk.Server {
 // Later batch-6 tasks register their own faces against the same (srv,
 // c, opts) seam.
 func RegisterTools(srv *mcpsdk.Server, c *apiclient.Client, opts Options) (stop func()) {
-	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot)}
+	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot), logf: opts.Logf}
 	ts.register(srv)
 	ts.dyn = newDynState(srv)
 	return ts.startDynamic(srv, opts.Refresh)

@@ -199,6 +199,11 @@ func TestCaptureNegativeBoundsFallToDefaults(t *testing.T) {
 	if req.MaxSeconds != 0 || req.MaxBytes != 0 {
 		t.Errorf("negative bounds crossed as %d/%d, want 0/0 (daemon defaults 600s/64MiB)", req.MaxSeconds, req.MaxBytes)
 	}
+	// B8 item 6 (batch-7 parked wording): this pins the CROSSING half at
+	// the fake daemon — zeros on the wire. The default-APPLICATION half
+	// (the daemon's clampCapture turning 0/0 into 600s/64MiB) rests on
+	// the fw docs + T5's capture evidence, not on this fake-daemon
+	// harness.
 
 	// the documented half: both param tags state the non-positive rule
 	secF, ok1 := reflect.TypeOf(captureIn{}).FieldByName("Seconds")

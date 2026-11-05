@@ -8,6 +8,7 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"regexp"
 	"sort"
@@ -642,17 +643,23 @@ var staticToolsRequiredAudit = map[string][]string{
 // finding at the time of writing: the omitempty split was already
 // handler-true for all 17 tools; this table is the executable form of
 // the audit, closing the coverage gap — no tag changes were needed.)
-func TestStaticToolsRequiredCoverage(t *testing.T) {
-	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
-	if err != nil {
-		t.Fatal(err)
+// staticServedRequired builds the audit's served set from a live
+// ListTools answer: every STATIC tool served, mapped to its schema's
+// sorted required list. B8 item 3: membership keys off staticToolNames
+// — the lockstep-pinned production list (TestStaticToolNamesSingleSource
+// pins it against the register calls) — NOT off
+// staticToolsRequiredAudit: filtering by the audit table itself skipped
+// exactly the tools the table forgot, and the count guard then
+// balanced (the slip-through a new static tool could ride forever).
+func staticServedRequired(t *testing.T, lr *mcpsdk.ListToolsResult) map[string][]string {
+	t.Helper()
+	static := map[string]bool{}
+	for _, name := range staticToolNames {
+		static[name] = true
 	}
 	served := map[string][]string{}
 	for _, tool := range lr.Tools {
-		if _, ok := staticToolsRequiredAudit[tool.Name]; !ok {
+		if !static[tool.Name] {
 			continue // dynamic tools carry their own required logic
 		}
 		m, ok := tool.InputSchema.(map[string]any)
@@ -670,20 +677,72 @@ func TestStaticToolsRequiredCoverage(t *testing.T) {
 		sort.Strings(req)
 		served[tool.Name] = req
 	}
-	for name, want := range staticToolsRequiredAudit {
+	return served
+}
+
+// staticAuditProblems returns the audit's failure list: per-name
+// required-set mismatches, audited-but-not-served names, and the count
+// guard — a served set larger than the audit table is the loud signal
+// that a static tool is missing its audit entry.
+func staticAuditProblems(served, audit map[string][]string) []string {
+	var probs []string
+	for name, want := range audit {
 		want = append([]string(nil), want...)
 		sort.Strings(want)
 		got, ok := served[name]
 		if !ok {
-			t.Errorf("static tool %s not served", name)
+			probs = append(probs, fmt.Sprintf("static tool %s not served", name))
 			continue
 		}
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("%s required = %v, want the audited %v", name, got, want)
+			probs = append(probs, fmt.Sprintf("%s required = %v, want the audited %v", name, got, want))
 		}
 	}
-	if len(served) != len(staticToolsRequiredAudit) {
-		t.Errorf("audited %d tools but %d served", len(staticToolsRequiredAudit), len(served))
+	if len(served) != len(audit) {
+		probs = append(probs, fmt.Sprintf("audited %d tools but %d served — a served static tool is missing from the audit table (or the table names a non-static tool)", len(audit), len(served)))
+	}
+	return probs
+}
+
+func TestStaticToolsRequiredCoverage(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range staticAuditProblems(staticServedRequired(t, lr), staticToolsRequiredAudit) {
+		t.Error(p)
+	}
+}
+
+// TestStaticToolsRequiredAuditFailsLoudlyWhenForgotten (B8 item 3 red
+// unit): simulate the slip-through — drop one entry from the audit
+// table and rerun the production audit path; it MUST report a problem.
+// Against the pre-B8 audit (served built by audit-table membership)
+// the dropped entry shrank both sides by one, the count guard
+// balanced, and NOTHING fired — exactly how a tool added to register +
+// staticToolNames but forgotten here would slip through forever.
+func TestStaticToolsRequiredAuditFailsLoudlyWhenForgotten(t *testing.T) {
+	const forgotten = "xuansi_capture"
+	saved, had := staticToolsRequiredAudit[forgotten]
+	if !had {
+		t.Fatalf("precondition: %s is in the audit table", forgotten)
+	}
+	delete(staticToolsRequiredAudit, forgotten)
+	defer func() { staticToolsRequiredAudit[forgotten] = saved }()
+
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probs := staticAuditProblems(staticServedRequired(t, lr), staticToolsRequiredAudit); len(probs) == 0 {
+		t.Fatalf("audit stayed silent with %q missing from the table — the slip-through is back (served=%d audit=%d)",
+			forgotten, len(staticServedRequired(t, lr)), len(staticToolsRequiredAudit))
 	}
 }
 

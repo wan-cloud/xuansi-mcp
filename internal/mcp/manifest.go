@@ -102,27 +102,41 @@ func loadManifest(path string) (*Manifest, error) {
 	return &m, nil
 }
 
-// writeDurableFile writes data to path and fsyncs BOTH the file and
-// its parent directory — the crash-durability pair (B7 minors item 2):
-// without the file fsync the bytes may be lost on power failure, and
-// without the directory fsync a fresh directory entry can vanish while
-// the data sits in an orphaned block. Verified by code review only —
-// fsync semantics cannot be unit-proven without crash simulation
-// (controller ruling: implement + note, no unit red/green possible).
+// writeDurableFile writes data to path ATOMICALLY (B8 item 5): a temp
+// file in the SAME directory (the rename stays on one filesystem),
+// written, fsynced, chmodded to perm and renamed over the target, then
+// the parent directory fsynced — the crash-durability pair (without
+// the file fsync the bytes may be lost on power failure; without the
+// directory fsync the fresh rename can vanish). A concurrent reader
+// ever only sees the old or the new whole file, never a torn mid-write
+// (the pre-B8 in-place O_TRUNC write was durable but tearable: caught
+// mid-write, the manifest's old sha disagreed with the half-written
+// driver until a push re-verified) — that rename semantics half is
+// pinned by TestWriteDurableFileNeverTorn; the crash half stays
+// code-review-only (no crash simulation).
 func writeDurableFile(path string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".durable-*.tmp")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
+	if err := tmp.Chmod(perm); err != nil { // CreateTemp's 0600 → the caller's perm
+		tmp.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 	return fsyncDir(filepath.Dir(path))
@@ -141,36 +155,16 @@ func fsyncDir(dir string) error {
 	return d.Sync()
 }
 
-// writeManifestAtomic writes m to path atomically: a temp file in the
-// SAME directory (the rename stays on one filesystem), written,
-// fsynced and renamed over the target, then the directory fsynced so
-// the rename itself survives a crash — a concurrent reader ever only
-// sees the old or the new whole manifest, never a torn write.
+// writeManifestAtomic writes m to path atomically — the same
+// temp+Sync+rename+dir-fsync writeDurableFile performs (B8 item 5
+// generalized it from the manifest's private helper to the one atomic
+// writer both files ride): a concurrent reader ever only sees the old
+// or the new whole manifest, never a torn write.
 func writeManifestAtomic(path string, m *Manifest) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".manifest-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	return fsyncDir(filepath.Dir(path))
+	return writeDurableFile(path, b, 0o600)
 }

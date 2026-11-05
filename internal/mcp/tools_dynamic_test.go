@@ -11,6 +11,7 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"reflect"
 	"sort"
@@ -281,28 +282,77 @@ func hasPrefixName(names []string, prefix string) int {
 // already disambiguates any truncation collision.
 func TestSanitizeToolBaseLengthBound(t *testing.T) {
 	long := strings.Repeat("a", 500)
-	base := sanitizeToolBase(long, "d75884")
+	base, truncated := sanitizeToolBase(long, "d75884")
 	if len(base) > 64 {
 		t.Errorf("500-char alias sanitized to %d chars, want the ≤64 bound (a 500-char tool prefix overflows the SDK's 128-char names)", len(base))
 	}
+	if !truncated {
+		t.Errorf("500-char alias did not report truncation — the refresh loop's one-line note keys on it (B8 item 4)")
+	}
 	// the mac6 fallback path (pure-symbol alias) is short by construction
-	if b := sanitizeToolBase("??!", "d75884"); b != "d75884" {
-		t.Errorf("mac6 fallback = %q, want d75884", b)
+	if b, trunc := sanitizeToolBase("??!", "d75884"); b != "d75884" || trunc {
+		t.Errorf("mac6 fallback = %q (truncated=%v), want d75884, false", b, trunc)
 	}
 	// 64 exactly passes through untouched; the cut keeps [a-z0-9_] only
-	if b := sanitizeToolBase(strings.Repeat("b", 64), "d75884"); b != strings.Repeat("b", 64) {
-		t.Errorf("64-char alias = %q, want it untouched at the bound", b)
+	if b, trunc := sanitizeToolBase(strings.Repeat("b", 64), "d75884"); b != strings.Repeat("b", 64) || trunc {
+		t.Errorf("64-char alias = %q (truncated=%v), want it untouched at the bound", b, trunc)
 	}
-	if b := sanitizeToolBase(strings.Repeat("c", 100), "d75884"); len(b) != 64 {
-		t.Errorf("100-char alias = %q (%d), want the 64-char cut", b, len(b))
+	if b, trunc := sanitizeToolBase(strings.Repeat("c", 100), "d75884"); len(b) != 64 || !trunc {
+		t.Errorf("100-char alias = %q (%d, truncated=%v), want the 64-char cut, true", b, len(b), trunc)
+	}
+}
+
+// TestLongAliasTruncationLoggedOnce (B8 item 4): a >64-char alias
+// truncates the tool-name base AND says so — exactly one log line per
+// board+prefix through Options.Logf (the operator's only way to
+// discover WHY a board's tools are named from a 64-char prefix), never
+// one per 5s refresh; a fitting alias logs nothing.
+func TestLongAliasTruncationLoggedOnce(t *testing.T) {
+	fd := newFakeDaemon(t)
+	df := newDynFake(t, fd, false)
+	df.setBoards(boardEntry("d75884", strings.Repeat("l", 100)))
+	df.setCaps("d75884", v1Caps())
+
+	var mu sync.Mutex
+	var lines []string
+	e := wireMCP(t, fd, Options{Holder: "mcp-fixed01", Logf: func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}})
+
+	e.ts.refreshDynamic(context.Background())
+	e.ts.refreshDynamic(context.Background()) // the 5s loop must not repeat the line
+	mu.Lock()
+	if len(lines) != 1 {
+		mu.Unlock()
+		t.Fatalf("truncation logged %d lines, want exactly one (no per-refresh spam): %v", len(lines), lines)
+	}
+	for _, want := range []string{"d75884", "64", strings.Repeat("l", 64)} {
+		if !strings.Contains(lines[0], want) {
+			mu.Unlock()
+			t.Errorf("truncation line %q does not mention %q", lines[0], want)
+		}
+	}
+	mu.Unlock()
+
+	// a board whose alias FITS logs nothing
+	df.setBoards(boardEntry("d75884", "bench1"))
+	e.ts.refreshDynamic(context.Background())
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lines) != 1 {
+		t.Fatalf("fitting alias logged %d lines total, want still the one: %v", len(lines), lines)
 	}
 }
 
 // TestDynamicExpansionTwoBoards: one aliased board (bench1, mac6
 // a1b2c3) and one bare-mac6 board (d75884) expand to 30 typed tools
-// each (60 dynamic + the 11 static); naming is <alias|mac6>_<prim>_<op>;
-// the refresh's daemon traffic is list_boards + per-board op caps
-// HOLDER-LESS (the connection-binding-preserving choice).
+// each (60 dynamic + the static set — counted from the production
+// staticToolNames, never a hand-copied number); naming is
+// <alias|mac6>_<prim>_<op>; the refresh's daemon traffic is
+// list_boards + per-board op caps HOLDER-LESS (the connection-binding-
+// preserving choice).
 func TestDynamicExpansionTwoBoards(t *testing.T) {
 	fd := newFakeDaemon(t)
 	df := newDynFake(t, fd, true)
@@ -328,8 +378,8 @@ func TestDynamicExpansionTwoBoards(t *testing.T) {
 	}
 
 	names := listTools(t, e)
-	if len(names) != len(staticTools)+60 {
-		t.Fatalf("served %d tools, want %d static + 60 dynamic", len(names), len(staticTools))
+	if len(names) != len(staticToolNames)+60 {
+		t.Fatalf("served %d tools, want %d static + 60 dynamic", len(names), len(staticToolNames))
 	}
 	if hasPrefixName(names, "bench1_") != 30 || hasPrefixName(names, "d75884_") != 30 {
 		t.Errorf("bench1_* = %d, d75884_* = %d, want 30 each", hasPrefixName(names, "bench1_"), hasPrefixName(names, "d75884_"))
@@ -340,7 +390,7 @@ func TestDynamicExpansionTwoBoards(t *testing.T) {
 		}
 	}
 	// the static toolset is untouched by the dynamic face
-	for _, s := range staticTools {
+	for _, s := range staticToolNames {
 		if !contains(names, s) {
 			t.Errorf("static tool %s displaced by the dynamic expansion", s)
 		}

@@ -37,6 +37,7 @@ type toolset struct {
 	dyn     *dynState
 	ev      *eventState
 	ws      *wsState
+	logf    func(format string, args ...any) // Options.Logf; nil → stdlib log (logline below)
 
 	feedMu   sync.Mutex
 	feedStop func() // the ONE apiclient event feed's cancel (nil = not armed)

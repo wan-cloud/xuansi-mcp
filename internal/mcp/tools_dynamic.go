@@ -42,6 +42,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +67,11 @@ type dynState struct {
 	mu   sync.Mutex // guards live and caps, serializes refreshes
 	live map[string]dynSpec
 	caps map[string]cachedCaps // mac6 → the last caps answer
+
+	// truncSeen is mac6 → the truncated base last logged (B8 item 4):
+	// one truncation line per board+prefix, not one per 5s refresh.
+	// Guarded by mu like the rest.
+	truncSeen map[string]string
 }
 
 // cachedCaps is one board's last caps answer: its api_version and when
@@ -93,7 +99,7 @@ func (d dynSpec) id() string {
 }
 
 func newDynState(srv *mcpsdk.Server) *dynState {
-	return &dynState{srv: srv, live: map[string]dynSpec{}}
+	return &dynState{srv: srv, live: map[string]dynSpec{}, truncSeen: map[string]string{}}
 }
 
 // startDynamic launches the refresh loop (immediately, then on every
@@ -193,7 +199,19 @@ func (ts *toolset) refreshDynamic(ctx context.Context) []dynBoard {
 		used[name] = true // never displace the static face
 	}
 	for _, b := range boards {
-		base := sanitizeToolBase(b.alias, b.mac6)
+		base, truncated := sanitizeToolBase(b.alias, b.mac6)
+		if truncated && ds.truncSeen[b.mac6] != base {
+			// B8 item 4: the truncation is silent no longer — one
+			// line per board+prefix through the log seam, so an
+			// operator can discover why this board's tools are
+			// named from a 64-char prefix. A later fitting alias
+			// forgets the board (a re-growth re-logs).
+			ds.truncSeen[b.mac6] = base
+			ts.logline("mcp: board %s alias %q exceeds the %d-char tool-name base bound — its dynamic tools are named from the truncated prefix %q",
+				b.mac6, b.alias, toolBaseMax, base)
+		} else if !truncated {
+			delete(ds.truncSeen, b.mac6)
+		}
 		caps, err := ts.call(ctx, server.Request{Type: "op", Board: b.mac6, Op: "caps"})
 		if err != nil {
 			continue // no lease / held / unreachable: sticky — keep what is live
@@ -509,18 +527,21 @@ func structuredResult(v any) (*mcpsdk.CallToolResult, error) {
 // base + "_<prim>_<op>" plus claimToolName's disambiguation suffix
 // ("_<mac6>" and a numeric tail in the adversarial worst case) stays
 // inside the SDK's 128-char tool-name cap even at the bound. TRUNCATE,
-// not refuse: the bound fires inside the background refresh loop,
-// which has no error channel to an operator, and dropping a board's
-// whole dynamic toolset over a long alias would be the surprising
-// outcome — claimToolName already disambiguates truncation collisions
-// (mac6 is 12 chars and never hit). The sanitized alphabet is pure
-// ASCII, so byte slicing == rune slicing.
+// not refuse: dropping a board's whole dynamic toolset over a long
+// alias would be the surprising outcome — claimToolName already
+// disambiguates truncation collisions (mac6 is 12 chars and never
+// hit), and since B8 item 4 the refresh loop LOGS the truncation (one
+// line per board+prefix), so the silent half is silent no longer. The
+// sanitized alphabet is pure ASCII, so byte slicing == rune slicing.
 const toolBaseMax = 64
 
 // sanitizeToolBase reduces an alias (or mac6) to [a-z0-9_], falling
 // back to the mac6 when nothing survives (an alias of pure symbols),
-// and bounds the result's length at toolBaseMax.
-func sanitizeToolBase(alias, mac6 string) string {
+// and bounds the result's length at toolBaseMax. The second return
+// says whether the bound FIRED — the refresh loop turns that into its
+// one-line truncation note (B8 item 4); the mac6 fallback path can
+// never fire it (12 chars).
+func sanitizeToolBase(alias, mac6 string) (string, bool) {
 	base := alias
 	if base == "" {
 		base = mac6
@@ -536,13 +557,25 @@ func sanitizeToolBase(alias, mac6 string) string {
 	}
 	out := strings.Trim(b.String(), "_")
 	if out == "" {
-		return strings.ToLower(mac6)
+		return strings.ToLower(mac6), false
 	}
 	if len(out) > toolBaseMax {
 		// keep the head, re-trim a cut landing on '_'
 		out = strings.TrimRight(out[:toolBaseMax], "_")
+		return out, true
 	}
-	return out
+	return out, false
+}
+
+// logline emits one operational note on the process's log seam —
+// Options.Logf when injected, else the stdlib log package (stderr; the
+// mcp face keeps stdout for MCP traffic either way).
+func (ts *toolset) logline(format string, args ...any) {
+	if ts.logf != nil {
+		ts.logf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 // claimToolName reserves want, or disambiguates it with the board's

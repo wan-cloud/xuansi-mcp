@@ -143,7 +143,7 @@ func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.Cli
 		t.Fatal(err)
 	}
 	srv := NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"})
-	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot)}
+	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot), logf: opts.Logf}
 	ts.register(srv)
 	ts.dyn = newDynState(srv)
 	stop := ts.startDynamic(srv, opts.Refresh)
@@ -263,46 +263,27 @@ func noContact(t *testing.T, reqs chan server.Request) {
 	}
 }
 
-// staticTools is the exact static toolset — task 8's twelve daemon-
-// surface tools (eleven request-face + task 10's events_recent), task
-// 11's four driver-workspace tools, task 12's blocking capture
-// tool (the rings events_recent reads ride the dynamic refresh, but
-// the tool itself is static contract; the workspace tools never touch
-// the daemon on the store side), B8's fs_rm + driver_pull (the
-// removal path), and B8's session_reset (the ns-0 release).
-var staticTools = []string{
-	"xuansi_list_boards",
-	"xuansi_board_status",
-	"xuansi_lease",
-	"xuansi_release",
-	"xuansi_run_lua",
-	"xuansi_submit",
-	"xuansi_script_start",
-	"xuansi_script_stop",
-	"xuansi_fs_write",
-	"xuansi_fs_read",
-	"xuansi_board_op",
-	"xuansi_events_recent",
-	"xuansi_ws_put",
-	"xuansi_ws_list",
-	"xuansi_ws_get",
-	"xuansi_driver_push",
-	"xuansi_capture",
-	"xuansi_fs_rm",
-	"xuansi_driver_pull",
-	"xuansi_session_reset",
-}
+// staticTools is GONE (B8 item 7): the test-side hand copy of the
+// static tool list drifted every time a face extended the contract
+// (its count prose said 17 when the list was 20). Both pins —
+// TestRegistersExactStaticToolset here and TestStaticToolNamesSingleSource
+// (tools_static_test.go) — now derive from the PRODUCTION
+// staticToolNames (tools_static.go), the same lockstep-pinned list the
+// register calls keep; adding a tool without the list fails loudly.
 
 // ---------------------------------------------------------------------------
 // registration, holder identity, error mapping
 
 // TestRegistersExactStaticToolset: the served tool list is exactly the
-// 17 static tools (T8's twelve + task 11's four workspace tools + task
-// 12's capture — the count drift is expected: each face extends the
-// same static contract), each with a non-empty agent-facing
-// description, and the inferred schemas mark the required/optional
-// split the handlers rely on (board required, holder/transport
-// optional).
+// production staticToolNames list (task 8's daemon-surface set, since
+// extended by task 10's events_recent, task 11's workspace tools, task
+// 12's capture, B8's fs_rm/driver_pull/session_reset — the count
+// drifts BY DESIGN as each face extends the same static contract, so
+// the pin is the shared list, never a hand-copied count: drift fails
+// here and again in TestStaticToolNamesSingleSource), each with a
+// non-empty agent-facing description, and the inferred schemas mark
+// the required/optional split the handlers rely on (board required,
+// holder/transport optional).
 func TestRegistersExactStaticToolset(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -321,7 +302,7 @@ func TestRegistersExactStaticToolset(t *testing.T) {
 		}
 	}
 	sort.Strings(got)
-	want := append([]string(nil), staticTools...)
+	want := append([]string(nil), staticToolNames...)
 	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("served tools = %v, want exactly %v", got, want)
