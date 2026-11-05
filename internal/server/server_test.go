@@ -235,6 +235,18 @@ func newEnv(t *testing.T, aliases map[string]string, boards ...discover.Board) *
 // newEnvTTL is newEnv with a custom lease grace TTL (the boundary tests
 // run the real expiry path with a short window).
 func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, boards ...discover.Board) *env {
+	return newEnvFull(t, ttl, 0, aliases, boards...)
+}
+
+// newEnvIdle is newEnv with the idle-exit window set (0 = disabled; the
+// idle-exit tests inject their own timer seam via afterFunc).
+func newEnvIdle(t *testing.T, idle time.Duration, aliases map[string]string, boards ...discover.Board) *env {
+	return newEnvFull(t, 10*time.Second, idle, aliases, boards...)
+}
+
+// newEnvFull is the shared env builder: a custom grace TTL plus the
+// idle-exit window (0 = the disabled default every older test relies on).
+func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string, boards ...discover.Board) *env {
 	t.Helper()
 	e := &env{
 		t:         t,
@@ -259,8 +271,9 @@ func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, board
 	srv, err := New(Opts{
 		SockPath:        e.sock,
 		Registry:        reg,
-		GraceTTL:        ttl, // HIL-short by default; no test waits it out
-		RefreshInterval: -1,  // no background loop; the initial sweep still runs
+		GraceTTL:        ttl,  // HIL-short by default; no test waits it out
+		IdleExit:        idle, // 0 = disabled unless an idle-exit test sets it
+		RefreshInterval: -1,   // no background loop; the initial sweep still runs
 		Log:             func(format string, args ...any) { t.Logf("srv: "+format, args...) },
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
@@ -2549,4 +2562,227 @@ func TestEnsureLiveLeaseTeardownWindowGated(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("entry never removed after teardown: %+v", m.Snapshot())
+}
+
+// ---------------------------------------------------------------------------
+// idle exit (Opts.IdleExit): the last-client self-exit state machine.
+// ---------------------------------------------------------------------------
+
+// idleSeam replaces the package afterFunc seam: every arming is RECORDED
+// (closure + the window it asked for) and the returned timer is inert —
+// the test fires the captured closure by hand, so "the timer went off"
+// happens on the test's cue, deterministically, never the scheduler's.
+type idleSeam struct {
+	mu sync.Mutex
+	fn func()
+	d  time.Duration
+	n  int // arms so far (each arm is a fresh afterFunc call)
+}
+
+// installIdleSeam swaps afterFunc for the recorder and restores it at
+// test end.
+func installIdleSeam(t *testing.T) *idleSeam {
+	t.Helper()
+	s := &idleSeam{}
+	prev := afterFunc
+	afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		s.mu.Lock()
+		s.fn, s.d, s.n = fn, d, s.n+1
+		s.mu.Unlock()
+		tm := time.NewTimer(time.Hour) // inert stand-in: Stop() disarms cleanly
+		tm.Stop()
+		return tm
+	}
+	t.Cleanup(func() { afterFunc = prev })
+	return s
+}
+
+// armed returns the latest arming's closure and window (nil when never
+// armed) plus the arm count so far.
+func (s *idleSeam) armed() (fn func(), d time.Duration, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fn, s.d, s.n
+}
+
+// waitConns polls the live-connection count under the server lock until
+// it reaches want (bounded; loud on timeout). Observing the count under
+// the lock is also the arm barrier: the conn-delete hook arms INSIDE the
+// same critical section that made the count zero.
+func waitConns(t *testing.T, srv *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.mu.Lock()
+		n := len(srv.conns)
+		srv.mu.Unlock()
+		if n == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("live conn count never reached %d", want)
+}
+
+// assertNoIdleExit asserts the idle-exit channel stays open for the
+// given window (the never-triggers cases).
+func assertNoIdleExit(t *testing.T, srv *Server, wait time.Duration) {
+	t.Helper()
+	select {
+	case <-srv.IdleExited():
+		t.Fatalf("IdleExited() closed, want it still open (no idle exit)")
+	case <-time.After(wait):
+	}
+}
+
+// TestIdleExitFiresWhenLastConnLeaves: with two live connections, the
+// FIRST departure arms nothing; the LAST one arms the timer for the FULL
+// IdleExit window, and its firing (no conns, no captures) closes
+// IdleExited() exactly once.
+func TestIdleExitFiresWhenLastConnLeaves(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c1 := dialSock(t, e.sock)
+	c2 := dialSock(t, e.sock)
+	waitConns(t, e.srv, 2)
+
+	c1.conn.Close()
+	waitConns(t, e.srv, 1)
+	if fn, _, n := seam.armed(); fn != nil || n != 0 {
+		t.Fatal("idle timer armed while a connection still lives")
+	}
+
+	c2.conn.Close()
+	waitConns(t, e.srv, 0)
+	fn, d, n := seam.armed()
+	if fn == nil || n != 1 {
+		t.Fatal("the last disconnect never armed the idle timer")
+	}
+	if d != 50*time.Millisecond {
+		t.Fatalf("armed window = %s, want the FULL IdleExit 50ms", d)
+	}
+
+	fn() // the timer goes off
+	select {
+	case <-e.srv.IdleExited():
+	case <-time.After(2 * time.Second):
+		t.Fatal("IdleExited() never closed after the window fired with no clients")
+	}
+}
+
+// TestIdleExitKeptAliveByRemainingConn: closing one of two connections
+// never arms (let alone fires) the idle exit — the survivor holds the
+// daemon open.
+func TestIdleExitKeptAliveByRemainingConn(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c1 := dialSock(t, e.sock)
+	c2 := dialSock(t, e.sock)
+	waitConns(t, e.srv, 2)
+
+	c1.conn.Close()
+	waitConns(t, e.srv, 1)
+	if fn, _, n := seam.armed(); fn != nil || n != 0 {
+		t.Fatal("idle timer armed while a connection still lives")
+	}
+	// the survivor is still served — the daemon is not winding down
+	rep, _ := c2.call(9, map[string]any{"type": "list_boards"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("survivor's request refused: %#v", rep)
+	}
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+}
+
+// TestIdleExitDisarmedByReconnect: a reconnection inside the window
+// disarms the armed timer — and even the already-spent closure racing in
+// after the disarm (Stop() returned false) must be refused by the
+// locked re-check, not close the channel.
+func TestIdleExitDisarmedByReconnect(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c1 := dialSock(t, e.sock)
+	waitConns(t, e.srv, 1)
+	c1.conn.Close()
+	waitConns(t, e.srv, 0)
+	fn, _, n := seam.armed()
+	if fn == nil || n != 1 {
+		t.Fatal("the last disconnect never armed the idle timer")
+	}
+
+	c2 := dialSock(t, e.sock) // the reconnect disarms the pending window
+	waitConns(t, e.srv, 1)
+	fn() // the stale closure fires anyway (the Stop()-returned-false race)
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+	// the reconnected client is still served — no shutdown happened
+	rep, _ := c2.call(9, map[string]any{"type": "list_boards"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("reconnected client's request refused: %#v", rep)
+	}
+}
+
+// TestIdleExitDisabledByZero: IdleExit=0 disables the whole face — no
+// arming ever happens, and the channel stays open past the point where
+// an armed window would long have fired.
+func TestIdleExitDisabledByZero(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 0, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	waitConns(t, e.srv, 1)
+	c.conn.Close()
+	waitConns(t, e.srv, 0)
+	if fn, _, n := seam.armed(); fn != nil || n != 0 {
+		t.Fatal("IdleExit=0 armed a timer — zero must disable the face entirely")
+	}
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+}
+
+// TestIdleExitBlockedByLiveCapture: a live capture session outlives the
+// clients — the armed timer's firing is REFUSED while the capture runs,
+// and the capture's own ending re-arms the window; only then does the
+// next firing close the channel.
+func TestIdleExitBlockedByLiveCapture(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "192.168.7.1"))
+	e.srv.mu.Lock()
+	e.srv.captureRoot = t.TempDir()
+	e.srv.mu.Unlock()
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "h1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	res := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "gpio.1", "max_seconds": 1})
+	capID := asStr(res["capture_id"])
+	if capID == "" {
+		t.Fatalf("capture_start result = %#v", res)
+	}
+
+	// every client leaves while the capture is live
+	c.conn.Close()
+	waitConns(t, e.srv, 0)
+	fn1, _, n := seam.armed()
+	if fn1 == nil || n != 1 {
+		t.Fatal("the last disconnect never armed the idle timer")
+	}
+	fn1() // fires inside the capture's lifetime → must NOT trigger
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+
+	// the capture ends on its own deadline (no client asked) → re-arm
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, n := seam.armed(); n >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fn2, _, n := seam.armed()
+	if fn2 == nil || n < 2 {
+		t.Fatal("the capture's ending never re-armed the idle timer")
+	}
+	fn2() // fires again, now with no conns AND no captures → trigger
+	select {
+	case <-e.srv.IdleExited():
+	case <-time.After(2 * time.Second):
+		t.Fatal("IdleExited() never closed after the post-capture window fired")
+	}
 }

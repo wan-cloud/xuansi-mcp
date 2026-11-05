@@ -411,6 +411,12 @@ func (s *Server) captureEnd(cs *captureSession, reason string, notify bool) {
 		}
 		s.mu.Lock()
 		delete(s.captures, cs.id)
+		// idle-exit hook: a capture that outlived the clients kept the
+		// armed timer stood down (idleFire's re-check refused it); its
+		// ending re-arms the window when no connection is left to serve
+		if len(s.conns) == 0 {
+			s.idleArmLocked()
+		}
 		s.mu.Unlock()
 		close(cs.exited)
 		if notify {

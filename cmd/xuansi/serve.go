@@ -26,10 +26,11 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	fs.SetOutput(stderr)
 	sock := fs.String("sock", "", "daemon unix socket (default $XDG_RUNTIME_DIR/xuansi/daemon.sock, fallback /tmp/xuansi-daemon.sock)")
 	graceTTL := fs.Duration("grace-ttl", lease.DefaultGraceTTL, "lease grace window after an agent disconnect (e.g. 300s, 10s)")
+	idleExit := fs.Duration("idle-exit", -1*time.Nanosecond, "self-exit after D with no clients and no live captures (-1ns = follow --grace-ttl, 0 = never)")
 	boardsFile := fs.String("boards-file", "", "boards.conf path (name=mac6 aliases; default user config dir xuansi/boards.conf, missing = zero-config)")
 	verbose := fs.Bool("verbose", false, "log at debug level (slog text handler)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: xuansi serve [--sock S] [--grace-ttl D] [--boards-file F] [--verbose]\n")
+		fmt.Fprintf(fs.Output(), "Usage: xuansi serve [--sock S] [--grace-ttl D] [--idle-exit D] [--boards-file F] [--verbose]\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -49,6 +50,13 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 		GraceTTL:   *graceTTL,
 		BoardsFile: *boardsFile,
 		Log:        slogLogf,
+	}
+	// --idle-exit resolution: the -1ns default (any negative) follows
+	// --grace-ttl; 0 opts out entirely; a positive value is the window.
+	if *idleExit < 0 {
+		opts.IdleExit = *graceTTL
+	} else {
+		opts.IdleExit = *idleExit
 	}
 	if *sock != "" {
 		opts.SockPath = *sock
@@ -73,7 +81,14 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
+	// Ctrl-C or the idle exit — whichever comes first. The idle branch
+	// only reports; the graceful shutdown below is the same either way
+	// (the server never Closes itself on idle).
+	select {
+	case <-ctx.Done():
+	case <-srv.IdleExited():
+		fmt.Fprintf(stdout, "xuansi: idle exit (no clients for %s)\n", opts.IdleExit)
+	}
 
 	fmt.Fprintf(stdout, "xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running — the next start's audit lists them)\n")
 	srv.Close()

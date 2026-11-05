@@ -58,6 +58,10 @@ const (
 // errUnreachable wraps dial/hello failures for the error taxonomy.
 var errUnreachable = errors.New("board unreachable")
 
+// afterFunc is the idle-exit timer seam (production: time.AfterFunc;
+// tests swap it to capture and fire the arming deterministically).
+var afterFunc = time.AfterFunc
+
 // ErrAlreadyListening is bindSock's spawn-race sentinel: the dial probe
 // found a live daemon owning the socket. The loser of a launcher spawn
 // race (or a deliberate double start) is a harmless no-op — serve.go
@@ -114,6 +118,14 @@ type Opts struct {
 	// $XDG_DATA_HOME/xuansi/captures — capturesRoot; tests inject a
 	// temp root).
 	CaptureRoot string
+	// IdleExit, when positive, is the self-exit window: the LAST API
+	// connection's departure arms a timer for the FULL duration, any new
+	// connection disarms it, and a firing with no connections AND no
+	// live captures closes IdleExited() — the serve main loop then walks
+	// its existing graceful shutdown path (the server never Closes
+	// itself). A live capture at fire time stands the timer down; the
+	// capture's own ending re-arms it. 0 = disabled (the default).
+	IdleExit time.Duration
 }
 
 // Server is the daemon's API face. New binds the socket; Start serves;
@@ -144,6 +156,16 @@ type Server struct {
 	// file; tests swap a failing writer). Both read under mu.
 	captureRoot string
 	captureOpen func(path string) (io.WriteCloser, error)
+
+	// idle-exit state (all under mu; Opts.IdleExit > 0 enables): the
+	// conn-register hook disarms, the last conn-delete / capture-remove
+	// arms, and the fire closure re-verifies emptiness under the lock
+	// before the one-line log + close-once idleCh.
+	idleExit   time.Duration
+	idleTimer  *time.Timer
+	idleCh     chan struct{}
+	idleFired  bool // idleCh closed — never triggers again
+	idleHalted bool // Close started — the idle exit stands down
 
 	auditCancel context.CancelFunc
 
@@ -224,6 +246,9 @@ func New(o Opts) (*Server, error) {
 	if o.CaptureRoot == "" {
 		o.CaptureRoot = capturesRoot()
 	}
+	if o.IdleExit < 0 {
+		o.IdleExit = 0 // negative is not a window; only 0 disables and positives arm
+	}
 
 	reg := o.Registry
 	if reg == nil {
@@ -259,6 +284,8 @@ func New(o Opts) (*Server, error) {
 		captures:    map[string]*captureSession{},
 		captureRoot: o.CaptureRoot,
 		captureOpen: osCreateCapture,
+		idleExit:    o.IdleExit,
+		idleCh:      make(chan struct{}),
 		closed:      make(chan struct{}),
 		done:        make(chan struct{}),
 	}
@@ -332,6 +359,44 @@ func (s *Server) Leases() *lease.Manager { return s.leases }
 // Done closes once every server goroutine has exited after Close.
 func (s *Server) Done() <-chan struct{} { return s.done }
 
+// IdleExited closes (exactly once) when the idle-exit window fired with
+// no API connections and no live captures — Opts.IdleExit > 0 enables
+// the face. The server NEVER Closes itself on idle: serve's main loop
+// selects on this and walks its existing graceful shutdown path.
+func (s *Server) IdleExited() <-chan struct{} { return s.idleCh }
+
+// idleArmLocked arms the idle-exit timer for the FULL window (caller
+// holds mu and has verified no live conns). Live captures do not block
+// the arming: the fire closure re-checks them under the lock — a
+// capture alive at fire time stands the timer down, and the capture's
+// own ending re-arms (captureEnd's hook).
+func (s *Server) idleArmLocked() {
+	if s.idleExit <= 0 || s.idleFired || s.idleHalted || s.idleTimer != nil {
+		return
+	}
+	s.idleTimer = afterFunc(s.idleExit, s.idleFire)
+}
+
+// idleFire is the armed timer's closure: re-verify under the lock that
+// the daemon is truly idle (a client may have re-registered after the
+// arming; a capture may outlive the window) and only then trigger — one
+// log line and the close-once idleCh. Anything else stands the timer
+// down silently; whichever ending re-empties the daemon re-arms it.
+func (s *Server) idleFire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idleTimer = nil // this arming is spent either way
+	if s.idleExit <= 0 || s.idleFired || s.idleHalted {
+		return
+	}
+	if len(s.conns) > 0 || len(s.captures) > 0 {
+		return // a client returned or a capture outlives the window
+	}
+	s.idleFired = true
+	s.logf("idle exit: no clients for %s", s.idleExit)
+	close(s.idleCh)
+}
+
 // Close shuts the daemon down gracefully: stop accepting, drop every
 // API connection (agent-gone), stop the lease reaper, close every
 // board controller connection (TCP close releases the board's
@@ -344,6 +409,18 @@ func (s *Server) Close() {
 			s.auditCancel()
 		}
 		s.ln.Close()
+
+		// the idle exit stands down for good, BEFORE any ending below
+		// can re-arm it: stopCapturesShutdown's capture endings and the
+		// conn drops both hook into idleArmLocked, and a window armed
+		// mid-shutdown would log a bogus "idle exit" on its way out
+		s.mu.Lock()
+		s.idleHalted = true
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+			s.idleTimer = nil
+		}
+		s.mu.Unlock()
 
 		// live captures end deliberately at shutdown (files closed,
 		// done pushes "stopped" — best effort toward connections that
@@ -427,6 +504,13 @@ func (s *Server) handleConn(c net.Conn) {
 		replyWait: defaultReplyWait,
 	}
 	s.conns[cc] = struct{}{}
+	// idle-exit hook: a live connection disarms the pending window (a
+	// client returned; the fire closure re-checks under this same lock,
+	// so a Stop()-too-late race is still refused)
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
 	s.mu.Unlock()
 
 	s.wg.Add(2)
@@ -486,6 +570,12 @@ func (cc *clientConn) drop() {
 			if len(set) == 0 {
 				delete(s.watchers, mac6)
 			}
+		}
+		// idle-exit hook: the LAST departure arms the window (captures
+		// do not block arming — the fire closure re-checks them under
+		// this lock and a live capture stands it down instead)
+		if len(s.conns) == 0 {
+			s.idleArmLocked()
 		}
 		s.mu.Unlock()
 
