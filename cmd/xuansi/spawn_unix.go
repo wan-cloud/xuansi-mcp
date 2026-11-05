@@ -13,7 +13,10 @@ import (
 	"syscall"
 )
 
-// detach puts cmd in its own session, cut loose from the client.
-func detach(cmd *exec.Cmd) {
+// detach puts cmd in its own session, cut loose from the client. The
+// attempt count exists for the Windows spawn's job-breakaway retry;
+// non-Windows spawns have no job concept and every attempt detaches
+// the same way.
+func detach(cmd *exec.Cmd, _ int) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }

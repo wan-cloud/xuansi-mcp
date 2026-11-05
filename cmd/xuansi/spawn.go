@@ -40,14 +40,18 @@ const (
 // serveSpawn builds the spawn command, spawnDial is the liveness
 // probe, spawnStateDir resolves the serve.log directory (production:
 // paths.StateDir; tests inject a sandbox so they never touch the real
-// user state dir on any OS), spawnRetryEvery/spawnRetryFor bound the
-// post-spawn retry loop (defaults: 100ms cadence, 10s window).
+// user state dir on any OS), spawnRetryOnStartErr decides whether a
+// failed Start is worth one plainer retry (set by spawn_windows.go —
+// a kill-on-close job denied the first attempt's breakaway; nil
+// elsewhere), spawnRetryEvery/spawnRetryFor bound the post-spawn
+// retry loop (defaults: 100ms cadence, 10s window).
 var (
-	serveSpawn      func(sock, logPath string) *exec.Cmd = buildServeCmd
-	spawnDial       func(path string) (net.Conn, error)  = dialUnix
-	spawnStateDir                                        = paths.StateDir
-	spawnRetryEvery                                      = 100 * time.Millisecond
-	spawnRetryFor                                        = 10 * time.Second
+	serveSpawn           func(sock, logPath string) *exec.Cmd = buildServeCmd
+	spawnDial            func(path string) (net.Conn, error)  = dialUnix
+	spawnStateDir                                             = paths.StateDir
+	spawnRetryOnStartErr func(startErr error) bool
+	spawnRetryEvery      = 100 * time.Millisecond
+	spawnRetryFor        = 10 * time.Second
 )
 
 // ensureBeforeDial is the wiring seam: dialDaemon and runMCP call
@@ -58,12 +62,19 @@ var ensureBeforeDial func(sockPath string) error = ensureDaemon
 // dialUnix is the real liveness probe behind the spawnDial seam.
 func dialUnix(path string) (net.Conn, error) { return net.Dial("unix", path) }
 
-// buildServeCmd is the default serveSpawn: re-exec this binary as
-// `serve --sock <sock>`, detached (per-OS detach), with stdout AND
-// stderr appended to the same serve.log handle. The stdio redirect is
-// unconditional — a spawned serve must never inherit the client's
-// stdout, where MCP traffic may be flowing.
+// buildServeCmd is the serveSpawn default: the first spawn attempt.
 func buildServeCmd(sock, logPath string) *exec.Cmd {
+	return buildServeCmdAttempt(sock, logPath, 0)
+}
+
+// buildServeCmdAttempt is the default serveSpawn (attempt 0) and its
+// own retry rebuild (attempt 1 — the windows no-breakaway retry):
+// re-exec this binary as `serve --sock <sock>`, detached per the
+// attempt (see spawn_windows.go), with stdout AND stderr appended to
+// the same serve.log handle. The stdio redirect is unconditional —
+// a spawned serve must never inherit the client's stdout, where MCP
+// traffic may be flowing.
+func buildServeCmdAttempt(sock, logPath string, attempt int) *exec.Cmd {
 	exe, err := os.Executable()
 	if err != nil {
 		exe = "" // Start() fails with "exec: no command"; ensureDaemon wraps it
@@ -72,8 +83,45 @@ func buildServeCmd(sock, logPath string) *exec.Cmd {
 	out := openServeLog(logPath)
 	cmd.Stdout = out
 	cmd.Stderr = out
-	detach(cmd)
+	detach(cmd, attempt)
 	return cmd
+}
+
+// startServe builds (through the serveSpawn seam) and starts the
+// spawn command; when the platform's spawnRetryOnStartErr classifies
+// the Start error as survivable by a plainer command (windows: the
+// parent's kill-on-close job refused the first attempt's
+// CREATE_BREAKAWAY_FROM_JOB), it retries ONCE through rebuild —
+// attempt 1 carries the plain detach flags. The failed attempt's
+// serve-log handles are closed before rebuilding; a second failure
+// surfaces with the rebuild's error. The rebuild leg bypasses the
+// serveSpawn seam deliberately: an overridden seam is a test's
+// stand-in, and only attempt 0 runs through it.
+func startServe(sockPath, logPath string, rebuild func(sock, logPath string, attempt int) *exec.Cmd) (*exec.Cmd, error) {
+	cmd := serveSpawn(sockPath, logPath)
+	err := cmd.Start()
+	if err == nil || spawnRetryOnStartErr == nil || !spawnRetryOnStartErr(err) {
+		return cmd, err
+	}
+	closeServeLogHandles(cmd)
+	cmd = rebuild(sockPath, logPath, 1)
+	if err := cmd.Start(); err != nil {
+		closeServeLogHandles(cmd)
+		return cmd, err
+	}
+	return cmd, nil
+}
+
+// closeServeLogHandles closes the parent's copies of a spawn
+// command's serve-log handles — after a successful Start the child
+// holds its own, and after a failed Start they were never inherited.
+func closeServeLogHandles(cmd *exec.Cmd) {
+	if f, ok := cmd.Stdout.(*os.File); ok {
+		f.Close()
+	}
+	if f, ok := cmd.Stderr.(*os.File); ok && cmd.Stdout != cmd.Stderr {
+		f.Close()
+	}
 }
 
 // openServeLog opens logPath O_APPEND|O_CREATE (making its directory
@@ -118,18 +166,13 @@ func ensureDaemon(sockPath string) error {
 	}
 
 	logPath := filepath.Join(spawnStateDir(), serveLogName)
-	cmd := serveSpawn(sockPath, logPath)
-	if err := cmd.Start(); err != nil {
+	cmd, err := startServe(sockPath, logPath, buildServeCmdAttempt)
+	if err != nil {
 		return fmt.Errorf("cannot spawn xuansi serve for %s: %w", sockPath, err)
 	}
 	slog.Info("spawned a detached xuansi serve; waiting for it to listen", "sock", sockPath, "pid", cmd.Process.Pid, "log", logPath)
 	// The parent's copies of the log fd close now; the child keeps its own.
-	if f, ok := cmd.Stdout.(*os.File); ok {
-		f.Close()
-	}
-	if f, ok := cmd.Stderr.(*os.File); ok && cmd.Stdout != cmd.Stderr {
-		f.Close()
-	}
+	closeServeLogHandles(cmd)
 
 	for deadline := time.Now().Add(spawnRetryFor); ; {
 		time.Sleep(spawnRetryEvery)

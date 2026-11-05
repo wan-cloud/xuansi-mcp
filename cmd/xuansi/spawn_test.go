@@ -261,6 +261,84 @@ func TestXuansiSpawnFailHelperProcess(t *testing.T) {
 	os.Exit(3)
 }
 
+// TestStartServeRetryFlow pins startServe's two-attempt shape with
+// OS-neutral fakes (the real trigger — a kill-on-close job denying
+// CREATE_BREAKAWAY_FROM_JOB — is windows-only; its classifier has its
+// own windows-tagged test): a Start error the hook flags as survivable
+// triggers exactly ONE rebuild at attempt 1 and succeeds there; a
+// declined or absent hook surfaces the original error with no rebuild.
+// No real serve ever spawns — attempt 0 is a nonexistent binary, the
+// rebuild is a noOpCmd.
+func TestStartServeRetryFlow(t *testing.T) {
+	quietSlog(t)
+	state := sandboxStateDir(t)
+	sock := filepath.Join(t.TempDir(), "flow.sock")
+	logPath := filepath.Join(state, serveLogName)
+	failing := func(sock, logPath string) *exec.Cmd {
+		return exec.Command(filepath.Join(t.TempDir(), "no-such-xuansi-binary"))
+	}
+
+	t.Run("hook flags error: one plainer rebuild wins", func(t *testing.T) {
+		overrideSpawn(t, failing)
+		origHook := spawnRetryOnStartErr
+		spawnRetryOnStartErr = func(error) bool { return true }
+		t.Cleanup(func() { spawnRetryOnStartErr = origHook })
+
+		var attempts []int
+		cmd, err := startServe(sock, logPath, func(sock, logPath string, attempt int) *exec.Cmd {
+			attempts = append(attempts, attempt)
+			return noOpCmd()
+		})
+		if err != nil {
+			t.Fatalf("startServe: %v", err)
+		}
+		if len(attempts) != 1 || attempts[0] != 1 {
+			t.Fatalf("rebuild attempts = %v, want exactly [1]", attempts)
+		}
+		if cmd == nil || cmd.Process == nil {
+			t.Fatal("startServe returned no started command")
+		}
+	})
+
+	t.Run("hook declines: original error, no rebuild", func(t *testing.T) {
+		overrideSpawn(t, failing)
+		origHook := spawnRetryOnStartErr
+		spawnRetryOnStartErr = func(error) bool { return false }
+		t.Cleanup(func() { spawnRetryOnStartErr = origHook })
+
+		called := false
+		_, err := startServe(sock, logPath, func(sock, logPath string, attempt int) *exec.Cmd {
+			called = true
+			return noOpCmd()
+		})
+		if err == nil {
+			t.Fatal("startServe succeeded; want the original Start error")
+		}
+		if called {
+			t.Fatal("rebuild ran although the hook declined")
+		}
+	})
+
+	t.Run("no hook: never retries", func(t *testing.T) {
+		overrideSpawn(t, failing)
+		origHook := spawnRetryOnStartErr
+		spawnRetryOnStartErr = nil
+		t.Cleanup(func() { spawnRetryOnStartErr = origHook })
+
+		called := false
+		_, err := startServe(sock, logPath, func(sock, logPath string, attempt int) *exec.Cmd {
+			called = true
+			return noOpCmd()
+		})
+		if err == nil {
+			t.Fatal("startServe succeeded; want the original Start error")
+		}
+		if called {
+			t.Fatal("rebuild ran although no hook is wired (non-windows shape)")
+		}
+	})
+}
+
 // TestSpawnRedirectsStdio: the command the default serveSpawn builds
 // sends stdout AND stderr to the SAME serve.log handle (opened
 // O_APPEND), never the client's stdio — proven behaviorally: another
