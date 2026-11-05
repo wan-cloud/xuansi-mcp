@@ -5,10 +5,18 @@
 // the Windows and macOS resolutions are testable on any builder, and
 // the Linux branch is BYTE-IDENTICAL to the inline logic it absorbed
 // (server.DefaultSockPath / capturesRoot / mcp.wsRoot).
+//
+// HOST-INDEPENDENCE (T9 finding): the *For pure functions pick the path
+// separator by the TARGET goos argument alone — path.Join (slash, on
+// every host) for the linux/darwin branches, winJoin (backslash) for
+// windows — never host-keyed filepath.Join, so computing another OS's
+// landing is deterministic no matter where the code runs. The public
+// wrappers stay host-keyed via runtime.GOOS, as they must.
 package paths
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -71,12 +79,12 @@ func sockPathFor(goos string, getenv func(string) string) string {
 		return winJoin("xuansi", "daemon.sock")
 	case "darwin":
 		if t := getenv("TMPDIR"); t != "" {
-			return filepath.Join(t, "xuansi", "daemon.sock")
+			return path.Join(t, "xuansi", "daemon.sock")
 		}
-		return filepath.Join("/tmp", "xuansi", "daemon.sock")
+		return path.Join("/tmp", "xuansi", "daemon.sock")
 	default: // linux — and anything unrecognized keeps today's behavior
 		if x := getenv("XDG_RUNTIME_DIR"); x != "" {
-			return filepath.Join(x, "xuansi", "daemon.sock")
+			return path.Join(x, "xuansi", "daemon.sock")
 		}
 		return "/tmp/xuansi-daemon.sock"
 	}
@@ -95,15 +103,15 @@ func stateDirFor(goos string, getenv func(string) string, home string) string {
 		}
 		return winJoin("xuansi", "state")
 	case "darwin":
-		return filepath.Join(home, "Library", "Logs", "xuansi")
+		return path.Join(home, "Library", "Logs", "xuansi")
 	default: // linux — XDG state convention, relative fallback when home is unknown
 		if s := getenv("XDG_STATE_HOME"); s != "" {
-			return filepath.Join(s, "xuansi")
+			return path.Join(s, "xuansi")
 		}
 		if home == "" {
-			return filepath.Join(".local", "state", "xuansi")
+			return path.Join(".local", "state", "xuansi")
 		}
-		return filepath.Join(home, ".local", "state", "xuansi")
+		return path.Join(home, ".local", "state", "xuansi")
 	}
 }
 
@@ -121,21 +129,24 @@ func dataDirFor(goos string, getenv func(string) string, home string) string {
 		}
 		return "xuansi"
 	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "xuansi")
+		return path.Join(home, "Library", "Application Support", "xuansi")
 	default: // linux — XDG data convention, relative fallback when home is unknown
 		if d := getenv("XDG_DATA_HOME"); d != "" {
-			return filepath.Join(d, "xuansi")
+			return path.Join(d, "xuansi")
 		}
 		if home == "" {
-			return filepath.Join(".local", "share", "xuansi")
+			return path.Join(".local", "share", "xuansi")
 		}
-		return filepath.Join(home, ".local", "share", "xuansi")
+		return path.Join(home, ".local", "share", "xuansi")
 	}
 }
 
 // winJoin joins with backslash separators regardless of the host OS —
-// the pure goos-keyed functions must yield the Windows spelling on a
-// Linux builder too — tolerating a trailing separator on the base.
+// the pure goos-keyed functions pick separators by TARGET goos (its
+// slash counterpart is stdlib path.Join, host-independent by spec), so
+// the Windows spelling is produced identically on a Linux builder and
+// the linux/darwin spelling on a Windows one — tolerating a trailing
+// separator on the base.
 func winJoin(base string, rest ...string) string {
 	p := strings.TrimSuffix(base, `\`)
 	for _, r := range rest {
