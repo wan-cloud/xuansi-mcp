@@ -17,10 +17,23 @@
 // Request  {"type": <req type>, "id": <int>, ...params}
 // Reply    {"type":"reply", "id", "result" | "error"}
 // Event    {"type":"event", "board": <mac6>, "event": {"source","data"}}
+// CaptureDone {"type":"capture_done", "capture_id", "path", "bytes",
+// "reason":"limit"|"stopped"|"error"} (MB-level capture completion
+// push; lands with T12 — documented here first)
 //
 // Every request gets exactly one reply carrying the same id. Events are
 // pushed unsolicited (only after watch_events established the
 // subscription for that connection) and carry no id.
+//
+// # Delivery policy (per agent connection)
+//
+// Each connection's outbound queue holds 256 messages — its replies and
+// its event pushes. Replies are NEVER silently dropped: a reply that
+// meets a full queue evicts the OLDEST QUEUED EVENT to make room
+// (logged) — a slow agent still receives every answer, at the price of
+// its oldest unseen events. Events stay fire-and-forget (fw §8 tap
+// semantics): an event that meets a full queue is dropped (logged), so
+// a slow consumer can never stall the board's read loop.
 //
 // # Requests
 //
@@ -32,9 +45,53 @@
 //	submit         {board, code, tag, args?, holder?} → board ack {tag, queued}  (lease required)
 //	script_start   {board, name, code, holder?}  → board ack       (lease required; runs under the LEASE's session namespace — the T10 eval ruling)
 //	script_stop    {board, name, holder?}        → board ack       (lease required)
-//	fs_write       {board, path, data, holder?}  → board ack       (lease required; data = base64 (JSON []byte); ≤16384B enforced daemon-side)
+//	fs_write       {board, path, data, holder?}  → board ack       (lease required; data = base64 (JSON []byte); ≤16384B enforced daemon-side with class api, mirroring the board's own refusal)
 //	fs_read        {board, path}                 → {data: base64}  (read-only, no lease)
 //	watch_events   {board, source?}              → {board}         (subscribes THIS connection; source, when given, is additionally events.subscribe'd board-side)
+//	op             {board, op, args?, holder?}   → board reply result  (the ops face — see below)
+//	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; lands with T12)
+//	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}  (lands with T12)
+//
+// eval/submit args numbers: the fw args bridge is int-only (v3 §4), so
+// the daemon validates the args tree BEFORE any board contact — an
+// integral float64 (JSON's only integer shape) converts to int64 and
+// msgpack-encodes as an int; a non-integral float, or one at/beyond
+// 2^53 where the float64 decode can silently corrupt integer literals,
+// is a daemon-side "api" error naming the offending path ("eval args:
+// a.b[2]: non-integer or ≥2^53 number"). The negative side extends to
+// the msgpack int64 floor: -2^63 crosses exactly.
+//
+// # The ops face (op passthrough)
+//
+// op forwards ONE allowlisted board op over the warm controller under
+// eval's lease gate — uniformly: EVERY allowlisted op requires the
+// lease, including the read-only diag/caps ops (the gate is the face's
+// shape, not each op's). The allowlist (server.go):
+//
+//	budget.get  budget.set  wifi.status  wifi.setup  wifi.off
+//	log.read    caps        diag.pins    diag.heapinfo  diag.stats
+//
+// args cross VERBATIM (the board is the authority) and the board's
+// reply result — or its error class/msg, verbatim like eval's — is the
+// reply. Anything else (eval/submit/fs.*/script.*/session.* and every
+// other diag.*) is a daemon-side "server" class refusal naming the op:
+// those faces keep their own request types with their own semantics.
+//
+// # Capture (the MB-level face — lands with T12, documented here first)
+//
+//	capture_start {board, source, max_bytes?=64MiB, max_seconds?=600, dest?}
+//	              → {capture_id, path}            (lease required)
+//	capture_stop  {capture_id} → {path, bytes, reason:"stopped"}
+//	push          {"type":"capture_done", capture_id, path, bytes,
+//	              reason:"limit"|"stopped"|"error"}
+//
+// A capture spools one watched source to a host file (the daemon is
+// the writer, design §8): $XDG_DATA_HOME/xuansi/captures/<UTC
+// ts>-<mac6>-<source>.bin|.jsonl — uart/stdout land byte-exact as raw
+// streams, gpio/net/job as JSON lines. The bounds end a capture
+// (reason:"limit"), capture_stop ends it early (reason:"stopped"), a
+// disk failure ends it as reason:"error"; every ending pushes
+// capture_done exactly once to the starting connection.
 //
 // BOARD selectors are mac6 / alias / hostname prefixes resolved by the
 // discovery registry (T9 Resolve): unique prefix hits, ambiguity or no
@@ -61,6 +118,10 @@
 // the USB open (a lease held by someone else must not reboot the
 // board); a lease whose USB open then fails stays held host-side
 // (same as a TCP lease on an unreachable board — release or retry).
+// Warm-controller reuse is transport-agnostic: whichever controller
+// is live serves every subsequent request — a USB lease's warm link
+// carries default-transport ops up to release, with no implicit
+// dialing of the other seam.
 // An unknown transport value is a "server" class error. Releasing a
 // USB-transport lease (and daemon shutdown on a live USB controller)
 // voluntarily YIELDS the controller slot first (§12 讓位 — observer
@@ -95,8 +156,11 @@
 // bound to a different holder), unreachable (dial/hello failed),
 // slot_held (controller arbitration window exhausted — the deliberate
 // USB reboot lease is the caller's explicit last resort), api
-// (daemon-side fs_write cap refusal mirrors the board's class), server
-// (malformed request, unknown type, bad params, bad transport).
+// (daemon-side refusals that deliberately mirror the board's own
+// class: fs_write above the 16 KiB single-file cap, and eval/submit
+// args numbers that cannot cross the int-only args bridge — see the
+// args note above), server (malformed request, unknown type, bad
+// params, bad transport, off-allowlist op).
 package server
 
 import (
@@ -127,7 +191,11 @@ type Request struct {
 	Path      string `json:"path,omitempty"`
 	Data      []byte `json:"data,omitempty"` // JSON base64 ↔ board bin
 	Source    string `json:"source,omitempty"`
-	Args      any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS
+	// Op is the op passthrough request's board op — allowlisted (see
+	// the ops-face note in the contract above); eval/submit/fs/script/
+	// session ops are NOT reachable through it.
+	Op   string `json:"op,omitempty"`
+	Args any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS (numbers validated daemon-side); op: the op's args object, verbatim
 }
 
 // RPCError is the structured error half of a reply.

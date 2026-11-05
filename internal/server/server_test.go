@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -1341,7 +1342,8 @@ func TestSubmitPassthrough(t *testing.T) {
 // pass-through would reach the fw as msgpack floats and be rejected
 // ("protocol: args: malformed", found by the b5-full HIL S3). The daemon
 // must convert integral float64s (the only way an integer can arrive over
-// JSON) back to int64; genuine fractions pass through untouched.
+// JSON) back to int64. Non-integral or ≥2^53 floats are refused
+// daemon-side before any board contact (TestEvalArgsValidation).
 func TestEvalArgsNumbersNormalizedToIntegers(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -1359,7 +1361,7 @@ func TestEvalArgsNumbersNormalizedToIntegers(t *testing.T) {
 	})
 	rep, _ = c.call(2, map[string]any{
 		"type": "eval", "board": "d75884", "code": "return ARGS",
-		"args": map[string]any{"n": float64(7), "f": 2.5, "arr": []any{float64(1), float64(-2)}},
+		"args": map[string]any{"n": float64(7), "arr": []any{float64(1), float64(-2)}},
 	})
 	if asMap(rep["error"]) != nil {
 		t.Fatalf("eval: %#v", rep)
@@ -1370,9 +1372,6 @@ func TestEvalArgsNumbersNormalizedToIntegers(t *testing.T) {
 	if v, ok := got["n"].(int64); !ok || v != 7 {
 		t.Fatalf("integral float64 7 must cross as int64, got %#v", got["n"])
 	}
-	if _, ok := got["f"].(float64); !ok {
-		t.Fatalf("fraction 2.5 must stay float64, got %#v", got["f"])
-	}
 	if len(gotArr) != 2 {
 		t.Fatalf("array args = %#v", got["arr"])
 	}
@@ -1381,6 +1380,268 @@ func TestEvalArgsNumbersNormalizedToIntegers(t *testing.T) {
 	}
 	if v, ok := gotArr[1].(int64); !ok || v != -2 {
 		t.Fatalf("array integral -2 must cross as int64, got %#v", gotArr[1])
+	}
+}
+
+// TestEvalArgsValidation: the fw args bridge is int-only (v3 §4) — the
+// daemon refuses the float shapes that cannot cross honestly BEFORE any
+// board contact (class api, the brief's exact message naming the
+// offending path), while integral float64s (JSON's only integer shape)
+// convert to int64 so they msgpack-encode as ints; -2^63, the msgpack
+// int64 floor, crosses exactly.
+func TestEvalArgsValidation(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "arg"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	boardEvals := 0
+	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		boardEvals++
+		return map[string]any{"out": ""}, nil
+	})
+
+	// rejections: class api, the exact message, the board untouched
+	for i, tc := range []struct {
+		name string
+		args any
+		want string
+	}{
+		{"fraction", map[string]any{"x": 0.5}, "eval args: x: non-integer or ≥2^53 number"},
+		{"2^53 boundary (corruptible literal)", map[string]any{"x": 9007199254740993}, "eval args: x: non-integer or ≥2^53 number"},
+		{"array leaf beyond 2^53", map[string]any{"a": []any{float64(1), 1e300}}, "eval args: a[1]: non-integer or ≥2^53 number"},
+	} {
+		rep, _ := c.call(int64(10+i), map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "args": tc.args})
+		er := errOf(t, rep)
+		if asStr(er["class"]) != "api" {
+			t.Fatalf("%s: class = %q, want api (%#v)", tc.name, er["class"], er)
+		}
+		if asStr(er["msg"]) != tc.want {
+			t.Fatalf("%s: msg = %q, want %q", tc.name, er["msg"], tc.want)
+		}
+		if boardEvals != 0 {
+			t.Fatalf("%s reached the board (%d eval calls)", tc.name, boardEvals)
+		}
+	}
+
+	// submit validates with the same message
+	rep, _ = c.call(20, map[string]any{"type": "submit", "board": "d75884", "code": "return 1", "tag": "t1", "args": map[string]any{"x": 0.5}})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "api" || asStr(er["msg"]) != "eval args: x: non-integer or ≥2^53 number" {
+		t.Fatalf("submit validation: %#v", er)
+	}
+	if boardEvals != 0 {
+		t.Fatal("submit validation reached the board")
+	}
+
+	// integral crossings: the board receives int64 (msgpack int), the
+	// int64 floor included
+	var gotX any
+	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		m, _ := args["args"].(map[string]any)
+		gotX = m["x"]
+		return map[string]any{"out": ""}, nil
+	})
+	for i, x := range []float64{3.0, float64(math.MinInt64)} {
+		rep, _ := c.call(int64(30+i), map[string]any{"type": "eval", "board": "d75884", "code": "return ARGS", "args": map[string]any{"x": x}})
+		if asMap(rep["error"]) != nil {
+			t.Fatalf("eval %v: %#v", x, rep)
+		}
+		v, ok := gotX.(int64)
+		if !ok {
+			t.Fatalf("%v crossed as %T (%#v), want int64 (msgpack int)", x, gotX, gotX)
+		}
+		if want := int64(x); v != want {
+			t.Fatalf("%v crossed as %d, want %d", x, v, want)
+		}
+	}
+}
+
+// TestOpPassthroughAllowlist: the ops face — op forwards an allowlisted
+// board op over the warm controller under eval's lease gate (uniformly:
+// even the read-only diag/caps ops need the lease), the board's result
+// crosses as the reply result, and a board error's class/msg pass
+// through verbatim like eval's.
+func TestOpPassthroughAllowlist(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	// uniform lease gate: even caps needs the lease first
+	rep, _ := c.call(1, map[string]any{"type": "op", "board": "d75884", "op": "caps"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "not_held" {
+		t.Fatalf("no-lease class = %q, want not_held (%#v)", er["class"], er)
+	}
+
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "op1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	e.fakes["d75884"].on("budget.set", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"budget_ms": args["budget_ms"]}, nil
+	})
+	rep, _ = c.call(3, map[string]any{
+		"type": "op", "board": "d75884", "op": "budget.set",
+		"args": map[string]any{"budget_ms": float64(5000)},
+	})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op budget.set: %#v", rep)
+	}
+	if asInt(asMap(rep["result"])["budget_ms"]) != 5000 {
+		t.Fatalf("op result = %#v", rep["result"])
+	}
+	sent := false
+	for _, call := range e.fakes["d75884"].got() {
+		if call.op == "budget.set" {
+			sent = true
+			if asInt(call.args["budget_ms"]) != 5000 {
+				t.Fatalf("forwarded args = %#v", call.args)
+			}
+		}
+	}
+	if !sent {
+		t.Fatal("op budget.set never reached the board")
+	}
+
+	// a board error crosses with its class/msg verbatim
+	e.fakes["d75884"].on("wifi.setup", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return nil, &replclient.OpError{Op: "wifi.setup", Class: "api", Msg: "wifi.setup: ssid missing at byte 3"}
+	})
+	rep, _ = c.call(4, map[string]any{
+		"type": "op", "board": "d75884", "op": "wifi.setup",
+		"args": map[string]any{"ssid": ""},
+	})
+	er = errOf(t, rep)
+	if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "ssid missing at byte 3") {
+		t.Fatalf("board error not verbatim: %#v", er)
+	}
+}
+
+// TestOpAllowlistRefusal: anything off the allowlist — other diag.*,
+// the reserved faces (eval/submit/fs.*/script.*/session.*), unknown or
+// empty ops — is a daemon-side "server" class refusal naming the op
+// and the ops-face allowlist; the board is never contacted for it.
+func TestOpAllowlistRefusal(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "op2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	offList := []string{"diag.corrupt", "eval", "submit", "fs.write", "fs.read", "script.start", "session.reset", "budget.blast", ""}
+	for i, op := range offList {
+		rep, _ := c.call(int64(10+i), map[string]any{"type": "op", "board": "d75884", "op": op})
+		er := errOf(t, rep)
+		if asStr(er["class"]) != "server" {
+			t.Fatalf("op %q: class = %q, want server (%#v)", op, er["class"], er)
+		}
+		msg := asStr(er["msg"])
+		if !strings.Contains(msg, fmt.Sprintf("%q", op)) {
+			t.Fatalf("op %q: msg does not name the op: %q", op, msg)
+		}
+		if !strings.Contains(msg, "allowlist") {
+			t.Fatalf("op %q: msg does not name the allowlist: %q", op, msg)
+		}
+	}
+	// none of the refused ops reached the board
+	for _, call := range e.fakes["d75884"].got() {
+		for _, op := range offList {
+			if call.op == op {
+				t.Fatalf("off-allowlist op %q reached the board", op)
+			}
+		}
+	}
+}
+
+// TestOutboundQueueEvictionPolicy pins the delivery policy on one
+// connection's queue: a full queue drops an incoming EVENT
+// (fire-and-forget, unchanged) but a REPLY is never dropped — the
+// oldest queued event is evicted to make room.
+func TestOutboundQueueEvictionPolicy(t *testing.T) {
+	s := &Server{logf: func(format string, args ...any) {}}
+	cc := &clientConn{srv: s, outbound: make(chan any, outboundQ)}
+	for i := 0; i < outboundQ; i++ {
+		cc.send(EventPush{Type: "event", Board: "b", Event: WireEvent{Source: "gpio.4", Data: map[string]any{"seq": int64(i)}}})
+	}
+
+	// a full queue drops an incoming event, displacing nothing
+	if !cc.send(EventPush{Type: "event", Board: "b", Event: WireEvent{Source: "gpio.4", Data: map[string]any{"seq": int64(outboundQ)}}}) {
+		t.Fatal("event send reported connection gone")
+	}
+	if len(cc.outbound) != outboundQ {
+		t.Fatalf("queue = %d, want still %d (an event must not displace anything)", len(cc.outbound), outboundQ)
+	}
+
+	// a reply evicts the OLDEST queued event and is itself queued
+	if !cc.send(&Reply{Type: "reply", ID: 42}) {
+		t.Fatal("reply send reported connection gone")
+	}
+	if len(cc.outbound) != outboundQ {
+		t.Fatalf("queue = %d, want %d (one event evicted, the reply queued)", len(cc.outbound), outboundQ)
+	}
+	first := <-cc.outbound
+	if fe, ok := first.(EventPush); !ok || asInt(fe.Event.Data["seq"]) != 1 {
+		t.Fatalf("front = %#v, want the seq-1 event — seq 0 must be the evicted one", first)
+	}
+	var last any
+	for len(cc.outbound) > 0 {
+		last = <-cc.outbound
+	}
+	if r, ok := last.(*Reply); !ok || r.ID != 42 {
+		t.Fatalf("back = %#v, want reply 42 — replies are never dropped", last)
+	}
+}
+
+// TestFullQueueReplyDelivered: the delivery policy end to end — a
+// watcher that stops reading first plugs the kernel socket buffer
+// (256-KiB pad events, far past any sndbuf/rcvbuf) so the writer
+// goroutine stalls and the 256-slot queue itself fills; the stalled
+// watcher's request still gets its reply, events beyond the cap drop,
+// and the connection stays live afterwards.
+func TestFullQueueReplyDelivered(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "watch_events", "board": "d75884"})
+	// the initial discovery sweep may still be mid-flight — poll until
+	// the board is resolvable before watching (TestListBoardsShape's
+	// pattern)
+	deadline := time.Now().Add(3 * time.Second)
+	for asMap(rep["error"]) != nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		rep, _ = c.call(1, map[string]any{"type": "watch_events", "board": "d75884"})
+	}
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("watch_events: %#v", rep)
+	}
+
+	pad := strings.Repeat("x", 256<<10)
+	for i := 0; i < 96; i++ {
+		e.fakes["d75884"].push("gpio.4", map[string]any{"pad": pad})
+	}
+	for i := 1; i <= 600; i++ {
+		e.fakes["d75884"].push("gpio.4", map[string]any{"edge": "rising", "seq": int64(i)})
+	}
+
+	// the stalled watcher's request still gets its reply — the oldest
+	// queued event was evicted for it (delivery policy, proto.go)
+	rep, events := c.call(2, map[string]any{"type": "list_boards"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("reply over a full queue: %#v", rep)
+	}
+	if len(events) > 96+outboundQ {
+		t.Fatalf("received %d events, want ≤ %d — overflow must drop", len(events), 96+outboundQ)
+	}
+
+	// the connection is alive and delivering afterwards
+	e.fakes["d75884"].push("gpio.4", map[string]any{"edge": "rising", "seq": int64(601)})
+	ev := c.recv()
+	if asInt(asMap(asMap(ev["event"])["data"])["seq"]) != 601 {
+		t.Fatalf("post-reply event = %#v", ev)
 	}
 }
 

@@ -37,7 +37,11 @@ const (
 	// fsFileMax mirrors the fw single-file cap (XS_FILE_MAX = 16384B,
 	// caps limits.file_max); fs_write is refused daemon-side above it.
 	fsFileMax = 16384
-	outboundQ = 256 // per-connection event/reply buffer; overflow drops (fire-and-forget, fw §8 style)
+	// outboundQ is the per-connection event/reply buffer. A full queue
+	// drops an incoming EVENT (fire-and-forget, fw §8 style) but never
+	// a REPLY — a reply evicts the oldest queued event (the delivery
+	// policy, proto.go).
+	outboundQ = 256
 )
 
 // errUnreachable wraps dial/hello failures for the error taxonomy.
@@ -446,17 +450,67 @@ func (cc *clientConn) drop() {
 func (cc *clientConn) send(m any) bool {
 	cc.wmu.Lock()
 	defer cc.wmu.Unlock()
+	return cc.enqueueLocked(m)
+}
+
+// sendLocked is send() for callers already holding srv.mu (both
+// serialize on cc.wmu; the server lock only guards the watcher set).
+func (cc *clientConn) sendLocked(m any) bool {
+	cc.wmu.Lock()
+	defer cc.wmu.Unlock()
+	return cc.enqueueLocked(m)
+}
+
+// enqueueLocked queues one outbound message (caller holds wmu). The
+// delivery policy (proto.go): replies are NEVER silently dropped — a
+// reply meeting a full queue evicts the oldest QUEUED EVENT to make
+// room; events stay fire-and-forget (a full queue drops the incoming
+// event, fw §8 tap semantics — a slow agent must not stall the board's
+// read loop).
+func (cc *clientConn) enqueueLocked(m any) bool {
 	if cc.wdead {
 		return false
 	}
-	select {
-	case cc.outbound <- m:
-		return true
-	default:
-		s := cc.srv
-		s.logf("server: outbound queue full (holder=%s) — message dropped", cc.holder_())
-		return true
+	for {
+		select {
+		case cc.outbound <- m:
+			return true
+		default:
+		}
+		if _, isEvent := m.(EventPush); isEvent {
+			cc.srv.logf("server: outbound queue full (holder=%s) — event dropped", cc.holder_())
+			return true
+		}
+		// a reply: make room by evicting the oldest queued event. A
+		// full queue met by a reply is necessarily all events — the
+		// reader enqueues one reply at a time and waits for it, and
+		// broadcast only ever queues events. The no-event fallback is
+		// that proof's belt-and-braces: rather than drop the reply,
+		// block until the writer drains a slot (the writer never takes
+		// wmu, so this cannot deadlock).
+		if !cc.evictOldestEventLocked() {
+			cc.srv.logf("server: outbound queue full (holder=%s) — reply enqueued with no event to evict (unreachable shape), waiting for the writer", cc.holder_())
+			cc.outbound <- m
+			return true
+		}
+		cc.srv.logf("server: outbound queue full (holder=%s) — oldest queued event evicted for the reply (replies are never dropped)", cc.holder_())
 	}
+}
+
+// evictOldestEventLocked removes the OLDEST queued event from the
+// outbound queue (caller holds wmu), reporting whether one was found.
+// Any queued reply encountered on the way rotates to the back —
+// preserved, never dropped.
+func (cc *clientConn) evictOldestEventLocked() bool {
+	n := len(cc.outbound)
+	for i := 0; i < n; i++ {
+		m := <-cc.outbound // n ≥ 1 items queued: never blocks
+		if _, isEvent := m.(EventPush); isEvent {
+			return true
+		}
+		cc.outbound <- m // a queued reply: rotate to the back, keep looking
+	}
+	return false
 }
 
 // holder_ reads the bound holder.
@@ -520,6 +574,8 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hFsWrite(ctx, cc, req)
 	case "fs_read":
 		result, err = s.hFsRead(ctx, req)
+	case "op":
+		result, err = s.hOp(ctx, cc, req)
 	case "watch_events":
 		result, err = s.hWatchEvents(ctx, cc, req)
 	default:
@@ -776,7 +832,11 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 	}
 	args := map[string]any{"code": req.Code}
 	if req.Args != nil {
-		args["args"] = normalizeNumbers(req.Args)
+		v, verr := validateArgs(req.Args)
+		if verr != nil {
+			return nil, verr
+		}
+		args["args"] = v
 	}
 	op := "eval"
 	if async {
@@ -797,34 +857,108 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 	return out, nil
 }
 
-// normalizeNumbers repairs the JSON→msgpack number shape mismatch for
-// eval/submit args: every JSON number decodes to float64, but the board's
-// args bridge (v3, §4) accepts integers — a float64-encoded 7 is rejected
-// ("protocol: args: malformed") where a native Go client sending int64(7)
-// passes. Integral float64s (the only way an integer can arrive over
-// JSON) are converted back to int64 recursively; genuine fractions pass
-// through untouched (the board's verdict on those is preserved verbatim).
-// Found by the b5-full HIL (S3 ARGS round-trip through the daemon).
-func normalizeNumbers(v any) any {
+// validateArgs walks the eval/submit args tree and repairs the
+// JSON→msgpack number shape (found by the b5-full HIL S3): every JSON
+// number decodes to float64, but the board's v3 args bridge (§4)
+// accepts integers only — an integral float64 must cross as int64.
+// The two float shapes that cannot cross honestly are refused
+// daemon-side, before any board contact, naming the offending path
+// (e.g. a.b[2]):
+//
+//   - non-integral floats (the fw would refuse them anyway — this
+//     error names the exact leaf instead of the fw's whole-args msg);
+//   - floats at or beyond 2^53 on the positive side, where JSON's
+//     float64 decode can no longer represent every integer literal
+//     (9007199254740993 would silently cross as 9007199254740992).
+//
+// The negative side extends down to the msgpack int64 floor: -2^63
+// converts exactly. map/array/bin (and any non-float scalar) pass
+// through untouched — bin/ext stay the fw bridge's verdict to give,
+// not the daemon's.
+func validateArgs(v any) (any, *RPCError) {
+	return validateArgsPath(v, "")
+}
+
+func validateArgsPath(v any, path string) (any, *RPCError) {
 	switch x := v.(type) {
 	case float64:
-		if x == math.Trunc(x) && math.Abs(x) < 1<<53 {
-			return int64(x)
+		if x != math.Trunc(x) || x >= 1<<53 || x < math.MinInt64 {
+			if path == "" {
+				path = "args"
+			}
+			return nil, &RPCError{Class: "api",
+				Msg: fmt.Sprintf("eval args: %s: non-integer or ≥2^53 number", path)}
 		}
-		return x
+		return int64(x), nil
 	case map[string]any:
 		for k, e := range x {
-			x[k] = normalizeNumbers(e)
+			kp := path + "." + k
+			if path == "" {
+				kp = k
+			}
+			ce, verr := validateArgsPath(e, kp)
+			if verr != nil {
+				return nil, verr
+			}
+			x[k] = ce
 		}
-		return x
+		return x, nil
 	case []any:
 		for i, e := range x {
-			x[i] = normalizeNumbers(e)
+			ce, verr := validateArgsPath(e, fmt.Sprintf("%s[%d]", path, i))
+			if verr != nil {
+				return nil, verr
+			}
+			x[i] = ce
 		}
-		return x
+		return x, nil
 	default:
-		return v
+		return v, nil
 	}
+}
+
+// opAllowlist is the ops face: the board ops an agent may reach
+// DIRECTLY through the op passthrough request type. Deliberately
+// narrow — the bench surface batch 6's MCP agents need (budget, wifi,
+// log, caps, diagnostics). eval/submit/fs.*/script.*/session.* have
+// their own request types and are NOT reachable through op; every
+// other diag.* stays internal.
+var opAllowlist = map[string]bool{
+	"budget.get": true, "budget.set": true,
+	"wifi.status": true, "wifi.setup": true, "wifi.off": true,
+	"log.read":  true,
+	"caps":      true,
+	"diag.pins": true, "diag.heapinfo": true, "diag.stats": true,
+}
+
+// hOp serves the ops face: an allowlisted board op forwarded over the
+// warm controller under eval's lease gate — uniformly for ALL
+// allowlisted ops (even read-only diag/caps; the gate is the ops
+// face's shape, not each op's). args cross verbatim (the board is the
+// authority); board error class/msg pass through like eval's. An
+// off-allowlist op is a daemon-side "server" refusal naming the op.
+func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, error) {
+	if !opAllowlist[req.Op] {
+		return nil, &RPCError{Class: "server",
+			Msg: fmt.Sprintf("op %q is outside the ops-face allowlist (budget.get, budget.set, wifi.status, wifi.setup, wifi.off, log.read, caps, diag.pins, diag.heapinfo, diag.stats) — eval/submit/fs/script/session keep their own request types", req.Op)}
+	}
+	b, rerr := s.resolve(req.Board)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
+		return nil, err
+	}
+	var args map[string]any
+	if req.Args != nil {
+		m, ok := req.Args.(map[string]any)
+		if !ok {
+			return nil, &RPCError{Class: "server",
+				Msg: fmt.Sprintf("op %s: args must be a JSON object of the op's parameters", req.Op)}
+		}
+		args = m
+	}
+	return s.boardOp(ctx, b, req.Op, args)
 }
 
 func (s *Server) hScriptStart(ctx context.Context, cc *clientConn, req *Request) (any, error) {
@@ -990,24 +1124,6 @@ func (s *Server) broadcast(mac6 string, ev replclient.Event) {
 		if !cc.sendLocked(msg) {
 			s.logf("server: event to holder %s dropped (connection gone)", cc.holder_())
 		}
-	}
-}
-
-// sendLocked is send() for callers already holding srv.mu (both
-// serialize on cc.wmu; the server lock only guards the watcher set).
-func (cc *clientConn) sendLocked(m any) bool {
-	cc.wmu.Lock()
-	defer cc.wmu.Unlock()
-	if cc.wdead {
-		return false
-	}
-	select {
-	case cc.outbound <- m:
-		return true
-	default:
-		s := cc.srv
-		s.logf("server: outbound queue full (holder=%s) — event dropped", cc.holder_())
-		return true
 	}
 }
 
