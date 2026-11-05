@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -2293,6 +2294,31 @@ func TestNewRefusesWhenSockAlive(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	if _, err := New(Opts{SockPath: e.sock, RefreshInterval: -1}); err == nil {
 		t.Fatalf("second daemon accepted on a live socket")
+	}
+}
+
+// TestNewAlreadyListeningSentinel: New against a sock a live listener
+// owns classifies the refusal as ErrAlreadyListening — the sentinel
+// serve.go keys its spawn-race exit-0 on. A raw listener is enough:
+// the probe only dials, it never speaks the protocol.
+func TestNewAlreadyListeningSentinel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "live.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
+	)
+	_, err = New(Opts{SockPath: path, Registry: reg, RefreshInterval: -1})
+	if !errors.Is(err, ErrAlreadyListening) {
+		t.Fatalf("New error = %v, want ErrAlreadyListening in the chain", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("error does not name the socket path: %v", err)
 	}
 }
 

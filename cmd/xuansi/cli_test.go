@@ -299,3 +299,18 @@ func TestDaemonDownIsCleanError(t *testing.T) {
 		t.Fatalf("stderr does not mention the daemon: %q", errb.String())
 	}
 }
+
+// TestServeAlreadyListeningExitsZero: a second serve against a live
+// daemon's socket is the spawn-race loser (or a deliberate double
+// start) — one clear line, exit 0, harmless.
+func TestServeAlreadyListeningExitsZero(t *testing.T) {
+	sock := startMockDaemon(t)
+	var out, errb strings.Builder
+	code := run(strings.NewReader(""), &out, &errb, []string{"serve", "--sock", sock})
+	if code != exitOK {
+		t.Fatalf("serve exit=%d, want %d (stdout %q stderr %q)", code, exitOK, out.String(), errb.String())
+	}
+	if !strings.Contains(errb.String(), "xuansi serve: another daemon is already listening — leaving") {
+		t.Fatalf("stderr missing the leaving line: %q", errb.String())
+	}
+}

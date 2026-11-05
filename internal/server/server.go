@@ -58,6 +58,13 @@ const (
 // errUnreachable wraps dial/hello failures for the error taxonomy.
 var errUnreachable = errors.New("board unreachable")
 
+// ErrAlreadyListening is bindSock's spawn-race sentinel: the dial probe
+// found a live daemon owning the socket. The loser of a launcher spawn
+// race (or a deliberate double start) is a harmless no-op — serve.go
+// keys its exit-0 "leaving" path on this; the wrapped error still
+// names the socket path.
+var ErrAlreadyListening = errors.New("server: another daemon is already listening")
+
 // USBRebootWarning is the honest label the deliberate USB-transport
 // lease route must state everywhere it succeeds — in the API reply's
 // result (key "warning"), in the daemon log, and on the CLI's stdout
@@ -270,7 +277,7 @@ func bindSock(path string) (net.Listener, error) {
 		if fi.Mode()&os.ModeSocket != 0 {
 			if c, derr := net.Dial("unix", path); derr == nil {
 				c.Close()
-				return nil, fmt.Errorf("server: %s: another daemon is already listening", path)
+				return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
 			}
 			if err := os.Remove(path); err != nil {
 				return nil, fmt.Errorf("server: remove stale sock %s: %w", path, err)

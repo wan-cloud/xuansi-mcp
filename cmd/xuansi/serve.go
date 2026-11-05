@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,7 +55,14 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	}
 	srv, err := server.New(opts)
 	if err != nil {
+		if errors.Is(err, server.ErrAlreadyListening) {
+			fmt.Fprintf(stderr, "xuansi serve: another daemon is already listening — leaving (spawn race or double start)\n")
+			return exitOK
+		}
 		fmt.Fprintf(stderr, "xuansi serve: %v\n", err)
+		if strings.Contains(err.Error(), "10047") { // WSAEAFNOSUPPORT: AF_UNIX needs Windows 10 1803+
+			fmt.Fprint(stderr, "requires Windows 10 1803+ (AF_UNIX)\n")
+		}
 		return 1
 	}
 	if err := srv.Start(); err != nil {
