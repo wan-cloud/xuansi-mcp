@@ -228,6 +228,40 @@ func TestCallDaemonErrorBecomesRPCError(t *testing.T) {
 	}
 }
 
+// TestNonMapResultIsTypedError: every documented request result is a
+// JSON object; a daemon replying anything else (bug or protocol drift)
+// crosses as a typed error naming the shape — never a silent nil map.
+func TestNonMapResultIsTypedError(t *testing.T) {
+	fd := newFakeDaemon(t)
+	fd.serve(t, func(conn net.Conn) {
+		for {
+			req := readReq(t, conn)
+			if req.Type == "" {
+				return
+			}
+			if err := server.WriteMsg(conn, &server.Reply{Type: "reply", ID: req.ID, Result: "not-an-object"}); err != nil {
+				t.Errorf("fake daemon reply: %v", err)
+			}
+		}
+	})
+	c, err := Dial(fd.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, rerr, err := c.Call(context.Background(), server.Request{Type: "list_boards"})
+	if res != nil {
+		t.Errorf("result = %v, want nil", res)
+	}
+	if rerr != nil {
+		t.Errorf("rerr = %v, want nil (not a daemon error reply)", rerr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "want a JSON object") {
+		t.Errorf("err = %v, want typed non-map result error", err)
+	}
+}
+
 // TestOutOfOrderReplies: replies that arrive swapped still pair by id —
 // each caller sees its own result, never the other's.
 func TestOutOfOrderReplies(t *testing.T) {
@@ -444,6 +478,55 @@ func TestSocketDeathFailsInFlightCallsImmediately(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("post-death call blocked instead of failing fast")
+	}
+}
+
+// TestCancelAfterDeathIsNoop: review round 1's lock-in — a handler
+// cancelled AFTER the client died (markDead already closed quit) must
+// be a panic-free no-op. This is the long-lived MCP-face lifecycle the
+// package exists for: daemon dies mid-session (mcp.go keeps the loop
+// alive), teardown cancels subscriptions later.
+func TestCancelAfterDeathIsNoop(t *testing.T) {
+	fd := newFakeDaemon(t)
+	gone := make(chan struct{})
+	fd.serve(t, func(conn net.Conn) {
+		if readReq(t, conn).Type == "" {
+			return
+		}
+		conn.Close() // abrupt death, no reply
+		fd.ln.Close()
+		close(gone)
+	})
+
+	c, err := Dial(fd.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	cancel := c.OnEvent(func(server.EventPush) {})
+
+	// the in-flight call's ErrDead return proves markDead ran — quit is
+	// closed — before the cancel under test
+	out := callAsync(c, server.Request{Type: "board_status", Board: "d75884"})
+	<-gone
+	if r := waitRecv(t, out, "in-flight call to die with the socket"); r.err == nil || !errors.Is(r.err, ErrDead) {
+		t.Fatalf("in-flight call error = %v, want ErrDead", r.err)
+	}
+
+	// cancel after death: a no-op, not a close-of-closed-channel panic
+	// (a panic would crash the test binary — a failure either way; the
+	// timeout guard also catches a hypothetical hang)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cancel()
+		cancel() // double-cancel while at it
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel after death did not return")
 	}
 }
 

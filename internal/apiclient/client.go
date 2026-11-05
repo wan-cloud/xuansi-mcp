@@ -40,7 +40,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 
 	"xuansi/internal/server"
 )
@@ -60,13 +59,12 @@ type Client struct {
 	conn net.Conn
 	path string
 
-	nextID atomic.Int64
-
 	wmu sync.Mutex // serializes request writes on the conn
 
 	mu      sync.Mutex
 	pending map[int64]chan *server.Reply // in-flight calls by id
 	regs    map[int64]*eventReg          // live event subscriptions
+	nextID  int64                        // id assignment, under mu
 	nextReg int64
 	dead    error // non-nil once sealed; wraps ErrDead
 
@@ -76,10 +74,20 @@ type Client struct {
 }
 
 // eventReg is one OnEvent subscription: its own delivery goroutine
-// draining queue, stopped by closing quit.
+// draining queue, ended by closing quit — exactly once, whichever path
+// gets there first: the user's cancel() or the client's death teardown
+// (both funnel through stop; a cancel arriving after death is a no-op).
 type eventReg struct {
-	queue chan server.EventPush
-	quit  chan struct{}
+	queue     chan server.EventPush
+	quit      chan struct{}
+	closeOnce sync.Once
+}
+
+// stop ends the handler goroutine. Idempotent and safe from any path:
+// user cancel, double cancel, or markDead after an earlier cancel (and
+// the reverse) — quit is closed exactly once.
+func (r *eventReg) stop() {
+	r.closeOnce.Do(func() { close(r.quit) })
 }
 
 // Dial connects to the daemon's unix socket and starts the background
@@ -174,8 +182,11 @@ func (c *Client) Call(ctx context.Context, req server.Request) (map[string]any, 
 		c.mu.Unlock()
 		return nil, nil, err
 	}
-	id := c.nextID.Add(1)
-	req.ID = id
+	// id assignment rides the pending map's lock — one serialization
+	// mechanism (mutex) covers both, not mutex-plus-atomic (review r1)
+	c.nextID++
+	req.ID = c.nextID
+	id := req.ID
 	ch := make(chan *server.Reply, 1)
 	c.pending[id] = ch
 	c.mu.Unlock()
@@ -203,7 +214,14 @@ func (c *Client) Call(ctx context.Context, req server.Request) (map[string]any, 
 		if rep.Error != nil {
 			return nil, rep.Error, nil
 		}
-		res, _ := rep.Result.(map[string]any)
+		res, ok := rep.Result.(map[string]any)
+		if !ok {
+			// every documented request result is a JSON object
+			// (proto.go's request table); anything else is daemon bug
+			// or protocol drift — name it instead of handing back a
+			// silent nil map
+			return nil, nil, fmt.Errorf("apiclient: reply %d: result is %T, want a JSON object", rep.ID, rep.Result)
+		}
 		return res, nil, nil
 	case <-ctx.Done():
 		c.mu.Lock()
@@ -218,7 +236,8 @@ func (c *Client) Call(ctx context.Context, req server.Request) (map[string]any, 
 // never blocks on fn, however slow; a handler more than
 // handlerQueueDepth events behind silently drops new ones (see the
 // delivery policy in the package comment). The returned cancel stops
-// delivery and is safe to call more than once.
+// delivery and is safe to call more than once — and after the client
+// has died (a no-op then, not a panic).
 func (c *Client) OnEvent(fn func(server.EventPush)) (cancel func()) {
 	r := &eventReg{
 		queue: make(chan server.EventPush, handlerQueueDepth),
@@ -245,14 +264,11 @@ func (c *Client) OnEvent(fn func(server.EventPush)) (cancel func()) {
 		}
 	}()
 
-	var once sync.Once
 	return func() {
-		once.Do(func() {
-			c.mu.Lock()
-			delete(c.regs, id)
-			c.mu.Unlock()
-			close(r.quit)
-		})
+		c.mu.Lock()
+		delete(c.regs, id)
+		c.mu.Unlock()
+		r.stop() // per-reg close-once: safe after death, and twice
 	}
 }
 
@@ -286,7 +302,7 @@ func (c *Client) markDead(reason error) {
 		ch <- nil // buffered(1) and id-exclusive: never blocks, never a real reply
 	}
 	for _, r := range regs {
-		close(r.quit)
+		r.stop() // per-reg close-once: safe even if the user cancelled first
 	}
 }
 
