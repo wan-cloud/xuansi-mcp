@@ -1385,10 +1385,13 @@ func TestEvalArgsNumbersNormalizedToIntegers(t *testing.T) {
 
 // TestEvalArgsValidation: the fw args bridge is int-only (v3 §4) — the
 // daemon refuses the float shapes that cannot cross honestly BEFORE any
-// board contact (class api, the brief's exact message naming the
-// offending path), while integral float64s (JSON's only integer shape)
-// convert to int64 so they msgpack-encode as ints; -2^63, the msgpack
-// int64 floor, crosses exactly.
+// board contact (class api, the exact message naming the offending
+// path), while integral float64s (JSON's only integer shape) convert to
+// int64 so they msgpack-encode as ints. The ±2^53 guard is
+// sign-symmetric (controller ruling: JSON-authored integers beyond
+// ±2^53 may have already lost precision client-side): ±2^53 and
+// everything beyond — the int64 floor -2^63 included — reject; the
+// largest passing integers are ±(2^53-1).
 func TestEvalArgsValidation(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -1410,7 +1413,11 @@ func TestEvalArgsValidation(t *testing.T) {
 		want string
 	}{
 		{"fraction", map[string]any{"x": 0.5}, "eval args: x: non-integer or ≥2^53 number"},
-		{"2^53 boundary (corruptible literal)", map[string]any{"x": 9007199254740993}, "eval args: x: non-integer or ≥2^53 number"},
+		{"+2^53 (corruptible literal 2^53+1)", map[string]any{"x": 9007199254740993}, "eval args: x: non-integer or ≥2^53 number"},
+		{"+2^53 exactly", map[string]any{"x": 9007199254740992}, "eval args: x: non-integer or ≥2^53 number"},
+		{"-2^53 exactly", map[string]any{"x": -9007199254740992}, "eval args: x: non-integer or ≥2^53 number"},
+		{"-2^53-2 (corruptible literal)", map[string]any{"x": -9007199254740994}, "eval args: x: non-integer or ≥2^53 number"},
+		{"-2^63 (int64 floor, beyond the guard)", map[string]any{"x": float64(math.MinInt64)}, "eval args: x: non-integer or ≥2^53 number"},
 		{"array leaf beyond 2^53", map[string]any{"a": []any{float64(1), 1e300}}, "eval args: a[1]: non-integer or ≥2^53 number"},
 	} {
 		rep, _ := c.call(int64(10+i), map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "args": tc.args})
@@ -1437,14 +1444,14 @@ func TestEvalArgsValidation(t *testing.T) {
 	}
 
 	// integral crossings: the board receives int64 (msgpack int), the
-	// int64 floor included
+	// ±(2^53-1) boundaries included
 	var gotX any
 	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		m, _ := args["args"].(map[string]any)
 		gotX = m["x"]
 		return map[string]any{"out": ""}, nil
 	})
-	for i, x := range []float64{3.0, float64(math.MinInt64)} {
+	for i, x := range []float64{3.0, 9007199254740991, -9007199254740991} {
 		rep, _ := c.call(int64(30+i), map[string]any{"type": "eval", "board": "d75884", "code": "return ARGS", "args": map[string]any{"x": x}})
 		if asMap(rep["error"]) != nil {
 			t.Fatalf("eval %v: %#v", x, rep)
@@ -1463,7 +1470,8 @@ func TestEvalArgsValidation(t *testing.T) {
 // board op over the warm controller under eval's lease gate (uniformly:
 // even the read-only diag/caps ops need the lease), the board's result
 // crosses as the reply result, and a board error's class/msg pass
-// through verbatim like eval's.
+// through verbatim like eval's. args run through the shared numeric
+// walk (controller ruling): JSON integers cross as msgpack ints.
 func TestOpPassthroughAllowlist(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -1497,8 +1505,8 @@ func TestOpPassthroughAllowlist(t *testing.T) {
 	for _, call := range e.fakes["d75884"].got() {
 		if call.op == "budget.set" {
 			sent = true
-			if asInt(call.args["budget_ms"]) != 5000 {
-				t.Fatalf("forwarded args = %#v", call.args)
+			if v, ok := call.args["budget_ms"].(int64); !ok || v != 5000 {
+				t.Fatalf("forwarded args = %#v, want budget_ms int64 5000 (msgpack int)", call.args)
 			}
 		}
 	}
@@ -1517,6 +1525,81 @@ func TestOpPassthroughAllowlist(t *testing.T) {
 	er = errOf(t, rep)
 	if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "ssid missing at byte 3") {
 		t.Fatalf("board error not verbatim: %#v", er)
+	}
+}
+
+// TestOpArgsValidation: op args run through the SAME numeric walk as
+// eval/submit (controller ruling — the motivating case: op budget.set
+// {"eval_ms":3000} would otherwise encode 3000 as a msgpack float the
+// fw refuses). JSON integers reach the board as int64; non-integral or
+// ±2^53 numbers reject daemon-side with the api class under the
+// "op args:" prefix, board untouched; strings cross unchanged.
+func TestOpArgsValidation(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "oparg"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	// the ruling's motivating case: budget.set's JSON integers cross as
+	// msgpack ints (a raw float64 would be refused by the fw bridge)
+	var gotEvalMs any
+	e.fakes["d75884"].on("budget.set", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		gotEvalMs = args["eval_ms"]
+		return map[string]any{"eval_ms": args["eval_ms"]}, nil
+	})
+	rep, _ = c.call(2, map[string]any{
+		"type": "op", "board": "d75884", "op": "budget.set",
+		"args": map[string]any{"eval_ms": float64(3000)},
+	})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op budget.set: %#v", rep)
+	}
+	if v, ok := gotEvalMs.(int64); !ok || v != 3000 {
+		t.Fatalf("eval_ms crossed as %#v, want int64 3000 (msgpack int)", gotEvalMs)
+	}
+
+	// strings (wifi.setup's ssid) cross the walk untouched
+	var gotSsid any
+	e.fakes["d75884"].on("wifi.setup", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		gotSsid = args["ssid"]
+		return map[string]any{"state": "joining"}, nil
+	})
+	rep, _ = c.call(3, map[string]any{
+		"type": "op", "board": "d75884", "op": "wifi.setup",
+		"args": map[string]any{"ssid": "bench-iot"},
+	})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op wifi.setup: %#v", rep)
+	}
+	if gotSsid != "bench-iot" {
+		t.Fatalf("ssid crossed as %#v, want the string verbatim", gotSsid)
+	}
+
+	// rejects: api class under the "op args:" prefix, board untouched
+	callsBefore := len(e.fakes["d75884"].got())
+	for i, tc := range []struct {
+		name string
+		args any
+		want string
+	}{
+		{"fraction", map[string]any{"x": 0.5}, "op args: x: non-integer or ≥2^53 number"},
+		{"+2^53", map[string]any{"x": 9007199254740992}, "op args: x: non-integer or ≥2^53 number"},
+		{"-2^53-2", map[string]any{"x": -9007199254740994}, "op args: x: non-integer or ≥2^53 number"},
+		{"array leaf", map[string]any{"a": []any{float64(1), 1e300}}, "op args: a[1]: non-integer or ≥2^53 number"},
+	} {
+		rep, _ := c.call(int64(10+i), map[string]any{"type": "op", "board": "d75884", "op": "budget.set", "args": tc.args})
+		er := errOf(t, rep)
+		if asStr(er["class"]) != "api" {
+			t.Fatalf("%s: class = %q, want api (%#v)", tc.name, er["class"], er)
+		}
+		if asStr(er["msg"]) != tc.want {
+			t.Fatalf("%s: msg = %q, want %q", tc.name, er["msg"], tc.want)
+		}
+	}
+	if got := len(e.fakes["d75884"].got()); got != callsBefore {
+		t.Fatalf("rejected op args reached the board (%d → %d calls)", callsBefore, got)
 	}
 }
 

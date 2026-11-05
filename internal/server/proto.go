@@ -52,14 +52,16 @@
 //	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; lands with T12)
 //	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}  (lands with T12)
 //
-// eval/submit args numbers: the fw args bridge is int-only (v3 §4), so
-// the daemon validates the args tree BEFORE any board contact — an
+// eval/submit/op args numbers: the fw args bridge is int-only (v3 §4),
+// so the daemon validates the args tree BEFORE any board contact — an
 // integral float64 (JSON's only integer shape) converts to int64 and
-// msgpack-encodes as an int; a non-integral float, or one at/beyond
-// 2^53 where the float64 decode can silently corrupt integer literals,
-// is a daemon-side "api" error naming the offending path ("eval args:
-// a.b[2]: non-integer or ≥2^53 number"). The negative side extends to
-// the msgpack int64 floor: -2^63 crosses exactly.
+// msgpack-encodes as an int; a non-integral float, or one at or beyond
+// ±2^53 — where the float64 decode may have already corrupted a JSON
+// integer literal client-side, a sign-symmetric hazard, hence a
+// sign-symmetric guard — is a daemon-side "api" error naming the
+// offending path under the face's prefix ("eval args: a.b[2]:
+// non-integer or ≥2^53 number", same shape for op as "op args: …").
+// The largest integers that cross are ±(2^53-1).
 //
 // # The ops face (op passthrough)
 //
@@ -71,11 +73,17 @@
 //	budget.get  budget.set  wifi.status  wifi.setup  wifi.off
 //	log.read    caps        diag.pins    diag.heapinfo  diag.stats
 //
-// args cross VERBATIM (the board is the authority) and the board's
-// reply result — or its error class/msg, verbatim like eval's — is the
-// reply. Anything else (eval/submit/fs.*/script.*/session.* and every
-// other diag.*) is a daemon-side "server" class refusal naming the op:
-// those faces keep their own request types with their own semantics.
+// args cross through the SAME numeric walk as eval/submit (controller
+// ruling): integral JSON numbers convert to int64 and msgpack-encode
+// as ints (budget.set's counters would otherwise reach the fw as
+// floats and be refused), while non-integral or ±2^53 numbers refuse
+// daemon-side under the "op args:" prefix — every other value shape,
+// strings included (wifi.setup's ssid/password), crosses verbatim (the
+// board is the authority). The board's reply result — or its error
+// class/msg, verbatim like eval's — is the reply. Anything else
+// (eval/submit/fs.*/script.*/session.* and every other diag.*) is a
+// daemon-side "server" class refusal naming the op: those faces keep
+// their own request types with their own semantics.
 //
 // # Capture (the MB-level face — lands with T12, documented here first)
 //
@@ -195,7 +203,7 @@ type Request struct {
 	// the ops-face note in the contract above); eval/submit/fs/script/
 	// session ops are NOT reachable through it.
 	Op   string `json:"op,omitempty"`
-	Args any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS (numbers validated daemon-side); op: the op's args object, verbatim
+	Args any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS; op: the op's args object — numbers validated daemon-side either way
 }
 
 // RPCError is the structured error half of a reply.

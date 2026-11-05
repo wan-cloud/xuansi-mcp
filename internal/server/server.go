@@ -832,7 +832,7 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 	}
 	args := map[string]any{"code": req.Code}
 	if req.Args != nil {
-		v, verr := validateArgs(req.Args)
+		v, verr := validateArgs("eval args", req.Args)
 		if verr != nil {
 			return nil, verr
 		}
@@ -857,37 +857,40 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 	return out, nil
 }
 
-// validateArgs walks the eval/submit args tree and repairs the
+// validateArgs walks the eval/submit/op args tree and repairs the
 // JSON→msgpack number shape (found by the b5-full HIL S3): every JSON
 // number decodes to float64, but the board's v3 args bridge (§4)
 // accepts integers only — an integral float64 must cross as int64.
 // The two float shapes that cannot cross honestly are refused
 // daemon-side, before any board contact, naming the offending path
-// (e.g. a.b[2]):
+// (e.g. a.b[2]) under the calling face's prefix ("eval args:" /
+// "op args:"):
 //
 //   - non-integral floats (the fw would refuse them anyway — this
 //     error names the exact leaf instead of the fw's whole-args msg);
-//   - floats at or beyond 2^53 on the positive side, where JSON's
-//     float64 decode can no longer represent every integer literal
-//     (9007199254740993 would silently cross as 9007199254740992).
+//   - floats at or beyond ±2^53 (controller ruling: the guard exists
+//     because JSON-authored integers beyond ±2^53 may have already
+//     lost precision client-side before the daemon sees them — the
+//     hazard is sign-symmetric, so the rule is too; 9007199254740993
+//     would silently cross as 9007199254740992). The largest integers
+//     that cross are ±(2^53-1).
 //
-// The negative side extends down to the msgpack int64 floor: -2^63
-// converts exactly. map/array/bin (and any non-float scalar) pass
-// through untouched — bin/ext stay the fw bridge's verdict to give,
-// not the daemon's.
-func validateArgs(v any) (any, *RPCError) {
-	return validateArgsPath(v, "")
+// map/array/bin (and any non-float scalar — wifi.setup's strings
+// included) pass through untouched — bin/ext stay the fw bridge's
+// verdict to give, not the daemon's.
+func validateArgs(prefix string, v any) (any, *RPCError) {
+	return validateArgsPath(prefix, v, "")
 }
 
-func validateArgsPath(v any, path string) (any, *RPCError) {
+func validateArgsPath(prefix string, v any, path string) (any, *RPCError) {
 	switch x := v.(type) {
 	case float64:
-		if x != math.Trunc(x) || x >= 1<<53 || x < math.MinInt64 {
+		if x != math.Trunc(x) || x >= 1<<53 || x <= -(1<<53) {
 			if path == "" {
 				path = "args"
 			}
 			return nil, &RPCError{Class: "api",
-				Msg: fmt.Sprintf("eval args: %s: non-integer or ≥2^53 number", path)}
+				Msg: fmt.Sprintf("%s: %s: non-integer or ≥2^53 number", prefix, path)}
 		}
 		return int64(x), nil
 	case map[string]any:
@@ -896,7 +899,7 @@ func validateArgsPath(v any, path string) (any, *RPCError) {
 			if path == "" {
 				kp = k
 			}
-			ce, verr := validateArgsPath(e, kp)
+			ce, verr := validateArgsPath(prefix, e, kp)
 			if verr != nil {
 				return nil, verr
 			}
@@ -905,7 +908,7 @@ func validateArgsPath(v any, path string) (any, *RPCError) {
 		return x, nil
 	case []any:
 		for i, e := range x {
-			ce, verr := validateArgsPath(e, fmt.Sprintf("%s[%d]", path, i))
+			ce, verr := validateArgsPath(prefix, e, fmt.Sprintf("%s[%d]", path, i))
 			if verr != nil {
 				return nil, verr
 			}
@@ -934,9 +937,14 @@ var opAllowlist = map[string]bool{
 // hOp serves the ops face: an allowlisted board op forwarded over the
 // warm controller under eval's lease gate — uniformly for ALL
 // allowlisted ops (even read-only diag/caps; the gate is the ops
-// face's shape, not each op's). args cross verbatim (the board is the
-// authority); board error class/msg pass through like eval's. An
-// off-allowlist op is a daemon-side "server" refusal naming the op.
+// face's shape, not each op's). args cross through the same numeric
+// walk as eval/submit (controller ruling: JSON integers must msgpack
+// as ints — budget.set's counters would otherwise reach the fw as
+// floats and be refused), refusing non-integral / ±2^53 numbers
+// daemon-side under the "op args:" prefix; every other value shape
+// crosses verbatim (the board is the authority), and board error
+// class/msg pass through like eval's. An off-allowlist op is a
+// daemon-side "server" refusal naming the op.
 func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	if !opAllowlist[req.Op] {
 		return nil, &RPCError{Class: "server",
@@ -956,7 +964,11 @@ func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, er
 			return nil, &RPCError{Class: "server",
 				Msg: fmt.Sprintf("op %s: args must be a JSON object of the op's parameters", req.Op)}
 		}
-		args = m
+		v, verr := validateArgs("op args", m)
+		if verr != nil {
+			return nil, verr
+		}
+		args = v.(map[string]any)
 	}
 	return s.boardOp(ctx, b, req.Op, args)
 }
