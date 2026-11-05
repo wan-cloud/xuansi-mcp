@@ -53,6 +53,7 @@
 //	script_stop    {board, name, holder?}        → board ack       (lease required)
 //	fs_write       {board, path, data, holder?}  → board ack       (lease required; data = base64 (JSON []byte); ≤16384B enforced daemon-side with class api, mirroring the board's own refusal)
 //	fs_read        {board, path}                 → {data: base64}  (read-only, no lease)
+//	fs_rm          {board, path, holder?}        → {}              (lease required; the removal path — the board's own fs.rm {path} verbatim, same gate as fs_write; a missing file is the board's api not-found, class/msg unmodified)
 //	watch_events   {board, source?}              → {board}         (subscribes THIS connection; source, when given, is additionally events.subscribe'd board-side)
 //	op             {board, op, args?, holder?}   → board reply result  (the ops face — see below)
 //	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; see the capture section below)

@@ -28,7 +28,9 @@ package mcp
 //	/drv/<name>.lua → fs_read back → sha256 compare → manifest
 //
 // The manifest records the push ONLY after the read-back verifies
-// byte-exact — a corrupt board write never becomes history.
+// byte-exact — a corrupt board write never becomes history. B8 task 1
+// appends the removal half, xuansi_driver_pull (fs_rm of the effective
+// file + Active cleared, footprints kept), after the capture tool.
 
 import (
 	"context"
@@ -218,6 +220,17 @@ type driverPushOut struct {
 	Path   string `json:"path" jsonschema:"the board's effective driver file that was overwritten"`
 	Sha256 string `json:"sha256" jsonschema:"sha256 of the pushed bytes, verified by fs_read-back"`
 	Bytes  int    `json:"bytes" jsonschema:"bytes written"`
+}
+
+type driverPullIn struct {
+	Board  string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
+	Name   string `json:"name" jsonschema:"driver name, lowercase [a-z0-9_-]+ — the board's effective file /drv/<name>.lua is removed"`
+	Holder string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
+}
+
+type driverPullOut struct {
+	Pulled bool   `json:"pulled" jsonschema:"true when the board file was removed and the manifest's Active cleared"`
+	Path   string `json:"path" jsonschema:"the board's effective driver file that was removed"`
 }
 
 // ---------------------------------------------------------------------------
@@ -454,4 +467,46 @@ func (ts *toolset) boardAPIVersion(ctx context.Context, board string, resolved b
 		ts.dyn.capsStore(board, ver)
 	}
 	return ver, nil
+}
+
+// driverPull removes the board's effective /drv/<name>.lua through the
+// fs_rm request (B8: the pipeline's removal path — the b7 HIL cleaned
+// /drv out-of-pipeline) and clears the manifest's Active: the board has
+// no effective driver to deploy anymore. History is never rewritten —
+// the Files entries and per-board push footprints STAY (rollback =
+// re-push the version explicitly), and the whole read-modify-write
+// rides wsMu like every other manifest cycle, so a pull racing a push
+// serializes instead of tearing the file. A board file that is already
+// absent surfaces the board's api not-found VERBATIM and rewrites
+// nothing (the pull did not remove anything, so Active stays).
+func (ts *toolset) driverPull(ctx context.Context, _ *mcpsdk.CallToolRequest, in driverPullIn) (*mcpsdk.CallToolResult, driverPullOut, error) {
+	if !wsNameRe.MatchString(in.Name) {
+		return nil, driverPullOut{}, errWs("xuansi_driver_pull: name must match [a-z0-9_-]+, got %q", in.Name)
+	}
+	path := drvBoardPath(in.Name)
+
+	// the removal first: only a file the board actually removed clears
+	// Active (its error — the api not-found on an absent file — crosses
+	// verbatim and the manifest below never runs).
+	if _, err := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: in.Board, Path: path, Holder: in.Holder}); err != nil {
+		return nil, driverPullOut{}, err
+	}
+
+	wsMu.Lock()
+	defer wsMu.Unlock()
+	m, err := loadManifest(ts.ws.manifestPath())
+	if err != nil {
+		return nil, driverPullOut{}, errWs("xuansi_driver_pull: %v", err)
+	}
+	if _, exists := m.Drivers[in.Name]; exists {
+		e := m.entry(in.Name)
+		e.Active = "" // footprints deliberately kept — history never lies
+		m.Drivers[in.Name] = e
+		if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
+			return nil, driverPullOut{}, errWs("xuansi_driver_pull: %v", err)
+		}
+	}
+	// no manifest entry: the board file is gone and there was no Active
+	// to clear — writing an empty entry would be noise, not history.
+	return nil, driverPullOut{Pulled: true, Path: path}, nil
 }

@@ -265,10 +265,11 @@ func noContact(t *testing.T, reqs chan server.Request) {
 
 // staticTools is the exact static toolset — task 8's twelve daemon-
 // surface tools (eleven request-face + task 10's events_recent), task
-// 11's four driver-workspace tools, and task 12's blocking capture
+// 11's four driver-workspace tools, task 12's blocking capture
 // tool (the rings events_recent reads ride the dynamic refresh, but
 // the tool itself is static contract; the workspace tools never touch
-// the daemon on the store side).
+// the daemon on the store side), and B8's fs_rm + driver_pull (the
+// removal path).
 var staticTools = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -287,6 +288,8 @@ var staticTools = []string{
 	"xuansi_ws_get",
 	"xuansi_driver_push",
 	"xuansi_capture",
+	"xuansi_fs_rm",
+	"xuansi_driver_pull",
 }
 
 // ---------------------------------------------------------------------------

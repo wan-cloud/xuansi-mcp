@@ -66,3 +66,15 @@ func errFsNotBase64(path string, cause error) error {
 		Msg:   fmt.Sprintf("fs_write %s: data_b64 is not valid base64 (%v)", path, cause),
 	}
 }
+
+// errFsPath is the client-side path-whitelist refusal for the
+// destructive fs face (fs_rm, B8): the fw's own fs gate (frozen §8:
+// named files under /lua/ or /drv/ only) mirrored one hop earlier, the
+// same api-class convention as the cap refusal above, so a traversal
+// or root-dir path is refused before any crossing.
+func errFsPath(path string) error {
+	return &server.RPCError{
+		Class: "api",
+		Msg:   fmt.Sprintf("fs_rm %s: path must be a named file directly under /lua/ or /drv/ (no \"..\", no \".\", no \"//\", no trailing \"/\", not empty), refused client-side", path),
+	}
+}

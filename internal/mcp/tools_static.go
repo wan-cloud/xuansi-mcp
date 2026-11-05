@@ -144,6 +144,12 @@ type fsReadIn struct {
 	Path  string `json:"path" jsonschema:"absolute file path on the board's filesystem"`
 }
 
+type fsRmIn struct {
+	Board  string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
+	Path   string `json:"path" jsonschema:"the file to remove: a NAMED FILE directly under /lua/ or /drv/ (no \"..\", no \"//\", no trailing \"/\") — the same whitelist the firmware enforces, checked client-side before any crossing"`
+	Holder string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
+}
+
 type boardOpIn struct {
 	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
 	// Op's tag list is hand-maintained (a struct tag cannot render
@@ -227,7 +233,8 @@ type opResultOut = map[string]any
 // staticToolNames is the static face's fixed name set — the dynamic
 // face seeds its name-claiming with it so no per-board tool can ever
 // displace a static one (server_test.go pins the served list to the
-// same names).
+// same names). B8 appends fs_rm + driver_pull after capture: the
+// existing 17 keep their positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -246,6 +253,8 @@ var staticToolNames = []string{
 	"xuansi_ws_get",
 	"xuansi_driver_push",
 	"xuansi_capture",
+	"xuansi_fs_rm",
+	"xuansi_driver_pull",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -307,6 +316,11 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 	}, ts.fsRead)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_fs_rm",
+		Description: "Remove one file from the board's filesystem under the lease (the pipeline's removal path — cleanup no longer needs an out-of-pipeline REPL). The path is whitelisted client-side exactly like the firmware's own fs gate: a NAMED FILE directly under /lua/ or /drv/ (no \"..\", no \"//\", no trailing \"/\", not empty); everything else is refused locally with an api-class error. A file that is already gone surfaces the board's own api not-found verbatim. Holder semantics: " + holderDesc + ".",
+	}, ts.fsRm)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_op",
 		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AllowlistedOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. Holder semantics: " + holderDesc + ".",
 	}, ts.boardOp)
@@ -335,6 +349,11 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_driver_push",
 		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.lua (the board knows nothing of versions). Gated BEFORE the flash write: the file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one), and the file must fit the board's 16384B single-file cap. The write is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
 	}, ts.driverPush)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_driver_pull",
+		Description: "Remove a board's effective driver file /drv/<name>.lua through the pipeline (fs_rm under the lease — take it with xuansi_lease) and clear the manifest's ACTIVE version for that driver. History is never rewritten: every stored version and its per-board push footprints STAY in the workspace and the manifest, so rollback is simply re-pushing the version explicitly. A driver whose board file is already gone surfaces the board's own api not-found verbatim (the manifest is untouched in that case). Holder semantics: " + holderDesc + ".",
+	}, ts.driverPull)
 
 	ts.registerCapture(srv)
 }
@@ -468,6 +487,39 @@ func (ts *toolset) fsRead(ctx context.Context, _ *mcpsdk.CallToolRequest, in fsR
 		return nil, fsReadOut{}, err
 	}
 	return nil, fsReadOut{DataB64: str(res, "data")}, nil
+}
+
+// fsPathNamesOneFile is the client-side mirror of the fw's fs gate
+// (frozen §8): only a NAMED FILE directly under /lua/ or /drv/ — a
+// non-empty basename with no separator (no subdirectories, no
+// trailing "/", no "//"), and neither "." nor ".." (no cwd/parent
+// reference, no traversal). The empty path, the bare /lua and /drv
+// roots, and every other prefix fail. fs_write never needed this
+// client-side (the fw refuses a bad write itself); fs_rm is the
+// destructive face, so the gate rides one hop earlier.
+func fsPathNamesOneFile(p string) bool {
+	for _, root := range []string{"/lua/", "/drv/"} {
+		if strings.HasPrefix(p, root) {
+			name := p[len(root):]
+			return name != "" && !strings.Contains(name, "/") && name != "." && name != ".."
+		}
+	}
+	return false
+}
+
+// fsRm removes one board file through the fs_rm request — the fs
+// face's destructive half. Whitelisted client-side (see
+// fsPathNamesOneFile); the daemon re-gates the lease, the board is the
+// authority for what exists, and its error class/msg cross verbatim.
+func (ts *toolset) fsRm(ctx context.Context, _ *mcpsdk.CallToolRequest, in fsRmIn) (*mcpsdk.CallToolResult, boardAckOut, error) {
+	if !fsPathNamesOneFile(in.Path) {
+		return nil, boardAckOut{}, errFsPath(in.Path)
+	}
+	res, err := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: in.Board, Holder: in.Holder, Path: in.Path})
+	if err != nil {
+		return nil, boardAckOut{}, err
+	}
+	return nil, boardAckOut(res), nil
 }
 
 func (ts *toolset) boardOp(ctx context.Context, _ *mcpsdk.CallToolRequest, in boardOpIn) (*mcpsdk.CallToolResult, opResultOut, error) {

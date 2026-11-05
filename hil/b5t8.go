@@ -65,8 +65,10 @@ func main() {
 		os.Exit(runB6MCP(*attempt, *daemonBin, *runDir))
 	case "b7mcp":
 		os.Exit(runB7MCP(*attempt, *daemonBin, *runDir))
+	case "b8t1":
+		os.Exit(runB8T1(*attempt, *daemonBin, *runDir))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR]")
+		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1 [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR]")
 		os.Exit(2)
 	}
 }

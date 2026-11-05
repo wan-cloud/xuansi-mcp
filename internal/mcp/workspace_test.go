@@ -82,6 +82,9 @@ func servePushDaemon(t *testing.T, fd *fakeDaemon, ver int, tamper bool) chan se
 				}
 				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{
 					"data": base64.StdEncoding.EncodeToString(data)}}
+			case "fs_rm":
+				delete(files, req.Board+"\x00"+req.Path)
+				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{}}
 			default:
 				t.Errorf("push daemon: unexpected request type %s", req.Type)
 				rep = &server.Reply{Type: "reply", ID: req.ID,
@@ -727,5 +730,206 @@ func TestWorkspaceListAndGetRoundTrip(t *testing.T) {
 	res = e.call("xuansi_ws_get", map[string]any{"name": "ads1115", "version": "9.9.9"})
 	if !res.IsError || !strings.Contains(resultText(t, res), "ads1115@9.9.9.lua") {
 		t.Errorf("ws_get missing = %v, want a refusal naming the file", res)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// driver_pull (B8 task 1: the pipeline's removal path)
+
+// TestDriverPullClearsActiveKeepsFootprints: after a verified push,
+// pull removes the board's effective file through ONE held fs_rm of
+// /drv/<name>.lua and clears the manifest's Active - while the Files
+// entries and per-board push footprints STAY (history never lies;
+// rollback = re-push), so ws_list still offers every stored version.
+func TestDriverPullClearsActiveKeepsFootprints(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
+	content := "--@api 1\n-- b8pull v1.0.0\nreturn {tag=\"b8pull\"}\n"
+	mustPut(t, e, "b8pull", "1.0.0", content)
+	if res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "b8pull", "version": "1.0.0",
+	}); res.IsError {
+		t.Fatalf("push failed: %s", resultText(t, res))
+	}
+	for i := 0; i < 3; i++ { // caps + write + read-back
+		wantReq(t, reqs)
+	}
+
+	res := e.call("xuansi_driver_pull", map[string]any{"board": "d75884", "name": "b8pull"})
+	if res.IsError {
+		t.Fatalf("pull failed: %s", resultText(t, res))
+	}
+	rmReq := wantReq(t, reqs)
+	if rmReq.Type != "fs_rm" || rmReq.Path != "/drv/b8pull.lua" || rmReq.Holder != "mcp-fixed01" {
+		t.Errorf("fs_rm request = %+v, want the held removal at /drv/b8pull.lua", rmReq)
+	}
+	out := structured(t, res)
+	if v, _ := out["pulled"].(bool); !v || out["path"] != "/drv/b8pull.lua" {
+		t.Errorf("pull result = %v, want {pulled:true, path:/drv/b8pull.lua}", out)
+	}
+
+	// ws_list: the version + its checksum still listed, active ABSENT
+	res = e.call("xuansi_ws_list", nil)
+	if res.IsError {
+		t.Fatalf("ws_list failed: %s", resultText(t, res))
+	}
+	var listed bool
+	if drs, ok := structured(t, res)["drivers"].([]any); ok {
+		for _, d := range drs {
+			dm, _ := d.(map[string]any)
+			if dm["name"] != "b8pull" {
+				continue
+			}
+			if act, _ := dm["active"].(string); act != "" {
+				t.Errorf("ws_list active = %q, want absent after the pull", act)
+			}
+			if vs, ok2 := dm["versions"].([]any); ok2 && len(vs) == 1 {
+				if vm, _ := vs[0].(map[string]any); vm["version"] == "1.0.0" && vm["sha256"] == sha256hex([]byte(content)) {
+					listed = true
+				}
+			}
+		}
+	}
+	if !listed {
+		t.Errorf("ws_list after pull does not offer b8pull@1.0.0 with its checksum (history must stay)")
+	}
+
+	// the manifest on disk: Active "", the version entry + footprint kept
+	m := wsManifest(t, root)
+	ent := m.Drivers["b8pull"]
+	if ent.Active != "" {
+		t.Errorf("Active = %q, want \"\" after the pull", ent.Active)
+	}
+	fm := ent.Files["1.0.0"]
+	if fm.Sha256 != sha256hex([]byte(content)) || fm.Size != len(content) {
+		t.Errorf("Files[1.0.0] = %+v, want the history kept verbatim", fm)
+	}
+	if len(fm.Boards) != 1 || fm.Boards["d75884"].IsZero() {
+		t.Errorf("Boards = %v, want the d75884 push footprint KEPT (history never lies)", fm.Boards)
+	}
+}
+
+// TestDriverPullBoardErrorVerbatimAndManifestUntouched: a pull whose
+// fs_rm is refused (the board's api not-found on an already-absent
+// file) crosses that error VERBATIM and rewrites nothing - Active
+// stays exactly as it was.
+func TestDriverPullBoardErrorVerbatimAndManifestUntouched(t *testing.T) {
+	content := "--@api 1\n-- ghost v1.0.0\nreturn {}\n"
+	want := "rm '/drv/ghost.lua' failed (No such file or directory)"
+	e, reqs, root := newWsEnv(t, []step{
+		capsStep(1),                          // push: caps
+		{result: map[string]any{"ok": true}}, // push: fs_write
+		{result: map[string]any{"data": base64.StdEncoding.EncodeToString([]byte(content))}}, // push: fs_read back
+		{rerr: &server.RPCError{Class: "api", Msg: want}},                                    // pull: fs_rm refused
+	})
+	mustPut(t, e, "ghost", "1.0.0", content)
+	if res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "ghost", "version": "1.0.0",
+	}); res.IsError {
+		t.Fatalf("push failed: %s", resultText(t, res))
+	}
+	for i := 0; i < 3; i++ { // the push's caps + write + read-back
+		wantReq(t, reqs)
+	}
+
+	res := e.call("xuansi_driver_pull", map[string]any{"board": "d75884", "name": "ghost"})
+	if !res.IsError {
+		t.Fatalf("pull of an absent file succeeded: %+v", res)
+	}
+	if got := resultText(t, res); got != "api: "+want {
+		t.Errorf("error text = %q, want exactly %q", got, "api: "+want)
+	}
+	rmReq := wantReq(t, reqs)
+	if rmReq.Type != "fs_rm" || rmReq.Path != "/drv/ghost.lua" {
+		t.Errorf("fs_rm request = %+v, want the removal at /drv/ghost.lua", rmReq)
+	}
+
+	m := wsManifest(t, root)
+	if act := m.Drivers["ghost"].Active; act != "1.0.0" {
+		t.Errorf("Active after the refused pull = %q, want 1.0.0 untouched", act)
+	}
+	if fm := m.Drivers["ghost"].Files["1.0.0"]; fm.Boards["d75884"].IsZero() {
+		t.Errorf("footprint disturbed by the refused pull: %+v", fm)
+	}
+}
+
+// TestDriverPullNameValidation: names outside wsNameRe are local
+// api-class refusals - nothing crosses, the manifest is not read.
+func TestDriverPullNameValidation(t *testing.T) {
+	e, reqs, _ := newWsEnv(t, nil)
+	for _, name := range []string{"../evil", "a/b", "A!", "", "x y"} {
+		res := e.call("xuansi_driver_pull", map[string]any{"board": "d75884", "name": name})
+		if !res.IsError || !strings.HasPrefix(resultText(t, res), "api:") {
+			t.Errorf("pull name %q = %v (%v), want a local api-class refusal", name, res, resultText(t, res))
+		}
+	}
+	noContact(t, reqs)
+}
+
+// TestDriverPullUnknownNameNoManifestNoise: pulling a driver the
+// workspace never recorded still removes the board file (that is the
+// cleanup path's point) but writes NO empty manifest entry - history
+// records pushes, not the absence of them.
+func TestDriverPullUnknownNameNoManifestNoise(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
+	res := e.call("xuansi_driver_pull", map[string]any{"board": "d75884", "name": "leftover"})
+	if res.IsError {
+		t.Fatalf("pull of a never-stored name failed: %s", resultText(t, res))
+	}
+	if req := wantReq(t, reqs); req.Type != "fs_rm" || req.Path != "/drv/leftover.lua" {
+		t.Errorf("fs_rm request = %+v, want the removal at /drv/leftover.lua", req)
+	}
+	if out := structured(t, res); out["pulled"] != true || out["path"] != "/drv/leftover.lua" {
+		t.Errorf("pull result = %v, want {pulled:true, path:/drv/leftover.lua}", out)
+	}
+	m := wsManifest(t, root)
+	if _, ok := m.Drivers["leftover"]; ok {
+		t.Errorf("manifest grew a %q entry with no history: %+v", "leftover", m.Drivers["leftover"])
+	}
+}
+
+// TestDriverPullConcurrentWithPush: a pull racing a re-push of the
+// same driver serializes on wsMu - the manifest file is never torn
+// (it reloads whole) and the final Active is EXACTLY one of the two
+// outcomes: "" (pull's write won) or the pushed version (push's write
+// won). Whichever wins, the stored version and its board footprint
+// survive - history never lies.
+func TestDriverPullConcurrentWithPush(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
+	content := "--@api 1\n-- race v1.0.0\nreturn {}\n"
+	mustPut(t, e, "race", "1.0.0", content)
+	if res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "race", "version": "1.0.0",
+	}); res.IsError {
+		t.Fatalf("seed push failed: %s", resultText(t, res))
+	}
+	for i := 0; i < 3; i++ {
+		wantReq(t, reqs)
+	}
+
+	outPull := e.callAsync("xuansi_driver_pull", map[string]any{"board": "d75884", "name": "race"})
+	outPush := e.callAsync("xuansi_driver_push", map[string]any{"board": "d75884", "name": "race", "version": "1.0.0"})
+	for _, out := range []chan *mcpsdk.CallToolResult{outPull, outPush} {
+		if res := waitResult(t, out, "concurrent pull/push"); res.IsError {
+			t.Fatalf("concurrent pull/push failed: %s", resultText(t, res))
+		}
+	}
+	for i := 0; i < 4; i++ { // pull: fs_rm; push: caps + write + read-back
+		wantReq(t, reqs)
+	}
+
+	m, err := loadManifest(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatalf("manifest torn by the race (cannot reload): %v", err)
+	}
+	ent, ok := m.Drivers["race"]
+	if !ok || len(ent.Files) != 1 {
+		t.Fatalf("manifest after the race = %+v, want the one whole version entry", m.Drivers)
+	}
+	fm := ent.Files["1.0.0"]
+	if fm.Sha256 != sha256hex([]byte(content)) || fm.Size != len(content) || fm.Boards["d75884"].IsZero() {
+		t.Fatalf("history disturbed by the race: %+v", fm)
+	}
+	if ent.Active != "" && ent.Active != "1.0.0" {
+		t.Fatalf("Active = %q, want exactly one of the two outcomes (\"\" or 1.0.0)", ent.Active)
 	}
 }

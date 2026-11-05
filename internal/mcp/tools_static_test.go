@@ -15,6 +15,8 @@ import (
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"xuansi/internal/server"
 )
 
 // base64Std encodes data with the standard alphabet (the data_b64
@@ -387,6 +389,80 @@ func TestFsWriteBase64PaddingStrictness(t *testing.T) {
 	noContact(t, reqs)
 }
 
+// TestFsRmWhitelistRefusedLocally (B8 task 1): fs_rm is the
+// destructive fs face, so it carries a client-side path whitelist
+// mirroring the fw's own fs gate (frozen op table 8: NAMED FILES under
+// /lua/ or /drv/ only). The exhaustive rejection set: traversal, the bare
+// roots, trailing slashes, empty "//" segments, subdirectories, the
+// cwd/parent references, non-absolute paths, other prefixes, and the
+// empty path - every one refused client-side, zero crossings.
+func TestFsRmWhitelistRefusedLocally(t *testing.T) {
+	e, reqs := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	for _, path := range []string{
+		"",                  // empty
+		"/drv",              // the root dir itself, not a named file
+		"/lua",              // ditto
+		"/drv/",             // trailing slash = not a file name
+		"/lua/",             // ditto
+		"/drv/../x.lua",     // traversal
+		"/lua/../drv/x.lua", // traversal out of the whitelisted root
+		"/drv//x.lua",       // empty segment
+		"/lua//x.lua",       // ditto
+		"/etc/passwd",       // non-whitelisted prefix
+		"drv/x.lua",         // not absolute
+		"/lua/sub/x.lua",    // subdirectory: named files only
+		"/drv/.",            // cwd reference
+		"/drv/..",           // parent reference
+	} {
+		res := e.call("xuansi_fs_rm", map[string]any{"board": "d75884", "path": path})
+		if !res.IsError {
+			t.Errorf("fs_rm %q succeeded, want a local refusal", path)
+			continue
+		}
+		if got := resultText(t, res); !strings.HasPrefix(got, "api:") {
+			t.Errorf("fs_rm %q error = %q, want the api-class refusal", path, got)
+		}
+	}
+	noContact(t, reqs) // every bad path was refused before any crossing
+}
+
+// TestFsRmCrossesWithHolder: a whitelisted path crosses as the fs_rm
+// request under the effective holder, and the daemon's ack result
+// passes back verbatim.
+func TestFsRmCrossesWithHolder(t *testing.T) {
+	e, reqs := newEnv(t, []step{{result: map[string]any{"ok": true}}}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_fs_rm", map[string]any{"board": "d75884", "path": "/drv/gone.lua"})
+	if res.IsError {
+		t.Fatalf("fs_rm failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Type != "fs_rm" || req.Board != "d75884" || req.Path != "/drv/gone.lua" || req.Holder != "mcp-fixed01" {
+		t.Errorf("fs_rm request = %+v, want the held removal at /drv/gone.lua", req)
+	}
+	if m := structured(t, res); m["ok"] != true {
+		t.Errorf("fs_rm result = %v, want the daemon ack verbatim", m)
+	}
+}
+
+// TestFsRmErrorPassthrough: the daemon's structured refusal (the
+// board's api not-found riding fs_rm) crosses to the tool error text
+// exactly - class and msg, no rewording.
+func TestFsRmErrorPassthrough(t *testing.T) {
+	e, _ := newEnv(t, []step{{rerr: &server.RPCError{
+		Class: "api", Msg: "rm '/drv/miss.lua' failed (No such file or directory)",
+	}}}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_fs_rm", map[string]any{"board": "d75884", "path": "/drv/miss.lua"})
+	if !res.IsError {
+		t.Fatalf("fs_rm on a missing file succeeded: %+v", res)
+	}
+	want := "api: rm '/drv/miss.lua' failed (No such file or directory)"
+	if got := resultText(t, res); got != want {
+		t.Errorf("error text = %q, want exactly %q", got, want)
+	}
+}
+
 // opsFaceAllowlistPinned mirrors the ops face's frozen allowlist
 // (transcribed independently of the daemon's table — server_test.go
 // holds the table-side pin; a shared typo survives only if both copies
@@ -463,6 +539,8 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_ws_get":        {"name", "version"},
 	"xuansi_driver_push":   {"board", "name"},
 	"xuansi_capture":       {"board", "source"},
+	"xuansi_fs_rm":         {"board", "path"},
+	"xuansi_driver_pull":   {"board", "name"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static

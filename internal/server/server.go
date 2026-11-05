@@ -714,6 +714,8 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hFsWrite(ctx, cc, req)
 	case "fs_read":
 		result, err = s.hFsRead(ctx, req)
+	case "fs_rm":
+		result, err = s.hFsRm(ctx, cc, req)
 	case "op":
 		result, err = s.hOp(ctx, cc, req)
 	case "watch_events":
@@ -1218,6 +1220,22 @@ func (s *Server) hFsRead(ctx context.Context, req *Request) (any, error) {
 		return nil, rerr
 	}
 	return s.boardOp(ctx, b, "fs.read", map[string]any{"path": req.Path})
+}
+
+// hFsRm removes one board file (op fs.rm) under fs_write's lease gate
+// — the removal path the fs face lacked until B8 (the b7 full HIL had
+// to clean /drv over an out-of-pipeline direct REPL, honestly labeled).
+// The board's error class/msg cross verbatim: a missing file is the
+// board's own api not-found, never reworded daemon-side.
+func (s *Server) hFsRm(ctx context.Context, cc *clientConn, req *Request) (any, error) {
+	b, rerr := s.resolve(req.Board)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
+		return nil, err
+	}
+	return s.boardOp(ctx, b, "fs.rm", map[string]any{"path": req.Path})
 }
 
 func (s *Server) hWatchEvents(ctx context.Context, cc *clientConn, req *Request) (any, error) {
