@@ -27,6 +27,7 @@ import (
 	"xuansi/internal/board"
 	"xuansi/internal/discover"
 	"xuansi/internal/lease"
+	"xuansi/internal/paths"
 	"xuansi/internal/replclient"
 )
 
@@ -66,12 +67,11 @@ const USBRebootWarning = "USB transport: opening the port REBOOTS the board — 
 
 // DefaultSockPath is the daemon socket: $XDG_RUNTIME_DIR/xuansi/daemon.sock,
 // falling back to /tmp/xuansi-daemon.sock when XDG_RUNTIME_DIR is unset
-// (e.g. a systemd unit without the env, or a manual run).
+// (e.g. a systemd unit without the env, or a manual run). Resolution
+// lives in internal/paths (per-OS; this delegation is byte-identical
+// on Linux).
 func DefaultSockPath() string {
-	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		return filepath.Join(x, "xuansi", "daemon.sock")
-	}
-	return "/tmp/xuansi-daemon.sock"
+	return paths.SockPath()
 }
 
 // defaultBoardsFile is the zero-config boards.conf location.

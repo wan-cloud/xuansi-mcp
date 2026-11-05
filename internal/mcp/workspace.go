@@ -49,6 +49,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"xuansi/internal/paths"
 	"xuansi/internal/server"
 )
 
@@ -57,18 +58,12 @@ import (
 
 // wsRoot is the default workspace root: $XDG_DATA_HOME/xuansi/workspace,
 // or ~/.local/share/xuansi/workspace when XDG_DATA_HOME is unset — the
-// XDG data convention, os.UserConfigDir's data-dir analogue. Tests
-// inject their root through Options.WorkspaceRoot instead of mutating
-// the environment.
+// XDG data convention, os.UserConfigDir's data-dir analogue; the
+// per-OS data-dir resolution lives in internal/paths (byte-identical
+// on Linux). Tests inject their root through Options.WorkspaceRoot
+// instead of mutating the environment.
 func wsRoot() string {
-	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
-		return filepath.Join(d, "xuansi", "workspace")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".local", "share", "xuansi", "workspace")
-	}
-	return filepath.Join(home, ".local", "share", "xuansi", "workspace")
+	return filepath.Join(paths.DataDir(), "workspace")
 }
 
 // wsMu serializes every manifest read-modify-write cycle in-process
