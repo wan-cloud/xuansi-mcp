@@ -38,12 +38,21 @@ func (ts *toolset) call(ctx context.Context, req server.Request) (map[string]any
 // submit/script_*/fs_write/op): the effective holder is stamped on
 // and the binding mirror settled once the daemon has REPLIED (its
 // bindHolder runs before dispatch — refusal or not, the holder the
-// daemon saw is what sticks).
+// daemon saw is what sticks). ONE exception: a class-"holder"
+// refusal means the daemon ALREADY had a different binding and never
+// bound the sent value — settling it could poison the mirror under
+// concurrent first calls (the loser's refusal processing before the
+// winner's success would pin the loser as the identity; review round
+// 1), so it never settles.
 func (ts *toolset) callHeld(ctx context.Context, req server.Request) (map[string]any, error) {
 	req.Holder = ts.holders.effective(req.Holder)
 	res, err := invoke(ctx, ts.c, req)
 	var rerr *server.RPCError
-	if err == nil || errors.As(err, &rerr) {
+	switch {
+	case errors.As(err, &rerr) && rerr.Class == "holder":
+		// refused against the daemon's existing binding: nothing
+		// settled daemon-side, so there is nothing to mirror
+	case err == nil || errors.As(err, &rerr):
 		ts.holders.settle(req.Holder)
 	}
 	return res, err

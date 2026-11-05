@@ -10,6 +10,8 @@ package mcp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"reflect"
@@ -127,12 +129,11 @@ type env struct {
 	cl *mcpsdk.ClientSession
 }
 
-// newEnv wires a full environment against a scripted fake daemon.
-func newEnv(t *testing.T, script []step, opts Options) (*env, chan server.Request) {
+// wireMCP wires the MCP half (apiclient ← server ⇄ in-memory client)
+// against a caller-owned fake daemon — for scripted daemons beyond
+// serveScript's fixed reply queue (e.g. request-dependent behavior).
+func wireMCP(t *testing.T, fd *fakeDaemon, opts Options) *env {
 	t.Helper()
-	fd := newFakeDaemon(t)
-	reqs := fd.serveScript(t, script)
-
 	c, err := apiclient.Dial(fd.path)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +157,15 @@ func newEnv(t *testing.T, script []step, opts Options) (*env, chan server.Reques
 		ss.Close()
 		c.Close()
 	})
-	return e, reqs
+	return e
+}
+
+// newEnv wires a full environment against a scripted fake daemon.
+func newEnv(t *testing.T, script []step, opts Options) (*env, chan server.Request) {
+	t.Helper()
+	fd := newFakeDaemon(t)
+	reqs := fd.serveScript(t, script)
+	return wireMCP(t, fd, opts), reqs
 }
 
 // call invokes one tool; tool errors (IsError results) are part of the
@@ -170,6 +179,26 @@ func (e *env) call(name string, args map[string]any) *mcpsdk.CallToolResult {
 		e.t.Fatalf("call %s: %v", name, err)
 	}
 	return res
+}
+
+// callAsync invokes one tool on its own goroutine — concurrent-call
+// scenarios, observed under a timeout via waitResult.
+func (e *env) callAsync(name string, args map[string]any) chan *mcpsdk.CallToolResult {
+	out := make(chan *mcpsdk.CallToolResult, 1)
+	go func() { out <- e.call(name, args) }()
+	return out
+}
+
+// waitResult receives one async tool result within 5s or fails.
+func waitResult(t *testing.T, ch <-chan *mcpsdk.CallToolResult, what string) *mcpsdk.CallToolResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		return nil
+	}
 }
 
 // resultText returns the first text content of a tool result.
@@ -335,6 +364,119 @@ func TestHolderEffectiveAndSettle(t *testing.T) {
 	fresh.settle("agent-1") // the FIRST holder the daemon saw binds
 	if got := fresh.effective(""); got != "agent-1" {
 		t.Errorf("effective after first-settle = %q, want agent-1", got)
+	}
+}
+
+// TestHolderRefusalNeverSettles (review round 1, unit pin): a
+// class-"holder" refusal means the daemon ALREADY had a different
+// binding and never bound the sent holder — callHeld must not settle
+// the mirror on it. Pre-fix, this pins the loser as the process
+// identity while the mirror is still empty.
+func TestHolderRefusalNeverSettles(t *testing.T) {
+	fd := newFakeDaemon(t)
+	fd.serveScript(t, []step{{rerr: &server.RPCError{
+		Class: "holder",
+		Msg:   `connection bound to holder "agent-x", request says "agent-y"`,
+	}}})
+	c, err := apiclient.Dial(fd.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ts := &toolset{c: c, holders: newHolderState("mcp-dflt")}
+	_, callErr := ts.callHeld(context.Background(), server.Request{Type: "lease", Board: "d75884", Holder: "agent-y"})
+	var rerr *server.RPCError
+	if !errors.As(callErr, &rerr) || rerr.Class != "holder" {
+		t.Fatalf("callHeld error = %v, want the holder-class refusal", callErr)
+	}
+	if got := ts.holders.effective(""); got != "mcp-dflt" {
+		t.Errorf("effective after a holder refusal = %q, want the untouched default mcp-dflt (refused holders never settle)", got)
+	}
+}
+
+// TestConcurrentFirstHoldersRideTheWinner (review round 1, the race
+// driven end-to-end): two concurrent first calls with different
+// holders — the daemon binds whichever lands first (mirroring its
+// bindHolder: first holder binds, different ones refused) and refuses
+// the other. Whatever order the replies PROCESS client-side, a later
+// default-holder call must ride the WINNER — the daemon's actual
+// binding. Pre-fix, the loser's refusal processing before the
+// winner's success poisoned the mirror with the loser's holder, and
+// every subsequent default call failed with class "holder" until
+// process restart; post-fix every interleaving converges on the
+// winner, so this test is deterministic.
+func TestConcurrentFirstHoldersRideTheWinner(t *testing.T) {
+	fd := newFakeDaemon(t)
+	reqs := make(chan server.Request, 8)
+	fd.serve(t, func(conn net.Conn) {
+		var bound string // the daemon's binding: the first holder it saw
+		for {
+			var req server.Request
+			if err := server.ReadMsg(conn, &req); err != nil {
+				return // client close: expected shutdown path
+			}
+			select {
+			case reqs <- req:
+			default:
+				t.Errorf("fake daemon: unexpected extra request %+v", req)
+			}
+			var rep *server.Reply
+			switch {
+			case bound == "":
+				bound = req.Holder // bindHolder: the first holder binds
+				rep = &server.Reply{Type: "reply", ID: req.ID,
+					Result: map[string]any{"board": "d75884", "holder": bound, "session": 1.0}}
+			case req.Holder != bound:
+				rep = &server.Reply{Type: "reply", ID: req.ID,
+					Error: &server.RPCError{Class: "holder",
+						Msg: fmt.Sprintf("connection bound to holder %q, request says %q", bound, req.Holder)}}
+			default:
+				rep = &server.Reply{Type: "reply", ID: req.ID,
+					Result: map[string]any{"board": "d75884", "holder": bound}}
+			}
+			if err := server.WriteMsg(conn, rep); err != nil {
+				t.Errorf("fake daemon reply: %v", err)
+				return
+			}
+		}
+	})
+	e := wireMCP(t, fd, Options{Holder: "mcp-dflt"})
+
+	outX := e.callAsync("xuansi_lease", map[string]any{"board": "d75884", "holder": "agent-x"})
+	outY := e.callAsync("xuansi_lease", map[string]any{"board": "d75884", "holder": "agent-y"})
+	resX := waitResult(t, outX, "the agent-x lease result")
+	resY := waitResult(t, outY, "the agent-y lease result")
+
+	winner, refusals := "", 0
+	for _, res := range []*mcpsdk.CallToolResult{resX, resY} {
+		if res.IsError {
+			refusals++
+			if got := resultText(t, res); !strings.HasPrefix(got, "holder: connection bound to holder") {
+				t.Errorf("refusal text = %q, want the daemon's holder-class refusal", got)
+			}
+			continue
+		}
+		if h, _ := structured(t, res)["holder"].(string); h != "" {
+			winner = h
+		}
+	}
+	if refusals != 1 || winner == "" {
+		t.Fatalf("want exactly one lease success + one holder refusal, got winner=%q refusals=%d", winner, refusals)
+	}
+
+	// the regression pin: the later DEFAULT-holder call rides the
+	// winner (the daemon's actual binding) — under the poisoned mirror
+	// it carried the refused loser and drew a second holder-class
+	// refusal
+	res := e.call("xuansi_release", map[string]any{"board": "d75884"})
+	if res.IsError {
+		t.Fatalf("post-race release failed (mirror poisoned?): %s", resultText(t, res))
+	}
+	wantReq(t, reqs) // lease winner
+	wantReq(t, reqs) // lease loser
+	if req := wantReq(t, reqs); req.Holder != winner {
+		t.Errorf("post-race release holder = %q, want the winner %q", req.Holder, winner)
 	}
 }
 
