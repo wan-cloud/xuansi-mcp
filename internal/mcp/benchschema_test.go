@@ -184,6 +184,12 @@ func TestBenchSchemaDescFaithfulness(t *testing.T) {
 		{"pwm.setup", "2^resolution"}, // duty bound
 		{"events.on", "polling"},
 		{"events.next", "0..5000"},
+		// the callback-registering ops must name the events face's
+		// arming path (final review): the sources flow only after
+		// xuansi_capture arms them board-side.
+		{"gpio.on", "xuansi_capture"},
+		{"uart.on", "xuansi_capture"},
+		{"events.on", "xuansi_capture"},
 	}
 	for _, s := range spots {
 		fn, ok := byName[s.fn]

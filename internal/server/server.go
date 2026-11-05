@@ -1032,7 +1032,7 @@ func validateArgsPath(prefix string, v any, path string) (any, *RPCError) {
 				path = "args"
 			}
 			return nil, &RPCError{Class: "api",
-				Msg: fmt.Sprintf("%s: %s: non-integer or ≥2^53 number", prefix, path)}
+				Msg: fmt.Sprintf("%s: %s: non-integer or |v|≥2^53 number", prefix, path)}
 		}
 		return int64(x), nil
 	case map[string]any:

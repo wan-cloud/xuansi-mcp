@@ -308,8 +308,10 @@ func TestRegistersExactStaticToolset(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got []string
+	desc := map[string]string{}
 	for _, tool := range lr.Tools {
 		got = append(got, tool.Name)
+		desc[tool.Name] = tool.Description
 		if tool.Description == "" {
 			t.Errorf("tool %s has an empty description", tool.Name)
 		}
@@ -357,6 +359,13 @@ func TestRegistersExactStaticToolset(t *testing.T) {
 	}
 	if r := required(byName["xuansi_driver_push"]); !r["board"] || !r["name"] || r["version"] || r["holder"] {
 		t.Errorf("driver_push required = %v, want board+name only (version/holder optional)", r)
+	}
+	// the polling tool carries the events face's arming precondition
+	// (final review): gpio.N/uartN.rx/stdout/net flow only after the
+	// source is armed board-side, and xuansi_capture is this face's
+	// in-contract arming path.
+	if d := desc["xuansi_events_recent"]; !strings.Contains(d, "armed") || !strings.Contains(d, "xuansi_capture") {
+		t.Errorf("events_recent description = %q, want the arming precondition naming xuansi_capture", d)
 	}
 }
 

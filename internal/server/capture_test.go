@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"xuansi/internal/replclient"
 )
 
 // newCaptureEnv builds a leased test env with the captures root pinned
@@ -402,6 +404,39 @@ func TestCaptureJobRefused(t *testing.T) {
 	// none of the refusals leaked a session: the ids never existed
 	if _, e := captureStop(t, c, 4, "cap-1"); e == nil {
 		t.Errorf("stopping a never-started capture id did not fail")
+	}
+}
+
+// TestCaptureSubscribeRefusalLeavesNoFile (final review): a refused
+// board-side subscribe crosses verbatim AND leaves no 0-byte file
+// behind — the capture never started, so its path is unlinked and the
+// captures root stays empty (litter, not corruption — but no litter).
+func TestCaptureSubscribeRefusalLeavesNoFile(t *testing.T) {
+	e, c := newCaptureEnv(t)
+	f := e.fakes["d75884"]
+	f.ops["events.subscribe"] = func(args map[string]any) (map[string]any, *replclient.OpError) {
+		if args["source"] == "uart1.rx" {
+			return nil, &replclient.OpError{Op: "events.subscribe", Class: "api", Msg: "uart1 not setup"}
+		}
+		return map[string]any{"source": args["source"]}, nil
+	}
+
+	reply, _ := c.call(2, map[string]any{"type": "capture_start", "board": "d75884", "source": "uart1.rx"})
+	errE := errOf(t, reply)
+	if errE == nil || asStr(errE["class"]) != "api" || !strings.Contains(asStr(errE["msg"]), "uart1 not setup") {
+		t.Fatalf("subscribe-refused capture_start error = %#v, want the board refusal verbatim", errE)
+	}
+
+	ents, rerr := os.ReadDir(captureRootOf(t, e))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(ents) != 0 {
+		t.Errorf("captures root after refused subscribe = %v, want empty (no 0-byte litter)", ents)
+	}
+	// and no session leaked either
+	if _, serr := captureStop(t, c, 3, "cap-1"); serr == nil {
+		t.Errorf("stopping the never-started capture id did not fail")
 	}
 }
 

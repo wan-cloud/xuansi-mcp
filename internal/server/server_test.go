@@ -1499,13 +1499,13 @@ func TestEvalArgsValidation(t *testing.T) {
 		args any
 		want string
 	}{
-		{"fraction", map[string]any{"x": 0.5}, "eval args: x: non-integer or ≥2^53 number"},
-		{"+2^53 (corruptible literal 2^53+1)", map[string]any{"x": 9007199254740993}, "eval args: x: non-integer or ≥2^53 number"},
-		{"+2^53 exactly", map[string]any{"x": 9007199254740992}, "eval args: x: non-integer or ≥2^53 number"},
-		{"-2^53 exactly", map[string]any{"x": -9007199254740992}, "eval args: x: non-integer or ≥2^53 number"},
-		{"-2^53-2 (corruptible literal)", map[string]any{"x": -9007199254740994}, "eval args: x: non-integer or ≥2^53 number"},
-		{"-2^63 (int64 floor, beyond the guard)", map[string]any{"x": float64(math.MinInt64)}, "eval args: x: non-integer or ≥2^53 number"},
-		{"array leaf beyond 2^53", map[string]any{"a": []any{float64(1), 1e300}}, "eval args: a[1]: non-integer or ≥2^53 number"},
+		{"fraction", map[string]any{"x": 0.5}, "eval args: x: non-integer or |v|≥2^53 number"},
+		{"+2^53 (corruptible literal 2^53+1)", map[string]any{"x": 9007199254740993}, "eval args: x: non-integer or |v|≥2^53 number"},
+		{"+2^53 exactly", map[string]any{"x": 9007199254740992}, "eval args: x: non-integer or |v|≥2^53 number"},
+		{"-2^53 exactly", map[string]any{"x": -9007199254740992}, "eval args: x: non-integer or |v|≥2^53 number"},
+		{"-2^53-2 (corruptible literal)", map[string]any{"x": -9007199254740994}, "eval args: x: non-integer or |v|≥2^53 number"},
+		{"-2^63 (int64 floor, beyond the guard)", map[string]any{"x": float64(math.MinInt64)}, "eval args: x: non-integer or |v|≥2^53 number"},
+		{"array leaf beyond 2^53", map[string]any{"a": []any{float64(1), 1e300}}, "eval args: a[1]: non-integer or |v|≥2^53 number"},
 	} {
 		rep, _ := c.call(int64(10+i), map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "args": tc.args})
 		er := errOf(t, rep)
@@ -1523,7 +1523,7 @@ func TestEvalArgsValidation(t *testing.T) {
 	// submit validates with the same message
 	rep, _ = c.call(20, map[string]any{"type": "submit", "board": "d75884", "code": "return 1", "tag": "t1", "args": map[string]any{"x": 0.5}})
 	er := errOf(t, rep)
-	if asStr(er["class"]) != "api" || asStr(er["msg"]) != "eval args: x: non-integer or ≥2^53 number" {
+	if asStr(er["class"]) != "api" || asStr(er["msg"]) != "eval args: x: non-integer or |v|≥2^53 number" {
 		t.Fatalf("submit validation: %#v", er)
 	}
 	if boardEvals != 0 {
@@ -1633,7 +1633,7 @@ func TestOpBudgetGetTranslation(t *testing.T) {
 	e.fakes["d75884"].on("caps", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		return map[string]any{
 			"api_version": float64(1),
-			"limits": map[string]any{"eval_budget_ms": float64(3000), "event_budget_ms": float64(50)},
+			"limits":      map[string]any{"eval_budget_ms": float64(3000), "event_budget_ms": float64(50)},
 		}, nil
 	})
 	rep, _ = c.call(2, map[string]any{"type": "op", "board": "d75884", "op": "budget.get"})
@@ -1714,10 +1714,10 @@ func TestOpArgsValidation(t *testing.T) {
 		args any
 		want string
 	}{
-		{"fraction", map[string]any{"x": 0.5}, "op args: x: non-integer or ≥2^53 number"},
-		{"+2^53", map[string]any{"x": 9007199254740992}, "op args: x: non-integer or ≥2^53 number"},
-		{"-2^53-2", map[string]any{"x": -9007199254740994}, "op args: x: non-integer or ≥2^53 number"},
-		{"array leaf", map[string]any{"a": []any{float64(1), 1e300}}, "op args: a[1]: non-integer or ≥2^53 number"},
+		{"fraction", map[string]any{"x": 0.5}, "op args: x: non-integer or |v|≥2^53 number"},
+		{"+2^53", map[string]any{"x": 9007199254740992}, "op args: x: non-integer or |v|≥2^53 number"},
+		{"-2^53-2", map[string]any{"x": -9007199254740994}, "op args: x: non-integer or |v|≥2^53 number"},
+		{"array leaf", map[string]any{"a": []any{float64(1), 1e300}}, "op args: a[1]: non-integer or |v|≥2^53 number"},
 	} {
 		rep, _ := c.call(int64(10+i), map[string]any{"type": "op", "board": "d75884", "op": "budget.set", "args": tc.args})
 		er := errOf(t, rep)

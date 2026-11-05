@@ -66,7 +66,7 @@
 // integer literal client-side, a sign-symmetric hazard, hence a
 // sign-symmetric guard — is a daemon-side "api" error naming the
 // offending path under the face's prefix ("eval args: a.b[2]:
-// non-integer or ≥2^53 number", same shape for op as "op args: …").
+// non-integer or |v|≥2^53 number", same shape for op as "op args: …").
 // The largest integers that cross are ±(2^53-1).
 //
 // # The ops face (op passthrough)

@@ -74,7 +74,7 @@ var benchSchemaV1 = []BenchFn{
 	{Prim: "gpio", Op: "read", Params: []BenchParam{pi("pin")},
 		Desc: `read the pin level; returns 0/1. A never-configured pin auto-enters safe input on first read (and is acquired)`},
 	{Prim: "gpio", Op: "on", Params: []BenchParam{pi("pin"), pe("edge", "rising", "falling", "both"), ps("fn")},
-		Desc: `register an edge callback — resident scripts only. fn is a Lua function and CANNOT cross this tool's bridge (the args bridge carries no functions): call it via xuansi_run_lua/xuansi_script_start with a resident yield loop instead, or take gpio.N events through the events face. Expanded only because caps advertises the op; the board refuses a non-function value verbatim`},
+		Desc: `register an edge callback — resident scripts only. fn is a Lua function and CANNOT cross this tool's bridge (the args bridge carries no functions): call it via xuansi_run_lua/xuansi_script_start with a resident yield loop instead, or take gpio.N events through the events face (the source must be armed board-side first — xuansi_capture is this face's arming path). Expanded only because caps advertises the op; the board refuses a non-function value verbatim`},
 
 	// uart — §7
 	{Prim: "uart", Op: "setup", Params: []BenchParam{pi("port"), pt("cfg")},
@@ -84,7 +84,7 @@ var benchSchemaV1 = []BenchFn{
 	{Prim: "uart", Op: "read", Params: []BenchParam{pi("port"), pi("max"), opt(pi("timeout_ms"))},
 		Desc: `read up to max bytes (max ≤65536), waiting until timeout_ms then returning the partial data WITHOUT raising (the frozen API's deliberate timeout exception). timeout_ms optional (omitted or 0 = non-blocking), cap 5000. Returns the byte-string`},
 	{Prim: "uart", Op: "on", Params: []BenchParam{pi("port"), ps("fn")},
-		Desc: `resident-script RX callback fn(data), ≤256B per event, 50ms budget each. fn is a Lua function and cannot cross this tool's bridge — use xuansi_script_start with a resident loop instead; the board refuses a non-function value verbatim`},
+		Desc: `resident-script RX callback fn(data), ≤256B per event, 50ms budget each. fn is a Lua function and cannot cross this tool's bridge — use xuansi_script_start with a resident loop instead (uartN.rx also reaches the events face, but only once armed board-side — xuansi_capture is this face's arming path); the board refuses a non-function value verbatim`},
 
 	// i2c — §7 (master mode only)
 	{Prim: "i2c", Op: "setup", Params: []BenchParam{pi("port"), pt("cfg")},
@@ -135,7 +135,7 @@ var benchSchemaV1 = []BenchFn{
 		Desc: `receive into {{level, us}, …} (≤256); no signal → empty table WITHOUT raising (the deliberate exception, like uart.read); timeout cap 5000ms`},
 
 	// events — §7
-	{Prim: "events", Op: "on", Params: []BenchParam{ps("source"), opt(ps("fn"))}, Desc: `subscribe to source "uart1.rx"/"uart2.rx"/"gpio.N". Omitting fn (the API's fn|nil) subscribes the source into this owner's polling queue — then poll it with events_next. A non-nil fn is a resident-only Lua callback and cannot cross this tool's bridge. Delivered events are tables {source=, kind=, data=} with kind==source; uart data ≤256B, per-owner queue depth 16`},
+	{Prim: "events", Op: "on", Params: []BenchParam{ps("source"), opt(ps("fn"))}, Desc: `subscribe to source "uart1.rx"/"uart2.rx"/"gpio.N". Omitting fn (the API's fn|nil) subscribes the source into this owner's polling queue — then poll it with events_next. A non-nil fn is a resident-only Lua callback and cannot cross this tool's bridge. Delivered events are tables {source=, kind=, data=} with kind==source; uart data ≤256B, per-owner queue depth 16. The events face's pushed events flow only after the source is armed board-side — xuansi_capture is this face's arming path`},
 	{Prim: "events", Op: "off", Params: []BenchParam{ps("source")},
 		Desc: `unsubscribe a source; a not-subscribed source refuses with class api`},
 	{Prim: "events", Op: "next", Params: []BenchParam{pi("timeout_ms")},

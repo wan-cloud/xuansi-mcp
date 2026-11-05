@@ -139,7 +139,7 @@ func startB6Daemon(h *harness, bin, sock, boardsFile string, extraEnv string) *b
 // its stderr pumped into the transcript. Returns the proc plus the two
 // pipe ends the SDK transport rides.
 func startB6MCP(h *harness, bin, sock, extraEnv string) (*b6Proc, io.ReadCloser, io.WriteCloser) {
-	inR, inW, err1 := os.Pipe()  // child stdin <- client writes
+	inR, inW, err1 := os.Pipe()   // child stdin <- client writes
 	outR, outW, err2 := os.Pipe() // child stdout -> client reads
 	if err1 != nil || err2 != nil {
 		h.check(false, fmt.Sprintf("mcp pipes: %v %v", err1, err2))
@@ -498,9 +498,6 @@ func runB6MCP(attempt int, daemonBin, runDir string) int {
 	var mcpR io.ReadCloser
 	var mcpW io.WriteCloser
 	mcp, mcpR, mcpW = startB6MCP(h, daemonBin, sock, "XDG_DATA_HOME="+xdg)
-	if mcp == nil {
-		return finish()
-	}
 	if mcp == nil {
 		return finish()
 	}

@@ -13,6 +13,19 @@ package mcp
 // (workspace.go): a reader ever only sees a whole manifest, and
 // concurrent pushes merge their footprints instead of losing them
 // (last-writer-wins on Active, every Boards entry kept).
+//
+// Single-writer expectation (final review): wsMu serializes the RMW
+// in-process ONLY — there is no cross-process lock, so two concurrent
+// `xuansi mcp` sessions sharing one workspace are each free to
+// read-modify-write manifest.json from the last on-disk state and can
+// drop one another's Active/footprint entries (classic lost update).
+// The blast radius is bounded: manifest.json itself always stays whole
+// (atomic rename), versioned driver files never collide (their names
+// are unique by construction), and board state stays read-back-verified
+// (sha256 read-back precedes any manifest write) — the worst case is a
+// stale Active or a missing audit entry, never a corrupt file or an
+// unverified push. Don't run parallel MCP sessions against one
+// workspace.
 
 import (
 	"encoding/json"

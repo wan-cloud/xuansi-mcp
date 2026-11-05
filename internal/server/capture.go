@@ -258,15 +258,21 @@ func (s *Server) hCaptureStart(ctx context.Context, cc *clientConn, req *Request
 
 	// The board-side subscription makes the source actually flow to
 	// the daemon's tap (mirroring watch_events). A refusal (e.g. api
-	// "uart1 not setup") never leaves a session behind: the file
-	// closes, the entry goes, the error crosses verbatim — no done
-	// push, because no capture ever started.
+	// "uart1 not setup") never leaves a session behind: the file closes
+	// and is unlinked (the never-started capture would otherwise leave
+	// 0-byte litter), the entry goes, the error crosses verbatim — no
+	// done push, because no capture ever started.
 	ctl, err := s.warmController(ctx, b)
 	if err == nil {
 		_, err = ctl.Op(ctx, "events.subscribe", map[string]any{"source": req.Source})
 	}
 	if err != nil {
 		s.captureEnd(cs, "", false)
+		// captureEnd closed the file; nothing was ever spooled to it,
+		// so remove the empty shell (final review)
+		if rerr := os.Remove(cs.path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			s.logf("server: capture %s: remove unstarted file: %v", cs.id, rerr)
+		}
 		return nil, err
 	}
 

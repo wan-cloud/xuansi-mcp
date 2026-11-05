@@ -451,6 +451,11 @@ func TestEventsResourceRegisteredAndSnapshotMatchesRing(t *testing.T) {
 		if !strings.Contains(r.Description, "job") {
 			t.Errorf("resource %s description lacks the job-source caveat: %q", r.URI, r.Description)
 		}
+		// the arming precondition (final review): pushed sources flow
+		// only after xuansi_capture arms them board-side.
+		if !strings.Contains(r.Description, "xuansi_capture") || !strings.Contains(r.Description, "armed") {
+			t.Errorf("resource %s description lacks the arming precondition naming xuansi_capture: %q", r.URI, r.Description)
+		}
 	}
 
 	// push two sources; the resource content must equal the rings
