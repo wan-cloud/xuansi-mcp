@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -45,7 +47,10 @@ type BoardRef struct {
 // face. The browse-resolved IP is preferred over the hostname: pure-Go
 // (CGO_ENABLED=0) builds resolve through the pure resolver, which does
 // not speak mDNS — .local SERVFAILs there — so the address the mDNS
-// browse already carried is the reliable route.
+// browse already carried is the reliable route. Rendering goes through
+// net.JoinHostPort — the same contract DialBoard uses — so a v6
+// address dials as "[addr]:port" (a bare "fe80::1:7777" is not a
+// dialable endpoint).
 func (b BoardRef) TCPAddr() string {
 	host := b.IP
 	if host == "" {
@@ -54,7 +59,7 @@ func (b BoardRef) TCPAddr() string {
 	if host == "" || b.Port == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s:%d", host, b.Port)
+	return net.JoinHostPort(host, strconv.Itoa(b.Port))
 }
 
 // Controller is the connection seam the Supervisor drives. Production

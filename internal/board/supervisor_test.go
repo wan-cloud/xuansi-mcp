@@ -232,8 +232,10 @@ const samplePinsDump = "pins (2):\n" +
 // TestBoardRefTCPAddrIPFirst: T10 — the warm controller's endpoint is
 // the browse-resolved IP when the registry filled one (CGO=0 pure
 // resolvers cannot resolve .local; the hostname dial SERVFAILs without
-// the /etc/hosts pin); the hostname stays the fallback, and an IP alone
-// (SRV-less entry) still dials.
+// the /etc/hosts pin); the hostname stays the fallback, an IP alone
+// (SRV-less entry) still dials, and a v6 address renders bracketed via
+// net.JoinHostPort (DialBoard's contract; a bare "fe80::1:7777" is not
+// dialable) while a plain hostname stays unbracketed.
 func TestBoardRefTCPAddrIPFirst(t *testing.T) {
 	cases := []struct {
 		name string
@@ -246,9 +248,19 @@ func TestBoardRefTCPAddrIPFirst(t *testing.T) {
 			want: "10.1.51.205:7777",
 		},
 		{
+			name: "ipv6 address renders bracketed",
+			ref:  BoardRef{MAC6: "d75884", Host: "xuansi-d75884.local", IP: "fe80::1", Port: 7777},
+			want: "[fe80::1]:7777",
+		},
+		{
 			name: "no ip falls back to hostname",
 			ref:  BoardRef{MAC6: "d75884", Host: "xuansi-d75884.local", Port: 7777},
 			want: "xuansi-d75884.local:7777",
+		},
+		{
+			name: "ipv6 without hostname still dials bracketed",
+			ref:  BoardRef{MAC6: "d75884", IP: "fe80::1", Port: 7777},
+			want: "[fe80::1]:7777",
 		},
 		{
 			name: "ip without hostname still dials",
