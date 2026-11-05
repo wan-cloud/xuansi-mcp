@@ -332,7 +332,14 @@ func (s *Server) Close() {
 		}
 		s.leases.Close()
 		for _, db := range sups {
+			// under connectMu: an in-flight connect (warmController /
+			// lease USB / teardown) finishes first, so the controller it
+			// installs is the one sup.Close reclaims — outside the
+			// critical section a re-dial racing the close leaks one
+			// extra controller connection (benign at exit, still wrong).
+			db.connectMu.Lock()
 			db.sup.Close()
+			db.connectMu.Unlock()
 		}
 		if s.ownSock {
 			os.Remove(s.sockPath)
@@ -841,7 +848,7 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 	res := map[string]any{"board": b.MAC6, "holder": holder, "session": sess}
 	if req.Transport == "usb" {
 		db := s.supervisor(b)
-		db.connectMu.Lock()
+		db.connectMu.Lock() // deliberate: held across ConnectUSB (~5s bounded — drain + hello); connects and Close serialize behind it
 		ctl, cerr := db.sup.ConnectUSB(ctx)
 		db.connectMu.Unlock()
 		if cerr != nil {

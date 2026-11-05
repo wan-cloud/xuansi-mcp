@@ -429,6 +429,10 @@ func TestSnapshotIsolation(t *testing.T) {
 	}
 	s1 := r.Snapshot()
 	s1[0].TXT["ver"] = "mutated"
+	// Sources is a slice too: a caller mutating the returned view must
+	// not reach the registry's own entry (aliasing the backing array).
+	s1[0].Sources[0] = "tampered"
+	s1[0].Sources = append(s1[0].Sources, "extra")
 	s2 := r.Snapshot()
 	if s2[0].TXT["ver"] != "3" {
 		t.Error("Snapshot leaks internal TXT map")
@@ -438,6 +442,6 @@ func TestSnapshotIsolation(t *testing.T) {
 	}
 
 	if got := fmt.Sprint(s2[0].Sources); got != "[usb mdns]" {
-		t.Errorf("sources = %s, want [usb mdns]", got)
+		t.Errorf("sources = %s, want [usb mdns] (Snapshot leaks the Sources array)", got)
 	}
 }

@@ -221,7 +221,9 @@ func (r *Registry) MDNSError() string {
 }
 
 // Snapshot returns all known boards (live and stale) sorted by mac6.
-// TXT maps are copied; the Hello pointer is shared read-only.
+// TXT maps and Sources slices are copied — a caller mutating its view
+// never reaches the registry's own entries; the Hello pointer is
+// shared read-only.
 func (r *Registry) Snapshot() []Board {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -233,6 +235,11 @@ func (r *Registry) Snapshot() []Board {
 				txt[k] = v
 			}
 			b.TXT = txt
+		}
+		if b.Sources != nil {
+			srcs := make([]string, len(b.Sources))
+			copy(srcs, b.Sources)
+			b.Sources = srcs
 		}
 		out = append(out, b)
 	}

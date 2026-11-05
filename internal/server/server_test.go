@@ -731,6 +731,91 @@ func TestLeaseUSBTransport(t *testing.T) {
 	}
 }
 
+// TestCloseWaitsForInflightConnect: Close's sup.Close must run under
+// connectMu. A connect parked mid-flight (here: the lease USB route,
+// blocked on its controller's first hello while hLease holds
+// connectMu) finishes after Close started; when sup.Close runs outside
+// the critical section it sees no controller yet (ConnectUSB installs
+// it only after the hello) and the connect's fresh controller link is
+// never closed — a re-dial racing the close leaks one extra controller
+// connection. With sup.Close inside the critical section, Close waits
+// for the connect and reclaims what it installed.
+func TestCloseWaitsForInflightConnect(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	// let the startup audit's TCP dial settle (same idiom as
+	// TestLeaseUSBTransport) so the lease connect below is the only
+	// traffic on this board's supervisor
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && e.dialedTCP("d75884") == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// gate: the USB controller's FIRST hello blocks — parking ConnectUSB
+	// (and hLease's connectMu critical section) mid-connect. Later
+	// hellos (the §12 yield) pass through once the gate is open.
+	usb := e.usbFakes["d75884"]
+	release := make(chan struct{})
+	usb.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		<-release
+		return map[string]any{
+			"protocol_ver": int64(3), "role": "controller", "fw": "xuansi-fw v0.1.0",
+			"fw_build": "deadbee", "fs": true,
+		}, nil
+	})
+
+	c.send(map[string]any{"type": "lease", "board": "d75884", "holder": "u1", "transport": "usb"})
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && e.dialedUSB("d75884") == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := e.dialedUSB("d75884"); n != 1 {
+		t.Fatalf("usb dials = %d, want 1 — lease never reached the USB seam", n)
+	}
+	// the dial happened; give the hello a beat to park in the gate so
+	// the racing Close below cannot win by scheduling luck
+	time.Sleep(20 * time.Millisecond)
+
+	// Close races the in-flight connect: it runs on its own goroutine
+	// because with sup.Close under connectMu it WAITS for the parked
+	// connect.
+	closed := make(chan struct{})
+	go func() {
+		e.srv.Close()
+		close(closed)
+	}()
+	// Barrier: the sock file is removed by Close strictly AFTER the
+	// sups loop, i.e. after the sup.Close decision point. When it
+	// disappears while the connect is still parked, sup.Close has
+	// already run (and seen no controller — ConnectUSB installs one
+	// only after its hello). With sup.Close under connectMu the file
+	// cannot disappear yet, so this poll just times out and opens the
+	// gate with Close still parked behind connectMu.
+	deadline = time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(e.sock); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// the connect finishes and installs the fresh controller
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Close did not return within 5s of the connect finishing")
+	}
+	select {
+	case <-e.srv.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("server goroutines did not finish within 5s of Close+release")
+	}
+	if !usb.Dead() {
+		t.Fatalf("USB controller left alive after Close — sup.Close ran outside connectMu and missed the racing connect's fresh controller (leaked connection)")
+	}
+}
+
 // TestLeaseDefaultPathUnchanged: a plain lease (no transport) keeps the
 // default TCP semantics — no warning keys in the reply, the USB seam
 // never touched, the first op dials the warm TCP route.
