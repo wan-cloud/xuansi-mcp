@@ -79,6 +79,11 @@
 //	budget.get  budget.set  wifi.status  wifi.setup  wifi.off
 //	log.read    caps        diag.pins    diag.heapinfo  diag.stats
 //
+// budget.get is the one assembled view: the frozen wire has no getter
+// op (budget.set refuses its no-keys form), so the daemon reads caps —
+// whose limits block reflects the runtime budgets — and projects the
+// {eval_ms, event_ms} pair; the board never sees a budget.get op.
+//
 // args cross through the SAME numeric walk as eval/submit (controller
 // ruling): integral JSON numbers convert to int64 and msgpack-encode
 // as ints (budget.set's counters would otherwise reach the fw as

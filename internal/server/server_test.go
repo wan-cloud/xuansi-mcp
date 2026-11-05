@@ -1615,12 +1615,12 @@ func TestOpPassthroughAllowlist(t *testing.T) {
 	}
 }
 
-// TestOpBudgetGetTranslation: budget.get crosses to the board as
-// budget.set with NO keys — the frozen §4 getter form (missing keys
-// keep the current values; the reply carries the applied pair) — so
-// the ops face's documented budget.get works against the real board,
-// whose op table carries only budget.set (b6 full-HIL finding: the
-// unit fake used to accept the raw name the daemon sent).
+// TestOpBudgetGetTranslation: budget.get has no wire op of its own
+// (the frozen §4 table has only budget.set, which refuses its no-keys
+// form), so the ops face reads caps — whose limits block reflects the
+// runtime budgets — and projects the {eval_ms, event_ms} pair it
+// promises. The board must never see a budget.get op (b6 full-HIL
+// finding: the unit fake used to accept the raw name the daemon sent).
 func TestOpBudgetGetTranslation(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -1630,8 +1630,11 @@ func TestOpBudgetGetTranslation(t *testing.T) {
 		t.Fatalf("lease: %#v", rep)
 	}
 
-	e.fakes["d75884"].on("budget.set", func(args map[string]any) (map[string]any, *replclient.OpError) {
-		return map[string]any{"eval_ms": 3000, "event_ms": 50}, nil
+	e.fakes["d75884"].on("caps", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{
+			"api_version": float64(1),
+			"limits": map[string]any{"eval_budget_ms": float64(3000), "event_budget_ms": float64(50)},
+		}, nil
 	})
 	rep, _ = c.call(2, map[string]any{"type": "op", "board": "d75884", "op": "budget.get"})
 	if asMap(rep["error"]) != nil {
@@ -1639,22 +1642,19 @@ func TestOpBudgetGetTranslation(t *testing.T) {
 	}
 	res := asMap(rep["result"])
 	if asInt(res["eval_ms"]) != 3000 || asInt(res["event_ms"]) != 50 {
-		t.Fatalf("budget.get result = %#v, want the applied pair", rep["result"])
+		t.Fatalf("budget.get result = %#v, want the projected applied pair", rep["result"])
 	}
-	sent := false
+	sawCaps := false
 	for _, call := range e.fakes["d75884"].got() {
 		if call.op == "budget.get" {
 			t.Fatal("budget.get crossed to the board verbatim — the wire has no such op")
 		}
-		if call.op == "budget.set" {
-			sent = true
-			if len(call.args) != 0 {
-				t.Fatalf("forwarded args = %#v, want the no-keys getter form", call.args)
-			}
+		if call.op == "caps" {
+			sawCaps = true
 		}
 	}
-	if !sent {
-		t.Fatal("the translated budget.set never reached the board")
+	if !sawCaps {
+		t.Fatal("the caps read behind budget.get never reached the board")
 	}
 }
 

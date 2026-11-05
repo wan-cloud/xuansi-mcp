@@ -1112,17 +1112,26 @@ func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, er
 		}
 		args = v.(map[string]any)
 	}
-	// budget.get has no wire op of its own: the frozen §4 contract makes
-	// budget.set with NO keys the getter (missing keys keep the current
-	// values; the reply carries the applied pair), and the board's op
-	// table has exactly that one budget op. Translate here so the ops
-	// face's documented budget.get works against the real board (found
-	// by the b6 full HIL — the unit fake accepted the raw name).
-	wireOp, wireArgs := req.Op, args
+	// budget.get has no wire op of its own: the frozen §4 table has only
+	// budget.set — and it REFUSES its no-keys form ("missing
+	// eval_ms/event_ms"), so there is no getter to forward. The frozen
+	// read path for the runtime budgets is caps' limits block (「limits
+	// 反映 runtime 當前值」 per the bench API page), so budget.get reads
+	// caps and projects the {eval_ms, event_ms} pair the ops face
+	// promises. Found by the b6 full HIL — the unit fake used to accept
+	// the raw name the daemon sent.
 	if req.Op == "budget.get" {
-		wireOp, wireArgs = "budget.set", nil
+		res, err := s.boardOp(ctx, b, "caps", nil)
+		if err != nil {
+			return nil, err
+		}
+		lim, _ := res["limits"].(map[string]any)
+		return map[string]any{
+			"eval_ms":  lim["eval_budget_ms"],
+			"event_ms": lim["event_budget_ms"],
+		}, nil
 	}
-	return s.boardOp(ctx, b, wireOp, wireArgs)
+	return s.boardOp(ctx, b, req.Op, args)
 }
 
 func (s *Server) hScriptStart(ctx context.Context, cc *clientConn, req *Request) (any, error) {
