@@ -38,11 +38,14 @@ const (
 
 // Test seams (package vars; this package's tests never run parallel):
 // serveSpawn builds the spawn command, spawnDial is the liveness
-// probe, spawnRetryEvery/spawnRetryFor bound the post-spawn retry
-// loop (defaults: 100ms cadence, 10s window).
+// probe, spawnStateDir resolves the serve.log directory (production:
+// paths.StateDir; tests inject a sandbox so they never touch the real
+// user state dir on any OS), spawnRetryEvery/spawnRetryFor bound the
+// post-spawn retry loop (defaults: 100ms cadence, 10s window).
 var (
 	serveSpawn      func(sock, logPath string) *exec.Cmd = buildServeCmd
 	spawnDial       func(path string) (net.Conn, error)  = dialUnix
+	spawnStateDir                                        = paths.StateDir
 	spawnRetryEvery                                      = 100 * time.Millisecond
 	spawnRetryFor                                        = 10 * time.Second
 )
@@ -114,7 +117,7 @@ func ensureDaemon(sockPath string) error {
 		return nil
 	}
 
-	logPath := filepath.Join(paths.StateDir(), serveLogName)
+	logPath := filepath.Join(spawnStateDir(), serveLogName)
 	cmd := serveSpawn(sockPath, logPath)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("cannot spawn xuansi serve for %s: %w", sockPath, err)

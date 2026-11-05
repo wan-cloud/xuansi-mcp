@@ -20,8 +20,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"xuansi/internal/paths"
 )
 
 // spawnFailHelperEnv carries the log path to the failure-tail helper
@@ -60,6 +58,21 @@ func shrinkSpawnRetries(t *testing.T, every, window time.Duration) {
 	origEvery, origFor := spawnRetryEvery, spawnRetryFor
 	spawnRetryEvery, spawnRetryFor = every, window
 	t.Cleanup(func() { spawnRetryEvery, spawnRetryFor = origEvery, origFor })
+}
+
+// sandboxStateDir points the spawnStateDir seam at a fresh sandbox
+// dir and returns it: the spawn tests must never read or write the
+// REAL user state dir on any OS, and env-key redirection cannot do
+// the job — XDG_STATE_HOME only covers the linux resolution while
+// Windows' rides LOCALAPPDATA, which is how the FailureTail marker
+// landed in the real AppData serve.log (the T9 Windows finding).
+func sandboxStateDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := spawnStateDir
+	spawnStateDir = func() string { return dir }
+	t.Cleanup(func() { spawnStateDir = orig })
+	return dir
 }
 
 // overrideSpawn swaps the serveSpawn seam for the test's duration.
@@ -134,9 +147,11 @@ func listenAndHold(t *testing.T, sock string, delay time.Duration) <-chan struct
 // TestEnsureDaemonSpawnsAndDials: a dead socket spawns (via the
 // serveSpawn seam) a helper that listens 150ms in; ensureDaemon
 // retries the REAL dial until it connects, returns nil, and handed
-// the seam the same sock plus the serve.log path under StateDir().
+// the seam the same sock plus the serve.log path under the injected
+// sandbox state dir.
 func TestEnsureDaemonSpawnsAndDials(t *testing.T) {
 	quietSlog(t)
+	state := sandboxStateDir(t)
 	sock := filepath.Join(t.TempDir(), "spawn.sock")
 	shrinkSpawnRetries(t, 10*time.Millisecond, 5*time.Second)
 	bound := listenAndHold(t, sock, 150*time.Millisecond)
@@ -159,7 +174,7 @@ func TestEnsureDaemonSpawnsAndDials(t *testing.T) {
 	if gotSock != sock {
 		t.Fatalf("serveSpawn received sock %q, want %q", gotSock, sock)
 	}
-	if want := filepath.Join(paths.StateDir(), serveLogName); gotLog != want {
+	if want := filepath.Join(state, serveLogName); gotLog != want {
 		t.Fatalf("serveSpawn received log path %q, want %q", gotLog, want)
 	}
 }
@@ -167,6 +182,7 @@ func TestEnsureDaemonSpawnsAndDials(t *testing.T) {
 // TestEnsureDaemonNoSpawnWhenAlive: a live daemon passes straight
 // through — the dial succeeds and serveSpawn must never fire.
 func TestEnsureDaemonNoSpawnWhenAlive(t *testing.T) {
+	sandboxStateDir(t) // even a mistaken spawn must stay off the real state dir
 	sock := filepath.Join(t.TempDir(), "alive.sock")
 	bound := listenAndHold(t, sock, 0)
 	<-bound // the stand-in daemon is really listening before we probe
@@ -188,12 +204,14 @@ func TestEnsureDaemonNoSpawnWhenAlive(t *testing.T) {
 // TestEnsureDaemonFailureTail: the spawned helper dies non-zero
 // without ever listening; after the retry window the error names the
 // sock and quotes the marker line the helper wrote into the serve
-// log. XDG_STATE_HOME redirects StateDir() (linux resolution) into the
-// test's temp dir so the marker never touches the real serve.log.
+// log. The serve.log dir comes from the injected sandbox state dir —
+// never the real user state dir, and via the seam rather than env
+// keys: XDG_STATE_HOME only redirects the linux resolution, so on
+// Windows the marker used to land in the real AppData serve.log
+// (the T9 finding).
 func TestEnsureDaemonFailureTail(t *testing.T) {
 	quietSlog(t)
-	state := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", state)
+	state := sandboxStateDir(t)
 	sock := filepath.Join(t.TempDir(), "dead.sock")
 	shrinkSpawnRetries(t, 5*time.Millisecond, time.Second)
 
@@ -209,7 +227,7 @@ func TestEnsureDaemonFailureTail(t *testing.T) {
 	if err == nil {
 		t.Fatal("ensureDaemon succeeded; want the retry-deadline failure")
 	}
-	wantLog := filepath.Join(state, "xuansi", serveLogName)
+	wantLog := filepath.Join(state, serveLogName)
 	for _, want := range []string{sock, wantLog, spawnFailMarker} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not mention %q", err.Error(), want)
