@@ -414,12 +414,15 @@ func TestCaptureJobRefused(t *testing.T) {
 func TestCaptureSubscribeRefusalLeavesNoFile(t *testing.T) {
 	e, c := newCaptureEnv(t)
 	f := e.fakes["d75884"]
-	f.ops["events.subscribe"] = func(args map[string]any) (map[string]any, *replclient.OpError) {
+	// through the locking on() helper: a bare f.ops[...] write here
+	// races the startup audit's warm-controller ops read (the unlocked
+	// write shipped with da33646 and detonated under -race)
+	f.on("events.subscribe", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		if args["source"] == "uart1.rx" {
 			return nil, &replclient.OpError{Op: "events.subscribe", Class: "api", Msg: "uart1 not setup"}
 		}
 		return map[string]any{"source": args["source"]}, nil
-	}
+	})
 
 	reply, _ := c.call(2, map[string]any{"type": "capture_start", "board": "d75884", "source": "uart1.rx"})
 	errE := errOf(t, reply)
