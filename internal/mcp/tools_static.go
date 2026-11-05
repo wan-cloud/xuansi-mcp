@@ -4,12 +4,13 @@ package mcp
 // 8): one typed tool per proto.go request type of the lease/eval/
 // script/fs/op faces, plus task 10's events_recent (the event face's
 // polling half — static contract name, content from the refresh-fed
-// rings). The websocket/capture tools land with tasks 11-12 and get
-// their own files. Every handler is the same shape: build the
-// internal-API request, cross errors.go's mapping, decode the reply
-// into a typed Out struct — JSON-friendly, with arbitrary board
-// payloads (run_lua's value, ops' results, board acks) passing through
-// verbatim.
+// rings), plus task 11's four driver-workspace tools (workspace.go —
+// versioned store, manifest, gated push). The websocket/capture tools
+// land with task 12 and get their own files. Every handler is the
+// same shape: build the internal-API request, cross errors.go's
+// mapping, decode the reply into a typed Out struct — JSON-friendly,
+// with arbitrary board payloads (run_lua's value, ops' results, board
+// acks) passing through verbatim.
 
 import (
 	"context"
@@ -25,13 +26,15 @@ import (
 
 // toolset carries the static tools' shared state: the daemon
 // connection, the process holder identity, the dynamic face's
-// bookkeeping (tools_dynamic.go), and the event face's rings/
-// resources (resources.go, task 10).
+// bookkeeping (tools_dynamic.go), the event face's rings/
+// resources (resources.go, task 10), and the driver workspace
+// (workspace.go, task 11).
 type toolset struct {
 	c       *apiclient.Client
 	holders *holderState
 	dyn     *dynState
 	ev      *eventState
+	ws      *wsState
 
 	feedMu   sync.Mutex
 	feedStop func() // the ONE apiclient event feed's cancel (nil = not armed)
@@ -233,6 +236,10 @@ var staticToolNames = []string{
 	"xuansi_fs_read",
 	"xuansi_board_op",
 	"xuansi_events_recent",
+	"xuansi_ws_put",
+	"xuansi_ws_list",
+	"xuansi_ws_get",
+	"xuansi_driver_push",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -302,6 +309,26 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_events_recent",
 		Description: "Read one board's most recent events from this process's local rings — no daemon call, no lease. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
 	}, ts.eventsRecent)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_ws_put",
+		Description: "Store one driver VERSION into the daemon-side workspace (drivers/<name>@<version>.lua + its manifest checksum entry). Storing is NOT activating — nothing reaches a board until xuansi_driver_push. The workspace keeps the full file: the board's 16384B single-file cap is a PUSH-time concern, so a fat version can sit here until it slims. Keep every version you may re-deploy — the workspace is the rollback history.",
+	}, ts.wsPut)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_ws_list",
+		Description: "List the driver workspace: per driver the ACTIVE version (what a bare xuansi_driver_push re-deploys; absent until a first push) and every stored version with size + sha256 — the deploy menu, history included.",
+	}, ts.wsList)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_ws_get",
+		Description: "Read one stored driver version back (content + sha256) — old versions stay retrievable for inspection and rollback.",
+	}, ts.wsGet)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_driver_push",
+		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.lua (the board knows nothing of versions). Gated BEFORE the flash write: the file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one), and the file must fit the board's 16384B single-file cap. The write is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
+	}, ts.driverPush)
 }
 
 // ---------------------------------------------------------------------------

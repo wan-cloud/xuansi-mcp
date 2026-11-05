@@ -143,7 +143,7 @@ func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.Cli
 		t.Fatal(err)
 	}
 	srv := NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"})
-	ts := &toolset{c: c, holders: newHolderState(opts.Holder)}
+	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot)}
 	ts.register(srv)
 	ts.dyn = newDynState(srv)
 	stop := ts.startDynamic(srv, opts.Refresh)
@@ -263,9 +263,11 @@ func noContact(t *testing.T, reqs chan server.Request) {
 	}
 }
 
-// staticTools is the exact static toolset — task 8's eleven daemon-
-// surface tools plus task 10's events_recent (the rings it reads ride
-// the dynamic refresh, but the tool itself is static contract).
+// staticTools is the exact static toolset — task 8's twelve daemon-
+// surface tools (eleven request-face + task 10's events_recent) plus
+// task 11's four driver-workspace tools (the rings events_recent reads
+// ride the dynamic refresh, but the tool itself is static contract;
+// the workspace tools never touch the daemon on the store side).
 var staticTools = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -279,15 +281,21 @@ var staticTools = []string{
 	"xuansi_fs_read",
 	"xuansi_board_op",
 	"xuansi_events_recent",
+	"xuansi_ws_put",
+	"xuansi_ws_list",
+	"xuansi_ws_get",
+	"xuansi_driver_push",
 }
 
 // ---------------------------------------------------------------------------
 // registration, holder identity, error mapping
 
 // TestRegistersExactStaticToolset: the served tool list is exactly the
-// 11 static tools, each with a non-empty agent-facing description, and
-// the inferred schemas mark the required/optional split the handlers
-// rely on (board required, holder/transport optional).
+// 16 static tools (T8's twelve + task 11's four workspace tools — the
+// count drift is expected: the workspace face extends the same static
+// contract), each with a non-empty agent-facing description, and the
+// inferred schemas mark the required/optional split the handlers rely
+// on (board required, holder/transport optional).
 func TestRegistersExactStaticToolset(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -340,6 +348,12 @@ func TestRegistersExactStaticToolset(t *testing.T) {
 	}
 	if r := required(byName["xuansi_events_recent"]); !r["board"] || r["source_prefix"] || r["limit"] {
 		t.Errorf("events_recent required = %v, want only board (source_prefix/limit optional)", r)
+	}
+	if r := required(byName["xuansi_ws_put"]); !r["name"] || !r["version"] || !r["content"] {
+		t.Errorf("ws_put required = %v, want name+version+content", r)
+	}
+	if r := required(byName["xuansi_driver_push"]); !r["board"] || !r["name"] || r["version"] || r["holder"] {
+		t.Errorf("driver_push required = %v, want board+name only (version/holder optional)", r)
 	}
 }
 

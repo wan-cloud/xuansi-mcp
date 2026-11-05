@@ -58,11 +58,22 @@ const DynRefreshDefault = 5 * time.Second
 
 // dynState is the dynamic face's mutable half: the registered tool set
 // and the serialization of refreshes (the loop and any manual refresh
-// never interleave).
+// never interleave). caps caches each board's last caps ANSWER for
+// task 11's driver-push gate (a fresh entry spares the push its own
+// op caps crossing).
 type dynState struct {
 	srv  *mcpsdk.Server
-	mu   sync.Mutex // guards live and serializes refreshes
+	mu   sync.Mutex // guards live and caps, serializes refreshes
 	live map[string]dynSpec
+	caps map[string]cachedCaps // mac6 → the last caps answer
+}
+
+// cachedCaps is one board's last caps answer: its api_version and when
+// it was learned — fresh within capsFreshTTL (workspace.go) for
+// driver_push's --@api gate.
+type cachedCaps struct {
+	ver int
+	at  time.Time
 }
 
 // dynSpec identifies what a registered dynamic tool IS, so a refresh
@@ -164,6 +175,11 @@ func (ts *toolset) refreshDynamic(ctx context.Context) []dynBoard {
 	for _, b := range boards {
 		present[b.mac6] = true
 	}
+	for mac6 := range ds.caps { // a board gone from the world took its facts with it
+		if !present[mac6] {
+			delete(ds.caps, mac6)
+		}
+	}
 
 	desired := map[string]dynSpec{}
 	// capsOK marks boards whose caps ANSWERED with a usable version
@@ -187,6 +203,7 @@ func (ts *toolset) refreshDynamic(ctx context.Context) []dynBoard {
 			continue // malformed caps is trouble, not a version statement
 		}
 		capsOK[b.mac6] = true
+		ds.rememberCapsLocked(b.mac6, ver)
 		fns := BenchSchema(ver)
 		if fns == nil {
 			// unknown api_version: exactly one notice tool for the board
@@ -534,6 +551,34 @@ func claimToolName(used map[string]bool, want, mac6 string) string {
 			return c
 		}
 	}
+}
+
+// rememberCapsLocked records a caps answer (caller holds ds.mu).
+func (ds *dynState) rememberCapsLocked(mac6 string, ver int) {
+	if ds.caps == nil {
+		ds.caps = map[string]cachedCaps{}
+	}
+	ds.caps[mac6] = cachedCaps{ver: ver, at: time.Now()}
+}
+
+// capsStore records a caps answer from outside the refresh loop
+// (workspace.go's own op caps fetch).
+func (ds *dynState) capsStore(mac6 string, ver int) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	ds.rememberCapsLocked(mac6, ver)
+}
+
+// capsFresh returns the board's cached api_version when one is fresh
+// enough to gate a driver push (capsFreshTTL), else (0, false).
+func (ds *dynState) capsFresh(mac6 string) (int, bool) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	c, ok := ds.caps[mac6]
+	if !ok || time.Since(c.at) > capsFreshTTL {
+		return 0, false
+	}
+	return c.ver, true
 }
 
 // ---------------------------------------------------------------------------

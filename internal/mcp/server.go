@@ -41,6 +41,13 @@ type Options struct {
 	// keeps the static-only face; the production cadence is Refresh:
 	// 5 * time.Second (cmd/xuansi/mcp.go).
 	Refresh time.Duration
+
+	// WorkspaceRoot pins the driver workspace root (task 11,
+	// workspace.go): drivers/ + manifest.json live under it. Empty
+	// uses wsRoot() ($XDG_DATA_HOME/xuansi/workspace, XDG data
+	// convention). Tests inject a temp root here — never by mutating
+	// the environment.
+	WorkspaceRoot string
 }
 
 // NewServer builds the MCP server the `xuansi mcp` face needs: the
@@ -75,7 +82,7 @@ func NewServer(impl *mcpsdk.Implementation) *mcpsdk.Server {
 // Later batch-6 tasks register their own faces against the same (srv,
 // c, opts) seam.
 func RegisterTools(srv *mcpsdk.Server, c *apiclient.Client, opts Options) (stop func()) {
-	ts := &toolset{c: c, holders: newHolderState(opts.Holder)}
+	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot)}
 	ts.register(srv)
 	ts.dyn = newDynState(srv)
 	return ts.startDynamic(srv, opts.Refresh)
