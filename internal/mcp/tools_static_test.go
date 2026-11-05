@@ -567,6 +567,16 @@ var opsFaceAllowlistPinned = []string{
 
 // spanList extracts the comma-separated op list between two anchors —
 // the single-source test's only parsing.
+//
+// B8 anchor-brittleness ruling (batch-7 T1 review wave): the anchors
+// are prose fragments, so rewording the surrounding schema/description
+// text fails here loudly ("anchor not found" with the full string
+// inline). That brittleness is accepted as-is: every alternative
+// surveyed weakens or complicates — substring containment of the
+// joined list would let an extra op appended before the end anchor
+// slip through, and a regex/parser adds machinery for zero strength
+// gain. If a reword trips this, update the anchor strings here, not
+// the check.
 func spanList(t *testing.T, s, from, to string) []string {
 	t.Helper()
 	i := strings.Index(s, from)

@@ -299,6 +299,10 @@ func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, board
 	return e
 }
 
+// sweepWait bounds awaitSweep and names its bound in the failure
+// message (the message cannot lie if the bound is ever tuned).
+const sweepWait = 2 * time.Second
+
 // awaitSweep waits bounded for the initial discovery sweep to land its
 // boards. The sweep runs ASYNC inside Start (the startupAudit
 // goroutine — the production shape, deliberately untouched): a test's
@@ -310,12 +314,12 @@ func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, board
 // boards inside the bound fails loudly instead of flaking downstream.
 func awaitSweep(t *testing.T, reg *discover.Registry, want int) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(sweepWait)
 	for len(reg.Snapshot()) < want && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	if got := len(reg.Snapshot()); got < want {
-		t.Fatalf("initial discovery sweep never landed its board(s): registry has %d of %d after 2s", got, want)
+		t.Fatalf("initial discovery sweep never landed its board(s): registry has %d of %d after %s", got, want, sweepWait)
 	}
 }
 
