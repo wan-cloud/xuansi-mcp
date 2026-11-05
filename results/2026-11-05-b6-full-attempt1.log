@@ -1,0 +1,71 @@
+capture: results/2026-11-05-b6-full-attempt1.log (2026-11-05T14:49:48+08:00)
+repo HEAD: f16c364 — dirty files: 4
+attempt: 1 (honest count — failures keep their own transcript)
+--- unit gates (must be green before the board is touched) ---
+ok  	xuansi/cmd/xuansi	1.726s
+?   	xuansi/hil	[no test files]
+ok  	xuansi/internal/apiclient	0.718s
+ok  	xuansi/internal/board	0.511s
+ok  	xuansi/internal/discover	0.014s
+ok  	xuansi/internal/lease	0.013s
+ok  	xuansi/internal/mcp	5.359s
+ok  	xuansi/internal/replclient	1.451s
+ok  	xuansi/internal/server	14.964s
+--- build the daemon binary fresh at HEAD ---
+mkdir -p bin
+GOOS=linux GOARCH=amd64 go build -trimpath -o bin/xuansi-linux-amd64 ./cmd/xuansi
+GOOS=linux GOARCH=arm64 go build -trimpath -o bin/xuansi-linux-arm64 ./cmd/xuansi
+bin/xuansi-linux-amd64: go1.27.3
+	path	xuansi/cmd/xuansi
+	mod	xuansi	v0.0.0-20261105064300-f16c364e7073+dirty	
+	dep	github.com/cenkalti/backoff	v2.2.1+incompatible	h1:tNowT99t7UNflLxfYYSlKYsBpXdEet03Pg2g16Swow4=
+	dep	github.com/google/jsonschema-go	v0.4.3	h1:/DBOLZTfDow7pe2GmaJNhltueGTtDKICi8V8p+DQPd0=
+	dep	github.com/grandcat/zeroconf	v1.0.0	h1:uHhahLBKqwWBV6WZUDAT71044vwOTL+McW0mBJvo6kE=
+	dep	github.com/miekg/dns	v1.1.27	h1:aEH/kqUzUxGJ/UHcEKdJY+ugH6WEzsEBBSPa8zuy1aM=
+	dep	github.com/modelcontextprotocol/go-sdk	v1.8.0	h1:KIvahhYqwtbeniWVPs3TcXEA7b8jEtwfBpOTAI+Urx4=
+=== b6 task-13 full MCP HIL — 2026-11-05T14:50:22+08:00 ===
+attempt: 1 (honest count — any failure is fixed and the WHOLE capture rerun)
+board: d75884 (bench GPIO1<->GPIO2 wired; TCP xuansi-d75884.local:7777; fw expect 775ecaa; WiFi creds in NVS — never touched)
+client: go-sdk mcp.NewClient over mcp.IOTransport (the mcp child's stdio pipes) — a REAL MCP client, zero test hooks
+wifi discipline: board_op coverage = budget.get/set + caps + READ-ONLY wifi.status snapshot lines;
+  wifi.setup/off stay unit-covered (allowlist test) and out of real-credential HIL scope — no credentials in any capture/log
+
+— S0: prelude — board reachable, sandbox prepared, bench clean —
+  [note] stale xuansi process: 3051 /home/wan/.codegraph/versions/v1.6.2/node --liftoff-only --disable-warning=ExperimentalWarning /home/wan/.codegraph/versions/v1.6.2/lib/dist/bin/codegraph.js serve --mcp --path /home/wan/work/Project/xuansi-hardware-probe
+  [FAIL] no stale xuansi serve/mcp processes on the bench (found 1)
+  [note] /dev/ttyACM0 present (USB discovery enumerates it; the daemon never opens it — no reboot)
+  [PASS] board TCP face reachable at xuansi-d75884.local:7777 (dial only — no reboot, no USB open)
+  [note] XDG sandbox: XDG_DATA_HOME=/tmp/opencode/b6-full/xdg (serve captures + mcp workspace land inside; the real user workspace untouched)
+  [note] boards.conf: comment-only (no alias) -> dynamic tool prefix = "d75884_"
+
+— S1: daemon serve up (REAL subprocess) —
+  [daemon] started pid=195672 argv=["bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/b6-full/daemon.sock" "--grace-ttl" "30s" "--boards-file" "/tmp/opencode/b6-full/boards.conf"] env+="XDG_DATA_HOME=/tmp/opencode/b6-full/xdg"
+  [daemon] xuansi daemon serving /tmp/opencode/b6-full/daemon.sock (grace-ttl 30s, Ctrl-C to stop)
+  [daemon] time=2026-11-05T14:50:22.334+08:00 level=INFO msg="server: serving /tmp/opencode/b6-full/daemon.sock (grace_ttl=30s)"
+  [PASS] daemon sock bound at /tmp/opencode/b6-full/daemon.sock (sock dialable)
+  [PASS] daemon reports serving (grace-ttl 30s)
+  [daemon] time=2026-11-05T14:50:22.629+08:00 level=INFO msg="server: conn dropped (holder=conn-1)"
+  [daemon] time=2026-11-05T14:50:25.339+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
+  [daemon] time=2026-11-05T14:50:25.386+08:00 level=INFO msg="tcp: connected 10.1.50.200:37908 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [PASS] initial discovery sweep found 1 board (sweep line)
+
+— S2: xuansi mcp up (REAL subprocess) + SDK client initialize over the pipes —
+  [mcp] started pid=195681 argv=["bin/xuansi-linux-amd64" "mcp" "--sock" "/tmp/opencode/b6-full/daemon.sock"] env+="XDG_DATA_HOME=/tmp/opencode/b6-full/xdg"
+  [PASS] initialize handshake ok: server=xuansi version=dev (protocol 2026-07-28)
+
+— S3: xuansi_list_boards — d75884 dual-source, fw build binding —
+  [daemon] time=2026-11-05T14:50:25.909+08:00 level=INFO msg="board d75884: hello forced observer (old slot not yet released) - re-helloing through the board's keepalive window (self-release ~17s, -12; budget 25s)"
+  [note] [rpc] xuansi_list_boards: context deadline exceeded
+  [daemon] time=2026-11-05T14:50:45.340+08:00 level=INFO msg="server: startup audit board d75884: context deadline exceeded"
+  [daemon] time=2026-11-05T14:50:45.435+08:00 level=INFO msg="tcp: connected 10.1.50.200:51406 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [daemon] time=2026-11-05T14:50:45.951+08:00 level=INFO msg="board d75884: hello forced observer (old slot not yet released) - re-helloing through the board's keepalive window (self-release ~17s, -12; budget 25s)"
+  [note] [rpc] xuansi_list_boards: context deadline exceeded
+  [note] [rpc] xuansi_list_boards: context deadline exceeded
+  [FAIL] list_boards shows d75884 with fw populated (list_boards trouble (isErr=true))
+=== b6-mcp: 5 pass, 2 fail ===
+  FAILED: no stale xuansi serve/mcp processes on the bench (found 1)
+  FAILED: list_boards shows d75884 with fw populated (list_boards trouble (isErr=true))
+  [note] driver exit: SIGKILLing the still-running mcp (mcp child)
+  [note] driver exit: SIGKILLing the still-running daemon (daemon)
+exit status 1
+driver exit: 1

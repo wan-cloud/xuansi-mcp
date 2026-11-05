@@ -1,0 +1,161 @@
+capture: results/2026-11-05-b6-full-attempt3.log (2026-11-05T15:04:03+08:00)
+repo HEAD: d667b8f — dirty files: 6
+attempt: 3 (honest count — failures keep their own transcript)
+--- unit gates (must be green before the board is touched) ---
+ok  	xuansi/cmd/xuansi	1.727s
+?   	xuansi/hil	[no test files]
+ok  	xuansi/internal/apiclient	0.717s
+ok  	xuansi/internal/board	0.508s
+ok  	xuansi/internal/discover	0.010s
+ok  	xuansi/internal/lease	0.006s
+ok  	xuansi/internal/mcp	5.362s
+ok  	xuansi/internal/replclient	1.450s
+ok  	xuansi/internal/server	14.970s
+--- build the daemon binary fresh at HEAD ---
+mkdir -p bin
+GOOS=linux GOARCH=amd64 go build -trimpath -o bin/xuansi-linux-amd64 ./cmd/xuansi
+GOOS=linux GOARCH=arm64 go build -trimpath -o bin/xuansi-linux-arm64 ./cmd/xuansi
+bin/xuansi-linux-amd64: go1.27.3
+	path	xuansi/cmd/xuansi
+	mod	xuansi	v0.0.0-20261105070400-d667b8fe2cd2+dirty	
+	dep	github.com/cenkalti/backoff	v2.2.1+incompatible	h1:tNowT99t7UNflLxfYYSlKYsBpXdEet03Pg2g16Swow4=
+	dep	github.com/google/jsonschema-go	v0.4.3	h1:/DBOLZTfDow7pe2GmaJNhltueGTtDKICi8V8p+DQPd0=
+	dep	github.com/grandcat/zeroconf	v1.0.0	h1:uHhahLBKqwWBV6WZUDAT71044vwOTL+McW0mBJvo6kE=
+	dep	github.com/miekg/dns	v1.1.27	h1:aEH/kqUzUxGJ/UHcEKdJY+ugH6WEzsEBBSPa8zuy1aM=
+	dep	github.com/modelcontextprotocol/go-sdk	v1.8.0	h1:KIvahhYqwtbeniWVPs3TcXEA7b8jEtwfBpOTAI+Urx4=
+=== b6 task-13 full MCP HIL — 2026-11-05T15:04:26+08:00 ===
+attempt: 3 (honest count — any failure is fixed and the WHOLE capture rerun)
+board: d75884 (bench GPIO1<->GPIO2 wired; TCP xuansi-d75884.local:7777; fw expect 775ecaa; WiFi creds in NVS — never touched)
+client: go-sdk mcp.NewClient over mcp.IOTransport (the mcp child's stdio pipes) — a REAL MCP client, zero test hooks
+wifi discipline: board_op coverage = budget.get/set + caps + READ-ONLY wifi.status snapshot lines;
+  wifi.setup/off stay unit-covered (allowlist test) and out of real-credential HIL scope — no credentials in any capture/log
+
+— S0: prelude — board reachable, sandbox prepared, bench clean —
+  [PASS] no stale xuansi serve/mcp processes on the bench (found 0)
+  [note] /dev/ttyACM0 present (USB discovery enumerates it; the daemon never opens it — no reboot)
+  [PASS] board TCP face reachable at xuansi-d75884.local:7777 (dial only — no reboot, no USB open)
+  [note] XDG sandbox: XDG_DATA_HOME=/tmp/opencode/b6-full/xdg (serve captures + mcp workspace land inside; the real user workspace untouched)
+  [note] boards.conf: comment-only (no alias) -> dynamic tool prefix = "d75884_"
+
+— S1: daemon serve up (REAL subprocess) —
+  [daemon] started pid=198536 argv=["bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/b6-full/daemon.sock" "--grace-ttl" "30s" "--boards-file" "/tmp/opencode/b6-full/boards.conf"] env+="XDG_DATA_HOME=/tmp/opencode/b6-full/xdg"
+  [daemon] xuansi daemon serving /tmp/opencode/b6-full/daemon.sock (grace-ttl 30s, Ctrl-C to stop)
+  [daemon] time=2026-11-05T15:04:26.274+08:00 level=INFO msg="server: serving /tmp/opencode/b6-full/daemon.sock (grace_ttl=30s)"
+  [PASS] daemon sock bound at /tmp/opencode/b6-full/daemon.sock (sock dialable)
+  [PASS] daemon reports serving (grace-ttl 30s)
+  [daemon] time=2026-11-05T15:04:26.570+08:00 level=INFO msg="server: conn dropped (holder=conn-1)"
+  [daemon] time=2026-11-05T15:04:29.279+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
+  [daemon] time=2026-11-05T15:04:29.366+08:00 level=INFO msg="tcp: connected 10.1.50.200:33964 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [daemon] time=2026-11-05T15:04:29.382+08:00 level=INFO msg="board d75884: controller warm connection up (fw=775ecaa protocol_ver=3)"
+  [daemon] time=2026-11-05T15:04:29.468+08:00 level=INFO msg="board d75884: resync scripts=[] survived=[] started=[] gone=[] pins=0 (cold=true) wifi_state=up [diag.pins raw 10B]"
+  [daemon] time=2026-11-05T15:04:29.468+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[] pins=0 wifi_state=up (orphans listed, not killed)"
+  [PASS] initial discovery sweep found 1 board (sweep line)
+
+— S2: xuansi mcp up (REAL subprocess) + SDK client initialize over the pipes —
+  [mcp] started pid=198549 argv=["bin/xuansi-linux-amd64" "mcp" "--sock" "/tmp/opencode/b6-full/daemon.sock"] env+="XDG_DATA_HOME=/tmp/opencode/b6-full/xdg"
+  [PASS] initialize handshake ok: server=xuansi version=dev (protocol 2026-07-28)
+
+— S3: xuansi_list_boards — d75884 dual-source, fw build binding —
+  [PASS] list_boards shows d75884 with fw populated (fw populated (hello-enriched))
+  [PASS] dual-source merged [usb mdns] (got [usb mdns])
+  [PASS] fw BUILD BINDING: "775ecaa" == expected "775ecaa" (flashed fw == fw HEAD bfa8e04 main/, T4 empty-diff)
+  [PASS] mdns face host=xuansi-d75884.local port=7777
+  [PASS] usb_path enumerated without opening (/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00)
+  [PASS] mdns face healthy (mdns_error="")
+
+— S4: subscribe the board's event resource; snapshot reads back —
+  [PASS] resources/subscribe xuansi://boards/d75884/events ok (resource exists — the face's refresh listed the board)
+  [PASS] resources/read snapshot parses as d75884's ring (board=d75884 ring_cap=256)
+
+— S5: xuansi_lease holder=b6-hil (default TCP route) + op-face budget prelude —
+  [daemon] time=2026-11-05T15:04:29.596+08:00 level=INFO msg="lease: grant board=d75884 holder=b6-hil session=1793862267"
+  [PASS] lease holder=b6-hil board=d75884 session=1.793862267e+09 (text="{\"board\":\"d75884\",\"holder\":\"b6-hil\",\"session\":1793862267}")
+  [PASS] lease took the DEFAULT TCP route: session=1.793862267e+09 transport="" warning="" (no usb field, no reboot)
+  [PASS] [prelude] board_op budget.set eval_ms=4000 for the 4s-class job (reply eval_ms=4000 event_ms=50; text="{\"eval_ms\":4000,\"event_ms\":50}")
+
+— S6: dynamic tools — ≥30 d75884_* after the lease; gpio on the wired pair —
+  [PASS] dynamic tools expanded after the lease (47 tools total)
+  [PASS] tools/list carries >=30 d75884_-prefixed tools (count=30, total tools=47)
+  [PASS] exact dynamic names present: d75884 (gpio_mode/write/read)
+  [note] static face: 17 tools; dynamic: 30; sample: d75884_gpio_mode/_gpio_write/_gpio_read/_uart1_setup/_i2c0_xfer?=false
+  [PASS] d75884_gpio_mode(1,"out") — claims the wired output pin (text="{\"out\":\"(no results)\"}")
+  [PASS] d75884_gpio_mode(2,"in") — claims the wired input pin (text="{\"out\":\"(no results)\"}")
+  [PASS] d75884_gpio_write(1,1) — drives the wired output high (text="{\"out\":\"(no results)\"}")
+  [PASS] d75884_gpio_read(2) -> value=1 (the wired input mirrors the driven high; text="{\"out\":\"1\",\"value\":1}")
+  [PASS] [cross-check] xuansi_run_lua bench.gpio.read(2) -> value=1 (same pin, bridge path; text="{\"out\":\"1\",\"value\":1}")
+  [PASS] d75884_gpio_write(1,0) — park the pair low before the edge phase (text="{\"out\":\"(no results)\"}")
+  [PASS] d75884_gpio_read(2) -> value=0 (wired input follows the parked low)
+
+— S7: deep nested tables — args->ARGS->value (depth-7) + return value (depth-8) —
+  [FAIL] depth-7 args table round-trip deep-equal, `value` key present (isErr=true hasValue=false; text=protocol: args: malformed at byte 42)
+  [PASS] depth-8 return table through the value bridge deep-equal (isErr=false; text={"out":"table","value":{"t":{"k":{"k":{"k":{"k":{"k":{"k":{"k":42}}}}}}}}})
+
+— S8: xuansi_submit 4s-class job -> job-done event through resource+ring —
+  [PASS] submit ack {tag=b6job4s queued=true} (text="{\"queued\":true,\"tag\":\"b6job4s\"}")
+  [PASS] job-done event in the ring: tag=b6job4s ok=true value=b6job4s-value (tag=b6job4s ok=true value=b6job4s-value; submitted through THIS process, so the direct-delivered job event landed in its own ring)
+  [PASS] resource-updated notification arrived for xuansi://boards/d75884/events (1 hint(s) drained)
+
+— S9: gpio edge events — capture-armed gpio.2, wired edges, ring+file+notification —
+  [daemon] time=2026-11-05T15:04:39.296+08:00 level=INFO msg="server: capture cap-1 started (d75884 gpio.2 - /tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070439-d75884-gpio.2-cap1.jsonl, max 64MiB/4s)"
+  [PASS] gpio.2 capture armed board-side through the MCP capture face (daemon log: capture started) — the per-pin source arming path
+  [PASS] edge 1: d75884_gpio_write(1,1) -> rising on the wired gpio.2 (text="{\"out\":\"(no results)\"}")
+  [PASS] edge 2: d75884_gpio_write(1,0) -> falling on the wired gpio.2 (text="{\"out\":\"(no results)\"}")
+  [daemon] time=2026-11-05T15:04:43.178+08:00 level=INFO msg="server: capture cap-1 done (limit): 187 bytes - /tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070439-d75884-gpio.2-cap1.jsonl"
+  [PASS] xuansi_capture gpio.2 returned {path=/tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070439-d75884-gpio.2-cap1.jsonl bytes=187 reason=limit}
+  [PASS] capture file inside the XDG sandbox (/tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070439-d75884-gpio.2-cap1.jsonl under /tmp/opencode/b6-full/xdg/xuansi/captures)
+  [PASS] capture ended reason="limit" bytes=187 (the 4s bound passed)
+  [PASS] capture FILE holds the gpio.2 edges in order: [rising falling] (jsonl)
+  [PASS] daemon log: capture cap-1 done (limit)
+  [PASS] xuansi_events_recent ring holds the same edges: [rising falling] (event face delivery)
+  [PASS] resource-updated notification fired for the gpio edges (2 hint(s))
+
+— S10: xuansi_events_recent {board, limit} sanity — non-empty, ordered —
+  [PASS] events_recent {board, limit:50} non-empty (3 events; text={"board":"d75884","dropped":{"gpio.2":0,"job":0},"events":[{"data":{"ok":true,"o)
+  [PASS] ring view newest-last ordered (ts monotonic across 3 events)
+  [note] ring sample: job@2026-11-05T15:04:38.668449791+08:00, gpio.2@2026-11-05T15:04:39.508962761+08:00, gpio.2@2026-11-05T15:04:39.7809388+08:00
+
+— S11: xuansi_capture stdout 4s while an eval prints lines —
+  [daemon] time=2026-11-05T15:04:43.598+08:00 level=INFO msg="server: capture cap-2 started (d75884 stdout - /tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070443-d75884-stdout-cap2.bin, max 64MiB/4s)"
+  [PASS] stdout capture armed board-side (daemon log: capture started)
+  [PASS] eval printed 3 distinctive lines while the capture ran (value=printed out="printed")
+  [daemon] time=2026-11-05T15:04:47.485+08:00 level=INFO msg="server: capture cap-2 done (limit): 35 bytes - /tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070443-d75884-stdout-cap2.bin"
+  [PASS] stdout capture returned {path=/tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070443-d75884-stdout-cap2.bin bytes=35 reason=limit}
+  [PASS] stdout capture file inside the XDG sandbox (/tmp/opencode/b6-full/xdg/xuansi/captures/20261105T070443-d75884-stdout-cap2.bin)
+  [PASS] file READABLE FROM THIS HIL PROCESS and contains all 3 printed lines (bytes=35, file bytes=35, rdErr=<nil>)
+
+— S12: workspace — ws_put tiny driver -> driver_push -> require on the board —
+  [PASS] ws_put b6tiny@1.0.0 stored (sha256=ac15adc722418f97… size=43; text={"sha256":"ac15adc722418f979b782ba652ad06a0ae5d0da06cc0b2d56033394964834891","si)
+  [PASS] ws_list sees version 1.0.0 stored, active ABSENT before any push (stored=true active="")
+  [PASS] driver_push landed /drv/b6tiny.lua on the board, read-back verified (bytes=43 sha=ac15adc722418f97…; text={"board":"d75884","bytes":43,"path":"/drv/b6tiny.lua","sha256":"ac15adc722418f97)
+  [PASS] require("bench.drv.b6tiny").ok == true through the --@api gate (value=true; text={"out":"true","value":true})
+  [PASS] manifest ACTIVE version right after the verified push (active="1.0.0")
+  [PASS] workspace roots under the XDG sandbox: drivers/b6tiny@1.0.0.lua byte-exact on disk, manifest.json parses (root=/tmp/opencode/b6-full/xdg/xuansi/workspace)
+
+— S13: board_op — budget.set/get round-trip, caps, heap+wifi snapshot lines —
+  [PASS] board_op budget.set {eval_ms:3000} -> applied eval_ms=3000 event_ms=50 (text="{\"eval_ms\":3000,\"event_ms\":50}")
+  [PASS] board_op budget.get round-trip -> eval_ms=3000 (the frozen no-keys getter, translated daemon-side; text="{\"eval_ms\":3000,\"event_ms\":50}")
+  [PASS] board_op caps: api_version=1 primitives advertise 30 ops (the 30-signature table's source; text={"api_version":1,"batch":2,"fw":"xuansi-fw v0.1.0","heap":{")
+  [note] heap snapshot (diag.stats carries the heap block; diag.heapinfo replies an empty ack by fw design): {"framing_drops":0,"heap":{"internal_free_kb":106,"internal_largest_kb":31,"psram_free_kb":7881,"psram_largest_kb":7808},"job_orphans":0,"stdout":{"acc":2964,"d...
+  [PASS] wifi snapshot (READ-ONLY op, no credentials anywhere): state=up ssid=Wan-Places ip=10.1.51.205 rssi=-37
+
+— S14: release, mcp EOF exit 0, serve SIGINT exit 0 —
+  [daemon] time=2026-11-05T15:04:47.816+08:00 level=INFO msg="board d75884: session.reset(1793862267) stopped=0"
+  [daemon] time=2026-11-05T15:04:47.837+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+  [daemon] time=2026-11-05T15:04:47.837+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=b6-hil session=1793862267 sessions=[1793862267 0] err=<nil> took=29ms"
+  [PASS] release holder=b6-hil (text="{\"board\":\"d75884\",\"holder\":\"b6-hil\"}")
+  [PASS] post-release board_status shows NO lease (lease key false, connected=true)
+  [PASS] daemon log: lease teardown reason=released (count=1)
+  [daemon] time=2026-11-05T15:04:47.849+08:00 level=INFO msg="server: conn dropped (holder=b6-hil)"
+  [PASS] xuansi mcp exited clean on stdin EOF (code=0 waitErr=<nil>)
+  [PASS] mcp stderr carries no error line (clean EOF path)
+  [daemon] xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)
+  [daemon] xuansi: shutdown complete
+  [PASS] daemon exited clean (code=0 waitErr=<nil>)
+  [PASS] daemon's own final log line: 'shutdown complete' (no goroutine-leak complaint)
+  [PASS] sock file removed at exit (stat err=stat /tmp/opencode/b6-full/daemon.sock: no such file or directory)
+  [note] no-goroutine-leak bar for a SUBPROCESS: exit 0 requires srv.Done() — every server goroutine joined before 'shutdown complete'
+  [note] XDG sandbox intact: captures under /tmp/opencode/b6-full/xdg/xuansi/captures, workspace under /tmp/opencode/b6-full/xdg/xuansi/workspace — the real user store untouched
+=== b6-mcp: 66 pass, 1 fail ===
+  FAILED: depth-7 args table round-trip deep-equal, `value` key present (isErr=true hasValue=false; text=protocol: args: malformed at byte 42)
+exit status 1
+driver exit: 1
