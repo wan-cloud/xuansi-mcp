@@ -40,14 +40,17 @@ package mcp
 // events_recent tool over them) are the LOSSLESS view; a storm can
 // evict old entries per the 256 cap but never drops an event at the
 // door. The resource-updated HINT rides a serial per-board notifier:
-// at most one notification queued per board (bursts collapse into it),
-// and after every delivery the notifier re-arms whenever new events
-// landed meanwhile — so every event is eventually followed by a
-// notification, calm traffic still notifies per event, and a slow
-// subscriber can never stall or starve the rings (the exact storm
-// shape review round 1 worried about). A notification just means
-// "re-read the snapshot" — the snapshot is always complete, so
-// coalescing loses nothing.
+// a per-board in-flight flag holds AT MOST ONE hint per board (queued
+// or being delivered) at any time, so a burst collapses into the
+// in-flight hint instead of stacking redundant ones, and the channel
+// occupancy never exceeds the distinct-board count. When delivery
+// finishes, the notifier re-arms whenever events landed meanwhile —
+// so every event is eventually followed by a notification (the
+// eventual-notification guarantee), calm traffic still notifies per
+// event, and a slow subscriber can never stall or starve the rings
+// (the exact storm shape review round 1 worried about). A
+// notification just means "re-read the snapshot" — the snapshot is
+// always complete, so coalescing loses nothing.
 
 import (
 	"context"
@@ -67,12 +70,13 @@ import (
 // never alias (aliases can collide and churn; the mac6 is stable).
 func boardResourceURI(mac6 string) string { return "xuansi://boards/" + mac6 + "/events" }
 
-// notifyQueueDepth bounds the per-board re-read hint queue. A board
-// occupies at most one queued slot at a time (the next hint only arms
-// after the previous is delivered), so any depth ≥ the board count
-// makes enqueue failure impossible on this bench; a pathological
-// world above it degrades to hints retrying on the next event (never
-// ring loss).
+// notifyQueueDepth bounds the per-board re-read hint queue. The
+// in-flight flag makes a board occupy AT MOST ONE slot — queued or
+// being delivered — so occupancy never exceeds the number of DISTINCT
+// boards and enqueue failure is impossible while boards ≤ depth (64:
+// far above any bench). A pathological world above it degrades to
+// hints retrying on the next event (never ring loss); the safety
+// valve counts itself in hintQueueFull.
 const notifyQueueDepth = 64
 
 // eventState is the event face's whole mutable half: the per-board
@@ -90,12 +94,15 @@ type eventState struct {
 
 	// notification coalescing (see the file comment): appended counts
 	// every event a ring took; queuedUpTo is the appended value the
-	// QUEUED hint already covers — appended != queuedUpTo means a hint
-	// is pending.
-	appended   map[string]int
-	queuedUpTo map[string]int
-	notifyCh   chan string
-	stopped    bool // set under mu before notifyCh closes
+	// last QUEUED hint already covered — appended != queuedUpTo means
+	// events lack a hint; inFlight marks a hint queued or being
+	// delivered (at most one per board, ever).
+	appended      map[string]int
+	queuedUpTo    map[string]int
+	inFlight      map[string]bool
+	hintQueueFull int // times the enqueue safety valve fired (diagnostic; 0 unless >notifyQueueDepth boards)
+	notifyCh      chan string
+	stopped       bool // set under mu before notifyCh closes
 }
 
 func newEventState(srv *mcpsdk.Server) *eventState {
@@ -105,6 +112,7 @@ func newEventState(srv *mcpsdk.Server) *eventState {
 		watched:    map[string]bool{},
 		appended:   map[string]int{},
 		queuedUpTo: map[string]int{},
+		inFlight:   map[string]bool{},
 		notifyCh:   make(chan string, notifyQueueDepth),
 	}
 	go es.notifyLoop()
@@ -112,7 +120,7 @@ func newEventState(srv *mcpsdk.Server) *eventState {
 }
 
 // feed is the ONE apiclient OnEvent handler: an event for a listed
-// board lands in its ring SYNCHRONOUSLY (the lossless path — never
+// board lands in its ring SYNCHRONONOUSLY (the lossless path — never
 // blocked by a subscriber) and arms the board's resource-updated hint;
 // an event for a board with no ring (not listed, or listed-but-not-
 // yet-reconciled) is dropped — the daemon contract only pushes watched
@@ -128,32 +136,38 @@ func (es *eventState) feed(ev server.EventPush) {
 	es.mu.Unlock()
 }
 
-// armHintLocked queues the board's re-read hint when the queued one no
-// longer covers the ring's contents (caller holds mu). The send is
-// non-blocking and under the lock — the notifier never locks to
-// receive, and stop() closes the channel under the same lock, so a
-// send can never race the close.
+// armHintLocked queues the board's re-read hint when the last queued
+// hint no longer covers the ring's contents AND no hint for the board
+// is in flight (queued or being delivered) — the at-most-one invariant
+// that keeps channel occupancy ≤ the distinct-board count (caller
+// holds mu). The send is non-blocking and under the lock — the
+// notifier never locks to receive, and stop() closes the channel
+// under the same lock, so a send can never race the close.
 func (es *eventState) armHintLocked(mac6 string) {
-	if es.stopped || es.appended[mac6] == es.queuedUpTo[mac6] {
+	if es.stopped || es.inFlight[mac6] || es.appended[mac6] == es.queuedUpTo[mac6] {
 		return
 	}
 	select {
 	case es.notifyCh <- mac6:
 		es.queuedUpTo[mac6] = es.appended[mac6]
-	default: // queue full (>notifyQueueDepth boards): retried on the next event
+		es.inFlight[mac6] = true
+	default: // queue full (>notifyQueueDepth distinct boards): retried on the next event
+		es.hintQueueFull++
 	}
 }
 
-// notifyLoop serially delivers the resource-updated hints; after each
-// delivery it re-arms when events landed meanwhile, so every event is
-// eventually followed by a notification (bursts coalesce into one
-// re-read hint; calm traffic is per-event). Exits when stop closes
-// the channel.
+// notifyLoop serially delivers the resource-updated hints. After each
+// delivery it clears the board's in-flight flag and re-arms when
+// events landed meanwhile — that re-arm is what makes every event
+// eventually followed by a notification even though arming during a
+// delivery is suppressed (bursts collapse into the in-flight hint;
+// calm traffic is per-event). Exits when stop closes the channel.
 func (es *eventState) notifyLoop() {
 	for mac6 := range es.notifyCh {
 		_ = es.srv.ResourceUpdated(context.Background(),
 			&mcpsdk.ResourceUpdatedNotificationParams{URI: boardResourceURI(mac6)})
 		es.mu.Lock()
+		es.inFlight[mac6] = false
 		es.armHintLocked(mac6) // events that landed during the delivery
 		es.mu.Unlock()
 	}

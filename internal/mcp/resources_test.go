@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"xuansi/internal/apiclient"
 	"xuansi/internal/server"
 )
 
@@ -98,6 +100,166 @@ func seqOf(t *testing.T, ev map[string]any) float64 {
 	data, _ := ev["data"].(map[string]any)
 	seq, _ := data["seq"].(float64)
 	return seq
+}
+
+// multiClientEnv is an event-face environment with N subscribed MCP
+// client sessions on one server — every ResourceUpdated delivers to
+// every session sequentially, so more sessions widen one delivery
+// into a proportionally longer window (the deterministic stand-in for
+// a "lagging subscriber": a sleeping client handler would NOT lag the
+// notifier, because jsonrpc2 dispatches handlers off an unbounded
+// queue while the read loop keeps draining the pipe).
+type multiClientEnv struct {
+	e    *env                    // session 0's view (tool calls ride cl)
+	df   *dynFake                // the fake daemon (push events with it)
+	recs []*notifRecorder        // one recorder per client session
+	sss  []*mcpsdk.ServerSession // server-side sessions
+	cls  []*mcpsdk.ClientSession // client sessions
+}
+
+// newMultiClientEnv wires N clients against one fake daemon + server.
+// Clients subscribe LATER (subscribeAll, after a refresh registered
+// the board's resource — the SDK only admits resource subscriptions
+// it can see resources for).
+func newMultiClientEnv(t *testing.T, n int, mac6 string) *multiClientEnv {
+	t.Helper()
+	fd := newFakeDaemon(t)
+	df := newDynFake(t, fd, false)
+	df.setBoards(boardEntry(mac6, ""))
+	df.setCaps(mac6, v1Caps())
+
+	c, err := apiclient.Dial(fd.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"})
+	ts := &toolset{c: c, holders: newHolderState("mcp-fixed01")}
+	ts.register(srv)
+	ts.dyn = newDynState(srv)
+	stop := ts.startDynamic(srv, 0)
+
+	ctx := context.Background()
+	m := &multiClientEnv{df: df}
+	for i := 0; i < n; i++ {
+		rec := &notifRecorder{}
+		ct, st := mcpsdk.NewInMemoryTransports()
+		ss, err := srv.Connect(ctx, st, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cl, err := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "test-client", Version: "0"}, &mcpsdk.ClientOptions{
+			ResourceUpdatedHandler: rec.handle,
+		}).Connect(ctx, ct, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.recs = append(m.recs, rec)
+		m.sss = append(m.sss, ss)
+		m.cls = append(m.cls, cl)
+	}
+	m.e = &env{t: t, c: c, ts: ts, stop: stop, ss: m.sss[0], cl: m.cls[0]}
+	t.Cleanup(func() {
+		stop()
+		ts.stopEvents()
+		for _, cl := range m.cls {
+			cl.Close()
+		}
+		for _, ss := range m.sss {
+			ss.Close()
+		}
+		c.Close()
+	})
+	return m
+}
+
+// subscribeAll points every client session at the board's resource.
+func (m *multiClientEnv) subscribeAll(t *testing.T, mac6 string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i, cl := range m.cls {
+		if err := cl.Subscribe(ctx, &mcpsdk.SubscribeParams{URI: boardResourceURI(mac6)}); err != nil {
+			t.Fatalf("client %d subscribe: %v", i, err)
+		}
+	}
+}
+
+// probeUntilLive pushes probe events until some session has received a
+// notification (the SDK's subscribe/registration race window), then
+// returns the probe count. Probes carry negative seq markers.
+func (m *multiClientEnv) probeUntilLive(t *testing.T, mac6 string) int {
+	t.Helper()
+	for i := 0; ; i++ {
+		if i > 200 {
+			t.Fatal("subscription never went live: no notification for 200 probes")
+		}
+		if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": -float64(i + 1)}) {
+			t.Fatal("probe push failed")
+		}
+		for _, r := range m.recs {
+			if r.count() > 0 {
+				return i + 1
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// hintState snapshots the coalescing state for assertions (white-box).
+func (m *multiClientEnv) hintState(mac6 string) (appended, queuedUpTo int, inFlight bool, queueLen, queueFull int) {
+	m.e.ts.ev.mu.Lock()
+	defer m.e.ts.ev.mu.Unlock()
+	return m.e.ts.ev.appended[mac6], m.e.ts.ev.queuedUpTo[mac6], m.e.ts.ev.inFlight[mac6],
+		len(m.e.ts.ev.notifyCh), m.e.ts.ev.hintQueueFull
+}
+
+// waitAllRecs waits until every recorder has received ≥ base[i]+add
+// notifications (per-session baselines: registrations settle at
+// different moments).
+func (m *multiClientEnv) waitAllRecs(t *testing.T, base []int64, add int64, what string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		done := true
+		for i, r := range m.recs {
+			if r.count() < base[i]+add {
+				done = false
+				break
+			}
+		}
+		if done {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s; counts=%v base=%v", what, m.counts(), base)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (m *multiClientEnv) counts() []int64 {
+	out := make([]int64, len(m.recs))
+	for i, r := range m.recs {
+		out[i] = r.count()
+	}
+	return out
+}
+
+// waitHintsSettled waits until every event has a covering hint DELIVERED
+// (nothing queued, nothing in flight, appended == queuedUpTo).
+func (m *multiClientEnv) waitHintsSettled(t *testing.T, mac6 string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		app, q, flying, qlen, _ := m.hintState(mac6)
+		if app == q && !flying && qlen == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hints never settled: appended=%d queuedUpTo=%d inFlight=%v queueLen=%d", app, q, flying, qlen)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // notifRecorder collects resource-updated notifications on the client.
@@ -762,5 +924,149 @@ func TestEventsHighFrequencyStorm(t *testing.T) {
 	waitLastSeq(t, e2, "a1b2c3", float64(storm-1)) // rings drained — no deadlock
 	if rec.count() < 1 {
 		t.Fatal("no notification survived the storm")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// review round 1: the at-most-one-hint-per-board invariant
+
+// TestEventsBurstOneHintInFlightPerBoard (review round 1): a single
+// board under a >notifyQueueDepth event burst with the delivery path
+// widened (8 subscribed sessions — one ResourceUpdated fans out to
+// each sequentially) must hold the invariant the sizing rationale
+// promises: at most ONE hint per board in flight, so the channel depth
+// for one board never exceeds 1, the enqueue safety valve never fires,
+// the ring still takes every event, and once settled every event is
+// covered. Pre-fix, armHintLocked enqueued per event whenever a hint
+// lagged, letting one board alone fill the queue (depth > 1, and the
+// >64-boards degradation reachable from a single board).
+func TestEventsBurstOneHintInFlightPerBoard(t *testing.T) {
+	const mac6 = "a1b2c3"
+	m := newMultiClientEnv(t, 8, mac6)
+	refreshWithEvents(t, m.e)
+	m.subscribeAll(t, mac6)
+	m.probeUntilLive(t, mac6)
+	// every session's subscription live before the burst (the SDK's
+	// per-session registrations settle at slightly different moments)
+	base := m.counts()
+	m.waitAllRecs(t, base, 1, "every session's subscription to go live")
+	m.waitHintsSettled(t, mac6)
+	probes := 2 // probeUntilLive pushes ≥1; the exact count is read from the ring below
+
+	// dense depth sampling: a background poller plus a sample per push
+	var maxDepth atomic.Int64
+	stopSampler := make(chan struct{})
+	samplerDone := make(chan struct{})
+	go func() {
+		defer close(samplerDone)
+		for {
+			select {
+			case <-stopSampler:
+				return
+			default:
+				if d := int64(len(m.e.ts.ev.notifyCh)); d > maxDepth.Load() {
+					maxDepth.Store(d)
+				}
+			}
+		}
+	}()
+
+	const burst = 100 // > notifyQueueDepth (64): one board alone, pre-fix, could fill the queue
+	for i := 0; i < burst; i++ {
+		if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": float64(i)}) {
+			t.Fatalf("burst push %d failed", i)
+		}
+		if d := int64(len(m.e.ts.ev.notifyCh)); d > maxDepth.Load() {
+			maxDepth.Store(d)
+		}
+	}
+	waitLastSeq(t, m.e, mac6, float64(burst-1)) // every event landed
+	m.waitHintsSettled(t, mac6)
+	close(stopSampler)
+	<-samplerDone
+
+	if got := maxDepth.Load(); got > 1 {
+		t.Errorf("one board reached hint-queue depth %d — the at-most-one-in-flight invariant is broken (redundant hints stacking)", got)
+	}
+	if _, _, _, qlen, full := m.hintState(mac6); full != 0 || qlen != 0 {
+		t.Errorf("safety valve fired %d times (queue len %d) below notifyQueueDepth=%d boards — enqueue failure must be unreachable here", full, qlen, notifyQueueDepth)
+	}
+
+	// the ring is the lossless view: probes + burst, whole, nothing
+	// lost at the door — probes carry negative seq markers, arrive
+	// first, and the burst follows in order
+	events := waitEvents(t, m.e, mac6, probes+burst)
+	total := len(events)
+	if last := seqOf(t, events[total-1]); last != float64(burst-1) {
+		t.Errorf("ring's newest event = seq %v, want %d", last, burst-1)
+	}
+	burstEvents := 0
+	for _, ev := range events {
+		if seqOf(t, ev) >= 0 {
+			burstEvents++
+		}
+	}
+	if burstEvents != burst {
+		t.Errorf("ring holds %d of the %d burst events — events were lost at the door", burstEvents, burst)
+	}
+	// every session was notified at all
+	m.waitAllRecs(t, base, 1, "every session's burst notification")
+	t.Logf("coalesced: ring holds %d events, notifications per session: %v (base %v)",
+		total, m.counts(), base)
+}
+
+// TestEventsHintReArmsAfterDelivery (review round 1): the missed-window
+// half of the guarantee — events landing WHILE a hint is being
+// delivered (in-flight flag set, arming suppressed) still get their
+// notification: the post-delivery re-arm sees appended != queuedUpTo
+// and queues the next hint. The 8-session fan-out widens one delivery
+// into a window the test can push into.
+func TestEventsHintReArmsAfterDelivery(t *testing.T) {
+	const mac6 = "a1b2c3"
+	m := newMultiClientEnv(t, 128, mac6) // wide fan-out: one delivery spans many session writes
+	refreshWithEvents(t, m.e)
+	m.subscribeAll(t, mac6)
+	m.probeUntilLive(t, mac6)
+	base := m.counts()
+	m.waitAllRecs(t, base, 1, "every session's subscription to go live")
+	m.waitHintsSettled(t, mac6)
+
+	// event A: catch its delivery IN PROGRESS server-side — inFlight
+	// with an empty queue means the hint was dequeued and the 128-write
+	// fan-out is running right now (client-side counters all jump at
+	// once when the dispatch queue drains, so they cannot see this
+	// window; the white-box state can).
+	if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": 1.0}) {
+		t.Fatal("push A failed")
+	}
+	caughtWindow := false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, flying, qlen, _ := m.hintState(mac6); flying && qlen == 0 {
+			caughtWindow = true // A's delivery is mid-flight right now
+			break
+		}
+		runtime.Gosched() // spin: the window is µs-to-ms scale
+	}
+	t.Logf("caught A's delivery mid-window: %v", caughtWindow)
+
+	// event B — during A's delivery when the window was caught: arming
+	// is suppressed (in-flight), so B's coverage must come from the
+	// post-delivery re-arm
+	if caughtWindow {
+		if _, _, flying, _, _ := m.hintState(mac6); !flying {
+			t.Fatalf("expected a hint in flight after catching the delivery window")
+		}
+	}
+	if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": 2.0}) {
+		t.Fatal("push B failed")
+	}
+
+	// the guarantee: every session ends up notified of BOTH A and B
+	m.waitAllRecs(t, base, 2, "A's and B's notifications on every session")
+	m.waitHintsSettled(t, mac6)
+	events := waitEvents(t, m.e, mac6, 2)
+	if last := seqOf(t, events[len(events)-1]); last != 2.0 {
+		t.Errorf("ring's newest event = seq %v, want 2 (B landed)", last)
 	}
 }
