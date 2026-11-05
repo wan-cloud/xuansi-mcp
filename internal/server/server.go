@@ -298,6 +298,25 @@ func New(o Opts) (*Server, error) {
 	return s, nil
 }
 
+// wsaeaddrinuse is Windows' bind-conflict errno (WSAEADDRINUSE 10048,
+// text "Only one usage of each socket address (protocol/network
+// address/port) is normally permitted."). Go's syscall.EADDRINUSE on
+// Windows is an invented APPLICATION_ERROR-offset value real Winsock
+// calls never return (there is no stdlib errno mapping for it), so the
+// race-loser classification below must know the WSA form too — the
+// T9 Windows real-machine finding. On Linux the constant is inert: the
+// kernel never reports an errno that high.
+const wsaeaddrinuse = syscall.Errno(10048)
+
+// isAddrInUse reports whether err is a bind conflict in either
+// supported platform's dress: Linux's EADDRINUSE or Windows'
+// WSAEADDRINUSE. Both sides of the spawn race — winner and loser —
+// must classify the same conflict so the loser re-probes into the
+// graceful ErrAlreadyListening exit instead of a bare exit-1.
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, wsaeaddrinuse)
+}
+
 // bindSock probes for a live daemon, clears a stale sock file, and
 // listens.
 func bindSock(path string) (net.Listener, error) {
@@ -330,7 +349,7 @@ func bindSock(path string) (net.Listener, error) {
 	// racing serves stat'd no file, then one lost the bind). Re-probe
 	// before erroring: a live daemon = the graceful exit-0 loser path;
 	// a dead file = stale, clear it and bind once more.
-	if errors.Is(err, syscall.EADDRINUSE) {
+	if isAddrInUse(err) {
 		if c, derr := net.Dial("unix", path); derr == nil {
 			c.Close()
 			return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)

@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2874,6 +2875,51 @@ func TestBindSockConcurrentRaceGracefulLosers(t *testing.T) {
 		}
 		if winners != 1 || bare != 0 || graceful != n-1 {
 			t.Fatalf("round %d: winners=%d graceful=%d bare=%d, want 1/%d/0", r, winners, graceful, bare, n-1)
+		}
+	}
+}
+
+// TestIsAddrInUseClassification pins the bind-conflict classifier for
+// BOTH supported platforms' errnos directly (the hammer test above is
+// the behavioral coverage, but it can only ever fire the host
+// platform's form): Linux's EADDRINUSE and Windows' WSAEADDRINUSE
+// 10048, both wrapped in the exact net.OpError → os.SyscallError chain
+// net.Listen produces, must classify as a conflict — the T9 Windows
+// real-machine finding was the WSA form dying bare. Near-miss errnos
+// and non-socket errors must NOT match, or a genuine failure would be
+// misread as a lost race.
+func TestIsAddrInUseClassification(t *testing.T) {
+	// listenChain rebuilds the error shape net.Listen returns on a
+	// failed bind: *net.OpError wrapping *os.SyscallError wrapping the
+	// raw errno (the Windows T9 evidence text "listen unix <path>:
+	// bind: Only one usage of each socket address ..." is exactly
+	// this chain around Errno(10048)).
+	listenChain := func(raw syscall.Errno) error {
+		return &net.OpError{
+			Op: "listen", Net: "unix",
+			Err: os.NewSyscallError("bind", raw),
+		}
+	}
+	conflicts := map[string]error{
+		"linux EADDRINUSE (raw)":              syscall.EADDRINUSE,
+		"linux EADDRINUSE (listen wrap)":      listenChain(syscall.EADDRINUSE),
+		"windows WSAEADDRINUSE (raw)":         wsaeaddrinuse,
+		"windows WSAEADDRINUSE (listen wrap)": listenChain(wsaeaddrinuse),
+	}
+	for name, err := range conflicts {
+		if !isAddrInUse(err) {
+			t.Errorf("isAddrInUse(%s) = false, want true — a spawn-race loser in this dress would die bare instead of re-probing", name)
+		}
+	}
+	others := map[string]error{
+		"plain error":            errors.New("server: listen C:\\x.sock: something else"),
+		"wrapped non-conflict":   fmt.Errorf("listen: %w", os.NewSyscallError("bind", syscall.EACCES)),
+		"ECONNREFUSED (raw)":     syscall.ECONNREFUSED,
+		"ECONNREFUSED (wrapped)": listenChain(syscall.ECONNREFUSED),
+	}
+	for name, err := range others {
+		if isAddrInUse(err) {
+			t.Errorf("isAddrInUse(%s) = true, want false — not every listen failure is a lost race", name)
 		}
 	}
 }
