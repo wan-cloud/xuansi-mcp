@@ -25,9 +25,14 @@ type rpcClient struct {
 	nextID int64
 }
 
-// dialDaemon connects to the daemon sock; a missing daemon gets the
-// actionable message.
+// dialDaemon connects to the daemon sock, auto-spawning a detached
+// serve first when nothing is listening (ensureBeforeDial is the
+// seam; every CLI client command funnels through here); a still-
+// missing daemon gets the actionable message.
 func dialDaemon(path string) (*rpcClient, error) {
+	if err := ensureBeforeDial(path); err != nil {
+		return nil, err
+	}
 	conn, err := net.Dial("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot reach the daemon at %s (is `xuansi serve` running?): %w", path, err)

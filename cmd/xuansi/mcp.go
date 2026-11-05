@@ -11,11 +11,13 @@ package main
 // xuansi://boards/<mac6>/events resources (subscribable, snapshot =
 // the per-source event rings) and the xuansi_events_recent polling
 // tool. The daemon connection is dialed EAGERLY, before the stdio
-// loop, so a missing daemon fails fast with the actionable message
-// instead of half-starting behind an MCP handshake; the SDK's
-// StdioTransport binds the process's real stdin/stdout, and MCP
-// traffic rides stdout while logs stay on stderr (slog, like every
-// command).
+// loop, and a missing daemon is auto-spawned first (spawn.go's
+// ensureBeforeDial — the spawned serve logs to serve.log, never this
+// process's stdio), so instead of half-starting behind an MCP
+// handshake it either comes up with a daemon behind it or fails fast
+// with the actionable message; the SDK's StdioTransport binds the
+// process's real stdin/stdout, and MCP traffic rides stdout while
+// logs stay on stderr (slog, like every command).
 //
 // Daemon death mid-session does not exit the loop: every tool call
 // rides the one connection, and once it is gone the calls fail fast
@@ -57,7 +59,16 @@ func runMCP(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	}
 	setupLogging(fsVerbose, stderr)
 
-	c, err := apiclient.Dial(sockFrom(*sock))
+	// same pre-dial guarantee as the CLI: a dead socket spawns a
+	// detached serve (ensureBeforeDial is the seam tests no-op). The
+	// spawn redirects its output to serve.log precisely because this
+	// process's stdout is MCP traffic.
+	sockPath := sockFrom(*sock)
+	if err := ensureBeforeDial(sockPath); err != nil {
+		fmt.Fprintf(stderr, "xuansi mcp: %v\n", err)
+		return 1
+	}
+	c, err := apiclient.Dial(sockPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "xuansi mcp: %v\n", err)
 		return 1

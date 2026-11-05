@@ -290,6 +290,13 @@ func TestStatusPrintsBlock(t *testing.T) {
 
 // TestDaemonDownIsCleanError: no daemon → one clear stderr line, exit 1.
 func TestDaemonDownIsCleanError(t *testing.T) {
+	// no-op the auto-spawn seam (preflight ruling): this test pins the
+	// PLAIN dial failure; with the real ensureDaemon it would spawn a
+	// serve and burn the retry window first.
+	orig := ensureBeforeDial
+	ensureBeforeDial = func(string) error { return nil }
+	t.Cleanup(func() { ensureBeforeDial = orig })
+
 	var out, errb strings.Builder
 	code := run(strings.NewReader(""), &out, &errb, []string{"list", "--sock", t.TempDir() + "/missing.sock"})
 	if code != 1 {
