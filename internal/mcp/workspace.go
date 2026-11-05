@@ -395,7 +395,14 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 
 	// write, read back, verify — then (and only then) the manifest.
+	// The WHOLE cycle rides wsMu (not just the manifest half): a
+	// concurrent driver_pull's fs_rm of the same path must not land
+	// between this fs_write and its fs_read-back (the read-back would
+	// see the removal and fail the sha check) — pull/push serialize as
+	// one unit per board file, the contract the B8 race test pins.
 	sum := sha256hex(content)
+	wsMu.Lock()
+	defer wsMu.Unlock()
 	if _, err := ts.callHeld(ctx, server.Request{Type: "fs_write", Board: board, Path: path, Data: content, Holder: in.Holder}); err != nil {
 		return nil, driverPushOut{}, err
 	}
@@ -410,8 +417,6 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 
 	now := time.Now().UTC()
-	wsMu.Lock()
-	defer wsMu.Unlock()
 	m, err = loadManifest(ts.ws.manifestPath())
 	if err != nil {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", err)
@@ -482,13 +487,18 @@ func (ts *toolset) driverPull(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 
 	// the removal first: only a file the board actually removed clears
 	// Active (its error — the api not-found on an absent file — crosses
-	// verbatim and the manifest below never runs).
+	// verbatim and the manifest below never runs). The removal rides
+	// wsMu TOGETHER with the manifest cycle: a concurrent driver_push's
+	// fs_write + fs_read-back of the same path must not interleave with
+	// this fs_rm (the read-back would see the removal and fail) — the
+	// whole board-file mutation + manifest cycle is one serialized unit
+	// (the contract TestDriverPullConcurrentWithPush pins).
+	wsMu.Lock()
+	defer wsMu.Unlock()
 	if _, err := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: in.Board, Path: path, Holder: in.Holder}); err != nil {
 		return nil, driverPullOut{}, err
 	}
 
-	wsMu.Lock()
-	defer wsMu.Unlock()
 	m, err := loadManifest(ts.ws.manifestPath())
 	if err != nil {
 		return nil, driverPullOut{}, errWs("xuansi_driver_pull: %v", err)
