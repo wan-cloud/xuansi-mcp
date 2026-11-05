@@ -2786,3 +2786,49 @@ func TestIdleExitBlockedByLiveCapture(t *testing.T) {
 		t.Fatal("IdleExited() never closed after the post-capture window fired")
 	}
 }
+
+// TestBindSockConcurrentRaceGracefulLosers: the spawn-race contract at
+// the bind level (task-2's promise, pinned after a task-10 HIL rerun
+// caught the narrow window): N servers binding the same sock path at
+// once leave exactly ONE listener, and EVERY loser gets the graceful
+// ErrAlreadyListening — including a loser whose stale-check ran before
+// the winner created the file (the stat-miss → bind-EADDRINUSE window
+// that used to die with a bare "address already in use" exit-1). The
+// hammer repeats the race; the property holds in every interleaving
+// with the fix and is violated in some without it.
+func TestBindSockConcurrentRaceGracefulLosers(t *testing.T) {
+	const rounds = 30
+	for r := 0; r < rounds; r++ {
+		path := filepath.Join(t.TempDir(), "race.sock")
+		const n = 6
+		res := make([]error, n)
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ln, err := bindSock(path)
+				if err == nil {
+					t.Cleanup(func() { ln.Close() })
+				}
+				res[i] = err
+			}(i)
+		}
+		wg.Wait()
+		winners, graceful, bare := 0, 0, 0
+		for _, err := range res {
+			switch {
+			case err == nil:
+				winners++
+			case errors.Is(err, ErrAlreadyListening):
+				graceful++
+			default:
+				bare++
+				t.Logf("round %d: non-graceful loser: %v", r, err)
+			}
+		}
+		if winners != 1 || bare != 0 || graceful != n-1 {
+			t.Fatalf("round %d: winners=%d graceful=%d bare=%d, want 1/%d/0", r, winners, graceful, bare, n-1)
+		}
+	}
+}

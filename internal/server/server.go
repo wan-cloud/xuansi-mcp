@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"xuansi/internal/board"
@@ -321,10 +322,26 @@ func bindSock(path string) (net.Listener, error) {
 		}
 	}
 	ln, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, fmt.Errorf("server: listen %s: %w", path, err)
+	if err == nil {
+		return ln, nil
 	}
-	return ln, nil
+	// The bind-race window: the sock file can appear between the
+	// stale-check above and the bind (the concurrent-spawn shape — both
+	// racing serves stat'd no file, then one lost the bind). Re-probe
+	// before erroring: a live daemon = the graceful exit-0 loser path;
+	// a dead file = stale, clear it and bind once more.
+	if errors.Is(err, syscall.EADDRINUSE) {
+		if c, derr := net.Dial("unix", path); derr == nil {
+			c.Close()
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
+		}
+		if rerr := os.Remove(path); rerr == nil {
+			if ln2, lerr := net.Listen("unix", path); lerr == nil {
+				return ln2, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("server: listen %s: %w", path, err)
 }
 
 // Start launches the serving loops: accept, the initial discovery sweep
