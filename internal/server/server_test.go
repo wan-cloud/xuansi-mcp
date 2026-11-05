@@ -1681,6 +1681,56 @@ func TestOpBudgetGetTranslation(t *testing.T) {
 	}
 }
 
+// TestOpBudgetGetNilLimitsGuard (B7 minors item 3): budget.get's caps
+// projection must not paper over an off-contract caps reply. Pinned
+// pre-fix behavior (red): a caps reply WITHOUT the limits block
+// answered {"eval_ms": null, "event_ms": null} — silent JSON nulls
+// reading as "budgets are null" — and a PARTIAL limits block projected
+// nulls per missing key. Guard (chosen per the pin): a missing limits
+// BLOCK is a structured api-class refusal (the fw's caps always
+// carries one — its absence is drift the caller must see, not
+// misread); a missing INDIVIDUAL key inside a present limits block
+// stays honest as an ABSENT projection key (the board did not report
+// it; null would claim it reported nothing).
+func TestOpBudgetGetNilLimitsGuard(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "opg2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	// caps WITHOUT the limits block: refusal, not silent nulls
+	e.fakes["d75884"].on("caps", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"api_version": float64(1), "primitives": map[string]any{}}, nil
+	})
+	rep, _ = c.call(2, map[string]any{"type": "op", "board": "d75884", "op": "budget.get"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "limits") {
+		t.Fatalf("caps without limits: error = %#v, want an api-class refusal naming the limits block", er)
+	}
+
+	// PARTIAL limits: the present key projects, the missing key is ABSENT
+	e.fakes["d75884"].on("caps", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{
+			"api_version": float64(1),
+			"limits":      map[string]any{"eval_budget_ms": float64(3000)},
+		}, nil
+	})
+	rep, _ = c.call(3, map[string]any{"type": "op", "board": "d75884", "op": "budget.get"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("partial-limits budget.get: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	if asInt(res["eval_ms"]) != 3000 {
+		t.Errorf("partial-limits result = %#v, want eval_ms 3000", res)
+	}
+	if v, has := res["event_ms"]; has {
+		t.Errorf("partial-limits result carries event_ms=%v, want the unreported key ABSENT", v)
+	}
+}
+
 // TestOpArgsValidation: op args run through the SAME numeric walk as
 // eval/submit (controller ruling — the motivating case: op budget.set
 // {"eval_ms":3000} would otherwise encode 3000 as a msgpack float the

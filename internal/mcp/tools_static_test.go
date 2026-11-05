@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/base64"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -335,6 +336,57 @@ func TestBoardOpArgsCrossThrough(t *testing.T) {
 	}
 }
 
+// TestFsWriteBase64PaddingStrictness (B7 minors item 4): non-canonical
+// and whitespace-padded data_b64 is a structured api-class refusal
+// (strict StdEncoding.DecodeString — pinned here; already the
+// behavior). Two tolerant corners are pinned as ACCEPTED so the
+// contract is explicit either way: Go's decoder ignores embedded
+// \r/\n, and non-canonical trailing bits ("QR==") decode to the same
+// bytes as their canonical form — neither can change the decoded
+// payload, so tolerance is harmless.
+func TestFsWriteBase64PaddingStrictness(t *testing.T) {
+	// the tolerant corners cross to the daemon (script one ack each):
+	// newline-wrapped and non-canonical-padding input decodes to the
+	// SAME bytes as canonical "QQ==" ("A")
+	tolerant := []string{"QQ==", "QQ==\n", "QQ==\r\n", "QR=="}
+	script := make([]step, len(tolerant))
+	for i := range script {
+		script[i] = step{result: map[string]any{"ok": true}}
+	}
+	e, reqs := newEnv(t, script, Options{Holder: "mcp-fixed01"})
+
+	// the malformed half: refused client-side, api class, zero crossings
+	for _, bad := range []string{"QQ=", "QUJD=", "QUJD==", "QQ=A", " QQ==", "QQ== ", "===="} {
+		res := e.call("xuansi_fs_write", map[string]any{
+			"board": "d75884", "path": "/data/x", "data_b64": bad,
+		})
+		if !res.IsError {
+			t.Errorf("data_b64 %q accepted, want the strict-decoder refusal", bad)
+			continue
+		}
+		got := resultText(t, res)
+		if !strings.HasPrefix(got, "api:") || !strings.Contains(got, "not valid base64") {
+			t.Errorf("data_b64 %q error = %q, want an api-class \"not valid base64\" refusal", bad, got)
+		}
+	}
+	noContact(t, reqs) // every malformed one was refused client-side
+
+	for _, okIn := range tolerant {
+		res := e.call("xuansi_fs_write", map[string]any{
+			"board": "d75884", "path": "/data/x", "data_b64": okIn,
+		})
+		if res.IsError {
+			t.Errorf("data_b64 %q refused (%s), want the pinned tolerance", okIn, resultText(t, res))
+		}
+	}
+	for range tolerant { // each tolerant write crossed, each carrying "A"
+		if req := wantReq(t, reqs); string(req.Data) != "A" {
+			t.Errorf("tolerated write carried %q, want the decoded \"A\"", req.Data)
+		}
+	}
+	noContact(t, reqs)
+}
+
 // opsFaceAllowlistPinned mirrors the ops face's frozen allowlist
 // (transcribed independently of the daemon's table — server_test.go
 // holds the table-side pin; a shared typo survives only if both copies
@@ -358,6 +410,110 @@ func spanList(t *testing.T, s, from, to string) []string {
 		t.Fatalf("end anchor %q not found in %q", to, s)
 	}
 	return strings.Split(rest[:j], ", ")
+}
+
+// TestStaticToolNamesSingleSource (B7 minors item 8): the static face's
+// name list (staticToolNames — the dynamic face's claim seed) and the
+// register calls' string literals are one set — a tool added to
+// register() without the list (or vice versa) fails here, the same
+// lockstep pattern TestBoardOpAllowlistSingleSource pins for the ops
+// allowlist.
+func TestStaticToolNamesSingleSource(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(lr.Tools))
+	for _, tool := range lr.Tools {
+		got = append(got, tool.Name)
+	}
+	sort.Strings(got)
+	want := append([]string(nil), staticToolNames...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("served static tools = %v, want exactly staticToolNames %v — keep the list and the register calls in lockstep", got, want)
+	}
+}
+
+// staticToolsRequiredAudit is the B7 item-9 audit table: for EVERY
+// static tool, the exact required-property set its served schema must
+// carry — each entry cross-checked against what the handler actually
+// needs (a field with a defaulting path is optional; one whose absence
+// errors daemon-side or client-side is required). The SDK infers
+// required-ness from the json tag's omitempty, so this table pins that
+// every input struct's omitempty split matches handler behavior.
+var staticToolsRequiredAudit = map[string][]string{
+	"xuansi_list_boards":   {},
+	"xuansi_board_status":  {"board"},
+	"xuansi_lease":         {"board"},
+	"xuansi_release":       {"board"},
+	"xuansi_run_lua":       {"board", "code"},
+	"xuansi_submit":        {"board", "code", "tag"},
+	"xuansi_script_start":  {"board", "name", "code"},
+	"xuansi_script_stop":   {"board", "name"},
+	"xuansi_fs_write":      {"board", "path", "data_b64"},
+	"xuansi_fs_read":       {"board", "path"},
+	"xuansi_board_op":      {"board", "op"},
+	"xuansi_events_recent": {"board"},
+	"xuansi_ws_put":        {"name", "version", "content"},
+	"xuansi_ws_list":       {},
+	"xuansi_ws_get":        {"name", "version"},
+	"xuansi_driver_push":   {"board", "name"},
+	"xuansi_capture":       {"board", "source"},
+}
+
+// TestStaticToolsRequiredCoverage (B7 minors item 9): every static
+// tool's served schema carries exactly the audited required set — a
+// tag whose omitempty drifts from handler reality fails here. (Audit
+// finding at the time of writing: the omitempty split was already
+// handler-true for all 17 tools; this table is the executable form of
+// the audit, closing the coverage gap — no tag changes were needed.)
+func TestStaticToolsRequiredCoverage(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := map[string][]string{}
+	for _, tool := range lr.Tools {
+		if _, ok := staticToolsRequiredAudit[tool.Name]; !ok {
+			continue // dynamic tools carry their own required logic
+		}
+		m, ok := tool.InputSchema.(map[string]any)
+		if !ok {
+			t.Fatalf("tool %s input schema = %#v, want a JSON object", tool.Name, tool.InputSchema)
+		}
+		var req []string
+		if r, ok := m["required"].([]any); ok {
+			for _, x := range r {
+				if s, ok := x.(string); ok {
+					req = append(req, s)
+				}
+			}
+		}
+		sort.Strings(req)
+		served[tool.Name] = req
+	}
+	for name, want := range staticToolsRequiredAudit {
+		want = append([]string(nil), want...)
+		sort.Strings(want)
+		got, ok := served[name]
+		if !ok {
+			t.Errorf("static tool %s not served", name)
+			continue
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s required = %v, want the audited %v", name, got, want)
+		}
+	}
+	if len(served) != len(staticToolsRequiredAudit) {
+		t.Errorf("audited %d tools but %d served", len(staticToolsRequiredAudit), len(served))
+	}
 }
 
 // TestBoardOpAllowlistSingleSource: xuansi_board_op's two allowlist

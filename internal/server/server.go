@@ -1138,16 +1138,31 @@ func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, er
 	// caps and projects the {eval_ms, event_ms} pair the ops face
 	// promises. Found by the b6 full HIL — the unit fake used to accept
 	// the raw name the daemon sent.
+	//
+	// nil-limits guard (B7 minors item 3): a caps reply WITHOUT a
+	// limits block is off-contract (every fw caps carries one) — refuse
+	// api-class rather than project silent JSON nulls that read as
+	// "budgets are null". A limits block missing an INDIVIDUAL key
+	// projects that key as ABSENT (the board did not report it; a null
+	// would claim it reported nothing).
 	if req.Op == "budget.get" {
 		res, err := s.boardOp(ctx, b, "caps", nil)
 		if err != nil {
 			return nil, err
 		}
-		lim, _ := res["limits"].(map[string]any)
-		return map[string]any{
-			"eval_ms":  lim["eval_budget_ms"],
-			"event_ms": lim["event_budget_ms"],
-		}, nil
+		lim, ok := res["limits"].(map[string]any)
+		if !ok {
+			return nil, &RPCError{Class: "api",
+				Msg: fmt.Sprintf("budget.get: board %s caps reply carries no limits block — cannot read the runtime budgets (fw off-contract?); re-run op caps directly to inspect the reply", b.MAC6)}
+		}
+		out := map[string]any{}
+		if v, ok := lim["eval_budget_ms"]; ok {
+			out["eval_ms"] = v
+		}
+		if v, ok := lim["event_budget_ms"]; ok {
+			out["event_ms"] = v
+		}
+		return out, nil
 	}
 	return s.boardOp(ctx, b, req.Op, args)
 }

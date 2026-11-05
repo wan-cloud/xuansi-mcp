@@ -9,6 +9,7 @@ package mcp
 import (
 	"context"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -173,6 +174,42 @@ func TestCaptureToolCtxCancelStops(t *testing.T) {
 	stopReq := wantReq(t, reqs)
 	if stopReq.Type != "capture_stop" || stopReq.CaptureID != "cap-9" {
 		t.Errorf("cancel path request = %+v, want capture_stop of cap-9", stopReq)
+	}
+}
+
+// TestCaptureNegativeBoundsFallToDefaults (B7 minors item 6): NEGATIVE
+// seconds/max_bytes are not errors and not negative bounds — the >0
+// checks drop them and the crossing carries zero, letting the daemon
+// apply its 600s/64MiB defaults. Pinned exactly (controller ruling:
+// pin + Desc states it, no behavior change), and the schema tags must
+// carry the same statement so the agent sees it.
+func TestCaptureNegativeBoundsFallToDefaults(t *testing.T) {
+	fd, reqs := captureDaemon(t, "cap-n", "/p.bin", func(conn net.Conn) {
+		pushCaptureDone(t, conn, server.CaptureDone{Type: "capture_done", CaptureID: "cap-n", Path: "/p.bin", Bytes: 0, Reason: "limit"})
+	})
+	e := wireMCP(t, fd, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_capture", map[string]any{
+		"board": "d75884", "source": "stdout", "seconds": -5, "max_bytes": -1024,
+	})
+	if res.IsError {
+		t.Fatalf("negative-bound capture failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.MaxSeconds != 0 || req.MaxBytes != 0 {
+		t.Errorf("negative bounds crossed as %d/%d, want 0/0 (daemon defaults 600s/64MiB)", req.MaxSeconds, req.MaxBytes)
+	}
+
+	// the documented half: both param tags state the non-positive rule
+	secF, ok1 := reflect.TypeOf(captureIn{}).FieldByName("Seconds")
+	mbF, ok2 := reflect.TypeOf(captureIn{}).FieldByName("MaxBytes")
+	if !ok1 || !ok2 {
+		t.Fatal("captureIn lost its Seconds/MaxBytes fields")
+	}
+	for _, tag := range []string{secF.Tag.Get("jsonschema"), mbF.Tag.Get("jsonschema")} {
+		if !strings.Contains(tag, "on-positive") {
+			t.Errorf("param tag %q does not state the non-positive-=-default rule", tag)
+		}
 	}
 }
 

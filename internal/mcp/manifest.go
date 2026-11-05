@@ -8,8 +8,9 @@ package mcp
 // footprints). The versioned files under drivers/ ARE the history; the
 // manifest is the index plus audit trail (生效版本、checksum、來源).
 //
-// All writes are atomic (temp file + rename, the temp fsynced) and
-// every read-modify-write cycle is serialized in-process by wsMu
+// All writes are atomic (temp file + rename, the temp fsynced, the
+// directory fsynced after the rename — crash durability) and every
+// read-modify-write cycle is serialized in-process by wsMu
 // (workspace.go): a reader ever only sees a whole manifest, and
 // concurrent pushes merge their footprints instead of losing them
 // (last-writer-wins on Active, every Boards entry kept).
@@ -101,9 +102,49 @@ func loadManifest(path string) (*Manifest, error) {
 	return &m, nil
 }
 
+// writeDurableFile writes data to path and fsyncs BOTH the file and
+// its parent directory — the crash-durability pair (B7 minors item 2):
+// without the file fsync the bytes may be lost on power failure, and
+// without the directory fsync a fresh directory entry can vanish while
+// the data sits in an orphaned block. Verified by code review only —
+// fsync semantics cannot be unit-proven without crash simulation
+// (controller ruling: implement + note, no unit red/green possible).
+func writeDurableFile(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return fsyncDir(filepath.Dir(path))
+}
+
+// fsyncDir flushes one directory's entries (create/rename) to stable
+// storage — the other half of writeDurableFile, and of an atomic
+// rename: without it the rename itself may be unrecorded after a
+// crash. Same code-review-only verification note as writeDurableFile.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 // writeManifestAtomic writes m to path atomically: a temp file in the
 // SAME directory (the rename stays on one filesystem), written,
-// fsynced and renamed over the target — a concurrent reader ever only
+// fsynced and renamed over the target, then the directory fsynced so
+// the rename itself survives a crash — a concurrent reader ever only
 // sees the old or the new whole manifest, never a torn write.
 func writeManifestAtomic(path string, m *Manifest) error {
 	b, err := json.MarshalIndent(m, "", "  ")
@@ -128,5 +169,8 @@ func writeManifestAtomic(path string, m *Manifest) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return fsyncDir(filepath.Dir(path))
 }

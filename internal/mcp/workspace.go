@@ -239,7 +239,7 @@ func (ts *toolset) wsPut(_ context.Context, _ *mcpsdk.CallToolRequest, in wsPutI
 		return nil, wsPutOut{}, errWs("xuansi_ws_put: %v", err)
 	}
 	content := []byte(in.Content)
-	if err := os.WriteFile(path, content, 0o644); err != nil {
+	if err := writeDurableFile(path, content, 0o644); err != nil {
 		return nil, wsPutOut{}, errWs("xuansi_ws_put: %v", err)
 	}
 	sum := sha256hex(content)
@@ -410,9 +410,12 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 	e := m.entry(in.Name)
 	fm := e.Files[ver]
-	if fm.Sha256 == "" || fm.Size == 0 {
-		fm.Sha256, fm.Size = sum, len(content) // tolerate a file without a put-recorded entry
-	}
+	// ALWAYS the disk-at-push-time values (single source): a file
+	// modified after its put must not leave a stale put-time checksum —
+	// the push just verified THESE bytes on the board, so these are the
+	// bytes the history records (B7 minors item 1; the old fill-only-
+	// when-empty guard desynced manifest vs disk).
+	fm.Sha256, fm.Size = sum, len(content)
 	fm.PushedAt = now
 	if fm.Boards == nil {
 		fm.Boards = map[string]time.Time{}

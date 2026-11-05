@@ -505,8 +505,21 @@ func structuredResult(v any) (*mcpsdk.CallToolResult, error) {
 // ---------------------------------------------------------------------------
 // naming
 
+// toolBaseMax bounds the sanitized alias/mac6 base (B7 minors item 5):
+// base + "_<prim>_<op>" plus claimToolName's disambiguation suffix
+// ("_<mac6>" and a numeric tail in the adversarial worst case) stays
+// inside the SDK's 128-char tool-name cap even at the bound. TRUNCATE,
+// not refuse: the bound fires inside the background refresh loop,
+// which has no error channel to an operator, and dropping a board's
+// whole dynamic toolset over a long alias would be the surprising
+// outcome — claimToolName already disambiguates truncation collisions
+// (mac6 is 12 chars and never hit). The sanitized alphabet is pure
+// ASCII, so byte slicing == rune slicing.
+const toolBaseMax = 64
+
 // sanitizeToolBase reduces an alias (or mac6) to [a-z0-9_], falling
-// back to the mac6 when nothing survives (an alias of pure symbols).
+// back to the mac6 when nothing survives (an alias of pure symbols),
+// and bounds the result's length at toolBaseMax.
 func sanitizeToolBase(alias, mac6 string) string {
 	base := alias
 	if base == "" {
@@ -524,6 +537,10 @@ func sanitizeToolBase(alias, mac6 string) string {
 	out := strings.Trim(b.String(), "_")
 	if out == "" {
 		return strings.ToLower(mac6)
+	}
+	if len(out) > toolBaseMax {
+		// keep the head, re-trim a cut landing on '_'
+		out = strings.TrimRight(out[:toolBaseMax], "_")
 	}
 	return out
 }

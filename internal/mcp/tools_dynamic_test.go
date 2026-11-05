@@ -270,6 +270,34 @@ func hasPrefixName(names []string, prefix string) int {
 // ---------------------------------------------------------------------------
 // expansion: count, naming, request shapes
 
+// TestSanitizeToolBaseLengthBound (B7 minors item 5): a pathological
+// alias cannot become a pathological tool-name prefix — the sanitized
+// base is bounded (64 chars), so base + "_<prim>_<op>" (+ the claim
+// suffix "_<mac6>" and a numeric tail in the disambiguated worst case)
+// stays inside the SDK's 128-char tool-name cap. TRUNCATE, not refuse:
+// the bound fires inside the background refresh loop, which has no
+// error channel to an operator, and dropping a board's whole toolset
+// over a long alias would be the surprising outcome — claimToolName
+// already disambiguates any truncation collision.
+func TestSanitizeToolBaseLengthBound(t *testing.T) {
+	long := strings.Repeat("a", 500)
+	base := sanitizeToolBase(long, "d75884")
+	if len(base) > 64 {
+		t.Errorf("500-char alias sanitized to %d chars, want the ≤64 bound (a 500-char tool prefix overflows the SDK's 128-char names)", len(base))
+	}
+	// the mac6 fallback path (pure-symbol alias) is short by construction
+	if b := sanitizeToolBase("??!", "d75884"); b != "d75884" {
+		t.Errorf("mac6 fallback = %q, want d75884", b)
+	}
+	// 64 exactly passes through untouched; the cut keeps [a-z0-9_] only
+	if b := sanitizeToolBase(strings.Repeat("b", 64), "d75884"); b != strings.Repeat("b", 64) {
+		t.Errorf("64-char alias = %q, want it untouched at the bound", b)
+	}
+	if b := sanitizeToolBase(strings.Repeat("c", 100), "d75884"); len(b) != 64 {
+		t.Errorf("100-char alias = %q (%d), want the 64-char cut", b, len(b))
+	}
+}
+
 // TestDynamicExpansionTwoBoards: one aliased board (bench1, mac6
 // a1b2c3) and one bare-mac6 board (d75884) expand to 30 typed tools
 // each (60 dynamic + the 11 static); naming is <alias|mac6>_<prim>_<op>;

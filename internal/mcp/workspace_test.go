@@ -478,6 +478,52 @@ func TestConcurrentPushesConsistentManifest(t *testing.T) {
 	}
 }
 
+// TestDriverPushRefreshesManifestShaFromDisk (B7 minors item 1): a
+// workspace file modified on disk after its ws_put must not leave a
+// STALE manifest checksum — the push ships the CURRENT bytes and the
+// manifest records exactly those (single source = disk at push time).
+// Pre-fix behavior (red): the "fill only when empty" guard kept the
+// put-time sha, so the manifest claimed bytes the board never saw.
+func TestDriverPushRefreshesManifestShaFromDisk(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
+	v1 := "--@api 1\n-- v1 original\nreturn {}\n"
+	v2 := "--@api 1\n-- v2 modified on disk behind the manifest's back\nreturn {changed=true}\n"
+	mustPut(t, e, "ads1115", "1.0.0", v1)
+
+	// external modification of the stored file (out-of-band edit)
+	if err := os.WriteFile(filepath.Join(root, "drivers", "ads1115@1.0.0.lua"), []byte(v2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "ads1115", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("push of the externally modified file failed: %s", resultText(t, res))
+	}
+	// the pipeline crossing order: caps, write, read-back
+	wantReq(t, reqs)
+	writeReq := wantReq(t, reqs)
+	wantReq(t, reqs)
+	if !reflect.DeepEqual(writeReq.Data, []byte(v2)) {
+		t.Fatalf("fs_write shipped %q, want the MODIFIED disk bytes", writeReq.Data)
+	}
+
+	sha2 := sha256hex([]byte(v2))
+	if out := structured(t, res); out["sha256"] != sha2 {
+		t.Errorf("push result sha256 = %v, want the modified bytes'", out["sha256"])
+	}
+	m := wsManifest(t, root)
+	fm := m.Drivers["ads1115"].Files["1.0.0"]
+	if fm.Sha256 != sha2 {
+		t.Errorf("manifest sha256 = %s, want the disk-at-push-time %s (put-time sha %s must not survive)",
+			fm.Sha256, sha2, sha256hex([]byte(v1)))
+	}
+	if fm.Size != len(v2) {
+		t.Errorf("manifest size = %d, want %d (the modified bytes)", fm.Size, len(v2))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // defaults, sanitization, caps reuse, list/get
 
