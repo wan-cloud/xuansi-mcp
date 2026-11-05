@@ -17,7 +17,6 @@ package paths
 import (
 	"os"
 	"path"
-	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -34,17 +33,21 @@ func StateDir() string { return stateDirFor(runtime.GOOS, osEnv(), homeDir()) }
 func DataDir() string { return dataDirFor(runtime.GOOS, osEnv(), homeDir()) }
 
 // osEnv is the live env lookup the wrappers hand the pure functions.
-// On Windows %LOCALAPPDATA% is sourced through os.UserCacheDir — the
-// sanctioned accessor returns <LocalAppData>\Cache there, so its
-// parent is the value — with the raw env var as fallback when even
-// that fails; elsewhere it is plain os.Getenv.
+// On Windows %LOCALAPPDATA% is sourced through os.UserCacheDir — on
+// Windows that sanctioned accessor IS %LocalAppData% itself (os/file
+// returns Getenv("LocalAppData") verbatim, no suffix), so its result
+// is used as-is — with the raw env var as fallback when even that
+// fails; elsewhere it is plain os.Getenv. (The T9 live finding: an
+// earlier version took filepath.Dir of it — true only of the darwin
+// \Caches shape — which stripped the "Local" component and landed
+// every Windows path one level high.)
 func osEnv() func(string) string {
 	if runtime.GOOS != "windows" {
 		return os.Getenv
 	}
 	lad := ""
 	if d, err := os.UserCacheDir(); err == nil {
-		lad = filepath.Dir(d)
+		lad = d
 	} else {
 		lad = os.Getenv("LOCALAPPDATA")
 	}
