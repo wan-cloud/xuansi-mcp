@@ -54,6 +54,7 @@
 //	fs_write       {board, path, data, holder?}  → board ack       (lease required; data = base64 (JSON []byte); ≤16384B enforced daemon-side with class api, mirroring the board's own refusal)
 //	fs_read        {board, path}                 → {data: base64}  (read-only, no lease)
 //	fs_rm          {board, path, holder?}        → {}              (lease required; the removal path — the board's own fs.rm {path} verbatim, same gate as fs_write; a missing file is the board's api not-found, class/msg unmodified)
+//	session_reset  {board, session?, holder?}    → {stopped:n}     (lease required; session omitted = 0. The board's own session.reset {session} verbatim under eval's gate — releases that session's scripts AND pins. ns-0 is where bare evals claim pins (owner _eval, shared across evals, §2/§3.2): the b7 S4b HIL could only sweep it by the release-lease/re-lease detour because session.* is deliberately outside the ops allowlist (batch-6 ruling) — THIS request type is the dedicated path instead. {stopped:n} counts scripts stopped (a pins-only ns-0 sweep answers 0 while still releasing the pins); board error class/msg crosses unmodified)
 //	watch_events   {board, source?}              → {board}         (subscribes THIS connection; source, when given, is additionally events.subscribe'd board-side)
 //	op             {board, op, args?, holder?}   → board reply result  (the ops face — see below)
 //	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; see the capture section below)
@@ -245,6 +246,9 @@ type Request struct {
 	// session ops are NOT reachable through it.
 	Op   string `json:"op,omitempty"`
 	Args any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS; op: the op's args object — numbers validated daemon-side either way
+	// Session is session_reset's target namespace — 0 (the bare-eval
+	// membership) when omitted; see the session_reset contract line.
+	Session int `json:"session,omitempty"`
 	// CaptureID addresses one capture (capture_stop's target).
 	CaptureID string `json:"capture_id,omitempty"`
 	// MaxBytes / MaxSeconds bound one capture (0 = the 64MiB / 600s

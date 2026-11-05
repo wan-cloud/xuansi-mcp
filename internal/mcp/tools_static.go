@@ -150,6 +150,15 @@ type fsRmIn struct {
 	Holder string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
+type sessionResetIn struct {
+	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
+	// Session omits to 0 — the namespace bare evals claim pins in; an
+	// explicit number targets a script namespace (a lease's reply
+	// names the namespace its script_start scripts run under).
+	Session int    `json:"session,omitempty" jsonschema:"board session namespace to reset. Omit for 0 — the shared membership BARE EVALS claim pins under (owner _eval): pins claimed by one eval persist into every later eval, and this is the in-pipeline release for them (no release/re-lease dance). An explicit number targets a script namespace — the lease reply's session field names the namespace its xuansi_script_start scripts run under, so naming it stops those scripts without giving up the lease"`
+	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
+}
+
 type boardOpIn struct {
 	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
 	// Op's tag list is hand-maintained (a struct tag cannot render
@@ -233,8 +242,9 @@ type opResultOut = map[string]any
 // staticToolNames is the static face's fixed name set — the dynamic
 // face seeds its name-claiming with it so no per-board tool can ever
 // displace a static one (server_test.go pins the served list to the
-// same names). B8 appends fs_rm + driver_pull after capture: the
-// existing 17 keep their positions (nothing renumbers).
+// same names). B8 appends fs_rm + driver_pull after capture, then
+// session_reset after those: the existing 17 keep their positions
+// (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -255,6 +265,7 @@ var staticToolNames = []string{
 	"xuansi_capture",
 	"xuansi_fs_rm",
 	"xuansi_driver_pull",
+	"xuansi_session_reset",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -354,6 +365,11 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_driver_pull",
 		Description: "Remove a board's effective driver file /drv/<name>.lua through the pipeline (fs_rm under the lease — take it with xuansi_lease) and clear the manifest's ACTIVE version for that driver. History is never rewritten: every stored version and its per-board push footprints STAY in the workspace and the manifest, so rollback is simply re-pushing the version explicitly. A driver whose board file is already gone surfaces the board's own api not-found verbatim (the manifest is untouched in that case). Holder semantics: " + holderDesc + ".",
 	}, ts.driverPull)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_session_reset",
+		Description: "Reset one board session: stops every script running in it and releases every pin it claimed (the board's own session.reset — pins go to the safe state, high-Z). Omit session for namespace 0, the shared membership BARE EVALS claim pins under (owner _eval): a pin claimed by one eval persists into every later eval on the board, and THIS tool is the in-pipeline release for those claims — no more release-lease/re-lease dance (the b7 S4b detour this tool replaces; the lease itself is untouched). An explicit session number targets a script namespace: a lease's reply names the session its xuansi_script_start scripts run under, so naming that number stops those scripts mid-lease. The reply is the board's own {stopped:n} where n counts SCRIPTS stopped — a pins-only ns-0 sweep answers 0 while still releasing the pins (verify with xuansi_board_op diag.pins). The board's error class/msg crosses verbatim. Holder semantics: " + holderDesc + ".",
+	}, ts.sessionReset)
 
 	ts.registerCapture(srv)
 }
@@ -516,6 +532,19 @@ func (ts *toolset) fsRm(ctx context.Context, _ *mcpsdk.CallToolRequest, in fsRmI
 		return nil, boardAckOut{}, errFsPath(in.Path)
 	}
 	res, err := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: in.Board, Holder: in.Holder, Path: in.Path})
+	if err != nil {
+		return nil, boardAckOut{}, err
+	}
+	return nil, boardAckOut(res), nil
+}
+
+// sessionReset crosses the ns-0 release as the session_reset request —
+// the eval-face's destructive half for pin claims (B8 task 2, the b7
+// S4b detour's proper fix). No client-side gate beyond the holder: the
+// session number's meaning is the board's, the daemon re-gates the
+// lease, and the board's {stopped:n} / error cross verbatim.
+func (ts *toolset) sessionReset(ctx context.Context, _ *mcpsdk.CallToolRequest, in sessionResetIn) (*mcpsdk.CallToolResult, boardAckOut, error) {
+	res, err := ts.callHeld(ctx, server.Request{Type: "session_reset", Board: in.Board, Session: in.Session, Holder: in.Holder})
 	if err != nil {
 		return nil, boardAckOut{}, err
 	}

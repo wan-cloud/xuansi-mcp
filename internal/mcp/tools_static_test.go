@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/base64"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -463,6 +464,97 @@ func TestFsRmErrorPassthrough(t *testing.T) {
 	}
 }
 
+// TestSessionResetOmittedSessionCrossesAsZero (B8 task 2): the tool's
+// optional session defaults to namespace 0 - the bare-eval membership -
+// and the request crosses held; the board's {stopped:n} reply maps back
+// verbatim (n counts SCRIPTS: a pins-only ns-0 reset answers 0).
+func TestSessionResetOmittedSessionCrossesAsZero(t *testing.T) {
+	e, reqs := newEnv(t, []step{{result: map[string]any{"stopped": 0.0}}}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_session_reset", map[string]any{"board": "d75884"})
+	if res.IsError {
+		t.Fatalf("session_reset failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Type != "session_reset" || req.Board != "d75884" || req.Session != 0 || req.Holder != "mcp-fixed01" {
+		t.Errorf("session_reset request = %+v, want session_reset/d75884/session 0 under the process holder", req)
+	}
+	if m := structured(t, res); m["stopped"] != 0.0 {
+		t.Errorf("session_reset result = %v, want the board's {stopped:0} verbatim", m)
+	}
+}
+
+// TestSessionResetExplicitSession: an explicit session number (a lease
+// namespace whose scripts the reset stops) crosses as itself.
+func TestSessionResetExplicitSession(t *testing.T) {
+	e, reqs := newEnv(t, []step{{result: map[string]any{"stopped": 2.0}}}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_session_reset", map[string]any{"board": "d75884", "session": 7.0})
+	if res.IsError {
+		t.Fatalf("session_reset failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Type != "session_reset" || req.Board != "d75884" || req.Session != 7 || req.Holder != "mcp-fixed01" {
+		t.Errorf("session_reset request = %+v, want session_reset/d75884/session 7 under the process holder", req)
+	}
+	if m := structured(t, res); m["stopped"] != 2.0 {
+		t.Errorf("session_reset result = %v, want the board's {stopped:2} verbatim", m)
+	}
+}
+
+// TestSessionResetErrorPassthrough: the daemon's structured refusal
+// (a board error riding session_reset) crosses to the tool error text
+// exactly - class and msg, no rewording.
+func TestSessionResetErrorPassthrough(t *testing.T) {
+	e, _ := newEnv(t, []step{{rerr: &server.RPCError{
+		Class: "api", Msg: "session 99 out of range",
+	}}}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_session_reset", map[string]any{"board": "d75884", "session": 99.0})
+	if !res.IsError {
+		t.Fatalf("session_reset on a bad session succeeded: %+v", res)
+	}
+	want := "api: session 99 out of range"
+	if got := resultText(t, res); got != want {
+		t.Errorf("error text = %q, want exactly %q", got, want)
+	}
+}
+
+// TestSessionResetHolderLadder: session_reset is lease-gated, so the
+// holder ladder applies in full - explicit tool input > the bound
+// mirror > the generated default (the same ladder the lease-gated
+// tools pin).
+func TestSessionResetHolderLadder(t *testing.T) {
+	// explicit input wins, and settles as the connection's binding
+	e, reqs := newEnv(t, []step{
+		{result: map[string]any{"stopped": 0.0}},
+		{result: map[string]any{"stopped": 0.0}},
+	}, Options{Holder: "mcp-fixed01"})
+	if res := e.call("xuansi_session_reset", map[string]any{"board": "d75884", "holder": "agent-s1"}); res.IsError {
+		t.Fatalf("explicit-holder session_reset failed: %s", resultText(t, res))
+	}
+	if req := wantReq(t, reqs); req.Holder != "agent-s1" {
+		t.Errorf("explicit rung: holder = %q, want agent-s1 (explicit input wins)", req.Holder)
+	}
+	// the plain follow-up rides the BOUND mirror, not the default
+	if res := e.call("xuansi_session_reset", map[string]any{"board": "d75884"}); res.IsError {
+		t.Fatalf("mirror-holder session_reset failed: %s", resultText(t, res))
+	}
+	if req := wantReq(t, reqs); req.Holder != "agent-s1" {
+		t.Errorf("mirror rung: holder = %q, want the bound agent-s1 (bound beats the default)", req.Holder)
+	}
+
+	// no explicit anything: the generated per-process default carries
+	e2, reqs2 := newEnv(t, []step{{result: map[string]any{"stopped": 0.0}}}, Options{})
+	if res := e2.call("xuansi_session_reset", map[string]any{"board": "d75884"}); res.IsError {
+		t.Fatalf("default-holder session_reset failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs2)
+	if !regexp.MustCompile(`^mcp-[0-9a-f]{8}$`).MatchString(req.Holder) {
+		t.Errorf("default rung: holder = %q, want the generated mcp-<8 hex> default", req.Holder)
+	}
+}
+
 // opsFaceAllowlistPinned mirrors the ops face's frozen allowlist
 // (transcribed independently of the daemon's table — server_test.go
 // holds the table-side pin; a shared typo survives only if both copies
@@ -541,6 +633,7 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_capture":       {"board", "source"},
 	"xuansi_fs_rm":         {"board", "path"},
 	"xuansi_driver_pull":   {"board", "name"},
+	"xuansi_session_reset": {"board"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static

@@ -716,6 +716,8 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hFsRead(ctx, req)
 	case "fs_rm":
 		result, err = s.hFsRm(ctx, cc, req)
+	case "session_reset":
+		result, err = s.hSessionReset(ctx, cc, req)
 	case "op":
 		result, err = s.hOp(ctx, cc, req)
 	case "watch_events":
@@ -1236,6 +1238,26 @@ func (s *Server) hFsRm(ctx context.Context, cc *clientConn, req *Request) (any, 
 		return nil, err
 	}
 	return s.boardOp(ctx, b, "fs.rm", map[string]any{"path": req.Path})
+}
+
+// hSessionReset releases one board session's scripts and pins (op
+// session.reset) under eval's lease gate — the dedicated path the b7
+// S4b detour (release-lease → re-lease) worked around: bare evals
+// claim pins in namespace 0 (owner _eval, shared across evals), which
+// no ops-face entry could reach because session.* is deliberately
+// keep-out of the op allowlist (batch-6 ruling — this request type is
+// the alternative, not an allowlist exception). Session omitted = 0;
+// the board's {stopped:n} reply and error class/msg cross verbatim.
+// The lease itself is untouched (its teardown keeps its own sweep).
+func (s *Server) hSessionReset(ctx context.Context, cc *clientConn, req *Request) (any, error) {
+	b, rerr := s.resolve(req.Board)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
+		return nil, err
+	}
+	return s.boardOp(ctx, b, "session.reset", map[string]any{"session": req.Session})
 }
 
 func (s *Server) hWatchEvents(ctx context.Context, cc *clientConn, req *Request) (any, error) {

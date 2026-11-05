@@ -268,8 +268,8 @@ func noContact(t *testing.T, reqs chan server.Request) {
 // 11's four driver-workspace tools, task 12's blocking capture
 // tool (the rings events_recent reads ride the dynamic refresh, but
 // the tool itself is static contract; the workspace tools never touch
-// the daemon on the store side), and B8's fs_rm + driver_pull (the
-// removal path).
+// the daemon on the store side), B8's fs_rm + driver_pull (the
+// removal path), and B8's session_reset (the ns-0 release).
 var staticTools = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -290,6 +290,7 @@ var staticTools = []string{
 	"xuansi_capture",
 	"xuansi_fs_rm",
 	"xuansi_driver_pull",
+	"xuansi_session_reset",
 }
 
 // ---------------------------------------------------------------------------
