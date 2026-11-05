@@ -7,9 +7,12 @@ package main
 // plus the dynamic per-board tools expanded from each board's caps
 // (refreshed every internal/mcp.DynRefreshDefault; boards arriving or
 // leaving grow or shrink the toolset with tools/list_changed
-// notifications). The daemon connection is dialed EAGERLY, before the
-// stdio loop, so a missing daemon fails fast with the actionable
-// message instead of half-starting behind an MCP handshake; the SDK's
+// notifications), plus the event face: per-board
+// xuansi://boards/<mac6>/events resources (subscribable, snapshot =
+// the per-source event rings) and the xuansi_events_recent polling
+// tool. The daemon connection is dialed EAGERLY, before the stdio
+// loop, so a missing daemon fails fast with the actionable message
+// instead of half-starting behind an MCP handshake; the SDK's
 // StdioTransport binds the process's real stdin/stdout, and MCP
 // traffic rides stdout while logs stay on stderr (slog, like every
 // command).
@@ -60,7 +63,10 @@ func runMCP(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	}
 	defer c.Close()
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "xuansi", Version: daemonVersion}, nil)
+	// NewServer (not the bare SDK constructor): arms the resource-
+	// subscription handlers the event face's per-board resources need
+	// (internal/mcp.NewServer documents the wiring).
+	srv := xumcp.NewServer(&mcp.Implementation{Name: "xuansi", Version: daemonVersion})
 	stopTools := xumcp.RegisterTools(srv, c, xumcp.Options{Refresh: xumcp.DynRefreshDefault})
 	defer stopTools()
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil && !errors.Is(err, io.EOF) {

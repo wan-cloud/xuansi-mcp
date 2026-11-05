@@ -2,17 +2,20 @@ package mcp
 
 // tools_static.go — the static daemon-surface tool set (batch 6 task
 // 8): one typed tool per proto.go request type of the lease/eval/
-// script/fs/op faces. The MCP-only tools (events, websocket, capture)
-// land with tasks 10-12 and get their own files. Every handler is the
-// same shape: build the internal-API request, cross errors.go's
-// mapping, decode the reply into a typed Out struct — JSON-friendly,
-// with arbitrary board payloads (run_lua's value, ops' results, board
-// acks) passing through verbatim.
+// script/fs/op faces, plus task 10's events_recent (the event face's
+// polling half — static contract name, content from the refresh-fed
+// rings). The websocket/capture tools land with tasks 11-12 and get
+// their own files. Every handler is the same shape: build the
+// internal-API request, cross errors.go's mapping, decode the reply
+// into a typed Out struct — JSON-friendly, with arbitrary board
+// payloads (run_lua's value, ops' results, board acks) passing through
+// verbatim.
 
 import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"sync"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -21,12 +24,17 @@ import (
 )
 
 // toolset carries the static tools' shared state: the daemon
-// connection, the process holder identity, and the dynamic face's
-// bookkeeping (tools_dynamic.go).
+// connection, the process holder identity, the dynamic face's
+// bookkeeping (tools_dynamic.go), and the event face's rings/
+// resources (resources.go, task 10).
 type toolset struct {
 	c       *apiclient.Client
 	holders *holderState
 	dyn     *dynState
+	ev      *eventState
+
+	feedMu   sync.Mutex
+	feedStop func() // the ONE apiclient event feed's cancel (nil = not armed)
 }
 
 // call sends a request the proto types holder-less (list_boards,
@@ -224,12 +232,17 @@ var staticToolNames = []string{
 	"xuansi_fs_write",
 	"xuansi_fs_read",
 	"xuansi_board_op",
+	"xuansi_events_recent",
 }
 
 // register adds the static tools. Names are fixed contract (agents
 // code against them); inputs are typed structs whose jsonschema tags
-// document the semantics an agent needs.
+// document the semantics an agent needs. The event face's state is
+// built here too (its rings/resources reconcile on the dynamic
+// refresh, but the polling tool itself is static contract — task 10).
 func (ts *toolset) register(srv *mcpsdk.Server) {
+	ts.ev = newEventState(srv)
+
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
 		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path) and firmware build. Read-only, no lease.",
@@ -284,6 +297,11 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_board_op",
 		Description: "Run ONE allowlisted board op under the lease: budget.get, budget.set, wifi.status, wifi.setup, wifi.off, log.read, caps, diag.pins, diag.heapinfo, diag.stats — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. Holder semantics: " + holderDesc + ".",
 	}, ts.boardOp)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_events_recent",
+		Description: "Read one board's most recent events from this process's local rings — no daemon call, no lease. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
+	}, ts.eventsRecent)
 }
 
 // ---------------------------------------------------------------------------

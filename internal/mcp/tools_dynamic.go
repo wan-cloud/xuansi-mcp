@@ -88,7 +88,11 @@ func newDynState(srv *mcpsdk.Server) *dynState {
 // startDynamic launches the refresh loop (immediately, then on every
 // tick) and returns the stop func. d <= 0 keeps the static-only face —
 // a zero Options stays exactly task 8's behavior (no startup daemon
-// contact from this face).
+// contact from this face; events_recent answers its honest no-boards
+// error). With the loop on, each successful refresh also reconciles
+// the event face (refreshEvents — rings, resources, watch_events) and
+// the first one arms the apiclient event feed; the returned stop tears
+// both down.
 func (ts *toolset) startDynamic(srv *mcpsdk.Server, d time.Duration) (stop func()) {
 	if d <= 0 {
 		return func() {}
@@ -97,7 +101,9 @@ func (ts *toolset) startDynamic(srv *mcpsdk.Server, d time.Duration) (stop func(
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ts.refreshDynamic(ctx) // the on-demand startup refresh
+		if boards := ts.refreshDynamic(ctx); boards != nil {
+			ts.refreshEvents(ctx, boards)
+		}
 		t := time.NewTicker(d)
 		defer t.Stop()
 		for {
@@ -105,7 +111,9 @@ func (ts *toolset) startDynamic(srv *mcpsdk.Server, d time.Duration) (stop func(
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				ts.refreshDynamic(ctx)
+				if boards := ts.refreshDynamic(ctx); boards != nil {
+					ts.refreshEvents(ctx, boards)
+				}
 			}
 		}
 	}()
@@ -113,7 +121,8 @@ func (ts *toolset) startDynamic(srv *mcpsdk.Server, d time.Duration) (stop func(
 	return func() {
 		once.Do(func() {
 			cancel()
-			<-done // the loop goroutine has exited when stop returns
+			ts.stopEvents() // the event face goes down with the loop that armed it
+			<-done          // the loop goroutine has exited when stop returns
 		})
 	}
 }
@@ -132,16 +141,24 @@ type dynBoard struct {
 // mid-session version flip or primitive shrink follows the caps).
 // Caps failures keep the current set — churn happens on facts, not on
 // trouble.
-func (ts *toolset) refreshDynamic(ctx context.Context) {
+//
+// It returns the parsed board list on success (nil when list_boards
+// failed) — the event face (resources.go refreshEvents) reconciles
+// against the SAME list on the loop, keeping rings, resources and the
+// per-board tools one world.
+func (ts *toolset) refreshDynamic(ctx context.Context) []dynBoard {
 	ds := ts.dyn
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 
 	res, err := ts.call(ctx, server.Request{Type: "list_boards"})
 	if err != nil {
-		return // daemon gone/refused: keep the current set
+		return nil // daemon gone/refused: keep the current set
 	}
 	boards := parseDynBoards(res)
+	if boards == nil {
+		boards = []dynBoard{} // success with zero boards: a real empty world
+	}
 	sort.Slice(boards, func(i, j int) bool { return boards[i].mac6 < boards[j].mac6 })
 	present := map[string]bool{}
 	for _, b := range boards {
@@ -218,6 +235,7 @@ func (ts *toolset) refreshDynamic(ctx context.Context) {
 		ds.srv.AddTool(spec.tool(name), ts.dynHandler(spec))
 		ds.live[name] = spec
 	}
+	return boards
 }
 
 // ---------------------------------------------------------------------------

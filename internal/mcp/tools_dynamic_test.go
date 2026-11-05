@@ -31,7 +31,11 @@ import (
 // dynFake is a scriptable stand-in daemon whose replies depend on the
 // request: list_boards answers the current board set, op caps answers
 // per-board caps (or a forced refusal), eval answers a configurable
-// hook. Every request it reads is counted and (optionally) published.
+// hook, watch_events acks the board (or a forced refusal). Every
+// request it reads is counted and (optionally) published; tests can
+// push board events (§8 EventPush frames) on the same connection via
+// pushEvent — serialized with the reply writes by wmu so frames never
+// interleave.
 type dynFake struct {
 	t    *testing.T
 	reqs chan server.Request // nil = counting only
@@ -42,19 +46,24 @@ type dynFake struct {
 	capsErr   map[string]*server.RPCError // mac6 → forced caps refusal
 	evalErr   map[string]*server.RPCError // mac6 → forced eval refusal
 	evalRes   map[string]map[string]any   // mac6 → eval result override
+	watchErr  map[string]*server.RPCError // mac6 → forced watch_events refusal
 	onEval    func(server.Request)        // observer hook (assertions)
 	counts    map[string]int              // request-type counters
 	listCount int
+
+	wmu  sync.Mutex // serializes frame writes (replies + pushed events)
+	conn net.Conn
 }
 
 func newDynFake(t *testing.T, fd *fakeDaemon, withChan bool) *dynFake {
 	df := &dynFake{
-		t:       t,
-		caps:    map[string]map[string]any{},
-		capsErr: map[string]*server.RPCError{},
-		evalErr: map[string]*server.RPCError{},
-		evalRes: map[string]map[string]any{},
-		counts:  map[string]int{},
+		t:        t,
+		caps:     map[string]map[string]any{},
+		capsErr:  map[string]*server.RPCError{},
+		evalErr:  map[string]*server.RPCError{},
+		evalRes:  map[string]map[string]any{},
+		watchErr: map[string]*server.RPCError{},
+		counts:   map[string]int{},
 	}
 	if withChan {
 		df.reqs = make(chan server.Request, 64)
@@ -64,6 +73,9 @@ func newDynFake(t *testing.T, fd *fakeDaemon, withChan bool) *dynFake {
 }
 
 func (df *dynFake) handle(conn net.Conn) {
+	df.wmu.Lock()
+	df.conn = conn
+	df.wmu.Unlock()
 	for {
 		var req server.Request
 		if err := server.ReadMsg(conn, &req); err != nil {
@@ -111,12 +123,22 @@ func (df *dynFake) handle(conn net.Conn) {
 		case "lease":
 			rep = &server.Reply{Type: "reply", ID: req.ID,
 				Result: map[string]any{"board": req.Board, "holder": req.Holder, "session": 1.0}}
+		case "watch_events":
+			if rerr := df.watchErr[req.Board]; rerr != nil {
+				rep = &server.Reply{Type: "reply", ID: req.ID, Error: rerr}
+			} else {
+				rep = &server.Reply{Type: "reply", ID: req.ID,
+					Result: map[string]any{"board": req.Board}}
+			}
 		default:
 			rep = &server.Reply{Type: "reply", ID: req.ID, Error: &server.RPCError{
 				Class: "server", Msg: "dynFake: unexpected request type " + req.Type}}
 		}
 		df.mu.Unlock()
-		if err := server.WriteMsg(conn, rep); err != nil {
+		df.wmu.Lock()
+		err := server.WriteMsg(conn, rep)
+		df.wmu.Unlock()
+		if err != nil {
 			df.t.Errorf("dynFake reply: %v", err)
 			return
 		}
@@ -145,6 +167,34 @@ func (df *dynFake) failEval(mac6 string, rerr *server.RPCError) {
 	df.mu.Lock()
 	defer df.mu.Unlock()
 	df.evalErr[mac6] = rerr
+}
+
+func (df *dynFake) failWatch(mac6 string, rerr *server.RPCError) {
+	df.mu.Lock()
+	defer df.mu.Unlock()
+	df.watchErr[mac6] = rerr
+}
+
+// clearWatchFailures drops every forced watch_events refusal.
+func (df *dynFake) clearWatchFailures() {
+	df.mu.Lock()
+	defer df.mu.Unlock()
+	df.watchErr = map[string]*server.RPCError{}
+}
+
+// pushEvent writes one §8 EventPush frame for (mac6, source) on the
+// served connection — the daemon's unsolicited event half. false means
+// the write failed (connection gone); frames never interleave with
+// replies (wmu).
+func (df *dynFake) pushEvent(mac6, source string, data map[string]any) bool {
+	df.wmu.Lock()
+	defer df.wmu.Unlock()
+	if df.conn == nil {
+		return false
+	}
+	return server.WriteMsg(df.conn, server.EventPush{
+		Type: "event", Board: mac6, Event: server.WireEvent{Source: source, Data: data},
+	}) == nil
 }
 
 func (df *dynFake) setEvalResult(mac6 string, res map[string]any) {

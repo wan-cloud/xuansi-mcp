@@ -3,11 +3,14 @@
 //
 // This file holds the registration seam and the process's holder
 // identity; tools_static.go holds the static daemon-surface tool set
-// (task 8), errors.go the failure mapping. Tasks 9-12 extend the same
-// seam with the events (watch/subscribe), websocket and capture faces.
+// (task 8), errors.go the failure mapping, tools_dynamic.go the
+// per-board dynamic tools (task 9), resources.go/ring.go the event
+// face (task 10). Tasks 11-12 extend the same seam with the websocket
+// and capture faces.
 package mcp
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"sync"
@@ -21,20 +24,41 @@ import (
 // Options configures RegisterTools. The zero value is ready: the
 // process holder is generated fresh per registration and the face
 // stays static-only (exactly task 8's behavior — no startup daemon
-// contact beyond the first tool call).
+// contact beyond the first tool call, and events_recent answers its
+// honest no-boards error).
 type Options struct {
 	// Holder pins the process's default lease holder instead of the
 	// generated "mcp-<8 hex>". Tests pin it for determinism.
 	Holder string
 
 	// Refresh, when positive, enables the dynamic per-board tool face
-	// (tools_dynamic.go): one refresh immediately at registration and
-	// then on every tick — list_boards + per-board op caps expanding
-	// <alias|mac6>_<prim>_<op> tools, tools/list_changed broadcast by
-	// the SDK on every change. Zero or negative keeps the static-only
-	// face; the production cadence is Refresh: 5 * time.Second
-	// (cmd/xuansi/mcp.go).
+	// (tools_dynamic.go) AND the event face (resources.go): one
+	// refresh immediately at registration and then on every tick —
+	// list_boards + per-board op caps expanding <alias|mac6>_<prim>_<op>
+	// tools, tools/list_changed broadcast by the SDK on every change;
+	// the same board list reconciles the xuansi://boards/<mac6>/events
+	// resources and their per-board watch_events. Zero or negative
+	// keeps the static-only face; the production cadence is Refresh:
+	// 5 * time.Second (cmd/xuansi/mcp.go).
 	Refresh time.Duration
+}
+
+// NewServer builds the MCP server the `xuansi mcp` face needs: the
+// go-sdk's resource-subscription handlers armed, so clients can
+// subscribe to the event face's xuansi://boards/<mac6>/events
+// resources (the SDK accepts resources/subscribe ONLY when
+// SubscribeHandler is set — UnsubscribeHandler must accompany it —
+// then tracks per-session subscriptions itself and delivers
+// notifications/resources/updated whenever we call
+// Server.ResourceUpdated). The handlers are no-ops: rings are
+// process-global, so a subscription needs no per-session action —
+// subscribe, read the resource for the current snapshot, re-read on
+// every update notification (resources.go documents the full path).
+func NewServer(impl *mcpsdk.Implementation) *mcpsdk.Server {
+	return mcpsdk.NewServer(impl, &mcpsdk.ServerOptions{
+		SubscribeHandler:   func(context.Context, *mcpsdk.SubscribeRequest) error { return nil },
+		UnsubscribeHandler: func(context.Context, *mcpsdk.UnsubscribeRequest) error { return nil },
+	})
 }
 
 // RegisterTools adds the daemon-surface tools to srv: the static set —
@@ -45,10 +69,11 @@ type Options struct {
 // daemon death mid-session surfaces per-call as a tool error naming
 // the lost connection (errors.go).
 //
-// The returned stop func shuts the dynamic face's refresh loop down
-// (identity: it returns only after the loop goroutine has exited); it
-// is a no-op for the static-only face. Later batch-6 tasks register
-// their own faces against the same (srv, c, opts) seam.
+// The returned stop func shuts the dynamic face's refresh loop and its
+// ONE apiclient event feed down (identity: it returns only after the
+// loop goroutine has exited); it is a no-op for the static-only face.
+// Later batch-6 tasks register their own faces against the same (srv,
+// c, opts) seam.
 func RegisterTools(srv *mcpsdk.Server, c *apiclient.Client, opts Options) (stop func()) {
 	ts := &toolset{c: c, holders: newHolderState(opts.Holder)}
 	ts.register(srv)

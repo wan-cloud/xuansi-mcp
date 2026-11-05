@@ -142,7 +142,7 @@ func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.Cli
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"}, nil)
+	srv := NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"})
 	ts := &toolset{c: c, holders: newHolderState(opts.Holder)}
 	ts.register(srv)
 	ts.dyn = newDynState(srv)
@@ -160,7 +160,8 @@ func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.Cli
 	}
 	e := &env{t: t, c: c, ts: ts, stop: stop, ss: ss, cl: cl}
 	t.Cleanup(func() {
-		stop() // the refresh loop goes down before the connection it rides
+		stop()          // the refresh loop goes down before the connection it rides
+		ts.stopEvents() // the event face's feed + notifier (no-op for the loop's own stop)
 		cl.Close()
 		ss.Close()
 		c.Close()
@@ -262,8 +263,9 @@ func noContact(t *testing.T, reqs chan server.Request) {
 	}
 }
 
-// staticTools is the exact task-8 toolset — no events/ws/capture
-// tools (those land with tasks 10-12).
+// staticTools is the exact static toolset — task 8's eleven daemon-
+// surface tools plus task 10's events_recent (the rings it reads ride
+// the dynamic refresh, but the tool itself is static contract).
 var staticTools = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -276,6 +278,7 @@ var staticTools = []string{
 	"xuansi_fs_write",
 	"xuansi_fs_read",
 	"xuansi_board_op",
+	"xuansi_events_recent",
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +337,9 @@ func TestRegistersExactStaticToolset(t *testing.T) {
 	}
 	if r := required(byName["xuansi_run_lua"]); !r["board"] || !r["code"] || r["args"] || r["holder"] {
 		t.Errorf("run_lua required = %v, want board+code only", r)
+	}
+	if r := required(byName["xuansi_events_recent"]); !r["board"] || r["source_prefix"] || r["limit"] {
+		t.Errorf("events_recent required = %v, want only board (source_prefix/limit optional)", r)
 	}
 }
 
