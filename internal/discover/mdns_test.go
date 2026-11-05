@@ -2,6 +2,7 @@ package discover
 
 import (
 	"context"
+	"net"
 	"reflect"
 	"testing"
 
@@ -126,6 +127,70 @@ func TestBoardFromEntry(t *testing.T) {
 	}
 }
 
+// TestBoardIPFromEntry: the browse entry's free A/AAAA record must ride
+// into Board.IP (T10: CGO=0 pure resolvers cannot resolve .local, so
+// the dial needs the address the browse already carried and used to
+// discard). First IPv4 wins; without v4 the first IPv6; none -> empty
+// (the dial falls back to the hostname).
+func TestBoardIPFromEntry(t *testing.T) {
+	cases := []struct {
+		name   string
+		entry  *zeroconf.ServiceEntry
+		wantIP string
+	}{
+		{
+			name: "ipv4 first entry",
+			entry: &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "xuansi-d75884"},
+				HostName:      "xuansi-d75884.local.",
+				Port:          7777,
+				AddrIPv4:      []net.IP{net.ParseIP("10.1.51.205"), net.ParseIP("10.1.51.206")},
+			},
+			wantIP: "10.1.51.205",
+		},
+		{
+			name: "no v4 falls to first v6",
+			entry: &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "xuansi-d75884"},
+				HostName:      "xuansi-d75884.local.",
+				Port:          7777,
+				AddrIPv6:      []net.IP{net.ParseIP("fe80::1"), net.ParseIP("fe80::2")},
+			},
+			wantIP: "fe80::1",
+		},
+		{
+			name: "v4 preferred over v6",
+			entry: &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "xuansi-d75884"},
+				HostName:      "xuansi-d75884.local.",
+				Port:          7777,
+				AddrIPv4:      []net.IP{net.ParseIP("10.1.51.205")},
+				AddrIPv6:      []net.IP{net.ParseIP("fe80::1")},
+			},
+			wantIP: "10.1.51.205",
+		},
+		{
+			name: "no addresses -> empty (hostname fallback)",
+			entry: &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "xuansi-d75884"},
+				HostName:      "xuansi-d75884.local.",
+				Port:          7777,
+			},
+			wantIP: "",
+		},
+	}
+	for _, c := range cases {
+		got, ok := boardFromEntry(c.entry)
+		if !ok {
+			t.Errorf("%s: boardFromEntry rejected a valid entry", c.name)
+			continue
+		}
+		if got.IP != c.wantIP {
+			t.Errorf("%s: Board.IP = %q, want %q", c.name, got.IP, c.wantIP)
+		}
+	}
+}
+
 // A pre-canceled caller context must surface as an error without the
 // resolver ever touching the network (pure ctx-driven entry check).
 func TestDiscoverMDNSCanceled(t *testing.T) {
@@ -165,6 +230,32 @@ func TestMDNSAccumMergesPartialEntries(t *testing.T) {
 		}
 		if !reflect.DeepEqual(b.Sources, []string{"mdns"}) {
 			t.Errorf("sources = %#v", b.Sources)
+		}
+	}
+}
+
+// TestMDNSAccumMergesIPAcrossPackets: the A record can land in a
+// separate packet from the SRV (the two-window split-packet bench
+// shape) — the accumulator must merge the address into the face like
+// any other field, in either arrival order.
+func TestMDNSAccumMergesIPAcrossPackets(t *testing.T) {
+	srv := Board{MAC6: "d75884", Sources: []string{"mdns"}, Host: "xuansi-d75884.local", Port: 7777}
+	aOnly := Board{MAC6: "d75884", Sources: []string{"mdns"}, Host: "xuansi-d75884.local", IP: "10.1.51.205"}
+	for _, order := range [][]Board{
+		{srv, aOnly}, // A-record packet after the SRV packet
+		{aOnly, srv}, // A-record packet first
+	} {
+		a := mdnsAccum{}
+		for _, b := range order {
+			a.add(b)
+		}
+		got := a.snapshot()
+		if len(got) != 1 {
+			t.Fatalf("order %v: accum = %#v, want 1 board", order, got)
+		}
+		b := got[0]
+		if b.IP != "10.1.51.205" || b.Port != 7777 || b.Host != "xuansi-d75884.local" {
+			t.Errorf("order %v: face incomplete after merge: %#v", order, b)
 		}
 	}
 }

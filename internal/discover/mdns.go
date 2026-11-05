@@ -104,6 +104,9 @@ func (a mdnsAccum) add(b Board) {
 	if b.Host != "" {
 		prev.Host = b.Host
 	}
+	if b.IP != "" {
+		prev.IP = b.IP
+	}
 	if b.Port != 0 {
 		prev.Port = b.Port
 	}
@@ -156,10 +159,21 @@ func boardFromEntry(e *zeroconf.ServiceEntry) (Board, bool) {
 			txt[k] = v
 		}
 	}
+	// The browse carried the A/AAAA records for free — keep the first
+	// v4 (else first v6) as the dial address: CGO=0 pure resolvers
+	// cannot resolve .local, so this address is the TCP face's primary
+	// route (empty = none seen; the hostname remains the fallback).
+	ip := ""
+	if len(e.AddrIPv4) > 0 {
+		ip = e.AddrIPv4[0].String()
+	} else if len(e.AddrIPv6) > 0 {
+		ip = e.AddrIPv6[0].String()
+	}
 	return Board{
 		MAC6:    mac6,
 		Sources: []string{SourceMDNS},
 		Host:    strings.TrimSuffix(e.HostName, "."),
+		IP:      ip,
 		Port:    e.Port,
 		TXT:     txt,
 	}, true

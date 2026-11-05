@@ -2787,6 +2787,51 @@ func TestIdleExitBlockedByLiveCapture(t *testing.T) {
 	}
 }
 
+// TestSupervisorRefCarriesIP: T10 — the daemon's warm-controller dial
+// chain must carry the browse-resolved IP from the registry into the
+// BoardRef (BoardRef.TCPAddr dials it first; CGO=0 cannot resolve
+// .local). The default wiring is asserted here so the IP cannot be
+// dropped between discover and board without a test failing.
+func TestSupervisorRefCarriesIP(t *testing.T) {
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			return []discover.Board{{
+				MAC6: "d75884", Sources: []string{discover.SourceMDNS},
+				Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777,
+			}}, nil
+		}),
+	)
+	var gotRef board.BoardRef
+	srv, err := New(Opts{
+		SockPath: filepath.Join(t.TempDir(), "d.sock"),
+		Registry: reg,
+		GraceTTL: time.Second,
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			gotRef = ref
+			return board.NewSupervisor(ref, board.SupOpts{})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Close()
+	if err := reg.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	b, rerr := reg.Resolve("d75884")
+	if rerr != nil {
+		t.Fatalf("Resolve: %v", rerr)
+	}
+	srv.supervisor(b) // the lazy per-board construction the board paths ride
+	if gotRef.IP != "10.1.51.205" || gotRef.Host != "xuansi-d75884.local" || gotRef.Port != 7777 {
+		t.Errorf("BoardRef = %#v, want IP 10.1.51.205 carried from the registry entry", gotRef)
+	}
+	if addr := gotRef.TCPAddr(); addr != "10.1.51.205:7777" {
+		t.Errorf("BoardRef.TCPAddr() = %q, want 10.1.51.205:7777 (IP first)", addr)
+	}
+}
+
 // TestBindSockConcurrentRaceGracefulLosers: the spawn-race contract at
 // the bind level (task-2's promise, pinned after a task-10 HIL rerun
 // caught the narrow window): N servers binding the same sock path at

@@ -36,16 +36,25 @@ var ErrControllerSlotHeld = errors.New("controller slot not freed within the arb
 type BoardRef struct {
 	MAC6    string
 	Host    string // mDNS face, e.g. "xuansi-d75884.local"
+	IP      string // browse-resolved A/AAAA, e.g. "10.1.51.205" — dialed first (CGO=0 cannot resolve .local)
 	Port    int    // REPL TCP listener, 7777
 	USBPath string // /dev/serial/by-id path (fallback; opening reboots)
 }
 
-// TCPAddr renders the TCP endpoint, "" when the board has no mdns face.
+// TCPAddr renders the TCP endpoint, "" when the board has no mdns
+// face. The browse-resolved IP is preferred over the hostname: pure-Go
+// (CGO_ENABLED=0) builds resolve through the pure resolver, which does
+// not speak mDNS — .local SERVFAILs there — so the address the mDNS
+// browse already carried is the reliable route.
 func (b BoardRef) TCPAddr() string {
-	if b.Host == "" || b.Port == 0 {
+	host := b.IP
+	if host == "" {
+		host = b.Host
+	}
+	if host == "" || b.Port == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s:%d", b.Host, b.Port)
+	return fmt.Sprintf("%s:%d", host, b.Port)
 }
 
 // Controller is the connection seam the Supervisor drives. Production

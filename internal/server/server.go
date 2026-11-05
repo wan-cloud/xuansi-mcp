@@ -902,6 +902,7 @@ func boardView(b discover.Board) map[string]any {
 		"alias":    b.Alias,
 		"sources":  b.Sources,
 		"host":     b.Host,
+		"ip":       b.IP, // browse-resolved A/AAAA — the address the daemon dials first
 		"port":     b.Port,
 		"usb_path": b.USBPath,
 	}
@@ -1425,6 +1426,7 @@ func (s *Server) supervisor(b discover.Board) *daemonBoard {
 	db.sup = s.opts.NewSupervisor(board.BoardRef{
 		MAC6:    b.MAC6,
 		Host:    b.Host,
+		IP:      b.IP, // browse-resolved address — TCPAddr dials it first (CGO=0 cannot resolve .local)
 		Port:    b.Port,
 		USBPath: b.USBPath,
 	})

@@ -229,6 +229,42 @@ const samplePinsDump = "pins (2):\n" +
 	"  GPIO2   sess=1792000001 owner=t10keep prim=gpio mode=in watch=rising\n" +
 	"  uart: 1 port(s) installed (driver+rx ring active)\n"
 
+// TestBoardRefTCPAddrIPFirst: T10 — the warm controller's endpoint is
+// the browse-resolved IP when the registry filled one (CGO=0 pure
+// resolvers cannot resolve .local; the hostname dial SERVFAILs without
+// the /etc/hosts pin); the hostname stays the fallback, and an IP alone
+// (SRV-less entry) still dials.
+func TestBoardRefTCPAddrIPFirst(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  BoardRef
+		want string
+	}{
+		{
+			name: "ip preferred over hostname",
+			ref:  BoardRef{MAC6: "d75884", Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777},
+			want: "10.1.51.205:7777",
+		},
+		{
+			name: "no ip falls back to hostname",
+			ref:  BoardRef{MAC6: "d75884", Host: "xuansi-d75884.local", Port: 7777},
+			want: "xuansi-d75884.local:7777",
+		},
+		{
+			name: "ip without hostname still dials",
+			ref:  BoardRef{MAC6: "d75884", IP: "10.1.51.205", Port: 7777},
+			want: "10.1.51.205:7777",
+		},
+		{name: "no port", ref: BoardRef{MAC6: "d75884", IP: "10.1.51.205"}, want: ""},
+		{name: "nothing", ref: BoardRef{MAC6: "d75884"}, want: ""},
+	}
+	for _, c := range cases {
+		if got := c.ref.TCPAddr(); got != c.want {
+			t.Errorf("%s: TCPAddr() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestTeardownSessionOpAndRedial(t *testing.T) {
 	ctl := newFakeCtl()
 	ctl.resetRes[1792000001] = 2

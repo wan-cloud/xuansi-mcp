@@ -83,6 +83,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -96,6 +97,7 @@ import (
 	"syscall"
 	"time"
 
+	"xuansi/internal/discover"
 	"xuansi/internal/server"
 )
 
@@ -527,12 +529,34 @@ func runSpawnIdle(attempt int, daemonBin, runDir string) int {
 	} else {
 		h.note("NOTE: USB by-id absent (%v) - discovery may run mdns-only this run (honest note)", err)
 	}
-	if conn, err := net.DialTimeout("tcp", spTCPEndp, 3*time.Second); err != nil {
-		h.check(false, fmt.Sprintf("board TCP face reachable at %s: %v", spTCPEndp, err))
+	// T10 regression premise: the /etc/hosts board pin is GONE, so this
+	// driver must not resolve the hostname either (the old preflight
+	// dialed xuansi-d75884.local and silently leaned on the pin). The
+	// preflight now browses mDNS (the same face the daemon uses), takes
+	// the board's browse-resolved A-record address, and dials the IP
+	// directly: .local resolution is nowhere on the critical path.
+	if hosts, herr := os.ReadFile("/etc/hosts"); herr == nil && strings.Contains(string(hosts), "xuansi-") {
+		h.check(false, "bench shape: /etc/hosts still carries a xuansi pin - remove it (the T10 regression premise) and rerun")
+		return finish()
+	}
+	h.check(true, "bench shape: /etc/hosts carries NO xuansi pin (T10 regression premise holds)")
+	mb, merr := discover.DiscoverMDNS(context.Background())
+	var boardIP string
+	for _, b := range mb {
+		if b.MAC6 == spBoard {
+			boardIP = b.IP
+		}
+	}
+	h.check(boardIP != "", fmt.Sprintf("mDNS browse found %s with a browse-resolved IP (boards=%d err=%v) - the address every dial below rides", spBoard, len(mb), merr))
+	if boardIP == "" {
+		return finish()
+	}
+	if conn, err := net.DialTimeout("tcp", net.JoinHostPort(boardIP, "7777"), 3*time.Second); err != nil {
+		h.check(false, fmt.Sprintf("board TCP face reachable at %s:7777 (mDNS-resolved IP dial): %v", boardIP, err))
 		return finish()
 	} else {
 		conn.Close()
-		h.check(true, fmt.Sprintf("board TCP face reachable at %s (dial only)", spTCPEndp))
+		h.check(true, fmt.Sprintf("board TCP face reachable at %s:7777 (mDNS-resolved IP dial, no hostname resolution; mDNS face %s)", boardIP, spTCPEndp))
 	}
 	if n := len(spServePIDs(s)); n != 0 {
 		h.check(false, fmt.Sprintf("bench clean: no sandbox serve before the run (found %d - kill it / rerun the wrapper)", n))

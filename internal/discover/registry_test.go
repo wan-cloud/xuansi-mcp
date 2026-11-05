@@ -387,6 +387,166 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- dial seam --
+
+// dialSpy captures DialBoard's transport calls (the dial seam; production
+// dials replclient, tests assert the addressed endpoint without touching
+// devices).
+type dialSpy struct {
+	tcp []string // host:port strings the TCP face was dialed at
+	usb []string // by-id paths the USB face was dialed at
+}
+
+// stubDials swaps DialBoard's dial seams for spies; the originals are
+// restored on cleanup.
+func stubDials(t *testing.T) *dialSpy {
+	t.Helper()
+	s := &dialSpy{}
+	origTCP, origUSB := dialTCP, dialUSB
+	dialTCP = func(hostport string, o replclient.DialOpts) (*replclient.Client, error) {
+		s.tcp = append(s.tcp, hostport)
+		return nil, errors.New("spy: no real dial")
+	}
+	dialUSB = func(path string, o replclient.DialOpts) (*replclient.Client, error) {
+		s.usb = append(s.usb, path)
+		return nil, errors.New("spy: no real dial")
+	}
+	t.Cleanup(func() { dialTCP, dialUSB = origTCP, origUSB })
+	return s
+}
+
+// TestDialBoardIPFirst: T10 — when the browse filled Board.IP, the TCP
+// face dials the ADDRESS, not the hostname (CGO=0 pure resolvers cannot
+// resolve .local; the old hostname-only dial SERVFAILs without the
+// /etc/hosts pin). USB stays the preferred face; an empty IP falls back
+// to the hostname (the pre-T10 behavior); neither is the no-source error.
+func TestDialBoardIPFirst(t *testing.T) {
+	spy := stubDials(t)
+	b := Board{MAC6: "d75884", Sources: []string{"mdns"},
+		Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777}
+	if _, err := DialBoard(b, replclient.DialOpts{}); err == nil {
+		t.Fatal("spy dial returns an error; DialBoard must surface it")
+	}
+	if len(spy.tcp) != 1 || spy.tcp[0] != "10.1.51.205:7777" {
+		t.Errorf("TCP dialed %v, want exactly [10.1.51.205:7777] (IP first, hostname NOT dialed)", spy.tcp)
+	}
+	if len(spy.usb) != 0 {
+		t.Errorf("USB dialed %v, want none for an mdns-only board", spy.usb)
+	}
+}
+
+func TestDialBoardEmptyIPFallsBackToHost(t *testing.T) {
+	spy := stubDials(t)
+	b := Board{MAC6: "d75884", Sources: []string{"mdns"},
+		Host: "xuansi-d75884.local", Port: 7777} // no A record ever seen
+	if _, err := DialBoard(b, replclient.DialOpts{}); err == nil {
+		t.Fatal("spy dial returns an error; DialBoard must surface it")
+	}
+	if len(spy.tcp) != 1 || spy.tcp[0] != "xuansi-d75884.local:7777" {
+		t.Errorf("TCP dialed %v, want [xuansi-d75884.local:7777] (hostname fallback)", spy.tcp)
+	}
+}
+
+func TestDialBoardUSBStillPreferred(t *testing.T) {
+	spy := stubDials(t)
+	b := Board{MAC6: "d75884", Sources: []string{"usb", "mdns"},
+		USBPath: usbA.USBPath, Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777}
+	if _, err := DialBoard(b, replclient.DialOpts{}); err == nil {
+		t.Fatal("spy dial returns an error; DialBoard must surface it")
+	}
+	if len(spy.usb) != 1 || spy.usb[0] != usbA.USBPath {
+		t.Errorf("USB dialed %v, want [%s] (USB stays the preferred face)", spy.usb, usbA.USBPath)
+	}
+	if len(spy.tcp) != 0 {
+		t.Errorf("TCP dialed %v, want none when USB is live", spy.tcp)
+	}
+}
+
+func TestDialBoardNoSourceErrorUnchanged(t *testing.T) {
+	spy := stubDials(t)
+	for _, b := range []Board{
+		{MAC6: "d75884", Sources: []string{"mdns"}, Port: 7777},              // no host, no IP
+		{MAC6: "d75884", Sources: []string{"mdns"}, IP: "10.1.51.205"},      // no port
+		{MAC6: "d75884", Sources: []string{"mdns"}, Host: "xuansi-d75884.local"}, // no port
+		{MAC6: "d75884", Sources: []string{"usb"}},                           // no USBPath
+	} {
+		_, err := DialBoard(b, replclient.DialOpts{})
+		if err == nil || !strings.Contains(err.Error(), "no live source") {
+			t.Errorf("DialBoard(%#v) = %v, want the no-live-source error", b, err)
+		}
+	}
+	if len(spy.tcp)+len(spy.usb) != 0 {
+		t.Errorf("no dial may happen, got tcp=%v usb=%v", spy.tcp, spy.usb)
+	}
+}
+
+// TestRefreshKeepsLastKnownIP: Board.IP is last-known mdns-face data
+// like Host/Port/TXT — a later sweep whose packets carried no A record
+// keeps the previously seen address, a NEW address wins (the DHCP-drift
+// shape the /etc/hosts pin could not survive), and an mdns failure
+// freezes the whole face including the IP.
+func TestRefreshKeepsLastKnownIP(t *testing.T) {
+	r, f := newFakeRegistry(nil)
+	withIP := mdnsA
+	withIP.IP = "10.1.51.205"
+	f.set([]Board{usbA}, []Board{withIP})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh 1: %v", err)
+	}
+	if b := r.Snapshot()[0]; b.IP != "10.1.51.205" {
+		t.Fatalf("sweep with A record: IP = %q, want 10.1.51.205", b.IP)
+	}
+
+	// sweep sees the service again but no A record this time: keep last-known
+	f.set([]Board{usbA}, []Board{mdnsA}) // mdnsA carries no IP
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh 2: %v", err)
+	}
+	if b := r.Snapshot()[0]; b.IP != "10.1.51.205" {
+		t.Errorf("sweep without A record erased last-known IP: %#v", b)
+	}
+
+	// DHCP drift: a NEW address must win over the stale one
+	drift := mdnsA
+	drift.IP = "10.1.51.99"
+	f.set([]Board{usbA}, []Board{drift})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh 3: %v", err)
+	}
+	if b := r.Snapshot()[0]; b.IP != "10.1.51.99" {
+		t.Errorf("drifted address did not win: IP = %q, want 10.1.51.99", b.IP)
+	}
+
+	// mdns failure: the face (IP included) freezes at last-known
+	f.failMDNS(errors.New("no multicast interface available"))
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh 4 (mdns failure must not fail Refresh): %v", err)
+	}
+	b := r.Snapshot()[0]
+	if b.IP != "10.1.51.99" || !b.hasSource(SourceMDNS) {
+		t.Errorf("degraded refresh lost the mdns face/IP: %#v", b)
+	}
+}
+
+// TestResolveErrorListsIP: the candidate display line carries the IP
+// next to the hostname (the dialable address is part of the face).
+func TestResolveErrorListsIP(t *testing.T) {
+	r, f := newFakeRegistry(nil)
+	withIP := mdnsA
+	withIP.IP = "10.1.51.205"
+	f.set(nil, []Board{withIP})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	_, err := r.Resolve("zzzz")
+	if err == nil {
+		t.Fatal("Resolve(unmatched) must error")
+	}
+	if !strings.Contains(err.Error(), "10.1.51.205") {
+		t.Errorf("Resolve error must list the board IP: %q", err.Error())
+	}
+}
+
 func TestLoadBoardsFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "boards.conf")

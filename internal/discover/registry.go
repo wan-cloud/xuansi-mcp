@@ -30,14 +30,19 @@ var sourceOrder = map[string]int{SourceUSB: 0, SourceMDNS: 1}
 // the entry is last-known only, kept instead of hard-deleted (honest
 // stale-marking). USBPath is the by-id path (preferred: stable across
 // re-enumeration). Host/Port/TXT are the mDNS face, nil until the
-// board has been seen via mdns. Hello is filled only by explicit
-// enrichment (Enrich): discovery itself never dials a board.
+// board has been seen via mdns; IP is the browse-resolved A/AAAA
+// address of that face (dialed FIRST — CGO=0 pure resolvers cannot
+// resolve .local, so the free address the browse already carried must
+// not be discarded; empty = no address seen, dial falls back to Host).
+// Hello is filled only by explicit enrichment (Enrich): discovery
+// itself never dials a board.
 type Board struct {
 	MAC6    string
 	Alias   string   // boards.conf 命中時
 	Sources []string // ["usb","mdns"]
 	USBPath string   // by-id 優先
 	Host    string   // "xuansi-d75884.local"
+	IP      string   // "10.1.51.205" — browse A/AAAA 首值，撥號優先
 	Port    int
 	TXT     map[string]string     // ver/api…
 	Hello   *replclient.HelloInfo // 按需 enrich
@@ -153,7 +158,7 @@ func (r *Registry) Refresh(ctx context.Context) error {
 			if old.hasSource(SourceMDNS) {
 				mdnsBoards = append(mdnsBoards, Board{
 					MAC6: mac6, Sources: []string{SourceMDNS},
-					Host: old.Host, Port: old.Port, TXT: old.TXT,
+					Host: old.Host, IP: old.IP, Port: old.Port, TXT: old.TXT,
 				})
 			}
 		}
@@ -181,7 +186,7 @@ func (r *Registry) Refresh(ctx context.Context) error {
 			e.MAC6 = b.MAC6
 		}
 		e.addSource(SourceMDNS)
-		e.Host, e.Port, e.TXT = b.Host, b.Port, b.TXT
+		e.Host, e.IP, e.Port, e.TXT = b.Host, b.IP, b.Port, b.TXT
 		fresh[b.MAC6] = e
 	}
 	for mac6, old := range r.boards {
@@ -199,6 +204,9 @@ func (r *Registry) Refresh(ctx context.Context) error {
 		}
 		if e.Host == "" {
 			e.Host, e.Port, e.TXT = old.Host, old.Port, old.TXT
+		}
+		if e.IP == "" {
+			e.IP = old.IP
 		}
 		e.Hello = old.Hello // enriched identity is last-known data too
 		fresh[mac6] = e
@@ -289,6 +297,9 @@ func describeBoards(boards []Board) string {
 		if b.Host != "" {
 			p += " " + b.Host
 		}
+		if b.IP != "" {
+			p += " " + b.IP
+		}
 		if len(b.Sources) == 0 {
 			p += " [stale]"
 		} else {
@@ -302,17 +313,33 @@ func describeBoards(boards []Board) string {
 	return strings.Join(parts, "; ")
 }
 
+// Dial seams: DialBoard's transports (tests inject spies to assert the
+// addressed endpoint; production dials replclient).
+var (
+	dialUSB = replclient.DialUSB
+	dialTCP = replclient.DialTCP
+)
+
 // DialBoard dials b over its preferred LIVE source: the by-id USB path
 // when the usb source is current (§2: the open reboots the board into a
-// fresh device session), else the mDNS host:port (§13: no reboot, the
-// first frame may be hello). A board with no live source is not
-// dialable — dialing last-known paths would guess.
+// fresh device session), else the mDNS endpoint — the browse-resolved
+// IP first when the sweep filled one (CGO=0 pure resolvers cannot
+// resolve .local; the hostname dial SERVFAILs without an /etc/hosts
+// pin), the hostname as the fallback (§13: no reboot, the first frame
+// may be hello). A board with no live source is not dialable — dialing
+// last-known paths would guess.
 func DialBoard(b Board, o replclient.DialOpts) (*replclient.Client, error) {
 	if b.hasSource(SourceUSB) && b.USBPath != "" {
-		return replclient.DialUSB(b.USBPath, o)
+		return dialUSB(b.USBPath, o)
 	}
-	if b.hasSource(SourceMDNS) && b.Host != "" && b.Port != 0 {
-		return replclient.DialTCP(net.JoinHostPort(b.Host, strconv.Itoa(b.Port)), o)
+	if b.hasSource(SourceMDNS) && b.Port != 0 {
+		host := b.IP
+		if host == "" {
+			host = b.Host
+		}
+		if host != "" {
+			return dialTCP(net.JoinHostPort(host, strconv.Itoa(b.Port)), o)
+		}
 	}
 	return nil, fmt.Errorf("discover: board %s has no live source to dial (sources: %v)", b.MAC6, b.Sources)
 }
