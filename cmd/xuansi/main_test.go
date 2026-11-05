@@ -52,7 +52,7 @@ func TestUnknownCommandFailsWithUsage(t *testing.T) {
 // the dispatch table stays honest now that the stubs are gone.
 func TestClientCommandsNeedTheirPositionals(t *testing.T) {
 	for _, c := range commands {
-		if c.name == "serve" || c.name == "list" {
+		if c.name == "serve" || c.name == "list" || c.name == "mcp" {
 			continue // no positional args required
 		}
 		var stdin, stdout, stderr bytes.Buffer

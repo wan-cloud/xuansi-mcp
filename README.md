@@ -21,21 +21,26 @@ Requires Go ≥ 1.27.
 
 ## Dependency policy
 
-Stdlib only, plus exactly three approved external dependencies (introduced
+Stdlib only, plus exactly four approved external dependencies (introduced
 by their owning tasks, not before):
 
 - `vmihailenco/msgpack/v5` — wire frame codec
 - `go.bug.st/serial` — USB serial transport
 - `grandcat/zeroconf` — mDNS discovery
+- `modelcontextprotocol/go-sdk` — the MCP face (`xuansi mcp`)
 
-Nothing else enters go.mod without changing this policy. The CLI uses
-stdlib `flag` subcommand dispatch (no cobra). Logging is stdlib `log/slog`,
-text handler on stderr, `--verbose` for debug level.
+Nothing else enters go.mod without changing this policy. The whitelist
+governs DIRECT dependencies: the go-sdk pulls its own indirect
+requirements (golang.org/x/… and friends), which is fine — direct
+additions are what need a ruling. The CLI uses stdlib `flag` subcommand
+dispatch (no cobra). Logging is stdlib `log/slog`, text handler on
+stderr, `--verbose` for debug level.
 
 ## Layout
 
     cmd/xuansi/          CLI entry: stdlib-flag subcommand dispatch
-                         (serve / list / status / lease / release / eval / repl)
+                         (serve / list / status / lease / release / eval /
+                         repl / mcp)
     internal/replclient/ frame codec + Link abstraction + router + client
                          (repl.py protocol knowledge, Go port)
     internal/discover/   USB by-id + mDNS browse → mac6-joined board registry
