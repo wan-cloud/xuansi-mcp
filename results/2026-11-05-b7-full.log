@@ -1,0 +1,201 @@
+capture: results/2026-11-05-b7-full-attempt3.log (2026-11-05T19:39:31+08:00)
+repo HEAD: 0a8b6c0 — dirty files: 8
+attempt: 3 (honest count — failures keep their own transcript)
+--- driver bodies: regenerated + sha-asserted from the fw repo (verbatim, never retyped) ---
+i2cecho@1.0.0  bytes=1412 sha256=a9c83d9499224196ecc1bcf6d3d79125bc13b313727ac4224fcfdb08ef0d97d4
+spiloop@1.0.0  bytes=1398 sha256=047f3757d01faa1acacf6449a34ca5499f0dd6acbfccbd217bf5e7c40bc55458
+i2cecho@1.1.0  bytes=1436 sha256=cfdeed8e2c2648ebc46ce5f24b777f2b22efe874b22d06744f8590d00b2bc3b6
+wrote /home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon/hil/b7-drivers.go
+--- unit gates (must be green before the board is touched) ---
+ok  	xuansi/cmd/xuansi	1.725s
+?   	xuansi/hil	[no test files]
+ok  	xuansi/internal/apiclient	0.717s
+ok  	xuansi/internal/board	0.510s
+ok  	xuansi/internal/discover	0.009s
+ok  	xuansi/internal/lease	0.011s
+ok  	xuansi/internal/mcp	5.415s
+ok  	xuansi/internal/replclient	1.452s
+ok  	xuansi/internal/server	15.491s
+--- build the daemon binary fresh at HEAD ---
+mkdir -p bin
+GOOS=linux GOARCH=amd64 go build -trimpath -o bin/xuansi-linux-amd64 ./cmd/xuansi
+GOOS=linux GOARCH=arm64 go build -trimpath -o bin/xuansi-linux-arm64 ./cmd/xuansi
+bin/xuansi-linux-amd64: go1.27.3
+	path	xuansi/cmd/xuansi
+	mod	xuansi	v0.0.0-20261105094909-0a8b6c0faec0+dirty	
+	dep	github.com/cenkalti/backoff	v2.2.1+incompatible	h1:tNowT99t7UNflLxfYYSlKYsBpXdEet03Pg2g16Swow4=
+	dep	github.com/google/jsonschema-go	v0.4.3	h1:/DBOLZTfDow7pe2GmaJNhltueGTtDKICi8V8p+DQPd0=
+	dep	github.com/grandcat/zeroconf	v1.0.0	h1:uHhahLBKqwWBV6WZUDAT71044vwOTL+McW0mBJvo6kE=
+	dep	github.com/miekg/dns	v1.1.27	h1:aEH/kqUzUxGJ/UHcEKdJY+ugH6WEzsEBBSPa8zuy1aM=
+	dep	github.com/modelcontextprotocol/go-sdk	v1.8.0	h1:KIvahhYqwtbeniWVPs3TcXEA7b8jEtwfBpOTAI+Urx4=
+=== b7 task-5 full MCP HIL — 2026-11-05T19:39:51+08:00 ===
+attempt: 3 (honest count — any failure is fixed and the WHOLE capture rerun)
+board: d75884 (echo fixture I2C0 8/9 <-> I2C1 10/11 @0x28; SPI self-loop 12<->13 sclk=14; TCP xuansi-d75884.local:7777; fw expect 775ecaa)
+drivers: fw-repo bodies, verbatim via hil/gen-b7-drivers.py (AST dump) — sha256 asserted at startup, never retyped
+discipline: NEVER read before a write in the same bus epoch (empty-ring read wedges the bus — T3 pin); every vector writes first
+
+— S0: prelude — bench clean, sandbox, driver sha asserts, serve+mcp up, list_boards —
+  [PASS] no stale xuansi serve/mcp processes on the bench (found 0)
+  [PASS] board TCP face reachable at xuansi-d75884.local:7777 (dial only — no reboot, no USB open)
+  [PASS] S0 driver sha assert: i2cecho@1.0.0 (fw repo I2CECHO_LUA, verbatim) -> 1412B sha256=a9c83d9499224196ecc1bcf6d3d79125bc13b313727ac4224fcfdb08ef0d97d4 first-line="--@api 1"
+  [PASS] S0 driver sha assert: spiloop@1.0.0 (fw repo SPILOOP_LUA, verbatim) -> 1398B sha256=047f3757d01faa1acacf6449a34ca5499f0dd6acbfccbd217bf5e7c40bc55458 first-line="--@api 1"
+  [PASS] S0 driver sha assert: i2cecho@1.1.0 (derived: +drv.version line) -> 1436B sha256=cfdeed8e2c2648ebc46ce5f24b777f2b22efe874b22d06744f8590d00b2bc3b6 first-line="--@api 1"
+  [PASS] S0 i2cecho@1.1.0 minimal diff: +24 bytes, exactly one drv.version line
+  [note] XDG sandbox: XDG_DATA_HOME=/tmp/opencode/b7-full/xdg (serve captures + mcp workspace land inside; the real user workspace untouched)
+  [note] boards.conf: comment-only (no alias) -> dynamic tool prefix = "d75884_"
+  [daemon] started pid=235099 argv=["bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/b7-full/daemon.sock" "--grace-ttl" "30s" "--boards-file" "/tmp/opencode/b7-full/boards.conf"] env+="XDG_DATA_HOME=/tmp/opencode/b7-full/xdg"
+  [daemon] time=2026-11-05T19:39:51.389+08:00 level=INFO msg="server: serving /tmp/opencode/b7-full/daemon.sock (grace_ttl=30s)"
+  [daemon] xuansi daemon serving /tmp/opencode/b7-full/daemon.sock (grace-ttl 30s, Ctrl-C to stop)
+  [PASS] daemon sock bound at /tmp/opencode/b7-full/daemon.sock (sock dialable)
+  [PASS] daemon reports serving (grace-ttl 30s)
+  [daemon] time=2026-11-05T19:39:51.685+08:00 level=INFO msg="server: conn dropped (holder=conn-1)"
+  [daemon] time=2026-11-05T19:39:54.394+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
+  [daemon] time=2026-11-05T19:39:54.457+08:00 level=INFO msg="tcp: connected 10.1.50.200:34472 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [daemon] time=2026-11-05T19:39:54.480+08:00 level=INFO msg="board d75884: controller warm connection up (fw=775ecaa protocol_ver=3)"
+  [daemon] time=2026-11-05T19:39:54.581+08:00 level=INFO msg="board d75884: resync scripts=[] survived=[] started=[] gone=[] pins=0 (cold=true) wifi_state=up [diag.pins raw 10B]"
+  [daemon] time=2026-11-05T19:39:54.581+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[] pins=0 wifi_state=up (orphans listed, not killed)"
+  [PASS] initial discovery sweep found 1 board (sweep line)
+  [mcp] started pid=235109 argv=["bin/xuansi-linux-amd64" "mcp" "--sock" "/tmp/opencode/b7-full/daemon.sock"] env+="XDG_DATA_HOME=/tmp/opencode/b7-full/xdg"
+  [PASS] initialize handshake ok: server=xuansi version=dev (protocol 2026-07-28)
+  [PASS] list_boards shows d75884 with fw populated (fw populated (hello-enriched))
+  [PASS] dual-source merged [usb mdns] (got [usb mdns])
+  [PASS] fw BUILD BINDING: "775ecaa" == expected "775ecaa" (flashed fw == fw HEAD bfa8e04 main/, b6's empty-diff binding)
+
+— S1: xuansi_lease holder=b7-hil (default TCP route) + budget prelude —
+  [daemon] time=2026-11-05T19:39:54.709+08:00 level=INFO msg="lease: grant board=d75884 holder=b7-hil session=1793878792"
+  [PASS] lease holder=b7-hil session=1.793878792e+09 (text="{\"board\":\"d75884\",\"holder\":\"b7-hil\",\"session\":1793878792}")
+  [PASS] lease took the DEFAULT TCP route: transport="" warning="" (no usb field, no reboot)
+  [PASS] [prelude] board_op budget.set eval_ms=4000 event_ms=500 (script callbacks; both restored at S10) -> eval_ms=4000 event_ms=500
+
+— S2: board_op diag.i2cslave {mode:1} + functional verify (setup+scan) —
+  [PASS] diag.i2cslave {mode:1} -> {mode:1} (echo-slave fixture ON at 0x28, pins 10/11; text={"mode":1})
+  [PASS] [functional verify] eval i2c.setup{8/9,100k} + scan == {0x28} (Lua returns decimal 40): value=1,40 (text={"out":"1,40","value":"1,40"})
+
+— S3: i2cecho@1.0.0 — ws_put (sha bound) -> driver_push -> eval require/attach -> vectors —
+  [PASS] ws_put i2cecho@1.0.0 stored VERBATIM (sha256=a9c83d9499224196… size=1412 == fw-repo body; text={"sha256":"a9c83d9499224196ecc1bcf6d3d79125bc13b313727ac4224fcfdb08ef0d97d4","si)
+  [PASS] ws_list sees i2cecho 1.0.0 stored, active ABSENT before any push (stored=true active="")
+  [PASS] driver_push i2cecho@1.0.0 landed /drv/i2cecho.lua, fs_read-back verified (bytes=1412 sha=a9c83d9499224196…; text={"board":"d75884","bytes":1412,"path":"/drv/i2cecho.lua","sha256":"a9c83d9499224)
+  [PASS] eval require+attach through the --@api 1 gate — op surface scan/reg_write/reg_read/echo (value=table,function,table,function,function,function,function; text={"out":"table,function,table,function,function,function,function","value":"table)
+  [PASS] drv.scan == {0x28} through the driver face (value=1,40)
+  [PASS] S3 vector: drv reg round-trip 63B @0x10 — rreg 64B window == 256B-reg-file model (value=eq; text={"out":"eq","value":"eq"})
+  [note] S3.5b echo-group clean slate: fixture off->on (ring/TX FIFO/reg file zeroed) + master re-setup
+  [PASS] S3 vector: drv echo 63B round-trip == payload (value=eq; text={"out":"eq","value":"eq"})
+  [note] S3.6b overflow-group clean slate: fixture off->on (ring/TX FIFO/reg file zeroed) + master re-setup
+  [PASS] S3 vector: single 100B write -> first 64B echoed as-is (single-cb silent clamp; full set in T3 evidence; value=eq)
+  [PASS] manifest ACTIVE == 1.0.0 right after the verified push (active="1.0.0")
+
+— S4: spiloop@1.0.0 — ws_put -> push -> eval require/attach -> vectors —
+  [PASS] ws_put spiloop@1.0.0 stored VERBATIM (sha256=047f3757d01faa1a… size=1398; text={"sha256":"047f3757d01faa1acacf6449a34ca5499f0dd6acbfccbd217bf5e7c40bc55458","si)
+  [PASS] driver_push spiloop@1.0.0 landed /drv/spiloop.lua, read-back verified (bytes=1398 sha=047f3757d01faa1a…)
+  [PASS] eval require+attach spiloop through the --@api 1 gate (value=table,function,table,function,function,function; text={"out":"table,function,table,function,function,function","value":"table,function)
+  [PASS] S4 vector: drv xfer 64B @1MHz (polling bound) == sent (value=eq)
+  [PASS] S4 vector: drv xfer 65B @1MHz (DMA edge) == sent (value=eq)
+  [PASS] S4 vector: drv read(8) == 0xFF x 8 (live MISO dummy clocking; value=eq)
+  [PASS] manifest ACTIVE spiloop == 1.0.0 (active="1.0.0")
+
+— S4b: lease cycle — release (LeaseTeardown sweeps ns-0 `_eval`) + re-lease —
+  [note] the ops face has NO session.reset (T3/T4 used it directly); the only MCP-reachable equivalent is release+re-lease —
+  [note]   release resets the holder namespace AND ns-0 (lease/session.go teardownNamespaces), freeing the S2-S4 eval claims on 8/9 + 12/13/14 for the S5 script session
+  [note]   the fixture is OUTSIDE the session pin table (fw s_fix) — it survives the sweep, proven by the script's own scan next
+  [daemon] time=2026-11-05T19:39:55.471+08:00 level=INFO msg="board d75884: session.reset(1793878792) stopped=0"
+  [daemon] time=2026-11-05T19:39:55.481+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+  [daemon] time=2026-11-05T19:39:55.481+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=b7-hil session=1793878792 sessions=[1793878792 0] err=<nil> took=21ms"
+  [PASS] release #1 (ns-0 eval sweep; text="{\"board\":\"d75884\",\"holder\":\"b7-hil\"}")
+  [PASS] between leases board_status shows NO lease (lease key false)
+  [daemon] time=2026-11-05T19:39:55.493+08:00 level=INFO msg="lease: grant board=d75884 holder=b7-hil session=1793878793"
+  [PASS] re-lease holder=b7-hil -> FRESH session=1.793878793e+09 (was 1.793878792e+09; every lease gets its own namespace)
+
+— S5: script resident form — ONE script, BOTH drivers, measure loop, capture+ring, stop+release —
+  [note] S5 pre-script clean slate: fixture off->on (ring/TX FIFO/reg file zeroed) (master setup left to the next owner)
+  [daemon] time=2026-11-05T19:39:55.580+08:00 level=INFO msg="server: capture cap-1 started (d75884 stdout - /tmp/opencode/b7-full/xdg/xuansi/captures/20261105T113955-d75884-stdout-cap1.bin, max 64MiB/6s)"
+  [PASS] stdout capture cap-1 armed board-side through the MCP capture face (daemon log: capture started) — the stdout arming path
+  [PASS] script_start b7loop (requires BOTH drivers, attaches both, 250ms measure loop; text={"name":"b7loop"})
+  [PASS] board_status lists the resident script (scripts=[b7loop])
+  [PASS] events_recent ring carries the script's per-iteration stdout lines LIVE (4 measure-loop lines in the ring)
+  [PASS] script_stop b7loop (text={})
+  [PASS] post-stop board_status: script gone (scripts=<nil>)
+  [PASS] board_op diag.pins (dump lands on stdout, collected by cap-1; text={})
+  [daemon] time=2026-11-05T19:40:01.574+08:00 level=INFO msg="server: capture cap-1 done (limit): 182 bytes - /tmp/opencode/b7-full/xdg/xuansi/captures/20261105T113955-d75884-stdout-cap1.bin"
+  [PASS] stdout capture cap-1 returned {path=/tmp/opencode/b7-full/xdg/xuansi/captures/20261105T113955-d75884-stdout-cap1.bin bytes=182 reason=limit}
+  [PASS] capture file inside the XDG sandbox, readable from THIS HIL process (/tmp/opencode/b7-full/xdg/xuansi/captures/20261105T113955-d75884-stdout-cap1.bin, 182 bytes)
+  [PASS] cap-1 holds the script's start line + fixture-alive proof (scan=1 -> 0x28 answered after the lease cycle)
+  [PASS] cap-1 holds >=3 measure-loop lines (ring said 4, file says 4)
+  [PASS] cap-1's first iteration line reads echo=b7loop-1 xfer16=16 (i2c echo AND spi self-loop both alive in the script)
+  [PASS] diag.pins (in cap-1): 8/9 + 12/13/14 ALL RELEASED by script_stop (busFree=true)
+  [note] the fixture's 10/11 never appear in the pin table (fw s_fix holds them OUTSIDE the session pin registry — T3 evidence: pins(2)=8/9 only); their release is proven by the S9 functional negative
+  [note] script echo writes landed at reg[0x62..0x6A] ('b' pointer) — outside every window this HIL asserts; count non-deterministic, unmodeled
+
+— S6: dynamic tool cross-check — d75884_i2c_scan == eval scan —
+  [PASS] eval drv.scan() -> [40] (decimal 40 == 0x28; re-attach claims 8/9 for ns-0 `_eval`)
+  [PASS] dynamic tool d75884_i2c_scan{port:0} -> [40] == eval result (the caps-driven synthesized-eval path agrees)
+
+— S7: version swap — ws_put i2cecho@1.1.0 -> push -> hot-swap -> ROLLBACK to 1.0.0 —
+  [PASS] ws_put i2cecho@1.1.0 stored (runtime sha256=cfdeed8e2c2648eb… size=1436; text={"sha256":"cfdeed8e2c2648ebc46ce5f24b777f2b22efe874b22d06744f8590d00b2bc3b6","si)
+  [PASS] driver_push i2cecho@1.1.0 overwrote /drv/i2cecho.lua, read-back verified (sha=cfdeed8e2c2648eb…)
+  [PASS] HOT-SWAP idiom (package.loaded nil-out + require re-reads /drv from flash) -> drv.version == "1.1.0" (value=1.1.0)
+  [PASS] manifest ACTIVE == 1.1.0 after the swap (active="1.1.0")
+  [note] rollback = push the older version explicitly (the workspace is the rollback history)
+  [PASS] ROLLBACK driver_push i2cecho@1.0.0 (read-back sha=a9c83d9499224196…)
+  [PASS] hot-swap after rollback -> drv.version ABSENT for 1.0.0 (tostring="nil" — behavior-keyed, not sha-keyed)
+  [PASS] post-rollback reg round-trip 16B @0x20 still passes on the 1.0.0 body (window==model; value=eq)
+  [PASS] manifest ACTIVE back to 1.0.0 (active="1.0.0")
+
+— S8: /drv reconciliation — fs_read the expected files (no fs.ls in the MCP face) —
+  [PASS] fs_read /drv/i2cecho.lua sha256 == a9c83d9499224196… (post-rollback active body)
+  [PASS] fs_read /drv/spiloop.lua sha256 == 047f3757d01faa1a… (pushed at S4, never swapped)
+  [note] fs_read /drv/b6tiny.lua: absent (the possible batch-6 leftover is not on this board)
+  [note] reconciliation method: the MCP face has no fs.ls — the three expected /drv files are reconciled by fs_read sha (b6tiny honestly noted either way)
+
+— S9: fixture-off negative — diag.i2cslave {mode:0} -> scan == {} —
+  [PASS] diag.i2cslave {mode:0} -> {mode:0} (fixture OFF — slave 0x28 gone, pins 10/11 released)
+  [PASS] fresh i2c.setup after off + scan == {} (value=0, — the negative: no 0x28 without the fixture)
+
+— S10: teardown — budget restore, release+sweep, pins ALL free (capture#2), mcp EOF, serve SIGINT, /drv cleanup + sandbox —
+  [PASS] budget restored eval_ms=200 event_ms=50 (board as found; eval_ms=200)
+  [daemon] time=2026-11-05T19:40:02.371+08:00 level=INFO msg="board d75884: session.reset(1793878793) stopped=0"
+  [daemon] time=2026-11-05T19:40:02.380+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+  [daemon] time=2026-11-05T19:40:02.380+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=b7-hil session=1793878793 sessions=[1793878793 0] err=<nil> took=26ms"
+  [PASS] final release (holder ns + ns-0 `_eval` swept -> 8/9 free; text="{\"board\":\"d75884\",\"holder\":\"b7-hil\"}")
+  [PASS] daemon log: lease teardowns reason=released (count=2)
+  [PASS] post-release board_status shows NO lease (lease key false)
+  [daemon] time=2026-11-05T19:40:02.404+08:00 level=INFO msg="lease: grant board=d75884 holder=b7-hil session=1793878794"
+  [PASS] brief re-lease for the pins read (a fresh lease claims nothing; text={"board":"d75884","holder":"b7-hil","session":1793878794})
+  [daemon] time=2026-11-05T19:40:02.410+08:00 level=INFO msg="server: capture cap-2 started (d75884 stdout - /tmp/opencode/b7-full/xdg/xuansi/captures/20261105T114002-d75884-stdout-cap2.bin, max 64MiB/3s)"
+  [PASS] stdout capture cap-2 armed for the pins dump (daemon log: capture started)
+  [PASS] board_op diag.pins post-release (dump on stdout via cap-2; text={})
+  [daemon] time=2026-11-05T19:40:05.406+08:00 level=INFO msg="server: capture cap-2 done (limit): 10 bytes - /tmp/opencode/b7-full/xdg/xuansi/captures/20261105T114002-d75884-stdout-cap2.bin"
+  [PASS] final diag.pins: 8/9/10/11/12/13/14 ALL FREE (busy=[]; dump head: pins (0):-)
+  [daemon] time=2026-11-05T19:40:05.521+08:00 level=INFO msg="board d75884: session.reset(1793878794) stopped=0"
+  [daemon] time=2026-11-05T19:40:05.527+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"
+  [daemon] time=2026-11-05T19:40:05.527+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=b7-hil session=1793878794 sessions=[1793878794 0] err=<nil> took=119ms"
+  [PASS] release #2 — the bench is left UNLEASED (text={"board":"d75884","holder":"b7-hil"})
+  [daemon] time=2026-11-05T19:40:05.528+08:00 level=INFO msg="server: conn dropped (holder=b7-hil)"
+  [PASS] xuansi mcp exited clean on stdin EOF (code=0 waitErr=<nil>)
+  [PASS] mcp stderr carries no error line (clean EOF path)
+  [daemon] xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)
+  [daemon] xuansi: shutdown complete
+  [PASS] daemon exited clean (code=0 waitErr=<nil>)
+  [PASS] daemon's own final log line: 'shutdown complete' (no goroutine-leak complaint)
+  [PASS] sock file removed at exit (stat err=stat /tmp/opencode/b7-full/daemon.sock: no such file or directory)
+
+— S10b: FINDING + out-of-pipeline /drv cleanup (direct TCP REPL, honestly labeled) —
+  [note] FINDING: neither the MCP static face (17 tools) nor the daemon internal API has a file-removal request —
+  [note]   the driver pipeline can deploy (ws_put/driver_push) and read back (fs_read) but cannot CLEAN UP /drv; reported in the task report
+[dial] tcp: connected 10.1.50.200:42282 → 10.1.51.205:7777 (no reboot, no drain window — §13; keepalive 3s/1s×3 ≈6s verdict)
+  [PASS] cleanup REPL hello binds fw_build=775ecaa protocol_ver=3 role=controller
+  [PASS] fs.rm /drv/i2cecho.lua (direct REPL, outside the MCP pipeline; err=<nil>)
+  [PASS] fs.rm /drv/spiloop.lua (direct REPL, outside the MCP pipeline; err=<nil>)
+  [note] fs.rm /drv/b6tiny.lua: refused (fs.rm: error api: rm '/drv/b6tiny.lua' failed (No such file or directory)) — reading back to classify
+  [note] fs.read /drv/b6tiny.lua errors too (fs.read: error api: '/drv/b6tiny.lua' not found (No such file or directory)) — the file was never there; board already clean
+  [PASS] fs.read /drv/i2cecho.lua post-rm errors (fs.read: error api: '/drv/i2cecho.lua' not found (No such file or directory)) — file GONE, /drv as found
+  [PASS] fs.read /drv/spiloop.lua post-rm errors (fs.read: error api: '/drv/spiloop.lua' not found (No such file or directory)) — file GONE, /drv as found
+  [note] XDG sandbox accounting:
+  [note]   captures/ (2 entries): 20261105T113955-d75884-stdout-cap1.bin, 20261105T114002-d75884-stdout-cap2.bin
+  [note]   workspace/ (2 entries): drivers, manifest.json
+  [note]   workspace/drivers/i2cecho@1.0.0.lua present (the rollback history)
+  [note]   workspace/drivers/i2cecho@1.1.0.lua present (the rollback history)
+  [note]   workspace/drivers/spiloop@1.0.0.lua present (the rollback history)
+  [PASS] workspace manifest.json parses under the sandbox (root=/tmp/opencode/b7-full/xdg/xuansi/workspace)
+=== b7-mcp: 84 pass, 0 fail ===
+=== ALL PASS — task-5 v1 driver-story closeout: real loopback drivers through the whole MCP pipeline, single capture (attempt 3, S0..S10) ===
+driver exit: 0
