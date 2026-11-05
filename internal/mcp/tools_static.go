@@ -5,8 +5,9 @@ package mcp
 // script/fs/op faces, plus task 10's events_recent (the event face's
 // polling half — static contract name, content from the refresh-fed
 // rings), plus task 11's four driver-workspace tools (workspace.go —
-// versioned store, manifest, gated push). The websocket/capture tools
-// land with task 12 and get their own files. Every handler is the
+// versioned store, manifest, gated push), plus task 12's blocking
+// xuansi_capture (tools_capture.go — the MB-level face: the daemon
+// spools the file, the tool returns its path). Every handler is the
 // same shape: build the internal-API request, cross errors.go's
 // mapping, decode the reply into a typed Out struct — JSON-friendly,
 // with arbitrary board payloads (run_lua's value, ops' results, board
@@ -240,6 +241,7 @@ var staticToolNames = []string{
 	"xuansi_ws_list",
 	"xuansi_ws_get",
 	"xuansi_driver_push",
+	"xuansi_capture",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -329,6 +331,8 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_driver_push",
 		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.lua (the board knows nothing of versions). Gated BEFORE the flash write: the file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one), and the file must fit the board's 16384B single-file cap. The write is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
 	}, ts.driverPush)
+
+	ts.registerCapture(srv)
 }
 
 // ---------------------------------------------------------------------------

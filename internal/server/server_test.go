@@ -351,14 +351,16 @@ func (c *sockClient) recvNone() {
 }
 
 // call sends one request and waits for the reply with the same id
-// (events on the wire are skipped and returned alongside).
+// (unsolicited pushes — events, capture_done — on the wire are skipped
+// and returned alongside; capture tests that assert pushes use the
+// send+collect pattern instead).
 func (c *sockClient) call(id int64, req map[string]any) (reply map[string]any, events []map[string]any) {
 	c.t.Helper()
 	req["id"] = id
 	c.send(req)
 	for {
 		m := c.recv()
-		if m["type"] == "event" {
+		if m["type"] == "event" || m["type"] == "capture_done" {
 			events = append(events, m)
 			continue
 		}

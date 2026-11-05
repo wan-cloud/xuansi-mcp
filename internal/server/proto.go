@@ -55,8 +55,8 @@
 //	fs_read        {board, path}                 → {data: base64}  (read-only, no lease)
 //	watch_events   {board, source?}              → {board}         (subscribes THIS connection; source, when given, is additionally events.subscribe'd board-side)
 //	op             {board, op, args?, holder?}   → board reply result  (the ops face — see below)
-//	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; lands with T12)
-//	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}  (lands with T12)
+//	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; see the capture section below)
+//	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}
 //
 // eval/submit/op args numbers: the fw args bridge is int-only (v3 §4),
 // so the daemon validates the args tree BEFORE any board contact — an
@@ -102,10 +102,27 @@
 // A capture spools one watched source to a host file (the daemon is
 // the writer, design §8): $XDG_DATA_HOME/xuansi/captures/<UTC
 // ts>-<mac6>-<source>.bin|.jsonl — uart/stdout land byte-exact as raw
-// streams, gpio/net/job as JSON lines. The bounds end a capture
-// (reason:"limit"), capture_stop ends it early (reason:"stopped"), a
-// disk failure ends it as reason:"error"; every ending pushes
-// capture_done exactly once to the starting connection.
+// streams, gpio/net as JSON lines ({"ts","source","data"} per line).
+// source is the subscribable set gpio.N / uart1.rx / uart2.rx /
+// stdout / net; "job" is refused with an api-class error (§8: job
+// results are direct-delivered to the submitting connection, not a
+// subscribable source) and anything else is a server-class refusal.
+// dest, when given, must be a bare basename (no separators) inside
+// the captures root. The start subscribes the source board-side
+// (events.subscribe, like watch_events); stopping does NOT
+// unsubscribe — another watcher of the same source must not lose its
+// events (daemon policy: subscriptions die with the connection only).
+// Bounds clamp to 1..64MiB and 1..600s. A RAW chunk that would cross
+// max_bytes is truncated so the file lands exactly on the cap; a JSON
+// line that would cross is left UNWRITTEN (a truncated line would be
+// corrupt JSON). The bounds end a capture (reason:"limit"),
+// capture_stop ends it early (reason:"stopped", flushing the tail the
+// tap already fed before the stop signal), a disk failure ends
+// it as reason:"error"; daemon shutdown with live captures ends them
+// reason:"stopped" (a shutdown is a deliberate stop, not a failure).
+// Every ending pushes capture_done exactly once to the starting
+// connection; capture_stop on an unknown/finished id is a server-class
+// error (the push carries the reason that actually won any race).
 //
 // BOARD selectors are mac6 / alias / hostname prefixes resolved by the
 // discovery registry (T9 Resolve): unique prefix hits, ambiguity or no
@@ -210,6 +227,15 @@ type Request struct {
 	// session ops are NOT reachable through it.
 	Op   string `json:"op,omitempty"`
 	Args any    `json:"args,omitempty"` // eval/submit: array|map → Lua ARGS; op: the op's args object — numbers validated daemon-side either way
+	// CaptureID addresses one capture (capture_stop's target).
+	CaptureID string `json:"capture_id,omitempty"`
+	// MaxBytes / MaxSeconds bound one capture (0 = the 64MiB / 600s
+	// defaults; clamped 1..64MiB and 1..600 daemon-side).
+	MaxBytes   int64 `json:"max_bytes,omitempty"`
+	MaxSeconds int64 `json:"max_seconds,omitempty"`
+	// Dest overrides a capture's filename (a bare basename inside the
+	// captures root — path separators are refused daemon-side).
+	Dest string `json:"dest,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.
@@ -247,6 +273,19 @@ type EventPush struct {
 	Type  string    `json:"type"` // "event"
 	Board string    `json:"board"`
 	Event WireEvent `json:"event"`
+}
+
+// CaptureDone is the unsolicited capture-completion push (T12):
+// {"type":"capture_done", capture_id, path, bytes, reason}. It rides
+// the starting connection's outbound queue with REPLY priority (never
+// dropped for a full queue the way event pushes are — it is the only
+// answer a blocking capture waiter gets).
+type CaptureDone struct {
+	Type      string `json:"type"` // "capture_done"
+	CaptureID string `json:"capture_id"`
+	Path      string `json:"path"`
+	Bytes     int64  `json:"bytes"`
+	Reason    string `json:"reason"` // "limit" | "stopped" | "error"
 }
 
 // WriteMsg frames and writes one JSON message.

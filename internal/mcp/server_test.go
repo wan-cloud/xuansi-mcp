@@ -264,10 +264,11 @@ func noContact(t *testing.T, reqs chan server.Request) {
 }
 
 // staticTools is the exact static toolset — task 8's twelve daemon-
-// surface tools (eleven request-face + task 10's events_recent) plus
-// task 11's four driver-workspace tools (the rings events_recent reads
-// ride the dynamic refresh, but the tool itself is static contract;
-// the workspace tools never touch the daemon on the store side).
+// surface tools (eleven request-face + task 10's events_recent), task
+// 11's four driver-workspace tools, and task 12's blocking capture
+// tool (the rings events_recent reads ride the dynamic refresh, but
+// the tool itself is static contract; the workspace tools never touch
+// the daemon on the store side).
 var staticTools = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -285,17 +286,19 @@ var staticTools = []string{
 	"xuansi_ws_list",
 	"xuansi_ws_get",
 	"xuansi_driver_push",
+	"xuansi_capture",
 }
 
 // ---------------------------------------------------------------------------
 // registration, holder identity, error mapping
 
 // TestRegistersExactStaticToolset: the served tool list is exactly the
-// 16 static tools (T8's twelve + task 11's four workspace tools — the
-// count drift is expected: the workspace face extends the same static
-// contract), each with a non-empty agent-facing description, and the
-// inferred schemas mark the required/optional split the handlers rely
-// on (board required, holder/transport optional).
+// 17 static tools (T8's twelve + task 11's four workspace tools + task
+// 12's capture — the count drift is expected: each face extends the
+// same static contract), each with a non-empty agent-facing
+// description, and the inferred schemas mark the required/optional
+// split the handlers rely on (board required, holder/transport
+// optional).
 func TestRegistersExactStaticToolset(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

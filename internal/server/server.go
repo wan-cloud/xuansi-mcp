@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -101,6 +102,10 @@ type Opts struct {
 	// NewSupervisor is the per-board supervisor factory (default:
 	// board.NewSupervisor with the Log seam; tests inject dial fakes).
 	NewSupervisor func(ref board.BoardRef) *board.Supervisor
+	// CaptureRoot pins where capture files land (default:
+	// $XDG_DATA_HOME/xuansi/captures — capturesRoot; tests inject a
+	// temp root).
+	CaptureRoot string
 }
 
 // Server is the daemon's API face. New binds the socket; Start serves;
@@ -117,11 +122,19 @@ type Server struct {
 	sockPath string
 	ownSock  bool // we created the sock file → Close removes it
 
-	mu       sync.Mutex
-	sups     map[string]*daemonBoard             // mac6 → supervisor wrapper
-	conns    map[*clientConn]struct{}            // live API connections
-	watchers map[string]map[*clientConn]struct{} // mac6 → subscribed conns
-	connSeq  int64
+	mu         sync.Mutex
+	sups       map[string]*daemonBoard             // mac6 → supervisor wrapper
+	conns      map[*clientConn]struct{}            // live API connections
+	watchers   map[string]map[*clientConn]struct{} // mac6 → subscribed conns
+	connSeq    int64
+	captures   map[string]*captureSession // capture_id → live capture (capture.go)
+	captureSeq int64                      // capture_id assignment, under mu
+	// captureRoot / captureOpen are the capture face's filesystem
+	// seams: the root defaults to capturesRoot() (Opts.CaptureRoot
+	// injects a temp root in tests) and the opener defaults to
+	// os.Create (tests swap a failing writer). Both read under mu.
+	captureRoot string
+	captureOpen func(path string) (io.WriteCloser, error)
 
 	auditCancel context.CancelFunc
 
@@ -199,6 +212,9 @@ func New(o Opts) (*Server, error) {
 			return board.NewSupervisor(ref, board.SupOpts{Log: o.Log})
 		}
 	}
+	if o.CaptureRoot == "" {
+		o.CaptureRoot = capturesRoot()
+	}
 
 	reg := o.Registry
 	if reg == nil {
@@ -222,17 +238,20 @@ func New(o Opts) (*Server, error) {
 	}
 
 	s := &Server{
-		opts:     o,
-		logf:     o.Log,
-		reg:      reg,
-		ln:       ln,
-		sockPath: o.SockPath,
-		ownSock:  true,
-		sups:     map[string]*daemonBoard{},
-		conns:    map[*clientConn]struct{}{},
-		watchers: map[string]map[*clientConn]struct{}{},
-		closed:   make(chan struct{}),
-		done:     make(chan struct{}),
+		opts:        o,
+		logf:        o.Log,
+		reg:         reg,
+		ln:          ln,
+		sockPath:    o.SockPath,
+		ownSock:     true,
+		sups:        map[string]*daemonBoard{},
+		conns:       map[*clientConn]struct{}{},
+		watchers:    map[string]map[*clientConn]struct{}{},
+		captures:    map[string]*captureSession{},
+		captureRoot: o.CaptureRoot,
+		captureOpen: osCreateCapture,
+		closed:      make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 	s.leases = lease.NewManager(lease.Policy{
 		GraceTTL: o.GraceTTL,
@@ -316,6 +335,11 @@ func (s *Server) Close() {
 			s.auditCancel()
 		}
 		s.ln.Close()
+
+		// live captures end deliberately at shutdown (files closed,
+		// done pushes "stopped" — best effort toward connections that
+		// drop moments later; proto.go's capture contract)
+		s.stopCapturesShutdown()
 
 		s.mu.Lock()
 		conns := make([]*clientConn, 0, len(s.conns))
@@ -692,6 +716,10 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hOp(ctx, cc, req)
 	case "watch_events":
 		result, err = s.hWatchEvents(ctx, cc, req)
+	case "capture_start":
+		result, err = s.hCaptureStart(ctx, cc, req)
+	case "capture_stop":
+		result, err = s.hCaptureStop(req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1246,6 +1274,7 @@ func (s *Server) broadcast(mac6 string, ev replclient.Event) {
 	msg := EventPush{Type: "event", Board: mac6, Event: WireEvent{Source: ev.Source, Data: ev.Data}}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.feedCapturesLocked(mac6, ev) // the capture face rides the same tap
 	for cc := range s.watchers[mac6] {
 		if !cc.sendLocked(msg) {
 			s.logf("server: event to holder %s dropped (connection gone)", cc.holder_())

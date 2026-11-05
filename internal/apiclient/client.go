@@ -29,8 +29,8 @@
 // behind drops newly arriving events until it catches up — it never
 // stalls the connection and never slows other handlers.
 //
-// Unknown message types (the capture_done push documented in the
-// contract but landing with T12) are read and ignored for now.
+// Unknown message types (beyond reply / event / capture_done) are read
+// and ignored — the contract may grow new push types.
 package apiclient
 
 import (
@@ -64,6 +64,7 @@ type Client struct {
 	mu      sync.Mutex
 	pending map[int64]chan *server.Reply // in-flight calls by id
 	regs    map[int64]*eventReg          // live event subscriptions
+	cregs   map[int64]*capReg            // live capture_done subscriptions (OnCaptureDone)
 	nextID  int64                        // id assignment, under mu
 	nextReg int64
 	dead    error // non-nil once sealed; wraps ErrDead
@@ -90,6 +91,19 @@ func (r *eventReg) stop() {
 	r.closeOnce.Do(func() { close(r.quit) })
 }
 
+// capReg is one OnCaptureDone subscription — the capture_done
+// counterpart of eventReg (same delivery shape: own goroutine, own
+// queue, fire-and-forget overflow).
+type capReg struct {
+	queue     chan server.CaptureDone
+	quit      chan struct{}
+	closeOnce sync.Once
+}
+
+func (r *capReg) stop() {
+	r.closeOnce.Do(func() { close(r.quit) })
+}
+
 // Dial connects to the daemon's unix socket and starts the background
 // read loop. An unreachable daemon gets the same actionable message
 // the CLI prints (mirror of cmd/xuansi/client.go).
@@ -103,6 +117,7 @@ func Dial(path string) (*Client, error) {
 		path:    path,
 		pending: make(map[int64]chan *server.Reply),
 		regs:    make(map[int64]*eventReg),
+		cregs:   make(map[int64]*capReg),
 		done:    make(chan struct{}),
 	}
 	go c.readLoop()
@@ -135,8 +150,14 @@ func (c *Client) readLoop() {
 				continue
 			}
 			c.fanOut(ev)
+		case "capture_done":
+			var cd server.CaptureDone
+			if err := json.Unmarshal(payload, &cd); err != nil {
+				continue
+			}
+			c.fanOutCapture(cd)
 		default:
-			// capture_done lands with T12; unknown types are ignored
+			// unknown types are ignored (the contract may grow)
 		}
 	}
 }
@@ -167,6 +188,22 @@ func (c *Client) fanOut(ev server.EventPush) {
 		select {
 		case r.queue <- ev:
 		default: // this handler is handlerQueueDepth behind: drop
+		}
+	}
+}
+
+// fanOutCapture is fanOut for capture_done pushes (same policy).
+func (c *Client) fanOutCapture(cd server.CaptureDone) {
+	c.mu.Lock()
+	regs := make([]*capReg, 0, len(c.cregs))
+	for _, r := range c.cregs {
+		regs = append(regs, r)
+	}
+	c.mu.Unlock()
+	for _, r := range regs {
+		select {
+		case r.queue <- cd:
+		default:
 		}
 	}
 }
@@ -272,6 +309,51 @@ func (c *Client) OnEvent(fn func(server.EventPush)) (cancel func()) {
 	}
 }
 
+// OnCaptureDone subscribes fn to every capture_done push — the
+// completion half of the capture face (proto.go), delivered with the
+// same shape and guarantees as OnEvent (own goroutine, bounded queue,
+// fire-and-forget overflow, idempotent cancel safe after death). The
+// event face is untouched: the two subscription sets are independent.
+func (c *Client) OnCaptureDone(fn func(server.CaptureDone)) (cancel func()) {
+	r := &capReg{
+		queue: make(chan server.CaptureDone, handlerQueueDepth),
+		quit:  make(chan struct{}),
+	}
+	c.mu.Lock()
+	if c.dead != nil {
+		c.mu.Unlock()
+		return func() {} // dead: no push will ever arrive
+	}
+	id := c.nextReg
+	c.nextReg++
+	c.cregs[id] = r
+	c.mu.Unlock()
+
+	go func() {
+		for {
+			select {
+			case cd := <-r.queue:
+				fn(cd)
+			case <-r.quit:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		c.mu.Lock()
+		delete(c.cregs, id)
+		c.mu.Unlock()
+		r.stop()
+	}
+}
+
+// Done closes when the read loop exits — every connection death path
+// (read failure, EOF, Close). Waiters blocking on daemon pushes
+// (xuansi_capture's blocking wait) select on it so a daemon that dies
+// mid-capture cannot wedge them until their own context deadline.
+func (c *Client) Done() <-chan struct{} { return c.done }
+
 // Close tears the connection down: in-flight Calls return immediately
 // with errors wrapping ErrDead, handlers stop, later Calls fail fast.
 // Idempotent; the first close error is the one reported.
@@ -296,6 +378,8 @@ func (c *Client) markDead(reason error) {
 	c.pending = make(map[int64]chan *server.Reply)
 	regs := c.regs
 	c.regs = make(map[int64]*eventReg)
+	cregs := c.cregs
+	c.cregs = make(map[int64]*capReg)
 	c.mu.Unlock()
 
 	for _, ch := range pending {
@@ -303,6 +387,9 @@ func (c *Client) markDead(reason error) {
 	}
 	for _, r := range regs {
 		r.stop() // per-reg close-once: safe even if the user cancelled first
+	}
+	for _, r := range cregs {
+		r.stop()
 	}
 }
 

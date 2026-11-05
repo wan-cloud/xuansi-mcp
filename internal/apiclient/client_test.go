@@ -606,3 +606,75 @@ func TestContextCancelKeepsClientUsable(t *testing.T) {
 		t.Errorf("post-cancel result = %v, want echo list_boards", res)
 	}
 }
+
+// pushCaptureDone writes one unsolicited capture_done push.
+func pushCaptureDone(t *testing.T, conn net.Conn, cd server.CaptureDone) {
+	t.Helper()
+	if err := server.WriteMsg(conn, cd); err != nil {
+		t.Errorf("fake daemon capture_done push: %v", err)
+	}
+}
+
+// TestOnCaptureDoneRoutesAndCoexistsWithEvents: the capture_done
+// extension routes pushes to OnCaptureDone subscribers while the
+// event flow is untouched (one of each, both delivered), cancels are
+// idempotent, and Done() closes on Close.
+func TestOnCaptureDoneRoutesAndCoexistsWithEvents(t *testing.T) {
+	fd := newFakeDaemon(t)
+	fd.serve(t, func(conn net.Conn) {
+		req := readReq(t, conn)
+		if req.Type == "" {
+			return
+		}
+		writeReply(t, conn, req.ID, map[string]any{"echo": req.Type})
+		pushEvent(t, conn, "d75884", "gpio.4", map[string]any{"level": 1})
+		pushCaptureDone(t, conn, server.CaptureDone{
+			Type: "capture_done", CaptureID: "cap-1", Path: "/p.bin", Bytes: 42, Reason: "limit",
+		})
+		// hold the connection until the client is done asserting
+		time.Sleep(300 * time.Millisecond)
+	})
+
+	c, err := Dial(fd.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evs := make(chan server.EventPush, 4)
+	evCancel := c.OnEvent(func(ev server.EventPush) { evs <- ev })
+	cds := make(chan server.CaptureDone, 4)
+	cdCancel := c.OnCaptureDone(func(cd server.CaptureDone) { cds <- cd })
+
+	if _, _, err := c.Call(context.Background(), server.Request{Type: "board_status", Board: "d75884"}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-evs:
+		if ev.Board != "d75884" || ev.Event.Source != "gpio.4" {
+			t.Errorf("event push = %+v", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the event push")
+	}
+	select {
+	case cd := <-cds:
+		if cd.CaptureID != "cap-1" || cd.Path != "/p.bin" || cd.Bytes != 42 || cd.Reason != "limit" {
+			t.Errorf("capture_done push = %+v", cd)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the capture_done push")
+	}
+
+	evCancel()
+	evCancel() // idempotent
+	cdCancel()
+	cdCancel()
+
+	c.Close()
+	select {
+	case <-c.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done() did not close after Close")
+	}
+}
