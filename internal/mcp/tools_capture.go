@@ -55,7 +55,7 @@ func (ts *toolset) registerCapture(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "xuansi_capture",
 		Description: "Capture one board event source to a HOST file (MB-level — the daemon spools it; this call BLOCKS until the capture ends, bounded by seconds/max_bytes). " +
-			"The file lands under the daemon's captures root as <UTC ts>-<mac6>-<source>.bin|.jsonl: uart1.rx/uart2.rx/stdout as raw concatenated bytes, gpio.N/net as one JSON line per event ({ts,source,data}). " +
+			"The file lands under the daemon's captures root as <UTC ts>-<mac6>-<source>-cap<N>.bin|.jsonl (unique by construction — the capture sequence rides the name): uart1.rx/uart2.rx/stdout as raw concatenated bytes, gpio.N/net as one JSON line per event ({ts,source,data}). " +
 			"Take the lease first (xuansi_lease). Returns {path, bytes, reason} — reason is limit (a bound passed), stopped, or error (disk failure; the partial file still lands). " +
 			"Post-process the file with programs; that is the design. Cancelling the call stops the capture (reason stopped) and returns what landed when the stop completes in time. " +
 			"Holder semantics: " + holderDesc + ".",

@@ -101,9 +101,15 @@
 //
 // A capture spools one watched source to a host file (the daemon is
 // the writer, design §8): $XDG_DATA_HOME/xuansi/captures/<UTC
-// ts>-<mac6>-<source>.bin|.jsonl — uart/stdout land byte-exact as raw
-// streams, gpio/net as JSON lines ({"ts","source","data"} per line).
-// source is the subscribable set gpio.N / uart1.rx / uart2.rx /
+// ts>-<mac6>-<source>-cap<N>.bin|.jsonl — uart/stdout land byte-exact
+// as raw streams, gpio/net as JSON lines ({"ts","source","data"} per
+// line, ts fixed-width RFC3339 nanos). The default name embeds the
+// capture sequence N (the capture_id's number): unique by
+// construction, even for two same-second starts of the same
+// board+source. An explicit dest NEVER truncates: files open
+// O_CREAT|O_EXCL, and a path owned by a live capture or an existing
+// file is a server-class refusal naming the collision. source is the
+// subscribable set gpio.N / uart1.rx / uart2.rx /
 // stdout / net; "job" is refused with an api-class error (§8: job
 // results are direct-delivered to the submitting connection, not a
 // subscribable source) and anything else is a server-class refusal.

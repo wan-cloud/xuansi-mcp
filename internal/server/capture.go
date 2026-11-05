@@ -14,6 +14,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -44,6 +45,13 @@ const (
 	// request loop of that one connection waits; every other keeps
 	// flowing).
 	captureStopWait = 2 * time.Second
+
+	// captureTSLayout is the JSONL ts format — RFC3339 with the FULL
+	// 9-digit nanosecond fraction (fixed width, no trailing-zero
+	// trimming): every line a given event map produces has the same
+	// length, so byte-cap reasoning (and the test that pins it) is
+	// deterministic.
+	captureTSLayout = "2006-01-02T15:04:05.000000000Z"
 )
 
 // captureFormat is how one source family lands in the file.
@@ -95,10 +103,14 @@ func capturesRoot() string {
 	return filepath.Join(home, ".local", "share", "xuansi", "captures")
 }
 
-// osCreateCapture is the default capture-file opener (the seam tests
-// swap for failing writers).
+// osCreateCapture is the default capture-file opener: O_CREAT|O_EXCL —
+// a capture NEVER truncates (review round 1): a path already owned by
+// a live capture or an earlier landed file is a clean refusal, not a
+// destroyed file. The default name is unique by construction (the
+// capture sequence rides it), so this backstop mostly guards explicit
+// dests and the same-second daemon-restart corner.
 func osCreateCapture(path string) (io.WriteCloser, error) {
-	return os.Create(path)
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 }
 
 // captureSession is one live capture: the file, the bounds, and the
@@ -186,26 +198,33 @@ func (s *Server) hCaptureStart(ctx context.Context, cc *clientConn, req *Request
 	maxBytes := clampCapture(req.MaxBytes, 1, captureMaxBytesCap, captureDefaultMaxBytes)
 	maxSeconds := clampCapture(req.MaxSeconds, 1, captureMaxSecondsCap, captureDefaultMaxSeconds)
 
-	name := req.Dest
-	if name != "" {
-		if name != filepath.Base(name) || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+	if req.Dest != "" {
+		if req.Dest != filepath.Base(req.Dest) || req.Dest == "." || req.Dest == ".." || strings.ContainsAny(req.Dest, `/\`) {
 			return nil, &RPCError{Class: "server",
 				Msg: fmt.Sprintf("capture: dest %q must be a bare filename inside the captures root (no path separators)", req.Dest)}
 		}
-	} else {
-		ext := ".jsonl"
-		if format == capRaw {
-			ext = ".bin"
-		}
-		name = time.Now().UTC().Format("20060102T150405") + "-" + b.MAC6 + "-" + req.Source + ext
 	}
 
+	// the id and the default filename's uniqueness both ride the
+	// capture sequence: <ts>-<mac6>-<source>-cap<N>.ext is unique by
+	// construction, even for two same-second starts of the same
+	// board+source (review round 1's collision)
 	s.mu.Lock()
 	root := s.captureRoot
 	open := s.captureOpen
 	s.captureSeq++
-	id := "cap-" + strconv.FormatInt(s.captureSeq, 10)
+	seq := s.captureSeq
 	s.mu.Unlock()
+	id := "cap-" + strconv.FormatInt(seq, 10)
+
+	name := req.Dest
+	if name == "" {
+		ext := ".jsonl"
+		if format == capRaw {
+			ext = ".bin"
+		}
+		name = time.Now().UTC().Format("20060102T150405") + "-" + b.MAC6 + "-" + req.Source + "-cap" + strconv.FormatInt(seq, 10) + ext
+	}
 
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf("capture: mkdir %s: %v", root, err)}
@@ -213,6 +232,10 @@ func (s *Server) hCaptureStart(ctx context.Context, cc *clientConn, req *Request
 	path := filepath.Join(root, name)
 	file, oerr := open(path)
 	if oerr != nil {
+		if errors.Is(oerr, os.ErrExist) {
+			return nil, &RPCError{Class: "server",
+				Msg: fmt.Sprintf("capture: dest %q already exists — never truncated (a live capture or an earlier landed file owns it; omit dest for the unique default name)", name)}
+		}
 		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf("capture: open %s: %v", path, oerr)}
 	}
 
@@ -346,7 +369,7 @@ func (s *Server) captureWrite(cs *captureSession, ev replclient.Event) (ended bo
 		}
 	} else {
 		line, jerr := json.Marshal(captureLine{
-			TS: time.Now().UTC().Format(time.RFC3339Nano), Source: ev.Source, Data: ev.Data,
+			TS: time.Now().UTC().Format(captureTSLayout), Source: ev.Source, Data: ev.Data,
 		})
 		if jerr != nil {
 			s.logf("server: capture %s: encode event: %v — skipped", cs.id, jerr)

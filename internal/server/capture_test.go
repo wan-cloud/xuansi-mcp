@@ -109,8 +109,8 @@ func TestCaptureUartRawByteExact(t *testing.T) {
 	if capID == "" || path == "" {
 		t.Fatalf("capture_start result = %#v", res)
 	}
-	if !regexp.MustCompile(`^\d{8}T\d{6}-d75884-uart1\.rx\.bin$`).MatchString(filepath.Base(path)) {
-		t.Errorf("capture filename = %q, want <UTCYYYYmmddTHHMMSS>-d75884-uart1.rx.bin", filepath.Base(path))
+	if !regexp.MustCompile(`^\d{8}T\d{6}-d75884-uart1\.rx-cap\d+\.bin$`).MatchString(filepath.Base(path)) {
+		t.Errorf("capture filename = %q, want <UTCYYYYmmddTHHMMSS>-d75884-uart1.rx-cap<N>.bin", filepath.Base(path))
 	}
 	// the source was subscribed board-side so events actually flow
 	subbed := false
@@ -167,8 +167,8 @@ func TestCaptureStdoutRaw(t *testing.T) {
 
 	res := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "stdout"})
 	capID, path := asStr(res["capture_id"]), asStr(res["path"])
-	if !strings.HasSuffix(path, "-d75884-stdout.bin") {
-		t.Errorf("stdout capture filename = %q, want -d75884-stdout.bin", path)
+	if !strings.HasSuffix(path, "-d75884-stdout-cap1.bin") {
+		t.Errorf("stdout capture filename = %q, want -d75884-stdout-cap1.bin", path)
 	}
 	f.push("stdout", map[string]any{"data": "hello "})
 	f.push("stdout", map[string]any{"data": "world\n"})
@@ -198,8 +198,8 @@ func TestCaptureGpioJSONL(t *testing.T) {
 
 	res := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "gpio.4"})
 	capID, path := asStr(res["capture_id"]), asStr(res["path"])
-	if !strings.HasSuffix(path, "-d75884-gpio.4.jsonl") {
-		t.Errorf("gpio capture filename = %q, want -d75884-gpio.4.jsonl", path)
+	if !strings.HasSuffix(path, "-d75884-gpio.4-cap1.jsonl") {
+		t.Errorf("gpio capture filename = %q, want -d75884-gpio.4-cap1.jsonl", path)
 	}
 	f.push("gpio.4", map[string]any{"edge": "rising", "level": int64(1)})
 	f.push("gpio.4", map[string]any{"edge": "falling", "level": int64(0)})
@@ -501,6 +501,187 @@ func TestCaptureTwoSessionsDistinct(t *testing.T) {
 	}
 	if got, err := os.ReadFile(asStr(r2["path"])); err != nil || string(got) != "CD" {
 		t.Errorf("stdout capture file = %q (%v), want CD", got, err)
+	}
+	c.recvNone()
+}
+
+// captureRootOf reads a test env's injected captures root.
+func captureRootOf(t *testing.T, e *env) string {
+	t.Helper()
+	e.srv.mu.Lock()
+	defer e.srv.mu.Unlock()
+	return e.srv.captureRoot
+}
+
+// TestCaptureSameSourceConcurrent (review round 1): two LIVE captures
+// of the same board+source started in the same UTC second get distinct
+// paths (the default name embeds the capture sequence), both files
+// land byte-exact — the tap feeds both sessions — and each session
+// pushes its done exactly once. Pre-fix, both mapped to the same
+// second-resolution path and os.Create truncated the first capture's
+// file mid-flight.
+func TestCaptureSameSourceConcurrent(t *testing.T) {
+	e, c := newCaptureEnv(t)
+	f := e.fakes["d75884"]
+
+	r1 := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "uart1.rx"})
+	r2 := captureStart(t, c, 3, map[string]any{"board": "d75884", "source": "uart1.rx"})
+	p1, p2 := asStr(r1["path"]), asStr(r2["path"])
+	if p1 == p2 {
+		t.Fatalf("two same-second same-source captures share the path %q", p1)
+	}
+	for _, p := range []string{p1, p2} {
+		if !regexp.MustCompile(`^\d{8}T\d{6}-d75884-uart1\.rx-cap\d+\.bin$`).MatchString(filepath.Base(p)) {
+			t.Errorf("capture filename = %q, want <UTCYYYYmmddTHHMMSS>-d75884-uart1.rx-cap<N>.bin", filepath.Base(p))
+		}
+	}
+
+	chunks := [][]byte{[]byte("AAA"), []byte("BBB")}
+	for _, ch := range chunks {
+		f.push("uart1.rx", map[string]any{"data": ch})
+	}
+
+	c.send(map[string]any{"type": "capture_stop", "id": 4, "capture_id": asStr(r1["capture_id"])})
+	c.send(map[string]any{"type": "capture_stop", "id": 5, "capture_id": asStr(r2["capture_id"])})
+	dones := c.collectAll(t, map[int64]bool{4: true, 5: true}, 2)
+	seen := map[string]int{}
+	for _, d := range dones {
+		seen[d["capture_id"].(string)]++
+	}
+	if seen[asStr(r1["capture_id"])] != 1 || seen[asStr(r2["capture_id"])] != 1 {
+		t.Fatalf("done pushes per id = %v, want exactly one each", seen)
+	}
+
+	// both files hold the FULL stream byte-exact (the tap feeds every
+	// matching session) — no truncation, no interleaving on one fd
+	want := "AAABBB"
+	for i, p := range []string{p1, p2} {
+		got, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read capture file %d: %v", i, err)
+		}
+		if string(got) != want {
+			t.Errorf("capture file %d = %q, want %q", i, got, want)
+		}
+	}
+	c.recvNone()
+}
+
+// TestCaptureStopRestartSameSecond (review round 1): the CLI shape —
+// stop a capture and immediately start the same board+source again
+// within the same UTC second: the second capture gets a fresh path and
+// the first capture's landed file stays byte-exact. Pre-fix, the
+// restart truncated the first file.
+func TestCaptureStopRestartSameSecond(t *testing.T) {
+	e, c := newCaptureEnv(t)
+	f := e.fakes["d75884"]
+
+	r1 := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "stdout"})
+	f.push("stdout", map[string]any{"data": "first-run"})
+	c.send(map[string]any{"type": "capture_stop", "id": 3, "capture_id": asStr(r1["capture_id"])})
+	if reply, dones := c.collect(t, 3, 1); len(dones) != 1 || dones[0]["reason"] != "stopped" {
+		t.Fatalf("first stop: reply=%v dones=%v", reply, dones)
+	}
+
+	r2 := captureStart(t, c, 4, map[string]any{"board": "d75884", "source": "stdout"})
+	p1, p2 := asStr(r1["path"]), asStr(r2["path"])
+	if p1 == p2 {
+		t.Fatalf("restart in the same second reused the path %q", p1)
+	}
+	f.push("stdout", map[string]any{"data": "second-run"})
+	c.send(map[string]any{"type": "capture_stop", "id": 5, "capture_id": asStr(r2["capture_id"])})
+	if _, dones := c.collect(t, 5, 1); len(dones) != 1 {
+		t.Fatalf("second stop dones = %v", dones)
+	}
+
+	if got, _ := os.ReadFile(p1); string(got) != "first-run" {
+		t.Errorf("first capture's file = %q after the restart — truncated?", got)
+	}
+	if got, _ := os.ReadFile(p2); string(got) != "second-run" {
+		t.Errorf("second capture's file = %q, want second-run", got)
+	}
+}
+
+// TestCaptureDestCollisionRefused (review round 1): an explicit dest
+// NEVER truncates — a path owned by a live capture or an existing file
+// is refused with a server-class error naming the collision, and the
+// existing file's contents are untouched.
+func TestCaptureDestCollisionRefused(t *testing.T) {
+	e, c := newCaptureEnv(t)
+	f := e.fakes["d75884"]
+
+	// a landed file from an unrelated past capture
+	root := captureRootOf(t, e)
+	if err := os.WriteFile(filepath.Join(root, "landed.bin"), []byte("PRECIOUS"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// live-session collision
+	r1 := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "stdout", "dest": "dup.bin"})
+	reply, _ := c.call(3, map[string]any{"type": "capture_start", "board": "d75884", "source": "stdout", "dest": "dup.bin"})
+	e1 := errOf(t, reply)
+	if e1 == nil || asStr(e1["class"]) != "server" {
+		t.Fatalf("live-dest collision error = %#v, want class server", e1)
+	}
+	if !strings.Contains(asStr(e1["msg"]), "dup.bin") {
+		t.Errorf("collision msg = %q, want it to name dup.bin", asStr(e1["msg"]))
+	}
+
+	// on-disk collision (pre-existing file)
+	reply, _ = c.call(4, map[string]any{"type": "capture_start", "board": "d75884", "source": "stdout", "dest": "landed.bin"})
+	e2 := errOf(t, reply)
+	if e2 == nil || asStr(e2["class"]) != "server" {
+		t.Fatalf("on-disk dest collision error = %#v, want class server", e2)
+	}
+
+	// the live capture keeps landing; the pre-existing file is intact
+	f.push("stdout", map[string]any{"data": "payload"})
+	c.send(map[string]any{"type": "capture_stop", "id": 5, "capture_id": asStr(r1["capture_id"])})
+	if _, dones := c.collect(t, 5, 1); len(dones) != 1 {
+		t.Fatalf("live capture's done = %v", dones)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "dup.bin")); string(got) != "payload" {
+		t.Errorf("dup.bin = %q, want the live capture's payload", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "landed.bin")); string(got) != "PRECIOUS" {
+		t.Errorf("landed.bin = %q, want PRECIOUS untouched", got)
+	}
+}
+
+// TestCaptureJSONLLineAtCap (review round 1's minor #4): the JSONL
+// byte-cap boundary — a line that fits exactly (== max_bytes) lands
+// and the capture ends limit at that count; a line that would cross
+// is left UNWRITTEN (a truncated line is corrupt JSON), ending limit
+// at zero bytes. The expected length is computed independently from
+// the wire shape (fixed-width ts, sorted map keys).
+func TestCaptureJSONLLineAtCap(t *testing.T) {
+	e, c := newCaptureEnv(t)
+	f := e.fakes["d75884"]
+	data := map[string]any{"edge": "rising", "level": int64(1)}
+	line, err := json.Marshal(captureLine{TS: "2026-11-05T06:03:14.516726121Z", Source: "gpio.4", Data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
+	L := int64(len(line) + 1) // + '\n'
+
+	// exact fit: the line lands, limit fires at exactly L bytes
+	res := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "gpio.4", "max_bytes": L})
+	f.push("gpio.4", data)
+	if _, dones := c.collect(t, 0, 1); len(dones) != 1 || dones[0]["reason"] != "limit" || asInt(dones[0]["bytes"]) != L {
+		t.Fatalf("exact-fit done = %v, want one limit push at %d bytes", dones, L)
+	}
+	if got, _ := os.ReadFile(asStr(res["path"])); int64(len(got)) != L || !strings.HasSuffix(string(got), "\n") {
+		t.Errorf("exact-fit file = %q (%d B), want the whole %d-byte line", got, len(got), L)
+	}
+
+	// crossing line: nothing written, limit at zero
+	res = captureStart(t, c, 3, map[string]any{"board": "d75884", "source": "gpio.4", "max_bytes": L - 1})
+	f.push("gpio.4", data)
+	if _, dones := c.collect(t, 0, 1); len(dones) != 1 || dones[0]["reason"] != "limit" || asInt(dones[0]["bytes"]) != 0 {
+		t.Fatalf("crossing-line done = %v, want one limit push at 0 bytes", dones)
+	}
+	if got, _ := os.ReadFile(asStr(res["path"])); len(got) != 0 {
+		t.Errorf("crossing-line file = %q, want empty (the line was left unwritten)", got)
 	}
 	c.recvNone()
 }
