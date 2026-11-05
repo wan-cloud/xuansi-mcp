@@ -133,7 +133,8 @@ type Server struct {
 	// captureRoot / captureOpen are the capture face's filesystem
 	// seams: the root defaults to capturesRoot() (Opts.CaptureRoot
 	// injects a temp root in tests) and the opener defaults to
-	// os.Create (tests swap a failing writer). Both read under mu.
+	// osCreateCapture (O_CREAT|O_EXCL — never truncates an existing
+	// file; tests swap a failing writer). Both read under mu.
 	captureRoot string
 	captureOpen func(path string) (io.WriteCloser, error)
 
