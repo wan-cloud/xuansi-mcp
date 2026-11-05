@@ -21,10 +21,12 @@ import (
 )
 
 // toolset carries the static tools' shared state: the daemon
-// connection and the process holder identity.
+// connection, the process holder identity, and the dynamic face's
+// bookkeeping (tools_dynamic.go).
 type toolset struct {
 	c       *apiclient.Client
 	holders *holderState
+	dyn     *dynState
 }
 
 // call sends a request the proto types holder-less (list_boards,
@@ -205,6 +207,24 @@ type opResultOut = map[string]any
 
 // ---------------------------------------------------------------------------
 // registration
+
+// staticToolNames is the static face's fixed name set — the dynamic
+// face seeds its name-claiming with it so no per-board tool can ever
+// displace a static one (server_test.go pins the served list to the
+// same names).
+var staticToolNames = []string{
+	"xuansi_list_boards",
+	"xuansi_board_status",
+	"xuansi_lease",
+	"xuansi_release",
+	"xuansi_run_lua",
+	"xuansi_submit",
+	"xuansi_script_start",
+	"xuansi_script_stop",
+	"xuansi_fs_write",
+	"xuansi_fs_read",
+	"xuansi_board_op",
+}
 
 // register adds the static tools. Names are fixed contract (agents
 // code against them); inputs are typed structs whose jsonschema tags

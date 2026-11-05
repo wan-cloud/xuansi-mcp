@@ -4,12 +4,15 @@ package main
 // daemon, batch 6 stage C. An official-SDK MCP server over stdio whose
 // tools are the daemon's internal API (via internal/apiclient),
 // registered by internal/mcp — the static lease/eval/script/fs/op set
-// now, with the events/websocket/capture faces to follow. The daemon
-// connection is dialed EAGERLY, before the stdio loop, so a missing
-// daemon fails fast with the actionable message instead of
-// half-starting behind an MCP handshake; the SDK's StdioTransport
-// binds the process's real stdin/stdout, and MCP traffic rides stdout
-// while logs stay on stderr (slog, like every command).
+// plus the dynamic per-board tools expanded from each board's caps
+// (refreshed every internal/mcp.DynRefreshDefault; boards arriving or
+// leaving grow or shrink the toolset with tools/list_changed
+// notifications). The daemon connection is dialed EAGERLY, before the
+// stdio loop, so a missing daemon fails fast with the actionable
+// message instead of half-starting behind an MCP handshake; the SDK's
+// StdioTransport binds the process's real stdin/stdout, and MCP
+// traffic rides stdout while logs stay on stderr (slog, like every
+// command).
 //
 // Daemon death mid-session does not exit the loop: every tool call
 // rides the one connection, and once it is gone the calls fail fast
@@ -58,7 +61,8 @@ func runMCP(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	defer c.Close()
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "xuansi", Version: daemonVersion}, nil)
-	xumcp.RegisterTools(srv, c, xumcp.Options{})
+	stopTools := xumcp.RegisterTools(srv, c, xumcp.Options{Refresh: xumcp.DynRefreshDefault})
+	defer stopTools()
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(stderr, "xuansi mcp: %v\n", err)
 		return 1

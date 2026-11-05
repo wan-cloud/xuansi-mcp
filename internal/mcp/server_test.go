@@ -123,23 +123,30 @@ func (fd *fakeDaemon) serveScript(t *testing.T, script []step) chan server.Reque
 
 // env is one wired test environment over the in-memory MCP transport.
 type env struct {
-	t  *testing.T
-	c  *apiclient.Client
-	ss *mcpsdk.ServerSession
-	cl *mcpsdk.ClientSession
+	t    *testing.T
+	c    *apiclient.Client
+	ts   *toolset // the registered toolset (tests drive its dynamic face)
+	stop func()   // the dynamic refresh loop's stop func (no-op when off)
+	ss   *mcpsdk.ServerSession
+	cl   *mcpsdk.ClientSession
 }
 
-// wireMCP wires the MCP half (apiclient ← server ⇄ in-memory client)
-// against a caller-owned fake daemon — for scripted daemons beyond
-// serveScript's fixed reply queue (e.g. request-dependent behavior).
-func wireMCP(t *testing.T, fd *fakeDaemon, opts Options) *env {
+// wireMCPClient wires the MCP half (apiclient ← server ⇄ in-memory
+// client) against a caller-owned fake daemon, with caller-supplied
+// client options (e.g. a ToolListChangedHandler). The toolset is built
+// explicitly (not via RegisterTools) so tests hold it for direct
+// refreshDynamic drives; wireMCP is the nil-client-opts convenience.
+func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.ClientOptions) *env {
 	t.Helper()
 	c, err := apiclient.Dial(fd.path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"}, nil)
-	RegisterTools(srv, c, opts)
+	ts := &toolset{c: c, holders: newHolderState(opts.Holder)}
+	ts.register(srv)
+	ts.dyn = newDynState(srv)
+	stop := ts.startDynamic(srv, opts.Refresh)
 
 	ctx := context.Background()
 	ct, st := mcpsdk.NewInMemoryTransports()
@@ -147,17 +154,25 @@ func wireMCP(t *testing.T, fd *fakeDaemon, opts Options) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl, err := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "test-client", Version: "0"}, nil).Connect(ctx, ct, nil)
+	cl, err := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "test-client", Version: "0"}, copts).Connect(ctx, ct, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, c: c, ss: ss, cl: cl}
+	e := &env{t: t, c: c, ts: ts, stop: stop, ss: ss, cl: cl}
 	t.Cleanup(func() {
+		stop() // the refresh loop goes down before the connection it rides
 		cl.Close()
 		ss.Close()
 		c.Close()
 	})
 	return e
+}
+
+// wireMCP wires the MCP half against a caller-owned fake daemon — for
+// scripted daemons beyond serveScript's fixed reply queue (e.g.
+// request-dependent behavior).
+func wireMCP(t *testing.T, fd *fakeDaemon, opts Options) *env {
+	return wireMCPClient(t, fd, opts, nil)
 }
 
 // newEnv wires a full environment against a scripted fake daemon.

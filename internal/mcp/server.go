@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"sync"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -18,24 +19,41 @@ import (
 )
 
 // Options configures RegisterTools. The zero value is ready: the
-// process holder is generated fresh per registration.
+// process holder is generated fresh per registration and the face
+// stays static-only (exactly task 8's behavior — no startup daemon
+// contact beyond the first tool call).
 type Options struct {
 	// Holder pins the process's default lease holder instead of the
 	// generated "mcp-<8 hex>". Tests pin it for determinism.
 	Holder string
+
+	// Refresh, when positive, enables the dynamic per-board tool face
+	// (tools_dynamic.go): one refresh immediately at registration and
+	// then on every tick — list_boards + per-board op caps expanding
+	// <alias|mac6>_<prim>_<op> tools, tools/list_changed broadcast by
+	// the SDK on every change. Zero or negative keeps the static-only
+	// face; the production cadence is Refresh: 5 * time.Second
+	// (cmd/xuansi/mcp.go).
+	Refresh time.Duration
 }
 
-// RegisterTools adds the static daemon-surface tools to srv: boards /
-// status / lease / eval / script / fs / op (batch 6 task 8). The
-// daemon connection c is the one `xuansi mcp` dialed eagerly — every
-// tool call rides it, and daemon death mid-session surfaces per-call
-// as a tool error naming the lost connection (errors.go).
+// RegisterTools adds the daemon-surface tools to srv: the static set —
+// boards / status / lease / eval / script / fs / op (batch 6 task 8) —
+// plus, when opts.Refresh is positive, the dynamic per-board set
+// expanded from each board's caps (task 9). The daemon connection c is
+// the one `xuansi mcp` dialed eagerly — every tool call rides it, and
+// daemon death mid-session surfaces per-call as a tool error naming
+// the lost connection (errors.go).
 //
-// Later batch-6 tasks register their own faces against the same
-// (srv, c, opts) seam.
-func RegisterTools(srv *mcpsdk.Server, c *apiclient.Client, opts Options) {
+// The returned stop func shuts the dynamic face's refresh loop down
+// (identity: it returns only after the loop goroutine has exited); it
+// is a no-op for the static-only face. Later batch-6 tasks register
+// their own faces against the same (srv, c, opts) seam.
+func RegisterTools(srv *mcpsdk.Server, c *apiclient.Client, opts Options) (stop func()) {
 	ts := &toolset{c: c, holders: newHolderState(opts.Holder)}
 	ts.register(srv)
+	ts.dyn = newDynState(srv)
+	return ts.startDynamic(srv, opts.Refresh)
 }
 
 // holderState is this process's lease identity on its ONE daemon
