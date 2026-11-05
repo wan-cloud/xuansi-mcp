@@ -45,7 +45,7 @@ go relative too (see `internal/paths/paths.go`).
 
 ## Dependency policy
 
-Stdlib only, plus exactly four approved external dependencies (introduced
+Stdlib only, plus exactly five approved external dependencies (introduced
 by their owning tasks, not before):
 
 - `vmihailenco/msgpack/v5` — wire frame codec
@@ -54,6 +54,10 @@ by their owning tasks, not before):
   dependency
 - `grandcat/zeroconf` — mDNS discovery
 - `modelcontextprotocol/go-sdk` — the MCP face (`xuansi mcp`)
+- `golang.org/x/sys` — `windows/registry`, the USB serial fallback's
+  PnP enum-tree walk (upstream's `\w` serial regex cannot parse
+  Espressif's colon-MAC iSerial); promoted from indirect to direct per
+  the spec's pre-authorization — Go-team-maintained quasi-stdlib
 
 Nothing else enters go.mod without changing this policy. The whitelist
 governs DIRECT dependencies: the go-sdk pulls its own indirect

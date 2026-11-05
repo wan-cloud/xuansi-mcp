@@ -11,25 +11,61 @@ import (
 // face of the espressifPrefix filter the linux by-id scan uses.
 const espressifVID = "303A"
 
+// espressifPID is the matching product id, spelling the registry key
+// the Windows fallback walks (VID_303A&PID_1001).
+const espressifPID = "1001"
+
+// usbSerialFallback is the per-host seam that resolves LIVE enumerated
+// port names to USB serials when the enumerator itself cannot; nil on
+// hosts that don't need it (darwin, linux — linux doesn't ride
+// mapEnumerated at all). Windows wires it to the registry walk in
+// usb_windows_registry.go: go.bug.st/serial v1.8.0's parseDeviceID
+// regex (`\\(\w+)$`) cannot capture Espressif's colon-separated MAC
+// iSerial — `\w` excludes ':' — on the device AND on the parent
+// fallback walk, so USB serials come back empty and every board was
+// skipped wholesale on Windows (the T9 live finding; no newer
+// upstream exists).
+var usbSerialFallback func() map[string]string
+
+// fallbackSerials calls the usbSerialFallback seam when wired. An
+// absent or unreadable fallback is nil — discovery then degrades to
+// the enumerator-only behavior rather than failing.
+func fallbackSerials() map[string]string {
+	if usbSerialFallback == nil {
+		return nil
+	}
+	return usbSerialFallback()
+}
+
 // mapEnumerated filters an enumerated port list down to boards: USB
 // ports reporting the Espressif VID (case-insensitive — hosts disagree
 // on VID casing) become Boards keyed by mac6, the last six hex chars of
 // the USB serial number after stripping ':'/'-' separators, lower-cased
 // — the same identity the linux by-id path derives from the device
 // name, so both faces of USB discovery agree on a board's key (§14).
-// A serial whose tail is not six hex chars (too short, or non-hex) has
-// no MAC to key on and is skipped; a unit exposing several interfaces
-// (same serial under several port names) counts once, the first port
-// winning. USBPath is the port name itself (COMn on windows,
-// /dev/tty.usbmodem* on darwin): the stablest handle those hosts give.
-func mapEnumerated(ports []*enumerator.PortDetails) []Board {
+// serialByPort is the live-port→serial fallback join (windows
+// registry): a port whose SerialNumber came back empty from the
+// enumerator looks its name up there, and only there — the join runs
+// on LIVE ports, so a stale registry instance whose PortName names no
+// enumerated port can never surface, and the enumerator's own serial,
+// when present, stays authoritative. A serial whose tail is not six
+// hex chars (too short, or non-hex) has no MAC to key on and is
+// skipped; a unit exposing several interfaces (same serial under
+// several port names) counts once, the first port winning. USBPath is
+// the port name itself (COMn on windows, /dev/tty.usbmodem* on
+// darwin): the stablest handle those hosts give.
+func mapEnumerated(ports []*enumerator.PortDetails, serialByPort map[string]string) []Board {
 	var boards []Board
 	seen := map[string]bool{}
 	for _, p := range ports {
 		if p == nil || !p.IsUSB || !strings.EqualFold(p.VID, espressifVID) {
 			continue // not one of ours
 		}
-		mac6, ok := mac6FromSerial(p.SerialNumber)
+		serial := p.SerialNumber
+		if serial == "" {
+			serial = serialByPort[p.Name] // live-port join; "" when absent
+		}
+		mac6, ok := mac6FromSerial(serial)
 		if !ok {
 			continue // no MAC tail: not keyable by identity
 		}
