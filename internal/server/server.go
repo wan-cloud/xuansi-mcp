@@ -38,10 +38,18 @@ const (
 	// caps limits.file_max); fs_write is refused daemon-side above it.
 	fsFileMax = 16384
 	// outboundQ is the per-connection event/reply buffer. A full queue
-	// drops an incoming EVENT (fire-and-forget, fw §8 style) but never
-	// a REPLY — a reply evicts the oldest queued event (the delivery
-	// policy, proto.go).
+	// drops an incoming EVENT (fire-and-forget, fw §8 style); a REPLY
+	// evicts the oldest queued event — or, in the all-replies wedge of
+	// a pipelining client that stopped reading, waits boundedly and
+	// then evicts the oldest queued reply, logged and counted (the
+	// delivery policy, proto.go). Nothing ever stalls under wmu.
 	outboundQ = 256
+	// defaultReplyWait bounds how long a reply waits for a wedged
+	// all-replies queue to drain before the logged oldest-reply
+	// eviction; replyWaitPoll is the wmu-RELEASED poll cadence during
+	// that wait (the writer drains without wmu, so the wait is safe).
+	defaultReplyWait = 1 * time.Second
+	replyWaitPoll    = 2 * time.Millisecond
 )
 
 // errUnreachable wraps dial/hello failures for the error taxonomy.
@@ -155,6 +163,13 @@ type clientConn struct {
 	wmu   sync.Mutex
 	wdead bool // outbound closed; further sends are no-ops
 	dropO sync.Once
+
+	// replyWait bounds the send()-side wait in the all-replies wedge
+	// before the logged oldest-reply eviction (handleConn sets the
+	// default; tests inject shorter). repliesLost counts replies lost
+	// to that last resort (wmu-guarded; logged — never silent).
+	replyWait   time.Duration
+	repliesLost int64
 }
 
 // New builds the Server and binds the unix socket. A sock file left by
@@ -365,10 +380,11 @@ func (s *Server) handleConn(c net.Conn) {
 	s.mu.Lock()
 	s.connSeq++
 	cc := &clientConn{
-		srv:      s,
-		conn:     c,
-		outbound: make(chan any, outboundQ),
-		holder:   fmt.Sprintf("conn-%d", s.connSeq),
+		srv:       s,
+		conn:      c,
+		outbound:  make(chan any, outboundQ),
+		holder:    fmt.Sprintf("conn-%d", s.connSeq),
+		replyWait: defaultReplyWait,
 	}
 	s.conns[cc] = struct{}{}
 	s.mu.Unlock()
@@ -447,68 +463,159 @@ func (cc *clientConn) drop() {
 
 // send queues one message; false means the connection is gone and the
 // reader should stop. Never panics after drop (flag + close share wmu).
+// A reply that meets a full all-replies queue (a pipelining client
+// that stopped reading — review round 1's wedge) does NOT block: it
+// waits up to replyWait for the writer to drain a slot, with wmu
+// RELEASED between polls (broadcast and every other connection keep
+// flowing; only this connection's reader pauses), and only then takes
+// the last resort — evicting the oldest queued reply, logged and
+// counted. Never a stall, never a silent drop.
 func (cc *clientConn) send(m any) bool {
-	cc.wmu.Lock()
-	defer cc.wmu.Unlock()
-	return cc.enqueueLocked(m)
+	wait := cc.replyWait
+	if wait <= 0 {
+		wait = defaultReplyWait
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		cc.wmu.Lock()
+		res := cc.enqueueLocked(m)
+		if res != qWedged {
+			cc.wmu.Unlock()
+			return res == qEnqueued
+		}
+		cc.wmu.Unlock()
+		if time.Now().After(deadline) {
+			cc.wmu.Lock()
+			defer cc.wmu.Unlock()
+			return cc.lastResortEvictEnqueueLocked(m)
+		}
+		time.Sleep(replyWaitPoll) // wmu released: the writer (and only it) may drain
+	}
 }
 
 // sendLocked is send() for callers already holding srv.mu (both
 // serialize on cc.wmu; the server lock only guards the watcher set).
+// It NEVER waits: events drop themselves on a full queue, and a reply
+// reaching the wedge here (broadcast never sends one — belt and
+// braces) is dropped with accounting rather than stall the daemon
+// under srv.mu.
 func (cc *clientConn) sendLocked(m any) bool {
 	cc.wmu.Lock()
 	defer cc.wmu.Unlock()
-	return cc.enqueueLocked(m)
+	switch cc.enqueueLocked(m) {
+	case qGone:
+		return false
+	case qWedged:
+		cc.repliesLost++
+		cc.srv.logf("server: outbound queue wedged (holder=%s) — message dropped under srv.mu rather than stall the daemon (reply lost #%d)", cc.holder_(), cc.repliesLost)
+		return true
+	default:
+		return true
+	}
 }
 
+// enqueueResult is the non-blocking enqueue outcome.
+type enqueueResult int
+
+const (
+	qEnqueued enqueueResult = iota // queued (or an event dropped per policy)
+	qWedged                        // full queue, no event to evict — caller decides; never resolve it here
+	qGone                          // connection is dead
+)
+
 // enqueueLocked queues one outbound message (caller holds wmu). The
-// delivery policy (proto.go): replies are NEVER silently dropped — a
-// reply meeting a full queue evicts the oldest QUEUED EVENT to make
-// room; events stay fire-and-forget (a full queue drops the incoming
-// event, fw §8 tap semantics — a slow agent must not stall the board's
-// read loop).
-func (cc *clientConn) enqueueLocked(m any) bool {
+// delivery policy (proto.go): events are fire-and-forget — an event
+// meeting a full queue drops itself (fw §8 tap semantics — a slow
+// agent must not stall the board's read loop); a reply meeting a full
+// queue evicts the oldest QUEUED EVENT and never blocks. The one shape
+// enqueueLocked refuses to resolve here is a full queue holding NO
+// events — a pipelining client that parked 256+ replies and stopped
+// reading (send() waits boundedly for that one; sendLocked accounts
+// and drops) — because every resolution available under wmu is either
+// a block or a reply eviction, and those are the caller's call.
+func (cc *clientConn) enqueueLocked(m any) enqueueResult {
 	if cc.wdead {
-		return false
+		return qGone
 	}
 	for {
 		select {
 		case cc.outbound <- m:
-			return true
+			return qEnqueued
 		default:
 		}
 		if _, isEvent := m.(EventPush); isEvent {
 			cc.srv.logf("server: outbound queue full (holder=%s) — event dropped", cc.holder_())
-			return true
+			return qEnqueued // per policy: done, nothing further to do
 		}
-		// a reply: make room by evicting the oldest queued event. A
-		// full queue met by a reply is necessarily all events — the
-		// reader enqueues one reply at a time and waits for it, and
-		// broadcast only ever queues events. The no-event fallback is
-		// that proof's belt-and-braces: rather than drop the reply,
-		// block until the writer drains a slot (the writer never takes
-		// wmu, so this cannot deadlock).
-		if !cc.evictOldestEventLocked() {
-			cc.srv.logf("server: outbound queue full (holder=%s) — reply enqueued with no event to evict (unreachable shape), waiting for the writer", cc.holder_())
-			cc.outbound <- m
-			return true
+		if cc.evictOldestEventLocked() {
+			cc.srv.logf("server: outbound queue full (holder=%s) — oldest queued event evicted for the reply (replies are never silently dropped)", cc.holder_())
+			continue // the freed slot is ours (only wmu holders enqueue): retry
 		}
-		cc.srv.logf("server: outbound queue full (holder=%s) — oldest queued event evicted for the reply (replies are never dropped)", cc.holder_())
+		return qWedged
 	}
+}
+
+// lastResortEvictEnqueueLocked ends the bounded reply wait: the queue
+// is still full of replies and the writer has not drained a slot. The
+// oldest queued message goes — logged and counted, never silent — and
+// ours takes the slot. Strictly non-blocking: the caller holds wmu,
+// the popped slot is refilled by us (the only enqueuer under wmu), and
+// the writer only ever receives.
+func (cc *clientConn) lastResortEvictEnqueueLocked(m any) bool {
+	if cc.wdead {
+		return false
+	}
+	select {
+	case old := <-cc.outbound:
+		if _, isEvent := old.(EventPush); isEvent {
+			cc.srv.logf("server: outbound queue (holder=%s) — oldest queued event evicted after the bounded wait", cc.holder_())
+		} else {
+			cc.repliesLost++
+			cc.srv.logf("server: outbound queue wedged (holder=%s) — oldest queued reply (id %v) evicted after %s (reply lost #%d)", cc.holder_(), replyID(old), cc.replyWait, cc.repliesLost)
+		}
+		cc.outbound <- m // the slot we just freed: cannot block under wmu
+		return true
+	default:
+		// the writer drained during the wait — a plain enqueue fits
+		select {
+		case cc.outbound <- m:
+			return true
+		default:
+			// unreachable under wmu (only wmu holders enqueue, and we
+			// hold it); account the loss loudly rather than stall
+			cc.repliesLost++
+			cc.srv.logf("server: outbound queue (holder=%s) — reply dropped in the unreachable full-after-drain shape (reply lost #%d)", cc.holder_(), cc.repliesLost)
+			return true
+		}
+	}
+}
+
+// replyID digs the id out of a queued reply for the eviction log.
+func replyID(m any) any {
+	if r, ok := m.(*Reply); ok {
+		return r.ID
+	}
+	return "?"
 }
 
 // evictOldestEventLocked removes the OLDEST queued event from the
 // outbound queue (caller holds wmu), reporting whether one was found.
-// Any queued reply encountered on the way rotates to the back —
-// preserved, never dropped.
+// Every receive is non-blocking — the writer goroutine also receives
+// from the queue and may drain it concurrently, so a bare receive
+// could block under wmu (review round 1). Queued replies encountered
+// on the way rotate to the back — preserved, never dropped.
 func (cc *clientConn) evictOldestEventLocked() bool {
 	n := len(cc.outbound)
 	for i := 0; i < n; i++ {
-		m := <-cc.outbound // n ≥ 1 items queued: never blocks
-		if _, isEvent := m.(EventPush); isEvent {
-			return true
+		select {
+		case m := <-cc.outbound:
+			if _, isEvent := m.(EventPush); isEvent {
+				return true
+			}
+			cc.outbound <- m // the slot just freed: cannot block under wmu
+		default:
+			return false // the writer drained it: nothing to evict
 		}
-		cc.outbound <- m // a queued reply: rotate to the back, keep looking
 	}
 	return false
 }

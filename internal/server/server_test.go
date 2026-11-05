@@ -1643,7 +1643,8 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // TestOutboundQueueEvictionPolicy pins the delivery policy on one
 // connection's queue: a full queue drops an incoming EVENT
 // (fire-and-forget, unchanged) but a REPLY is never dropped — the
-// oldest queued event is evicted to make room.
+// oldest queued event is evicted to make room, with no reply lost.
+// (The all-replies wedge is TestWedgedReplyQueueBounded's job.)
 func TestOutboundQueueEvictionPolicy(t *testing.T) {
 	s := &Server{logf: func(format string, args ...any) {}}
 	cc := &clientConn{srv: s, outbound: make(chan any, outboundQ)}
@@ -1666,6 +1667,9 @@ func TestOutboundQueueEvictionPolicy(t *testing.T) {
 	if len(cc.outbound) != outboundQ {
 		t.Fatalf("queue = %d, want %d (one event evicted, the reply queued)", len(cc.outbound), outboundQ)
 	}
+	if cc.repliesLost != 0 {
+		t.Fatalf("repliesLost = %d, want 0 — the event-eviction path loses no replies", cc.repliesLost)
+	}
 	first := <-cc.outbound
 	if fe, ok := first.(EventPush); !ok || asInt(fe.Event.Data["seq"]) != 1 {
 		t.Fatalf("front = %#v, want the seq-1 event — seq 0 must be the evicted one", first)
@@ -1676,6 +1680,151 @@ func TestOutboundQueueEvictionPolicy(t *testing.T) {
 	}
 	if r, ok := last.(*Reply); !ok || r.ID != 42 {
 		t.Fatalf("back = %#v, want reply 42 — replies are never dropped", last)
+	}
+
+	// after the drain a plain send enqueues without any eviction
+	if !cc.send(&Reply{Type: "reply", ID: 43}) {
+		t.Fatal("post-drain send reported connection gone")
+	}
+	if cc.repliesLost != 0 {
+		t.Fatalf("repliesLost = %d, want 0 — a drained queue must not take the last-resort path", cc.repliesLost)
+	}
+}
+
+// TestWedgedReplyQueueBounded pins review round 1's wedge: a client
+// that parks 256 replies (pipelined requests, stopped reading) and is
+// handed one more reply must not block — the old fallback stalled
+// forever holding wmu. The bounded wait expires, the OLDEST queued
+// reply is evicted — logged and counted — and the new reply takes the
+// slot.
+func TestWedgedReplyQueueBounded(t *testing.T) {
+	s := &Server{logf: func(format string, args ...any) {}}
+	cc := &clientConn{srv: s, outbound: make(chan any, outboundQ), replyWait: 5 * time.Millisecond}
+	for i := 0; i < outboundQ; i++ {
+		cc.outbound <- &Reply{Type: "reply", ID: int64(1000 + i)}
+	}
+
+	done := make(chan bool, 1)
+	go func() { done <- cc.send(&Reply{Type: "reply", ID: 4242}) }()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("send reported connection gone")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reply send wedged — the fallback must be bounded, never a stall")
+	}
+
+	if cc.repliesLost != 1 {
+		t.Fatalf("repliesLost = %d, want 1 — the eviction must be accounted", cc.repliesLost)
+	}
+	if len(cc.outbound) != outboundQ {
+		t.Fatalf("queue = %d, want %d (one evicted, ours queued)", len(cc.outbound), outboundQ)
+	}
+	front := <-cc.outbound
+	if r, ok := front.(*Reply); !ok || r.ID != 1001 {
+		t.Fatalf("front = %#v, want reply 1001 — 1000 is the accounted eviction", front)
+	}
+	var last any
+	for len(cc.outbound) > 0 {
+		last = <-cc.outbound
+	}
+	if r, ok := last.(*Reply); !ok || r.ID != 4242 {
+		t.Fatalf("back = %#v, want reply 4242 — the new reply must be queued", last)
+	}
+
+	// after the drain a plain send enqueues directly (no wait, no loss)
+	if !cc.send(&Reply{Type: "reply", ID: 4243}) {
+		t.Fatal("post-wedge send reported gone")
+	}
+	if cc.repliesLost != 1 {
+		t.Fatalf("repliesLost = %d, want still 1 — a drained queue must not evict", cc.repliesLost)
+	}
+}
+
+// TestWedgedConnectionDoesNotStallDaemon: review round 1's daemon-wide
+// freeze — a pipelining client fills its queue with replies and stops
+// reading; under the old fallback its reader then blocked HOLDING wmu,
+// so the next event broadcast for it blocked inside sendLocked under
+// srv.mu and froze the whole daemon. Now: the event push returns (the
+// event drops on the full queue), other connections are served
+// throughout, and when the wedged client resumes it finds replies
+// 2..257 — reply 1 the logged, accounted eviction.
+func TestWedgedConnectionDoesNotStallDaemon(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	wedged := dialSock(t, e.sock)
+	other := dialSock(t, e.sock)
+
+	// wedged subscribes (events must target it), then plugs the kernel
+	// socket buffer with pad events so the writer stalls and the
+	// 256-slot queue itself fills
+	rep, _ := wedged.call(1, map[string]any{"type": "watch_events", "board": "d75884"})
+	deadline := time.Now().Add(3 * time.Second)
+	for asMap(rep["error"]) != nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		rep, _ = wedged.call(1, map[string]any{"type": "watch_events", "board": "d75884"})
+	}
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("watch_events: %#v", rep)
+	}
+	pad := strings.Repeat("x", 256<<10)
+	for i := 0; i < 96; i++ {
+		e.fakes["d75884"].push("gpio.4", map[string]any{"pad": pad})
+	}
+	for i := 0; i < 300; i++ {
+		e.fakes["d75884"].push("gpio.4", map[string]any{"edge": "rising", "seq": int64(i)})
+	}
+
+	// pipeline 257 requests without reading: the replies evict the 256
+	// queued events, and reply #257 meets the all-replies wedge — the
+	// bounded wait, with wmu released
+	for i := 1; i <= outboundQ+1; i++ {
+		wedged.send(map[string]any{"type": "list_boards", "id": int64(i)})
+	}
+	time.Sleep(300 * time.Millisecond) // the wedge's bounded wait is entered
+
+	// an event to the wedged watcher must not hang the broadcaster:
+	// under the old code this push blocked inside sendLocked holding
+	// srv.mu — the goroutine froze mid-push
+	pushed := make(chan struct{})
+	go func() {
+		e.fakes["d75884"].push("gpio.4", map[string]any{"edge": "rising", "seq": int64(999)})
+		close(pushed)
+	}()
+	select {
+	case <-pushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event push stalled — srv.mu frozen by the wedged connection")
+	}
+
+	// another connection is served throughout (watch_events takes
+	// srv.mu — exactly what the old freeze pinned)
+	rep, _ = other.call(2, map[string]any{"type": "watch_events", "board": "d75884"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("other connection starved: %#v", rep)
+	}
+
+	// past the bounded wait: the oldest queued reply (id 1) is evicted
+	// — logged and counted — and reply #257 queues
+	time.Sleep(1300 * time.Millisecond)
+	rep, _ = other.call(3, map[string]any{"type": "list_boards"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("daemon stalled after the eviction: %#v", rep)
+	}
+
+	// the wedged client resumes: 256 replies survive — ids 2..257
+	ids := make([]int64, 0, outboundQ)
+	for len(ids) < outboundQ {
+		m := wedged.recv()
+		if asStr(m["type"]) == "event" {
+			continue // the pad/small events that preceded the replies
+		}
+		ids = append(ids, asInt(m["id"]))
+	}
+	for i, id := range ids {
+		if want := int64(2 + i); id != want {
+			t.Fatalf("reply %d = id %d, want %d — reply 1 is the accounted eviction", i, id, want)
+		}
 	}
 }
 

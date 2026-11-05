@@ -28,12 +28,18 @@
 // # Delivery policy (per agent connection)
 //
 // Each connection's outbound queue holds 256 messages — its replies and
-// its event pushes. Replies are NEVER silently dropped: a reply that
-// meets a full queue evicts the OLDEST QUEUED EVENT to make room
-// (logged) — a slow agent still receives every answer, at the price of
-// its oldest unseen events. Events stay fire-and-forget (fw §8 tap
-// semantics): an event that meets a full queue is dropped (logged), so
-// a slow consumer can never stall the board's read loop.
+// its event pushes. Events are fire-and-forget (fw §8 tap semantics):
+// an event that meets a full queue is dropped (logged), so a slow
+// consumer can never stall the board's read loop. Replies are never
+// SILENTLY dropped: a reply that meets a full queue evicts the OLDEST
+// QUEUED EVENT (logged) — a slow agent still receives every answer, at
+// the price of its oldest unseen events. The one wedged shape — a
+// client that pipelines so many requests the queue holds nothing but
+// replies, then stops reading — is bounded, never blocking: the daemon
+// waits up to 1s for the writer to drain (with the connection's queue
+// lock released, so every other connection keeps being served), then
+// evicts the OLDEST QUEUED REPLY — logged and counted. Nothing in the
+// delivery path may stall the daemon.
 //
 // # Requests
 //
