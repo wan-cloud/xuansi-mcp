@@ -598,6 +598,58 @@ func TestDynamicHolderRidesTheBinding(t *testing.T) {
 	}
 }
 
+// TestDynamicCapsVersionFlipMidSession: a board that STAYS in
+// list_boards while its caps changes story must have its toolset
+// follow the caps — api_version 1→2 withdraws all 30 prim tools
+// leaving exactly the notice, 2→1 restores them, and a primitive
+// shrink under the same version withdraws the dropped prims' tools.
+// Review round 1: the withdraw switch only fired on board-absent or
+// changed-id, so a successful-but-smaller caps kept the stale tools
+// alongside the notice.
+func TestDynamicCapsVersionFlipMidSession(t *testing.T) {
+	fd := newFakeDaemon(t)
+	df := newDynFake(t, fd, false)
+	df.setBoards(boardEntry("a1b2c3", "bench1"))
+	df.setCaps("a1b2c3", v1Caps())
+	e := wireMCP(t, fd, Options{Holder: "mcp-fixed01"})
+
+	e.ts.refreshDynamic(context.Background())
+	names := listTools(t, e)
+	if got := hasPrefixName(names, "bench1_"); got != 30 {
+		t.Fatalf("bench1_* = %d after v1 caps, want 30", got)
+	}
+	if contains(names, "bench1_bench_unsupported") {
+		t.Fatal("notice present under api_version 1")
+	}
+
+	// the board never leaves list_boards; its caps flips to v2
+	df.setCaps("a1b2c3", map[string]any{"api_version": 2.0, "primitives": map[string]any{}})
+	e.ts.refreshDynamic(context.Background())
+	if names = listTools(t, e); hasPrefixName(names, "bench1_") != 1 || !contains(names, "bench1_bench_unsupported") {
+		t.Fatalf("after 1→2: bench1_* = %d (%v), want exactly the notice — stale prim tools must withdraw", hasPrefixName(names, "bench1_"), names)
+	}
+
+	// and back: 2→1 restores the 30 typed tools, notice gone
+	df.setCaps("a1b2c3", v1Caps())
+	e.ts.refreshDynamic(context.Background())
+	if names = listTools(t, e); contains(names, "bench1_bench_unsupported") || hasPrefixName(names, "bench1_") != 30 {
+		t.Fatalf("after 2→1: bench1_* = %d (notice present: %v), want the 30 prim tools back", hasPrefixName(names, "bench1_"), contains(names, "bench1_bench_unsupported"))
+	}
+
+	// a primitive shrink without a version change withdraws the
+	// dropped prims' tools too (gpio-only caps → gpio-only tools)
+	df.setCaps("a1b2c3", map[string]any{
+		"api_version": 1.0,
+		"primitives": map[string]any{
+			"gpio": map[string]any{"ops": []any{"mode", "write", "read", "on"}},
+		},
+	})
+	e.ts.refreshDynamic(context.Background())
+	if names = listTools(t, e); hasPrefixName(names, "bench1_") != 4 {
+		t.Fatalf("after caps shrink: bench1_* = %d, want 4 (gpio only)", hasPrefixName(names, "bench1_"))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // notification + loop lifecycle
 

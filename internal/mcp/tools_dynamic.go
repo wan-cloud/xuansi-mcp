@@ -14,11 +14,13 @@ package mcp
 // a holder-less request to the connection's binding, so the refresh
 // never pre-binds the connection to the process default and the task-8
 // grace-adopt story stays intact (an agent's explicit holder on its
-// FIRST lease still binds). A caps failure for a board that is STILL
+// FIRST lease still binds). A caps FAILURE for a board that is STILL
 // listed keeps that board's already-expanded tools (sticky — the ops
 // face is lease-gated, so an unleased board reads not_held between
-// leases and must not flap its toolset); only leaving list_boards
-// withdraws tools.
+// leases and must not flap its toolset). A caps ANSWER is a fact: when
+// it covers fewer names than before — a mid-session api_version flip
+// or a primitive shrink on a board that never left list_boards — the
+// uncovered tools withdraw on that same refresh (review round 1).
 //
 // Tool calls synthesize ONE eval — `return bench.<prim>.<op>(ARGS[1],
 // …, ARGS[n])` — with the positional args array built from the tool
@@ -125,8 +127,10 @@ type dynBoard struct {
 // refreshDynamic reconciles the dynamic toolset with the daemon's
 // world: every listed board contributes the frozen signatures its caps
 // advertises (api_version≠1 → a single notice tool instead), boards
-// gone from list_boards lose their tools, and everything else stays
-// put. Failures keep the current set — churn happens on facts, not on
+// gone from list_boards lose their tools, and a caps ANSWER that
+// covers fewer names than before withdraws the uncovered ones (a
+// mid-session version flip or primitive shrink follows the caps).
+// Caps failures keep the current set — churn happens on facts, not on
 // trouble.
 func (ts *toolset) refreshDynamic(ctx context.Context) {
 	ds := ts.dyn
@@ -145,6 +149,12 @@ func (ts *toolset) refreshDynamic(ctx context.Context) {
 	}
 
 	desired := map[string]dynSpec{}
+	// capsOK marks boards whose caps ANSWERED with a usable version
+	// this round — their toolset is then a fact, and names the answer
+	// no longer covers are stale (review round 1). Boards whose caps
+	// failed or parsed malformed are NOT marked: their tools stay
+	// (sticky) so lease-gated not_held flaps never churn the toolset.
+	capsOK := map[string]bool{}
 	used := map[string]bool{}
 	for _, name := range staticToolNames {
 		used[name] = true // never displace the static face
@@ -159,6 +169,7 @@ func (ts *toolset) refreshDynamic(ctx context.Context) {
 		if !ok {
 			continue // malformed caps is trouble, not a version statement
 		}
+		capsOK[b.mac6] = true
 		fns := BenchSchema(ver)
 		if fns == nil {
 			// unknown api_version: exactly one notice tool for the board
@@ -178,9 +189,13 @@ func (ts *toolset) refreshDynamic(ctx context.Context) {
 		}
 	}
 
-	// withdraw: names whose board left list_boards, or whose spec
-	// changed (those re-register below); names for boards still
-	// present that contributed nothing this round stay (caps failed)
+	// withdraw: names whose board left list_boards; names whose spec
+	// changed (those re-register below); and — for boards whose caps
+	// ANSWERED this round — names the answered caps no longer covers
+	// (a mid-session version flip or primitive shrink must not keep
+	// stale tools alongside the new story, review round 1). Boards
+	// still present whose caps failed or parsed malformed keep their
+	// tools (sticky).
 	for name, cur := range ds.live {
 		next, isDesired := desired[name]
 		switch {
@@ -188,6 +203,9 @@ func (ts *toolset) refreshDynamic(ctx context.Context) {
 			ds.srv.RemoveTools(name)
 			delete(ds.live, name)
 		case isDesired && next.id() != cur.id():
+			ds.srv.RemoveTools(name)
+			delete(ds.live, name)
+		case capsOK[cur.mac6] && !isDesired:
 			ds.srv.RemoveTools(name)
 			delete(ds.live, name)
 		}
