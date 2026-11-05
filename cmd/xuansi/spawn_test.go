@@ -33,11 +33,25 @@ const spawnFailHelperEnv = "XUANSI_SPAWN_FAIL_HELPER_LOG"
 // quote it.
 const spawnFailMarker = "xuansi-spawn-fail-marker: cannot bind, dying"
 
+// testExe resolves this test binary's path for the re-exec helpers
+// below. os.Args[0] is a bare RELATIVE name when the binary is invoked
+// bare, and Windows refuses to run an executable resolved relative to
+// the current directory ("cannot run executable found relative to
+// current directory" — the T9 finding); production spawn.go already
+// uses os.Executable(), the test seam must match it. os.Args[0] is the
+// documented fallback when Executable fails.
+func testExe() string {
+	if exe, err := os.Executable(); err == nil {
+		return exe
+	}
+	return os.Args[0]
+}
+
 // noOpCmd is a startable, instantly-exiting stand-in command: the
 // seam's real job (listening) is played by the goroutine beside it —
 // ensureDaemon never reads the spawned process's exit (bind-as-lock).
 func noOpCmd() *exec.Cmd {
-	return exec.Command(os.Args[0], "-test.run=^$")
+	return exec.Command(testExe(), "-test.run=^$")
 }
 
 // shrinkSpawnRetries points the retry loop at test scale.
@@ -184,7 +198,7 @@ func TestEnsureDaemonFailureTail(t *testing.T) {
 	shrinkSpawnRetries(t, 5*time.Millisecond, time.Second)
 
 	overrideSpawn(t, func(sock, logPath string) *exec.Cmd {
-		cmd := exec.Command(os.Args[0], "-test.run=TestXuansiSpawnFailHelperProcess")
+		cmd := exec.Command(testExe(), "-test.run=TestXuansiSpawnFailHelperProcess")
 		cmd.Env = append(os.Environ(), spawnFailHelperEnv+"="+logPath)
 		return cmd
 	})
