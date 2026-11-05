@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"sync"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -144,8 +145,11 @@ type fsReadIn struct {
 }
 
 type boardOpIn struct {
-	Board  string         `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, wifi.status, wifi.setup, wifi.off, log.read, caps, diag.pins, diag.heapinfo, diag.stats (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools)"`
+	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
+	// Op's tag list is hand-maintained (a struct tag cannot render
+	// from the daemon's table) and pinned to server.AllowlistedOps()
+	// by TestBoardOpAllowlistSingleSource — update both together.
+	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats, log.read, wifi.off, wifi.setup, wifi.status (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools)"`
 	Args   map[string]any `json:"args,omitempty" jsonschema:"the op's parameters as a JSON object; numbers must be integers with absolute value below 2^53 (validated daemon-side with an \"api\" error); every other value shape crosses verbatim — the board is the authority"`
 	Holder string         `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
@@ -304,7 +308,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_op",
-		Description: "Run ONE allowlisted board op under the lease: budget.get, budget.set, wifi.status, wifi.setup, wifi.off, log.read, caps, diag.pins, diag.heapinfo, diag.stats — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. Holder semantics: " + holderDesc + ".",
+		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AllowlistedOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. Holder semantics: " + holderDesc + ".",
 	}, ts.boardOp)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{

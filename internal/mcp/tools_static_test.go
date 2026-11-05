@@ -6,9 +6,14 @@ package mcp
 // structured content each reply maps to.
 
 import (
+	"context"
 	"encoding/base64"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // base64Std encodes data with the standard alphabet (the data_b64
@@ -328,4 +333,65 @@ func TestBoardOpArgsCrossThrough(t *testing.T) {
 	if !reflect.DeepEqual(req.Args, want) {
 		t.Errorf("op args = %#v, want the object verbatim", req.Args)
 	}
+}
+
+// opsFaceAllowlistPinned mirrors the ops face's frozen allowlist
+// (transcribed independently of the daemon's table — server_test.go
+// holds the table-side pin; a shared typo survives only if both copies
+// are wrong the same way).
+var opsFaceAllowlistPinned = []string{
+	"budget.get", "budget.set", "caps", "diag.heapinfo", "diag.i2cslave",
+	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup", "wifi.status",
+}
+
+// spanList extracts the comma-separated op list between two anchors —
+// the single-source test's only parsing.
+func spanList(t *testing.T, s, from, to string) []string {
+	t.Helper()
+	i := strings.Index(s, from)
+	if i < 0 {
+		t.Fatalf("anchor %q not found in %q", from, s)
+	}
+	rest := s[i+len(from):]
+	j := strings.Index(rest, to)
+	if j < 0 {
+		t.Fatalf("end anchor %q not found in %q", to, s)
+	}
+	return strings.Split(rest[:j], ", ")
+}
+
+// TestBoardOpAllowlistSingleSource: xuansi_board_op's two allowlist
+// listings — the Op schema tag (a struct tag cannot render from the
+// daemon's table, so it is hand-maintained) and the tool Description
+// (rendered from server.AllowlistedOps()) — carry exactly the ops
+// face's frozen allowlist. An op added to the table without the tag
+// (or vice versa) fails here.
+func TestBoardOpAllowlistSingleSource(t *testing.T) {
+	f, ok := reflect.TypeOf(boardOpIn{}).FieldByName("Op")
+	if !ok {
+		t.Fatal("boardOpIn has no Op field")
+	}
+	gotTag := spanList(t, f.Tag.Get("jsonschema"), "one board op: ", " (the daemon")
+	if !reflect.DeepEqual(gotTag, opsFaceAllowlistPinned) {
+		t.Errorf("Op schema tag lists %v, want the allowlist %v", gotTag, opsFaceAllowlistPinned)
+	}
+
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range lr.Tools {
+		if tool.Name != "xuansi_board_op" {
+			continue
+		}
+		gotDesc := spanList(t, tool.Description, "under the lease: ", " — every op requires")
+		if !reflect.DeepEqual(gotDesc, opsFaceAllowlistPinned) {
+			t.Errorf("tool Description lists %v, want the allowlist %v", gotDesc, opsFaceAllowlistPinned)
+		}
+		return
+	}
+	t.Fatal("xuansi_board_op not served")
 }

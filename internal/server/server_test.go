@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1767,6 +1768,95 @@ func TestOpAllowlistRefusal(t *testing.T) {
 				t.Fatalf("off-allowlist op %q reached the board", op)
 			}
 		}
+	}
+}
+
+// opsFaceAllowlistV1 is the ops face's frozen allowlist, transcribed
+// independently of the opAllowlist table (benchschema-style): the
+// single-source test below fails when the table, the hOp refusal's
+// rendered list, or either MCP description (pinned separately in
+// internal/mcp) drifts from it. diag.i2cslave joined with b7 — the
+// driver-pipeline loopback's on-board fixture toggle.
+var opsFaceAllowlistV1 = []string{
+	"budget.get", "budget.set", "caps", "diag.heapinfo", "diag.i2cslave",
+	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup", "wifi.status",
+}
+
+// TestOpAllowlistSingleSource: the ops face's allowlist is single-source
+// — opAllowlist (server.go) is the only truth; the hOp refusal's op list
+// renders from it (AllowlistedOps) and the MCP xuansi_board_op
+// descriptions quote the same set (pinned in internal/mcp). This fails
+// when the table drifts from the frozen contract or a listing stops
+// matching the table — an op added to one but not the other.
+func TestOpAllowlistSingleSource(t *testing.T) {
+	keys := make([]string, 0, len(opAllowlist))
+	for op := range opAllowlist {
+		keys = append(keys, op)
+	}
+	sort.Strings(keys)
+	if got, want := strings.Join(keys, ", "), strings.Join(opsFaceAllowlistV1, ", "); got != want {
+		t.Fatalf("opAllowlist = [%s], want the frozen %d-op set [%s]", got, len(opsFaceAllowlistV1), want)
+	}
+
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "op", "board": "d75884", "op": "diag.corrupt"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "server" {
+		t.Fatalf("off-allowlist class = %q, want server (%#v)", er["class"], er)
+	}
+	msg := asStr(er["msg"])
+	i := strings.Index(msg, "allowlist (")
+	j := strings.Index(msg, ") —")
+	if i < 0 || j < i {
+		t.Fatalf("refusal does not render the allowlist list: %q", msg)
+	}
+	got := strings.Split(msg[i+len("allowlist ("):j], ", ")
+	if g, w := strings.Join(got, ", "), strings.Join(opsFaceAllowlistV1, ", "); g != w {
+		t.Fatalf("refusal lists [%s], want the table's [%s]", g, w)
+	}
+}
+
+// TestOpDiagI2CSlaveForwarded: diag.i2cslave — the board's internal I2C
+// echo-slave loopback fixture toggle ({mode:-1..1} = status/off/on), the
+// b7 driver-pipeline loopback's sparring partner — is allowlisted like
+// every other op: no special-casing, the same uniform lease gate, args
+// through the shared numeric walk (mode crosses as a msgpack int), and
+// the board's reply as the result.
+func TestOpDiagI2CSlaveForwarded(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	// the uniform lease gate applies — diag.i2cslave is not special
+	rep, _ := c.call(1, map[string]any{"type": "op", "board": "d75884", "op": "diag.i2cslave"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "not_held" {
+		t.Fatalf("no-lease class = %q, want not_held (%#v)", er["class"], er)
+	}
+
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "i2cslv"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	var gotMode any
+	e.fakes["d75884"].on("diag.i2cslave", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		gotMode = args["mode"]
+		return map[string]any{"mode": args["mode"], "state": "on"}, nil
+	})
+	rep, _ = c.call(3, map[string]any{
+		"type": "op", "board": "d75884", "op": "diag.i2cslave",
+		"args": map[string]any{"mode": float64(1)},
+	})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op diag.i2cslave: %#v", rep)
+	}
+	if v, ok := gotMode.(int64); !ok || v != 1 {
+		t.Fatalf("mode crossed as %#v, want int64 1 (msgpack int)", gotMode)
+	}
+	res := asMap(rep["result"])
+	if asInt(res["mode"]) != 1 || asStr(res["state"]) != "on" {
+		t.Fatalf("diag.i2cslave result = %#v, want the board's reply", rep["result"])
 	}
 }
 

@@ -74,10 +74,16 @@
 // op forwards ONE allowlisted board op over the warm controller under
 // eval's lease gate — uniformly: EVERY allowlisted op requires the
 // lease, including the read-only diag/caps ops (the gate is the face's
-// shape, not each op's). The allowlist (server.go):
+// shape, not each op's). The allowlist (server.go's opAllowlist — the
+// single source; every rendered listing is sorted from it):
 //
-//	budget.get  budget.set  wifi.status  wifi.setup  wifi.off
-//	log.read    caps        diag.pins    diag.heapinfo  diag.stats
+//	budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave,
+//	diag.pins, diag.stats, log.read, wifi.off, wifi.setup, wifi.status
+//
+// diag.i2cslave toggles the board's INTERNAL I2C echo-slave loopback
+// fixture ({mode:-1..1} = status/off/on) — the b7 driver-pipeline
+// loopback's sparring partner; it crosses under the same uniform gate
+// and args walk as every other op.
 //
 // budget.get is the one assembled view: the frozen wire has no getter
 // op (budget.set refuses its no-keys form), so the daemon reads caps —

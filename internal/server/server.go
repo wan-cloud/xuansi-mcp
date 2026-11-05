@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1065,15 +1066,31 @@ func validateArgsPath(prefix string, v any, path string) (any, *RPCError) {
 // opAllowlist is the ops face: the board ops an agent may reach
 // DIRECTLY through the op passthrough request type. Deliberately
 // narrow — the bench surface batch 6's MCP agents need (budget, wifi,
-// log, caps, diagnostics). eval/submit/fs.*/script.*/session.* have
-// their own request types and are NOT reachable through op; every
-// other diag.* stays internal.
+// log, caps, diagnostics) plus diag.i2cslave, the board's internal
+// I2C echo-slave loopback fixture toggle ({mode:-1..1} = status/off/
+// on) the b7 driver-pipeline loopback rides. eval/submit/fs.*/
+// script.*/session.* have their own request types and are NOT
+// reachable through op; every other diag.* stays internal.
 var opAllowlist = map[string]bool{
 	"budget.get": true, "budget.set": true,
 	"wifi.status": true, "wifi.setup": true, "wifi.off": true,
 	"log.read":  true,
 	"caps":      true,
 	"diag.pins": true, "diag.heapinfo": true, "diag.stats": true,
+	"diag.i2cslave": true,
+}
+
+// AllowlistedOps renders the ops face's allowlisted op names, sorted —
+// the single-source view every allowlist listing (the hOp refusal's op
+// list below, the MCP xuansi_board_op descriptions) quotes, so the
+// table stays the only truth and no copy can drift silently.
+func AllowlistedOps() []string {
+	ops := make([]string, 0, len(opAllowlist))
+	for op := range opAllowlist {
+		ops = append(ops, op)
+	}
+	sort.Strings(ops)
+	return ops
 }
 
 // hOp serves the ops face: an allowlisted board op forwarded over the
@@ -1090,7 +1107,8 @@ var opAllowlist = map[string]bool{
 func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	if !opAllowlist[req.Op] {
 		return nil, &RPCError{Class: "server",
-			Msg: fmt.Sprintf("op %q is outside the ops-face allowlist (budget.get, budget.set, wifi.status, wifi.setup, wifi.off, log.read, caps, diag.pins, diag.heapinfo, diag.stats) — eval/submit/fs/script/session keep their own request types", req.Op)}
+			Msg: fmt.Sprintf("op %q is outside the ops-face allowlist (%s) — eval/submit/fs/script/session keep their own request types",
+				req.Op, strings.Join(AllowlistedOps(), ", "))}
 	}
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
