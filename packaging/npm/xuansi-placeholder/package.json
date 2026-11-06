@@ -2,6 +2,7 @@
   "name": "xuansi",
   "version": "0.0.1",
   "description": "defensive placeholder — the 'xuansi' name is reserved as a squat-guard; the real package is 'xuansi-mcp' (this placeholder provides no commands)",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/wan-cloud/xuansi-mcp.git"

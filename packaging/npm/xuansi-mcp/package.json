@@ -2,6 +2,7 @@
   "name": "xuansi-mcp",
   "version": "0.0.0",
   "description": "xuansi hardware probe — daemon + MCP stdio face (main launcher package; the binary arrives via @xuansi/<platform> optionalDependencies)",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/wan-cloud/xuansi-mcp.git"

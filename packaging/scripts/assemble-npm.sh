@@ -8,6 +8,8 @@
 #                             package.json, optionalDependencies PINNED
 #                             to <version> (in-repo they are "*"),
 #                             dual bin (xuansi + xuansi-mcp) + README.md
+#                             Every dist package dir also gets a copy of
+#                             the repo-root LICENSE (Apache-2.0).
 #     <platform-key>/         one dir per platform subpackage (standalone
 #                             publishable): package.json (os+cpu+files) and
 #                             bin/xuansi (bin/xuansi.exe on win32 keys)
@@ -88,6 +90,7 @@ mkdir -p "$DIST/xuansi-mcp/bin"
 cp "$MAIN_SRC/bin/xuansi.js" "$MAIN_SRC/bin/xuansi-mcp.js" "$DIST/xuansi-mcp/bin/"
 chmod 755 "$DIST/xuansi-mcp/bin/xuansi.js" "$DIST/xuansi-mcp/bin/xuansi-mcp.js"
 cp "$MAIN_SRC/README.md" "$DIST/xuansi-mcp/README.md"
+cp "$ROOT/LICENSE" "$DIST/xuansi-mcp/LICENSE"
 node - "$MAIN_SRC/package.json" "$DIST/xuansi-mcp/package.json" "$VERSION" <<'EOF'
 const fs = require('fs');
 const [src, dest, version] = process.argv.slice(2);
@@ -121,6 +124,7 @@ while IFS= read -r key; do
   binname=xuansi; [ "$os" = win32 ] && binname=xuansi.exe
   mkdir -p "$DIST/$key/bin"
   cp "$src_bin" "$DIST/$key/bin/$binname"
+  cp "$ROOT/LICENSE" "$DIST/$key/LICENSE"
   chmod 755 "$DIST/$key/bin/$binname"
   node - "$DIST/$key/package.json" "@xuansi/$key" "$VERSION" "$os" "$cpu" <<'EOF'
 const fs = require('fs');
@@ -129,6 +133,7 @@ fs.writeFileSync(dest, JSON.stringify({
   name,
   version,
   description: `xuansi daemon binary for ${os}-${cpu} (installed automatically by the xuansi-mcp package)`,
+  license: 'Apache-2.0',
   // repository.url must EXACTLY match the GitHub repo — hard requirement
   // of npm trusted publishers (OIDC): the registry matches it against
   // the per-package trusted publisher config. Same value as the

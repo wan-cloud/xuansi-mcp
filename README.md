@@ -94,3 +94,16 @@ stderr, `--verbose` for debug level.
 - Spec: ../../docs/資料/懸絲設計文件.md (§6 script lifecycle/teardown, §8 daemon & MCP face)
 - Protocol: ../../docs/資料/v1-repl-協議.md (§6 per-op silence bounds = client timeout table)
 - Rulings: ../../docs/資料/v1執行裁決與遺留.md
+
+## Firmware
+
+This is a hardware workbench project: the ESP32 firmware is closed-source
+for now and ships with the devices — it is not part of this repository.
+What lives here is the host side: the daemon, CLI, and MCP face that an
+agent drives over the wire. Board drivers are Lua scripts pushed to the
+device at runtime, so the driver surface stays an open extension point
+independent of the firmware image.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
