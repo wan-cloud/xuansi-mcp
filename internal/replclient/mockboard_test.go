@@ -101,11 +101,12 @@ func startMockBoard(t *testing.T, conn net.Conn) *mockBoard {
 	return mb
 }
 
-// defaultHello is a realistic protocol_ver=3 hello result (§2 full
-// picture); the role key is granted per request by helloHandler.
+// defaultHello is a realistic protocol_ver=4 hello result (§2 full
+// picture; ver 4 = the 0x02 data-frame overlay, B9); the role key is
+// granted per request by helloHandler.
 func defaultHello() map[string]any {
 	return map[string]any{
-		"protocol_ver": int64(3),
+		"protocol_ver": int64(4),
 		"api_version":  int64(1),
 		"fw":           "xuansi-fw v0.1.0",
 		"fw_build":     "deadbee",
@@ -427,8 +428,8 @@ func TestMockBoardDefaultScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	if h.Role != "controller" || h.ProtocolVer != 3 {
-		t.Fatalf("hello = role %q ver %d, want controller/3", h.Role, h.ProtocolVer)
+	if h.Role != "controller" || h.ProtocolVer != 4 {
+		t.Fatalf("hello = role %q ver %d, want controller/4", h.Role, h.ProtocolVer)
 	}
 	res, err := c.Op(ctx, "ping", nil)
 	if err != nil {

@@ -41,7 +41,7 @@ func TestDialTCPHelloFirstFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	if h.ProtocolVer != 3 || h.Role != "controller" {
+	if h.ProtocolVer != 4 || h.Role != "controller" {
 		t.Fatalf("hello = ver %d role %q, want 3/controller", h.ProtocolVer, h.Role)
 	}
 	if lat := time.Since(start); lat > time.Second {
