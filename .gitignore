@@ -9,3 +9,4 @@
 
 # npm assembly output (packaging/README.md documents the layout)
 /packaging/dist/
+results/
