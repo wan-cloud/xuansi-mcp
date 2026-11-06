@@ -2317,7 +2317,7 @@ func TestNewRefusesWhenSockAlive(t *testing.T) {
 // serve.go keys its spawn-race exit-0 on. A raw listener is enough:
 // the probe only dials, it never speaks the protocol.
 func TestNewAlreadyListeningSentinel(t *testing.T) {
-	dir := t.TempDir()
+	dir := testutil.ShortSockDir(t) // darwin's 104-byte sun_path: t.TempDir() overflows (T9 mac)
 	path := filepath.Join(dir, "live.sock")
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -2881,14 +2881,14 @@ func TestBindSockConcurrentRaceGracefulLosers(t *testing.T) {
 }
 
 // TestIsAddrInUseClassification pins the bind-conflict classifier for
-// BOTH supported platforms' errnos directly (the hammer test above is
-// the behavioral coverage, but it can only ever fire the host
-// platform's form): Linux's EADDRINUSE and Windows' WSAEADDRINUSE
-// 10048, both wrapped in the exact net.OpError → os.SyscallError chain
-// net.Listen produces, must classify as a conflict — the T9 Windows
-// real-machine finding was the WSA form dying bare. Near-miss errnos
-// and non-socket errors must NOT match, or a genuine failure would be
-// misread as a lost race.
+// ALL THREE supported platforms' errnos directly (the hammer test
+// above is the behavioral coverage, but it can only ever fire the host
+// platform's form): Linux's EADDRINUSE, Windows' WSAEADDRINUSE 10048,
+// and darwin's EEXIST — each raw and wrapped in the exact
+// net.OpError → os.SyscallError chain net.Listen produces — must
+// classify as a conflict (the T9 findings were the WSA and EEXIST
+// forms dying bare). Near-miss errnos and non-socket errors must NOT
+// match, or a genuine failure would be misread as a lost race.
 func TestIsAddrInUseClassification(t *testing.T) {
 	// listenChain rebuilds the error shape net.Listen returns on a
 	// failed bind: *net.OpError wrapping *os.SyscallError wrapping the
@@ -2906,6 +2906,8 @@ func TestIsAddrInUseClassification(t *testing.T) {
 		"linux EADDRINUSE (listen wrap)":      listenChain(syscall.EADDRINUSE),
 		"windows WSAEADDRINUSE (raw)":         wsaeaddrinuse,
 		"windows WSAEADDRINUSE (listen wrap)": listenChain(wsaeaddrinuse),
+		"darwin EEXIST (raw)":                 syscall.EEXIST,
+		"darwin EEXIST (listen wrap)":         listenChain(syscall.EEXIST),
 	}
 	for name, err := range conflicts {
 		if !isAddrInUse(err) {

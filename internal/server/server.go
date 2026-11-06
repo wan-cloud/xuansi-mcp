@@ -308,13 +308,21 @@ func New(o Opts) (*Server, error) {
 // kernel never reports an errno that high.
 const wsaeaddrinuse = syscall.Errno(10048)
 
-// isAddrInUse reports whether err is a bind conflict in either
-// supported platform's dress: Linux's EADDRINUSE or Windows'
-// WSAEADDRINUSE. Both sides of the spawn race — winner and loser —
+// isAddrInUse reports whether err is a bind conflict in any supported
+// platform's dress — the errno family a spawn-race loser's bind fails
+// with when the winner created the socket file between the loser's
+// stat and its bind: Linux EADDRINUSE, Windows WSAEADDRINUSE (10048),
+// darwin EEXIST ("file exists"). Matching EEXIST everywhere is safe:
+// Linux bind conflicts report EADDRINUSE, so EEXIST cannot
+// false-positive there; on darwin it IS the conflict form (the T9 mac
+// finding — unclassified losers died bare instead of re-probing into
+// the graceful exit). All sides of the spawn race — winner and loser —
 // must classify the same conflict so the loser re-probes into the
 // graceful ErrAlreadyListening exit instead of a bare exit-1.
 func isAddrInUse(err error) bool {
-	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, wsaeaddrinuse)
+	return errors.Is(err, syscall.EADDRINUSE) ||
+		errors.Is(err, wsaeaddrinuse) ||
+		errors.Is(err, syscall.EEXIST)
 }
 
 // bindSock probes for a live daemon, clears a stale sock file, and
