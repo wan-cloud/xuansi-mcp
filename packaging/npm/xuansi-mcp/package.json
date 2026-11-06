@@ -1,0 +1,17 @@
+{
+  "name": "xuansi-mcp",
+  "version": "0.0.0",
+  "description": "xuansi-mcp — zero-install MCP alias: `npx -y xuansi-mcp` runs the xuansi daemon's MCP stdio face (delegates to the xuansi launcher package)",
+  "bin": {
+    "xuansi-mcp": "bin/xuansi-mcp.js"
+  },
+  "dependencies": {
+    "xuansi": "*"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

@@ -333,32 +333,17 @@ var claimSeq atomic.Uint64
 
 // bindSock probes for a live daemon, clears a stale sock file, and
 // claims the listen path — ATOMICALLY on linux/darwin (bindClaim:
-// bind-temp + link), by the direct bind on windows (bindDirect).
+// bind-temp + link), under a transition lockfile on windows
+// (sockclaim_windows.go: the link protocol is not expressible there,
+// and its remove-stale TOCTOU is real — CI disproved the "residual,
+// theoretical" call). The platform seam is bindSockPlatform.
 func bindSock(path string) (net.Listener, error) {
-	if fi, err := os.Stat(path); err == nil {
-		if fi.Mode()&os.ModeSocket != 0 {
-			if c, derr := net.Dial("unix", path); derr == nil {
-				c.Close()
-				return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
-			}
-			if err := os.Remove(path); err != nil {
-				return nil, fmt.Errorf("server: remove stale sock %s: %w", path, err)
-			}
-		} else {
-			if err := os.Remove(path); err != nil {
-				return nil, fmt.Errorf("server: clear non-socket path %s: %w", path, err)
-			}
-		}
-	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("server: mkdir %s: %w", dir, err)
 		}
 	}
-	if !linkClaimSupported {
-		return bindDirect(path)
-	}
-	return bindClaim(path)
+	return bindSockPlatform(path)
 }
 
 // bindDirect is the plain bind: net.Listen, and on a bind-conflict

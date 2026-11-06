@@ -6,3 +6,6 @@
 
 # codegraph local index
 .codegraph/
+
+# npm assembly output (packaging/README.md documents the layout)
+/packaging/dist/

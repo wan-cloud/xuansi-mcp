@@ -1,0 +1,83 @@
+T4 CI matrix round 2 — platform-specific fixes beyond the mcp events
+family (gh run 42158718976; branch b85-npm-tail). 2026-11-06.
+
+== Leg 1: windows dir-fsync "Access is denied" x18 (PRODUCT-side) ==
+
+Diagnosis: internal/mcp/manifest.go fsyncDir did os.Open(dir)+d.Sync().
+On windows os.Open yields a read-only handle and Sync (FlushFileBuffers)
+needs FILE_WRITE_DATA -> Access denied on every workspace durability
+test (writeDurableFile -> fsyncDir at manifest.go:142; call sites:
+manifest writes, ws_put driver writes - 18 tests).
+
+Fix (commit "fix: skip dir-fsync on windows ..."): fsyncDir split into
+  internal/mcp/fsync_unix.go     //go:build !windows  (unchanged body)
+  internal/mcp/fsync_windows.go  //go:build windows   (no-op + why)
+Windows has no POSIX dir-fsync; NTFS journals metadata and the file's
+own fsync (writable handle - works on windows) persists data before
+the rename; atomicity (no torn reads) is platform-independent. Standard
+portable pattern (sqlite et al).
+
+== Leg 2: windows TestResolveUSBDevice (test-side) ==
+
+Diagnosis: the by-id fixture name carries MAC colons
+(usb-Espressif_..._3C:0F:02:D7:58:84-if00) - colons are NTFS
+alternate-data-stream separators, so os.Symlink fails "filename syntax
+is incorrect" (before symlink privileges are even consulted). by-id
+symlink trees are udev/unix device-manager semantics.
+Fix: symlink leg moved to serial_unix_test.go (//go:build !windows);
+portable legs (direct path as-is, unknown-name error naming both
+candidates) stay in serial_test.go and run everywhere
+(TestResolveUSBDeviceDirectAndUnknown).
+
+== Leg 3: macos TestResolveUSBDevice /private/var (test-side) ==
+
+Diagnosis: product resolveUSBDevice canonicalizes with
+filepath.EvalSymlinks (correct); on darwin t.TempDir() is under
+/var/folders (a symlink) so the resolved path gains /private and the
+test's LITERAL comparison failed.
+Fix: expected values canonicalized the same way (canonical() helper =
+EvalSymlinks on the fixture tty path), both tests.
+
+== Leg 4: windows+macos TestShortSockDirBindsLongNames 104-byte budget ==
+
+Diagnosis (both directions of one stale constant):
+  windows: check used flat sun_pathMax=104 and rejected a 105-byte path
+           although windows AF_UNIX budget is 108 (afunix.h) - the
+           helper itself was fine (os.TempDir() 38 bytes stayed).
+  macos:   riskyBaseLen=80 never fired for /var/folders (~49 bytes) +
+           the 46-byte probe name -> 117 > 104; threshold was tuned
+           for short socket names, not the long-name contract.
+Fix: internal/testutil/shortsock.go
+  - sunPathBudget(): darwin 104 / linux 107 / windows 108
+  - riskyBaseLen() = budget - dirCost(22) - nameAllowance(48):
+    darwin 34 (catches /var/folders 49 -> /tmp fallback),
+    linux 37 (/tmp=4 unaffected), windows 38 (CI %TEMP% 38 stays;
+    38+1+20+1+46=106<=108).
+  - shortsock_test.go: platform-budget check + new
+    TestShortSockDirReservesNameAllowance (exactly-48-byte name must
+    fit on every host).
+
+== Local gates (linux box; windows/darwin legs cross-vetted) ==
+
+go vet ./...                                              LINUX-VET-OK
+GOOS=windows go vet ./...                                 WIN-VET-OK
+  (vet typechecks test files: fsync split, !windows test tag,
+   shortsock rewrite all compile for windows)
+GOOS=darwin CGO_ENABLED=0 go vet ./internal/replclient/
+                                ./internal/testutil/     DARWIN-TOUCHED-VET-OK
+  (mcp on darwin needs the cgo enumerator - known, why make matrix
+   excludes darwin; the fsync split is windows-tagged only)
+go test ./internal/testutil/ ./internal/replclient/ -count=2   ok
+TMPDIR=<57-byte root> go test ./internal/testutil/ -run TestShortSockDir
+                                                          PASS x3
+  (forces the risky-base -> /tmp fallback: the darwin shape simulated)
+go test ./internal/mcp/ -run 'durability set' -count=2     ok 5.4s
+make vet                                                   OK
+go test ./...                                              all ok
+  (cmd/xuansi 2.994s, apiclient, board, discover, lease, mcp 7.453s,
+   paths, replclient 1.449s, server 19.030s, testutil)
+
+Known boundary (documented in shortsock.go): a windows host whose
+%TEMP% exceeds 38 bytes (e.g. non-8.3 runneradmin paths on dev boxes)
+keeps today's behavior (no shorter windows root is manufactured);
+CI runners' RUNNER~1 8.3 form fits the 108 budget.

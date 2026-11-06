@@ -1,0 +1,75 @@
+T4 first CI matrix run (gh run 42158718976, wan-cloud/xuansi-mcp, b85-npm-tail) —
+internal/mcp events-face failures + fix gates. 2026-11-06.
+
+== CI failure inventory (from --log-failed; the four in-scope events failures) ==
+
+ubuntu  go test            TestEventsHighFrequencyStorm (5.03s)
+                           resources_test.go:883: ring for a1b2c3 never drained to seq 999 (last=941)
+windows go test            TestEventsRingOverflowEvictsWholeOldest (5.02s)
+                           resources_test.go:401: ring for a1b2c3 never drained to seq 299 (last=256)
+windows go test            TestEventsRecentFilterLimitOrder (0.01s)
+                           resources_test.go:730: newest-last violated: last = seq 4 stdout (want 6 uart1.rx)
+                           resources_test.go:770: limited view = seq [5 1 3], want the newest three [4 5 6]
+make-gate -race            TestEventsHintReArmsAfterDelivery (5.61s)
+                           timed out waiting for every session's subscription to go live;
+                           counts=[1 x127, 0] base=[0 x127, 1 1 0...] (one straggler of 128 sessions)
+
+(Out-of-scope same-run failures, REPORTED to controller, not fixed here:
+ windows workspace fsync "Access is denied" x18 (writeManifestAtomic syncs a
+ directory handle - product-side on Windows); windows TestResolveUSBDevice
+ symlink; windows+macos TestShortSockDirBindsLongNames 104-byte sun_path
+ budget; macos TestResolveUSBDevice /var/folders -> /private/var/folders
+ symlink canonicalization. macos internal/mcp PASSED (6.858s).)
+
+== Diagnoses ==
+
+1+2. DOOR DROPS (test-side): apiclient fanOut is fire-and-forget — a handler
+   more than handlerQueueDepth=256 (internal/apiclient/client.go) behind
+   silently drops. Back-to-back 1000/300-push bursts outrun the feed
+   goroutine exactly on slow shared 2-core runners (last=941 / last=256).
+   Documented product policy, not ring lossage; the tests asserted ring
+   semantics through a lossy door. Fix: door-safe waves (200/wave, absorbed
+   between waves via waitLastSeq) — every original assertion kept exact.
+
+3. PRODUCT-SIDE ordering defect (fixed in 4bfc7f4): the merged view sorted
+   by receive timestamp, stable — the failure pattern [2,6|4|5|1,3] is four
+   per-source blocks in map-iteration order: ALL SIX events shared ONE Ts
+   (Windows monotonic clock ~15.6ms tick; the 6-event burst landed inside a
+   single tick) and the stable sort kept the map concatenation order.
+   ring.go's comment claimed "equal-timestamp events keep arrival order" —
+   false across sources. A real Windows daemon misorders events_recent's
+   merged view within a clock tick. Fix: per-board arrival counter stamped
+   at append (under es.mu, unexported, never crosses JSON); recent() sorts
+   by it. Regression tests: ring_test.go (equal-Ts interleave x50 reads,
+   limit cut, eviction leg; per-source cap leg).
+
+4. UNSATISFIABLE WAIT (test-side): probeUntilLive returned when ANY session
+   notified; a straggler session's registration settled later, missed every
+   probe notification, and nothing further was ever pushed — the follow-up
+   waitAllRecs(base,1) could never satisfy on a loaded runner. Fix:
+   probeUntilAllLive (probes until EVERY session >=1, door-safe 64-probe
+   waves with absorb) and no wait between it and the first event.
+   HintReArmsAfterDelivery also restructured: delivery-window catch by
+   RETRY (gate each A on landing via `appended`, then spin for the
+   dequeued-but-flying state; missed windows retry with a fresh event) —
+   the first local loaded-race reproduction showed the naive spin burning
+   200 retries in 1.7s reading the PRE-ARM settled state.
+   Deadlines: 5s -> evWaitDeadline() = 30s (60s under -race) — the
+   deadline fails hung tests, not slow runners (convention 438dc83).
+
+== Local gates (this box: 8-core; load legs pinned taskset -c 0,1 with two
+   busy-loop competitors) ==
+
+gate 0  go vet ./internal/mcp/                                   VET-OK
+gate 0b go test ./internal/mcp/ -run TestEvents -count=1         ok 1.476s
+gate 1  go test ./internal/mcp/ -count=3                         ok 22.513s
+gate 2  go test -race -count=3 ./internal/mcp/ (2-core + hammer)
+        first run (pre-landed-gate): FAIL TestEventsHintReArmsAfterDelivery
+          "never caught a mid-delivery window within 1m0s across 200 A events" (1.73s)
+          -> diagnosed: spin read pre-arm settled state; fixed with the
+             appended-landing gate (see above)
+        after fix: attempt 1 exit=0 ok 112.900s
+                   attempt 2 exit=0 ok 115.109s   (two consecutive greens)
+gate 3  go test ./...                                            all ok
+        (cmd/xuansi 2.994s, hil, apiclient, board, discover, lease, mcp 7.538s,
+         paths, replclient, server, testutil)

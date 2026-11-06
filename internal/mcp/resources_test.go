@@ -32,6 +32,52 @@ import (
 // ---------------------------------------------------------------------------
 // event-face helpers
 
+// evWaitDeadline bounds the event face's poll/subscribe waits. Generous
+// on purpose — 30s, doubled under -race — because the deadline exists
+// to fail a HUNG test, not to police latency (load-proofing convention,
+// commit 438dc83): CI runners are shared two-core boxes, and the first
+// matrix run (42158718976) showed legal drains crossing the old 5s on
+// exactly those runners. Success paths never see it; only the failure
+// message does.
+func evWaitDeadline() time.Duration {
+	if raceEnabled {
+		return 60 * time.Second
+	}
+	return 30 * time.Second
+}
+
+// doorSafeWave bounds one burst of pushed events. The apiclient event
+// door is fire-and-forget: a handler more than handlerQueueDepth
+// (256, internal/apiclient/client.go) pushes behind silently drops new
+// events — DOCUMENTED product policy, not ring lossage. A back-to-back
+// 1000-push storm outruns the handler goroutine exactly on slow shared
+// runners (first matrix run: ubuntu storm stopped at seq 941, windows
+// at 256), so tests that assert ring semantics (lossless AFTER the
+// door) push in waves of ≤ doorSafeWave and let each absorb before the
+// next — deterministic on any runner while still bursting far past the
+// notification queue depths the hint machinery must swallow.
+const doorSafeWave = 200
+
+// pushWaveEvents pushes n events (seqs first..first+n-1, one source) in
+// door-safe waves, waiting for each wave to fully land in the ring
+// before the next — the ring tests' storm shape, made runner-proof.
+func pushWaveEvents(t *testing.T, e *env, df *dynFake, board string, first, n int) {
+	t.Helper()
+	for pushed := 0; pushed < n; {
+		w := doorSafeWave
+		if rem := n - pushed; rem < w {
+			w = rem
+		}
+		for i := 0; i < w; i++ {
+			if !df.pushEvent(board, "gpio.4", map[string]any{"seq": float64(first + pushed + i)}) {
+				t.Fatalf("wave push %d failed", first+pushed+i)
+			}
+		}
+		waitLastSeq(t, e, board, float64(first+pushed+w-1)) // wave absorbed: door queue empty
+		pushed += w
+	}
+}
+
 // evA/evB are the two fixture boards the event tests churn.
 var (
 	evA = boardEntry("a1b2c3", "bench1")
@@ -71,7 +117,7 @@ func refreshWithEvents(t *testing.T, e *env) {
 // events cross the socket asynchronously, so pushes need a bounded wait.
 func waitEvents(t *testing.T, e *env, board string, n int) []map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(evWaitDeadline())
 	for {
 		res := e.call("xuansi_events_recent", map[string]any{"board": board, "limit": 10000})
 		if res.IsError {
@@ -88,7 +134,7 @@ func waitEvents(t *testing.T, e *env, board string, n int) []map[string]any {
 			return out
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("ring for %s held %d events, want ≥%d within 5s", board, len(events), n)
+			t.Fatalf("ring for %s held %d events, want ≥%d within %s", board, len(events), n, evWaitDeadline())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -175,7 +221,7 @@ func newMultiClientEnv(t *testing.T, n int, mac6 string) *multiClientEnv {
 // subscribeAll points every client session at the board's resource.
 func (m *multiClientEnv) subscribeAll(t *testing.T, mac6 string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), evWaitDeadline())
 	defer cancel()
 	for i, cl := range m.cls {
 		if err := cl.Subscribe(ctx, &mcpsdk.SubscribeParams{URI: boardResourceURI(mac6)}); err != nil {
@@ -184,24 +230,42 @@ func (m *multiClientEnv) subscribeAll(t *testing.T, mac6 string) {
 	}
 }
 
-// probeUntilLive pushes probe events until some session has received a
-// notification (the SDK's subscribe/registration race window), then
-// returns the probe count. Probes carry negative seq markers.
-func (m *multiClientEnv) probeUntilLive(t *testing.T, mac6 string) int {
+// probeUntilAllLive pushes probe events until EVERY session has
+// received at least one notification, absorbing in door-safe waves (a
+// probe wave ≤64 events, then waitLastSeq, keeps the fire-and-forget
+// door lossless — see pushWaveEvents). Probes carry negative seq
+// markers. The SDK's Subscribe returns before the server-side
+// registration is guaranteed visible, and registrations settle at
+// different moments per session: the FIRST matrix race run
+// (42158718976) caught the old any-session probe here — one straggler
+// of 128 sessions missed every probe notification and nothing further
+// was ever pushed, leaving the follow-up wait structurally
+// unsatisfiable. Every-session liveness is the actual precondition the
+// tests need; probe until it holds.
+func (m *multiClientEnv) probeUntilAllLive(t *testing.T, mac6 string) {
 	t.Helper()
+	deadline := time.Now().Add(evWaitDeadline())
 	for i := 0; ; i++ {
-		if i > 200 {
-			t.Fatal("subscription never went live: no notification for 200 probes")
+		live := true
+		for _, r := range m.recs {
+			if r.count() == 0 {
+				live = false
+				break
+			}
+		}
+		if live {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("subscriptions never went live on every session within %s: counts=%v", evWaitDeadline(), m.counts())
+		}
+		if i%64 == 63 { // absorb the probe wave before pushing more (door stays lossless)
+			waitLastSeq(t, m.e, mac6, -float64(i)) // probes -1..-i are pushed; this iteration's lands below
 		}
 		if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": -float64(i + 1)}) {
 			t.Fatal("probe push failed")
 		}
-		for _, r := range m.recs {
-			if r.count() > 0 {
-				return i + 1
-			}
-		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -218,7 +282,7 @@ func (m *multiClientEnv) hintState(mac6 string) (appended, queuedUpTo int, inFli
 // different moments).
 func (m *multiClientEnv) waitAllRecs(t *testing.T, base []int64, add int64, what string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(evWaitDeadline())
 	for {
 		done := true
 		for i, r := range m.recs {
@@ -231,7 +295,7 @@ func (m *multiClientEnv) waitAllRecs(t *testing.T, base []int64, add int64, what
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s; counts=%v base=%v", what, m.counts(), base)
+			t.Fatalf("timed out waiting for %s within %s; counts=%v base=%v", what, evWaitDeadline(), m.counts(), base)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -249,14 +313,14 @@ func (m *multiClientEnv) counts() []int64 {
 // (nothing queued, nothing in flight, appended == queuedUpTo).
 func (m *multiClientEnv) waitHintsSettled(t *testing.T, mac6 string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(evWaitDeadline())
 	for {
 		app, q, flying, qlen, _ := m.hintState(mac6)
 		if app == q && !flying && qlen == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("hints never settled: appended=%d queuedUpTo=%d inFlight=%v queueLen=%d", app, q, flying, qlen)
+			t.Fatalf("hints never settled within %s: appended=%d queuedUpTo=%d inFlight=%v queueLen=%d", evWaitDeadline(), app, q, flying, qlen)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -286,7 +350,7 @@ func (r *notifRecorder) list() []string {
 // waitNotifs blocks until at least n notifications landed (bounded).
 func waitNotifs(t *testing.T, r *notifRecorder, n int64, what string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(evWaitDeadline())
 	for r.count() < n {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s: got %d of %d notifications", what, r.count(), n)
@@ -298,7 +362,7 @@ func waitNotifs(t *testing.T, r *notifRecorder, n int64, what string) {
 // listResourceURIs returns the URIs the server currently serves.
 func listResourceURIs(t *testing.T, e *env) []string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), evWaitDeadline())
 	defer cancel()
 	lr, err := e.cl.ListResources(ctx, &mcpsdk.ListResourcesParams{})
 	if err != nil {
@@ -315,7 +379,7 @@ func listResourceURIs(t *testing.T, e *env) []string {
 // readResourceText reads one resource's text content.
 func readResourceText(t *testing.T, e *env, uri string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), evWaitDeadline())
 	defer cancel()
 	rr, err := e.cl.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: uri})
 	if err != nil {
@@ -384,20 +448,20 @@ func TestEventsRingPerBoardAndSource(t *testing.T) {
 	}
 }
 
-// TestEventsRingOverflowEvictsWholeOldest: 300 back-to-back events on
-// one source leave exactly ringCap=256 — the 44 OLDEST whole events
-// evicted (never a torn entry), dropped counting them, the ring holding
-// seq 44..299 in arrival order.
+// TestEventsRingOverflowEvictsWholeOldest: 300 events on one source in
+// door-safe waves leave exactly ringCap=256 — the 44 OLDEST whole
+// events evicted (never a torn entry), dropped counting them, the ring
+// holding seq 44..299 in arrival order. (Waved, not back-to-back: a
+// 300-deep burst can legitimately lose events at the apiclient
+// fire-and-forget door on a slow runner — first windows matrix run
+// stopped at seq 256 — and this test asserts ring semantics, not door
+// semantics. See pushWaveEvents.)
 func TestEventsRingOverflowEvictsWholeOldest(t *testing.T) {
 	e, df := newEventEnv(t, evA)
 	refreshWithEvents(t, e)
 
 	const total = 300
-	for i := 0; i < total; i++ {
-		if !df.pushEvent("a1b2c3", "gpio.4", map[string]any{"seq": float64(i)}) {
-			t.Fatalf("push %d failed", i)
-		}
-	}
+	pushWaveEvents(t, e, df, "a1b2c3", 0, total)
 	waitLastSeq(t, e, "a1b2c3", float64(total-1)) // fully drained
 	events := waitEvents(t, e, "a1b2c3", ringCap)
 	if len(events) != ringCap {
@@ -526,7 +590,7 @@ func TestEventsSubscribePushesResourceUpdated(t *testing.T) {
 	})
 	refreshWithEvents(t, e)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), evWaitDeadline())
 	defer cancel()
 	uri := "xuansi://boards/a1b2c3/events"
 	if err := e.cl.Subscribe(ctx, &mcpsdk.SubscribeParams{URI: uri}); err != nil {
@@ -534,11 +598,13 @@ func TestEventsSubscribePushesResourceUpdated(t *testing.T) {
 	}
 
 	// probe until the subscription is live (each probe event also fires
-	// a notification once it is)
+	// a notification once it is); deadline-bounded — a fixed probe
+	// count is a speed assumption CI runners break
 	probes := 0
+	deadline := time.Now().Add(evWaitDeadline())
 	for i := 0; rec.count() == 0; i++ {
-		if i > 200 {
-			t.Fatal("subscription never went live: no notification for 200 probes")
+		if time.Now().After(deadline) {
+			t.Fatalf("subscription never went live: no notification for %d probes within %s", probes, evWaitDeadline())
 		}
 		if !df.pushEvent("a1b2c3", "gpio.4", map[string]any{"seq": -float64(i + 1)}) {
 			t.Fatal("probe push failed")
@@ -848,14 +914,14 @@ func TestEventsRecentStaticOnlyFaceHonestError(t *testing.T) {
 // seq — the whole push stream has drained into the ring.
 func waitLastSeq(t *testing.T, e *env, board string, seq float64) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(evWaitDeadline())
 	for {
 		events := waitEvents(t, e, board, 1)
 		if last := seqOf(t, events[len(events)-1]); last == seq {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("ring for %s never drained to seq %v (last=%v)", board, seq, seqOf(t, events[len(events)-1]))
+			t.Fatalf("ring for %s never drained to seq %v (last=%v) within %s — if events are missing, suspect the fire-and-forget door (see pushWaveEvents), not the ring", board, seq, seqOf(t, events[len(events)-1]), evWaitDeadline())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -864,22 +930,23 @@ func waitLastSeq(t *testing.T, e *env, board string, seq float64) {
 // ---------------------------------------------------------------------------
 // the storm ceiling
 
-// TestEventsHighFrequencyStorm: 1000 events back-to-back on one board —
-// no deadlock, no unbounded growth: the ring settles at exactly
+// TestEventsHighFrequencyStorm: 1000 events on one board in door-safe
+// waves — no deadlock, no unbounded growth: the ring settles at exactly
 // ringCap entries with the eviction count honest, and a SUBSCRIBED
 // client rides the same storm alive (per-event notifications, at least
 // one observed; delivery is fire-and-forget, so exact counts are not
 // promised — see the package comment). Runs green under -race.
+// (Waved, not back-to-back: the apiclient fire-and-forget door drops
+// beyond a 256-deep handler backlog, and the first ubuntu matrix run
+// lost 58 of 1000 that way — documented product policy, not ring
+// lossage; waves keep every original assertion exact on any runner.
+// See pushWaveEvents.)
 func TestEventsHighFrequencyStorm(t *testing.T) {
 	// half 1: no subscriber — the deterministic end state
 	e, df := newEventEnv(t, evA)
 	refreshWithEvents(t, e)
 	const storm = 1000
-	for i := 0; i < storm; i++ {
-		if !df.pushEvent("a1b2c3", "gpio.4", map[string]any{"seq": float64(i)}) {
-			t.Fatalf("storm push %d failed", i)
-		}
-	}
+	pushWaveEvents(t, e, df, "a1b2c3", 0, storm)
 	waitLastSeq(t, e, "a1b2c3", float64(storm-1)) // fully drained
 	events := waitEvents(t, e, "a1b2c3", ringCap)
 	if len(events) != ringCap {
@@ -905,27 +972,25 @@ func TestEventsHighFrequencyStorm(t *testing.T) {
 		ResourceUpdatedHandler: rec.handle,
 	})
 	refreshWithEvents(t, e2)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), evWaitDeadline())
 	defer cancel()
 	if err := e2.cl.Subscribe(ctx, &mcpsdk.SubscribeParams{URI: "xuansi://boards/a1b2c3/events"}); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 	// probe until the subscription is live (Subscribe returns before
-	// the server-side registration is guaranteed visible)
+	// the server-side registration is guaranteed visible);
+	// deadline-bounded — a fixed probe count is a speed assumption
+	probeDeadline := time.Now().Add(evWaitDeadline())
 	for i := 0; rec.count() == 0; i++ {
-		if i > 200 {
-			t.Fatal("subscription never went live under the storm setup")
+		if time.Now().After(probeDeadline) {
+			t.Fatalf("subscription never went live under the storm setup within %s", evWaitDeadline())
 		}
 		if !df2.pushEvent("a1b2c3", "gpio.4", map[string]any{"seq": -1.0}) {
 			t.Fatal("probe push failed")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	for i := 0; i < storm; i++ {
-		if !df2.pushEvent("a1b2c3", "gpio.4", map[string]any{"seq": float64(i)}) {
-			t.Fatalf("subscribed storm push %d failed", i)
-		}
-	}
+	pushWaveEvents(t, e2, df2, "a1b2c3", 0, storm)
 	waitLastSeq(t, e2, "a1b2c3", float64(storm-1)) // rings drained — no deadlock
 	if rec.count() < 1 {
 		t.Fatal("no notification survived the storm")
@@ -950,13 +1015,16 @@ func TestEventsBurstOneHintInFlightPerBoard(t *testing.T) {
 	m := newMultiClientEnv(t, 8, mac6)
 	refreshWithEvents(t, m.e)
 	m.subscribeAll(t, mac6)
-	m.probeUntilLive(t, mac6)
 	// every session's subscription live before the burst (the SDK's
-	// per-session registrations settle at slightly different moments)
+	// per-session registrations settle at slightly different moments);
+	// probeUntilAllLive IS the liveness guarantee — no extra wait sits
+	// between it and the burst, because no notification source exists
+	// in that gap and a wait there could never satisfy (first matrix
+	// race run's straggler-session failure mode)
+	m.probeUntilAllLive(t, mac6)
 	base := m.counts()
-	m.waitAllRecs(t, base, 1, "every session's subscription to go live")
 	m.waitHintsSettled(t, mac6)
-	probes := 2 // probeUntilLive pushes ≥1; the exact count is read from the ring below
+	probes := 1 // probeUntilAllLive pushes ≥1; a safe LOWER bound — waitEvents only needs the ring's minimum, and the burst count is read by filtering seq ≥ 0 below
 
 	// dense depth sampling: a background poller plus a sample per push
 	var maxDepth atomic.Int64
@@ -1024,54 +1092,100 @@ func TestEventsBurstOneHintInFlightPerBoard(t *testing.T) {
 // half of the guarantee — events landing WHILE a hint is being
 // delivered (in-flight flag set, arming suppressed) still get their
 // notification: the post-delivery re-arm sees appended != queuedUpTo
-// and queues the next hint. The 8-session fan-out widens one delivery
+// and queues the next hint. The 128-session fan-out widens one delivery
 // into a window the test can push into.
+//
+// Determinism (first matrix race run finding): the delivery window is
+// caught by RETRY — push an event, spin for the white-box
+// dequeued-but-flying state; if the window closes before the spin sees
+// it (delivery finished on a loaded runner), push another event and
+// spin again (each extra event folds harmlessly into any in-flight
+// hint). Only a CAUGHT window gets event B pushed into it, so the
+// suppressed-arming shape under test is guaranteed, never hoped for.
 func TestEventsHintReArmsAfterDelivery(t *testing.T) {
 	const mac6 = "a1b2c3"
 	m := newMultiClientEnv(t, 128, mac6) // wide fan-out: one delivery spans many session writes
 	refreshWithEvents(t, m.e)
 	m.subscribeAll(t, mac6)
-	m.probeUntilLive(t, mac6)
+	m.probeUntilAllLive(t, mac6)
+	// Liveness is probeUntilAllLive's guarantee; no wait sits here —
+	// nothing is pushed in this gap, so any wait for MORE notifications
+	// could never satisfy (the first matrix race run's failure mode).
 	base := m.counts()
-	m.waitAllRecs(t, base, 1, "every session's subscription to go live")
 	m.waitHintsSettled(t, mac6)
 
-	// event A: catch its delivery IN PROGRESS server-side — inFlight
-	// with an empty queue means the hint was dequeued and the 128-write
-	// fan-out is running right now (client-side counters all jump at
-	// once when the dispatch queue drains, so they cannot see this
-	// window; the white-box state can).
-	if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": 1.0}) {
-		t.Fatal("push A failed")
-	}
+	// events A: catch a delivery window server-side — inFlight with an
+	// empty queue means the hint was dequeued and the 128-write fan-out
+	// is running right now (client-side counters all jump at once when
+	// the dispatch queue drains, so they cannot see this window; the
+	// white-box state can). Retry until a window is observed OPEN; the
+	// A events carry seqs 1, 2, 3… so the ring bookkeeping below stays
+	// exact regardless of how many retries the runner needed.
 	caughtWindow := false
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, _, flying, qlen, _ := m.hintState(mac6); flying && qlen == 0 {
-			caughtWindow = true // A's delivery is mid-flight right now
-			break
+	aCount := 0
+	const aBudget = 200 // keeps probes+A+B under ringCap so the ring assertions below stay exact
+	deadline := time.Now().Add(evWaitDeadline())
+	for !caughtWindow && time.Now().Before(deadline) && aCount < aBudget {
+		// gate on A_k LANDING first: `appended` increments when feed
+		// takes the event (same lock as arming). Without this gate the
+		// spin reads the PRE-ARM settled state — the event has not even
+		// crossed the socket yet — and under 2-core load burns the whole
+		// retry budget in seconds without ever watching a hint transit
+		// (the loaded-race flake this gate exists to catch).
+		prevAppended, _, _, _, _ := m.hintState(mac6)
+		aCount++
+		if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": float64(aCount)}) {
+			t.Fatalf("push A%d failed", aCount)
 		}
-		runtime.Gosched() // spin: the window is µs-to-ms scale
+		landed := false
+		for time.Now().Before(deadline) {
+			app, _, flying, qlen, _ := m.hintState(mac6)
+			if !landed {
+				if app > prevAppended {
+					landed = true // A_k is in the ring; its hint is armed or arming
+				} else {
+					runtime.Gosched()
+					continue
+				}
+			}
+			// A_k landed: the hint transits queued → dequeued (the
+			// 128-write fan-out — the window) → delivered. Catch the
+			// dequeue; a fully settled observation means the delivery
+			// completed between two spins — retry.
+			if flying && qlen == 0 {
+				caughtWindow = true
+				break
+			}
+			if !flying && qlen == 0 {
+				break // delivered and settled — retry
+			}
+			runtime.Gosched()
+		}
 	}
-	t.Logf("caught A's delivery mid-window: %v", caughtWindow)
+	if !caughtWindow {
+		t.Fatalf("never caught a mid-delivery window within %s across %d A events — the 128-session fan-out never showed a dequeue gap", evWaitDeadline(), aCount)
+	}
+	t.Logf("caught a delivery mid-window after %d event(s)", aCount)
 
-	// event B — during A's delivery when the window was caught: arming
-	// is suppressed (in-flight), so B's coverage must come from the
-	// post-delivery re-arm
-	if caughtWindow {
-		if _, _, flying, _, _ := m.hintState(mac6); !flying {
-			t.Fatalf("expected a hint in flight after catching the delivery window")
-		}
-	}
-	if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": 2.0}) {
+	// event B — into the window just observed open: arming is
+	// suppressed (in-flight), so B's coverage must come from the
+	// post-delivery re-arm. No re-check of flying here: if the delivery
+	// completed between the observation and this push, B takes the
+	// normal arm-own-hint path and every assertion below still holds —
+	// the caught window is evidence the suppressed shape was exercised,
+	// not a precondition to die on. B's seq is far above every A's so
+	// the newest-in-ring assertion stays exact.
+	if !m.df.pushEvent(mac6, "gpio.4", map[string]any{"seq": 1000.0}) {
 		t.Fatal("push B failed")
 	}
 
-	// the guarantee: every session ends up notified of BOTH A and B
+	// the guarantee: every session ends up notified of BOTH A's
+	// delivery and B's re-arm (base+2 — A's delivery completing past
+	// B's landing, or B's re-arm, covers each session either way)
 	m.waitAllRecs(t, base, 2, "A's and B's notifications on every session")
 	m.waitHintsSettled(t, mac6)
-	events := waitEvents(t, m.e, mac6, 2)
-	if last := seqOf(t, events[len(events)-1]); last != 2.0 {
-		t.Errorf("ring's newest event = seq %v, want 2 (B landed)", last)
+	events := waitEvents(t, m.e, mac6, aCount+1) // every A and B landed
+	if last := seqOf(t, events[len(events)-1]); last != 1000.0 {
+		t.Errorf("ring's newest event = seq %v, want 1000 (B landed)", last)
 	}
 }

@@ -1,0 +1,13 @@
+# B8.5 T3 launcher smoke — 2026-11-06
+# RED run (before bin/xuansi.js existed): 0 passed, 8 failed (MODULE_NOT_FOUND / rc=1 paths).
+# GREEN run (after launcher implementation):
+ok   - platform map: six exact keys + six stub dry-resolutions
+ok   - unsupported platform: error carries install hint
+ok   - stdio inherit: stdout byte-exact (frame seq), stderr clean
+ok   - exit-code forwarding: fake exit 7 -> launcher 7
+ok   - exit-code forwarding: fake exit 0 -> launcher 0
+ok   - xuansi-mcp: argv forwarded with 'mcp' prepended
+ok   - missing package: install hint on stderr, empty stdout, exit 1
+ok   - SIGTERM forwarding: child saw TERM, exit 9 propagated
+----
+launcher-test: 8 passed, 0 failed
