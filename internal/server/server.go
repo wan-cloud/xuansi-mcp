@@ -193,6 +193,10 @@ type daemonBoard struct {
 	// identity — production dynamic types are pointers, comparable). A
 	// redial swaps the controller; the next server-side touch re-taps.
 	tapped board.Controller
+	// cameraMu serializes camera_shot calls per board (capture.go):
+	// two concurrent captures would interleave their ch=1 stream
+	// chunks into each other's collectors on the shared warm link.
+	cameraMu sync.Mutex
 }
 
 // clientConn is one API connection: reader + writer goroutines over the
@@ -989,6 +993,8 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hCaptureStart(ctx, cc, req)
 	case "capture_stop":
 		result, err = s.hCaptureStop(req)
+	case "camera_shot":
+		result, err = s.hCameraShot(ctx, cc, req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1337,11 +1343,15 @@ func validateArgsPath(prefix string, v any, path string) (any, *RPCError) {
 // narrow — the bench surface batch 6's MCP agents need (budget, wifi,
 // log, caps, diagnostics) plus diag.i2cslave, the board's internal
 // I2C echo-slave loopback fixture toggle ({mode:-1..1} = status/off/
-// on) the b7 driver-pipeline loopback rides. eval/submit/fs.*/
+// on) the b7 driver-pipeline loopback rides, plus the camera face's
+// camera.capture/status/off (b9 — capture via op returns the board's
+// metadata reply while its 0x02 stream is dropped daemon-side;
+// camera_shot is the stream-consuming path). eval/submit/fs.*/
 // script.*/session.* have their own request types and are NOT
 // reachable through op; every other diag.* stays internal.
 var opAllowlist = map[string]bool{
 	"budget.get": true, "budget.set": true,
+	"camera.capture": true, "camera.status": true, "camera.off": true,
 	"wifi.status": true, "wifi.setup": true, "wifi.off": true,
 	"log.read":  true,
 	"caps":      true,
