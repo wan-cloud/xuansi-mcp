@@ -52,3 +52,7 @@ Zero-install via npx:
 Point your MCP client at the `xuansi-mcp` command, e.g. for OpenCode:
 
     { "mcp": { "xuansi": { "type": "local", "command": ["npx", "-y", "xuansi-mcp"] } } }
+
+## License
+
+Apache-2.0 — see the [repository LICENSE](https://github.com/wan-cloud/xuansi-mcp/blob/main/LICENSE).
