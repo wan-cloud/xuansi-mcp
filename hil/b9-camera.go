@@ -17,27 +17,36 @@
 //
 // Steps:
 //
-//	S0  prelude - no stale processes, board TCP reachable, XDG sandbox,
-//	    serve up + sweep, mcp up + initialize, xuansi_camera_shot
-//	    served (21 static tools), list_boards binds fw c366c0a, the
-//	    board starts clean (no lease)
-//	S1  no-lease refusal - xuansi_camera_shot BEFORE any lease must
-//	    refuse not_held (camera.capture is not ro; Review Focus #5's
-//	    MCP leg)
-//	S2  first shot, VGA default - lease -> board_op camera.status
-//	    {inited:false} -> ONE xuansi_camera_shot (timed: the sensor
-//	    power-up + AE settle first-shot latency) -> 1 file, w=640
-//	    h=480 sensor GC2145 gaps=0 -> SOI/EOI + decode 640x480 +
-//	    sha256 == file bytes -> camera.status now {inited:true}
-//	S3  warm burst - frames=2 -> two distinct files, both verify,
-//	    wall time noted against S2's first-shot latency
-//	S4  QVGA variant - framesize QVGA -> decode 320x240 (the size
+//	S0  prelude - no stale processes (the pgrep line parse takes the
+//	    binary from field 1 - pgrep -af lines LEAD with the pid; the
+//	    b6-house f[0] parse never matched anything and a competing
+//	    daemon starved attempt 1's audit), board TCP reachable, XDG
+//	    sandbox, serve up + sweep, mcp up + initialize,
+//	    xuansi_camera_shot served (21 static tools), list_boards binds
+//	    fw c366c0a, the board starts clean (no lease)
+//	S1  first shot, VGA default - lease FIRST (a holder-carrying call
+//	    before it would bind the connection to the generated default -
+//	    the holder ladder; attempt 1's honest finding) ->
+//	    board_op camera.status {inited:false} -> ONE timed
+//	    xuansi_camera_shot (the sensor power-up + AE settle first-shot
+//	    latency) -> 1 file, w=640 h=480 sensor GC2145 gaps=0 ->
+//	    SOI/EOI + decode 640x480 + sha256 == file bytes ->
+//	    camera.status now {inited:true}
+//	S2  QVGA variant - framesize QVGA -> decode 320x240 (the size
 //	    switch restart latency noted)
-//	S5  input refusals - framesize SVGA -> api error naming QVGA and
-//	    VGA; frames=5 -> api error naming 1..4; neither touched the
-//	    board (no capture in the daemon log)
-//	S6  warm repeat - back to VGA default (the second size switch),
-//	    verify again - the repeat-shot warm path
+//	S3  warm burst - frames=2 -> two distinct files, both verify,
+//	    wall time noted against S1's first-shot latency
+//	S4  input refusals - framesize SVGA -> api error naming QVGA and
+//	    VGA; frames=5 -> api error naming 1..4; neither produced a
+//	    capture (the daemon's landing-line count is unchanged)
+//	S5  release -> no-lease refusal -> grace adopt-back - release,
+//	    then xuansi_camera_shot under the still-bound holder must
+//	    refuse not_held (camera.capture is not ro; Review Focus #5's
+//	    MCP leg), then the re-lease under the same holder adopts the
+//	    lease back inside the grace TTL (the holder ladder's payoff)
+//	S6  warm repeat - VGA default again: the camera SURVIVED the lease
+//	    cycle (session.reset never touches op-face resources), the
+//	    second size switch rides the latency, verify again
 //	S7  fw observer vector (Review Focus #5's board leg, deliberately
 //	    OUTSIDE the MCP pipeline - the b7 out-of-pipeline precedent):
 //	    a direct replclient TCP connection hellos observer and issues
@@ -151,12 +160,21 @@ func runB9Camera(attempt int, daemonBin, runDir string) int {
 		stale := 0
 		for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			f := strings.Fields(ln)
-			if len(f) >= 2 && strings.Contains(filepath.Base(f[0]), "xuansi") && (f[1] == "serve" || f[1] == "mcp") {
+			// pgrep -af lines LEAD WITH THE PID: the binary is field 1
+			// and the subcommand field 2 (the b6-house parse took
+			// Base(f[0]) - the pid - and matched nothing, ever; a
+			// competing daemon then starved attempt 1's audit). Only
+			// `serve` counts as stale: a daemon owns the board's
+			// controller slot and the arbitration window - the real
+			// interference vector - while an unrelated `mcp` face owns
+			// nothing without ITS daemon (this harness's own session
+			// MCP face is exactly such an idle mcp).
+			if len(f) >= 3 && strings.Contains(filepath.Base(f[1]), "xuansi") && f[2] == "serve" {
 				stale++
-				fmt.Printf("  [note] stale xuansi process: %s\n", asciiLine(ln))
+				fmt.Printf("  [note] stale xuansi serve process: %s\n", asciiLine(ln))
 			}
 		}
-		h.check(stale == 0, fmt.Sprintf("no stale xuansi serve/mcp processes on the bench (found %d)", stale))
+		h.check(stale == 0, fmt.Sprintf("no stale xuansi serve daemon on the bench (found %d - a competing daemon holds the board's controller slot and starves this run's audit)", stale))
 	} else {
 		h.note("pgrep: no xuansi processes found (clean bench)")
 	}
@@ -258,14 +276,8 @@ func runB9Camera(attempt int, daemonBin, runDir string) int {
 	_, hasLease := m["lease"]
 	h.check(!isErr && !hasLease, fmt.Sprintf("precondition: board starts with NO lease (lease key %v; text=%.50s)", hasLease, text))
 
-	// ---------- S1: no-lease refusal ----------
-	fmt.Println("\n- S1: xuansi_camera_shot WITHOUT the lease -> refused (camera.capture is not ro) -")
-	m, text, isErr, _ = b.call(ctx, 15*time.Second, "xuansi_camera_shot", map[string]any{"board": b9Board})
-	h.check(isErr && strings.HasPrefix(text, "not_held:"),
-		fmt.Sprintf("no-lease camera_shot refused not_held (text=%.80s)", text))
-
-	// ---------- S2: first shot, VGA default ----------
-	fmt.Println("\n- S2: lease -> camera.status {inited:false} -> FIRST xuansi_camera_shot (VGA default, timed) -> verify -")
+	// ---------- S1: first shot, VGA default ----------
+	fmt.Println("\n- S1: lease FIRST (the holder ladder: a holder-carrying call before it binds the generated default) -> status cold -> FIRST shot (timed) -> verify -")
 	m, text, isErr, _ = b.call(ctx, 30*time.Second, "xuansi_lease", map[string]any{"board": b9Board, "holder": b9Holder})
 	leaseSess, _ := b6Num(m, "session")
 	h.check(!isErr && b6Str(m, "board") == b9Board && b6Str(m, "holder") == b9Holder && leaseSess > 0,
@@ -299,24 +311,24 @@ func runB9Camera(attempt int, daemonBin, runDir string) int {
 	h.check(!isErr && !bolAny(m, "inited"),
 		fmt.Sprintf("board_op camera.status BEFORE any shot: {inited:%v} - the lazy engine is cold (text=%.60s)", bolAny(m, "inited"), text))
 
-	shot("S2 first shot (VGA default)", map[string]any{"board": b9Board}, 640, 480, 1)
+	shot("S1 first shot (VGA default)", map[string]any{"board": b9Board}, 640, 480, 1)
 
 	m, text, isErr, _ = b.call(ctx, 30*time.Second, "xuansi_board_op",
 		map[string]any{"board": b9Board, "op": "camera.status"})
 	h.check(!isErr && bolAny(m, "inited"),
 		fmt.Sprintf("board_op camera.status AFTER the shot: {inited:%v sensor:%v} - the lazy engine warmed (text=%.60s)", bolAny(m, "inited"), gAny(m, "sensor"), text))
 
+	// ---------- S2: QVGA variant ----------
+	fmt.Println("\n- S2: framesize QVGA -> decode 320x240 (the size switch restart rides the latency) -")
+	shot("S2 QVGA", map[string]any{"board": b9Board, "framesize": "QVGA"}, 320, 240, 1)
+
 	// ---------- S3: warm burst ----------
 	fmt.Println("\n- S3: frames=2 warm burst -> two distinct files, both verify -")
 	shot("S3 warm burst (frames=2)", map[string]any{"board": b9Board, "frames": float64(2)}, 640, 480, 2)
-	h.note("burst latency per frame vs the S2 first shot above is the warm-path evidence (encode ~0.65s/frame vs the ~3s cold start)")
+	h.note("burst latency per frame vs the S1 first shot above is the warm-path evidence (encode ~0.65s/frame vs the ~3s cold start)")
 
-	// ---------- S4: QVGA variant ----------
-	fmt.Println("\n- S4: framesize QVGA -> decode 320x240 (the size switch restart rides the latency) -")
-	shot("S4 QVGA", map[string]any{"board": b9Board, "framesize": "QVGA"}, 320, 240, 1)
-
-	// ---------- S5: input refusals ----------
-	fmt.Println("\n- S5: bad framesize / frames -> api refusals BEFORE any board contact -")
+	// ---------- S4: input refusals ----------
+	fmt.Println("\n- S4: bad framesize / frames -> api refusals BEFORE any board contact -")
 	landingsBefore := serve.count("camera_shot " + b9Board + ":")
 	m, text, isErr, _ = b.call(ctx, 15*time.Second, "xuansi_camera_shot",
 		map[string]any{"board": b9Board, "framesize": "SVGA"})
@@ -330,8 +342,21 @@ func runB9Camera(attempt int, daemonBin, runDir string) int {
 		fmt.Sprintf("neither refusal produced a capture (daemon landing lines before=%d after=%d)",
 			landingsBefore, serve.count("camera_shot "+b9Board+":")))
 
-	// ---------- S6: warm repeat (back to VGA) ----------
-	fmt.Println("\n- S6: warm repeat - VGA default again (second size switch) -> verify -")
+	// ---------- S5: release -> no-lease refusal -> grace adopt-back ----------
+	fmt.Println("\n- S5: release -> xuansi_camera_shot under the bound holder refuses not_held -> re-lease adopts back -")
+	m, text, isErr, _ = b.call(ctx, 30*time.Second, "xuansi_release", map[string]any{"board": b9Board, "holder": b9Holder})
+	h.check(!isErr && b6Str(m, "board") == b9Board && b6Str(m, "holder") == b9Holder,
+		fmt.Sprintf("release the lease (text=%.60s)", text))
+	m, text, isErr, _ = b.call(ctx, 15*time.Second, "xuansi_camera_shot", map[string]any{"board": b9Board})
+	h.check(isErr && strings.HasPrefix(text, "not_held:"),
+		fmt.Sprintf("post-release camera_shot refused not_held (camera.capture is not ro; text=%.80s)", text))
+	m, text, isErr, _ = b.call(ctx, 30*time.Second, "xuansi_lease", map[string]any{"board": b9Board, "holder": b9Holder})
+	lease2, _ := b6Num(m, "session")
+	h.check(!isErr && b6Str(m, "holder") == b9Holder && lease2 > 0,
+		fmt.Sprintf("re-lease under the SAME holder adopted the lease back inside the grace TTL (session %.0f -> %.0f; text=%.60s)", leaseSess, lease2, text))
+
+	// ---------- S6: warm repeat (the camera survives the lease cycle) ----------
+	fmt.Println("\n- S6: warm repeat - VGA default again (session.reset never touches the camera; the second size switch rides the latency) -")
 	shot("S6 warm repeat (VGA default)", map[string]any{"board": b9Board}, 640, 480, 1)
 
 	// ---------- S7: the fw observer vector ----------
@@ -441,7 +466,7 @@ func runB9Camera(attempt int, daemonBin, runDir string) int {
 		}
 		h.note("  LANDED JPEG (left in place): %s  bytes=%d  sha256=%x  dims=%s", p, len(body), sha256.Sum256(body), dims)
 	}
-	h.check(jpegs == 5, fmt.Sprintf("sandbox holds exactly the five landed JPEGs of S2/S3(x2)/S4/S6 (found %d)", jpegs))
+	h.check(jpegs == 5, fmt.Sprintf("sandbox holds exactly the five landed JPEGs of S1/S2/S3(x2)/S6 (found %d)", jpegs))
 	h.note("visual verification handoff: the controller checks color byte-order (R/B) on these files; the fw's jpgSetRgb565BE() knob is NOT touched here")
 	return finish()
 }

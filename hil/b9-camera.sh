@@ -24,7 +24,8 @@ rm -rf "$run"; mkdir -p "$run"
 eviddir="${EVIDDIR:-$run/evidence}"
 mkdir -p "$eviddir"
 attempt="${ATTEMPT:-1}"
-log="$eviddir/$(date -u +%Y-%m-%d)-b9-t5-camera-hil-attempt${attempt}.log"
+# local-date naming, the evidence convention the earlier batches use
+log="$eviddir/$(date +%F)-b9-t5-camera-hil-attempt${attempt}.log"
 exec > >(tee "$log") 2>&1
 echo "capture: $log ($(date -Is))"
 echo "repo HEAD: $(git rev-parse --short HEAD) - dirty files: $(git status --porcelain | wc -l)"
@@ -45,7 +46,7 @@ set -e
 echo "driver exit: ${rc}"
 
 if [ "$rc" -eq 0 ]; then
-  cp "$log" "$eviddir/$(date -u +%Y-%m-%d)-b9-t5-camera-hil.log"
+  cp "$log" "$eviddir/$(date +%F)-b9-t5-camera-hil.log"
   echo "ALL PASS: canonical evidence copied alongside the attempt log (private evidence dir; this public repo keeps nothing)"
 fi
 echo "landed JPEGs (left in place for visual verification): $run/xdg/xuansi/captures/"
