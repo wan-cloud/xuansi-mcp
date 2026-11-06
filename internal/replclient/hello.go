@@ -5,7 +5,8 @@ import (
 )
 
 // HelloInfo is the parsed hello result — the §2 full picture at
-// protocol_ver 3 (14 pairs). Daemon-relevant fields are surfaced as Go
+// protocol_ver 4 (14 pairs; ver 3 + the B9 0x02 overlay bump).
+// Daemon-relevant fields are surfaced as Go
 // values; the nested snapshots (net/heap/gc/caps) stay maps, faithful
 // to the wire shape.
 type HelloInfo struct {

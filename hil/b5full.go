@@ -7,7 +7,7 @@
 //		S1  serve up          — subprocess, sock bound, initial discovery sweep
 //		                         + startup orphan audit (report-only)
 //		S2  discovery         — list shows d75884 dual-source usb+mdns, fw
-//		                         hello-enriched; TXT ver=3 proven by a
+//		                         hello-enriched; TXT ver=4 proven by a
 //		                         driver-side registry browse (the daemon's list
 //		                         view surfaces fw, not TXT)
 //		S3  lease + eval      — holder=h1 lease via the boards.conf alias;
@@ -569,7 +569,7 @@ func runFull(attempt int, daemonBin, runDir string) int {
 	}
 
 	// ——— S2: discovery dual-source ———
-	fmt.Println("\n— S2: discovery — list shows d75884 dual-source, fw-enriched; TXT ver=3 —")
+	fmt.Println("\n— S2: discovery — list shows d75884 dual-source, fw-enriched; TXT ver=4 —")
 	var fwNote string
 	ok, fwNote = pollUntil(time.Second, 45*time.Second, func() (bool, string) {
 		r, rerr, err := mon.call(10*time.Second, server.Request{Type: "list_boards"})
@@ -623,19 +623,19 @@ func runFull(attempt int, daemonBin, runDir string) int {
 	h.check(d.has("startup audit board d75884"), "startup orphan audit ran (report-only)")
 	h.check(d.has("cold=true scripts=[] pins=0"), "audit reported the clean board (cold=true scripts=[] pins=0, nothing killed)")
 
-	// TXT ver=3 — the daemon's list view surfaces fw (hello), not TXT; the
+	// TXT ver=4 — the daemon's list view surfaces fw (hello), not TXT; the
 	// TXT binding is proven here by one driver-side registry browse.
 	mb, merr := discover.DiscoverMDNS(ctx)
 	txtOK := false
 	var txtNote string
 	for _, b := range mb {
 		if b.MAC6 == boardSel {
-			txtOK = b.TXT["ver"] == "3" && b.TXT["api"] == "1"
+			txtOK = b.TXT["ver"] == "4" && b.TXT["api"] == "1"
 			txtNote = fmt.Sprintf("TXT=%v", b.TXT)
 		}
 	}
 	h.check(merr == nil && txtOK,
-		fmt.Sprintf("[driver-side browse] mDNS TXT ver=3 api=1 (%s, err=%v) — same single source as hello protocol_ver (§14)", txtNote, merr))
+		fmt.Sprintf("[driver-side browse] mDNS TXT ver=4 api=1 (%s, err=%v) — same single source as hello protocol_ver (§14)", txtNote, merr))
 
 	// ——— S3: lease + structured eval ———
 	fmt.Println("\n— S3: lease (holder=h1, via alias) + structured eval —")

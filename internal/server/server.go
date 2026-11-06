@@ -1443,6 +1443,17 @@ func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, er
 		}
 		return out, nil
 	}
+	// camera.capture via op drops its 0x02 stream daemon-side (no sink
+	// on this path) — but its chunks still ride the SAME warm connection
+	// a concurrent camera_shot is reassembling from. Hold the board's
+	// camera mutex so the documented "frames are DROPPED" claim holds
+	// unconditionally, never just when no capture happens to be in
+	// flight (b9 review minor 4).
+	if req.Op == "camera.capture" {
+		db := s.supervisor(b)
+		db.cameraMu.Lock()
+		defer db.cameraMu.Unlock()
+	}
 	return s.boardOp(ctx, b, req.Op, args)
 }
 

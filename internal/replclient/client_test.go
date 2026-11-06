@@ -67,7 +67,7 @@ func TestHelloParsesAndCachesCaps(t *testing.T) {
 		t.Fatalf("hello: %v", err)
 	}
 	if h.ProtocolVer != 4 || h.APIVersion != 1 {
-		t.Fatalf("ver/api = %d/%d, want 3/1", h.ProtocolVer, h.APIVersion)
+		t.Fatalf("ver/api = %d/%d, want 4/1", h.ProtocolVer, h.APIVersion)
 	}
 	if h.Role != "controller" {
 		t.Fatalf("role = %q, want controller", h.Role)

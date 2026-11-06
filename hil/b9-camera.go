@@ -110,6 +110,12 @@ func b9VerifyJPEG(h *harness, fm map[string]any, wantW, wantH int) bool {
 		h.check(false, fmt.Sprintf("landed file readable from THIS HIL process (%s: %v)", path, rerr))
 		return false
 	}
+	// a sub-4-byte body cannot carry SOI+EOI — refuse it as a failed
+	// check, never a slice panic (b9 review minor 5)
+	if len(body) < 4 {
+		h.check(false, fmt.Sprintf("%s is %dB — too short to carry SOI+EOI markers", filepath.Base(path), len(body)))
+		return false
+	}
 	ok := true
 	ok = h.check(len(body) > 2 && body[0] == 0xFF && body[1] == 0xD8,
 		fmt.Sprintf("%s SOI marker FFD8 in place (head % X)", filepath.Base(path), body[:2])) && ok
