@@ -10,6 +10,34 @@ bottom-up: `internal/replclient` → `internal/discover` → `internal/lease`
 (pure lease/teardown policy) + `internal/board` (per-board controller
 connection + resync) → `internal/server`, fronted by `cmd/xuansi`.
 
+## Install (npm)
+
+Published on npm — main package
+[xuansi-mcp](https://www.npmjs.com/package/xuansi-mcp): a pure-Node
+launcher (zero npm dependencies, Node ≥ 16) that resolves the matching
+`@xuansi/<platform>` binary package (linux/windows/macos × x64/arm64 —
+npm auto-installs the host's match by `os`/`cpu` fields) and execs it
+with stdio inherited, so MCP frames pass through byte-exact in both
+directions.
+
+Zero-install (what MCP clients should run):
+
+    npx -y xuansi-mcp
+
+MCP client config (stdio face):
+
+    { "mcpServers": {
+        "xuansi": { "command": "npx", "args": ["-y", "xuansi-mcp"] } } }
+
+Global install — provides both `xuansi` (the full CLI) and `xuansi-mcp`
+(the MCP stdio face, which runs exactly `xuansi mcp`):
+
+    npm install -g xuansi-mcp
+
+`XUANSI_BIN=/path/to/xuansi` overrides package resolution (e.g. to use a
+locally-built binary). The bare npm name `xuansi` is a defensive
+placeholder, not this tool — the package to install is `xuansi-mcp`.
+
 ## Build
 
 Requires Go ≥ 1.27.
