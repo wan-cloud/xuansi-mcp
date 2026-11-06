@@ -23,7 +23,7 @@
 //	    daemon starved attempt 1's audit), board TCP reachable, XDG
 //	    sandbox, serve up + sweep, mcp up + initialize,
 //	    xuansi_camera_shot served (21 static tools), list_boards binds
-//	    fw c366c0a, the board starts clean (no lease)
+//	    fw 9dce098, the board starts clean (no lease)
 //	S1  first shot, VGA default - lease FIRST (a holder-carrying call
 //	    before it would bind the connection to the generated default -
 //	    the holder ladder; attempt 1's honest finding) ->
@@ -85,7 +85,7 @@ import (
 
 const (
 	b9Board   = "d75884"  // the bench board (GC2145 camera on the 14-pin gate)
-	b9FwBuild = "c366c0a" // B9-T4 canonical re-flash: fw repo main HEAD, protocol_ver 4
+	b9FwBuild = "9dce098" // B10-T1 canonical re-flash: fw repo main HEAD, protocol_ver 5
 	b9Holder  = "b9-t5"   // custom lease holder for this run
 	b9TCPEndp = "xuansi-d75884.local:7777"
 )
@@ -143,7 +143,7 @@ func runB9Camera(attempt int, daemonBin, runDir string) int {
 
 	fmt.Printf("=== b9 task-5 HIL: the camera face - MCP xuansi_camera_shot end to end - %s ===\n", time.Now().Format(time.RFC3339))
 	fmt.Printf("attempt: %d (honest count - any failure is fixed and the WHOLE capture rerun)\n", attempt)
-	fmt.Printf("board: %s over TCP %s (daemon never opens CDC - that reboots); fw expect %s (protocol_ver 4)\n", b9Board, b9TCPEndp, b9FwBuild)
+	fmt.Printf("board: %s over TCP %s (daemon never opens CDC - that reboots); fw expect %s (protocol_ver 5)\n", b9Board, b9TCPEndp, b9FwBuild)
 	fmt.Printf("discipline: evidence ASCII only; the landed JPEGs STAY under the sandbox run dir for visual verification\n")
 
 	var serve, mcp *b6Proc

@@ -4,7 +4,7 @@
 //
 //	scenario discover —
 //	  A: board on WiFi+USB → Refresh ⇒ exactly ONE entry (mac6=d75884,
-//	     sources usb+mdns, TXT ver=4), Resolve by mac6/alias/hostname,
+//	     sources usb+mdns, TXT ver=5), Resolve by mac6/alias/hostname,
 //	     unmatched selector errors listing candidates; lazy enrich
 //	     (observer hello, never steals the controller slot, §12).
 //	  B: wifi.off from the USB controller (T8 pattern) → Refresh ⇒ the
@@ -156,7 +156,7 @@ func runDiscover(credsPath string) int {
 	h.check(strings.Join(b.Sources, "+") == "usb+mdns", fmt.Sprintf("sources=%v (one entry, both faces)", b.Sources))
 	h.check(b.USBPath == usbByID, fmt.Sprintf("USBPath is the by-id path (%s)", b.USBPath))
 	h.check(b.Host == "xuansi-d75884.local" && b.Port == 7777, fmt.Sprintf("mdns face host=%s port=%d", b.Host, b.Port))
-	h.check(b.TXT["ver"] == "4" && b.TXT["api"] == "1", fmt.Sprintf("TXT ver=%s api=%s (§14, same source as hello protocol_ver)", b.TXT["ver"], b.TXT["api"]))
+	h.check(b.TXT["ver"] == "5" && b.TXT["api"] == "1", fmt.Sprintf("TXT ver=%s api=%s (§14, same source as hello protocol_ver)", b.TXT["ver"], b.TXT["api"]))
 	h.check(b.Alias == "bench", fmt.Sprintf("alias from boards.conf = %q", b.Alias))
 	h.check(b.Hello == nil, "Hello nil before any dial (lazy enrichment)")
 
@@ -246,7 +246,7 @@ func runDiscover(credsPath string) int {
 		h.check(strings.Join(b3.Sources, "+") == "usb",
 			fmt.Sprintf("mdns source downgraded away (sources=%v) — service withdrawn at net-down (§14)", b3.Sources))
 		h.check(b3.USBPath == usbByID, "usb face still live")
-		h.check(b3.Host == "xuansi-d75884.local" && b3.Port == 7777 && b3.TXT["ver"] == "4",
+		h.check(b3.Host == "xuansi-d75884.local" && b3.Port == 7777 && b3.TXT["ver"] == "5",
 			fmt.Sprintf("last-known mdns face kept (host=%s port=%d txt=%v) — honest stale-marking, no hard delete", b3.Host, b3.Port, b3.TXT))
 		h.check(b3.Hello != nil && b3.Hello.FwBuild == expectFwBuild, "enriched identity survived the downgrade")
 	}

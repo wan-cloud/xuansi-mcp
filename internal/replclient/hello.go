@@ -5,7 +5,7 @@ import (
 )
 
 // HelloInfo is the parsed hello result — the §2 full picture at
-// protocol_ver 4 (14 pairs; ver 3 + the B9 0x02 overlay bump).
+// protocol_ver 5 (ver 4 + the B10-T1 fs chunked-transport trio).
 // Daemon-relevant fields are surfaced as Go
 // values; the nested snapshots (net/heap/gc/caps) stay maps, faithful
 // to the wire shape.

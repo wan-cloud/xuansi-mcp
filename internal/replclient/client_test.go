@@ -66,8 +66,8 @@ func TestHelloParsesAndCachesCaps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	if h.ProtocolVer != 4 || h.APIVersion != 1 {
-		t.Fatalf("ver/api = %d/%d, want 4/1", h.ProtocolVer, h.APIVersion)
+	if h.ProtocolVer != 5 || h.APIVersion != 1 {
+		t.Fatalf("ver/api = %d/%d, want 5/1", h.ProtocolVer, h.APIVersion)
 	}
 	if h.Role != "controller" {
 		t.Fatalf("role = %q, want controller", h.Role)
@@ -447,7 +447,7 @@ func TestZeroLenFramesTolerated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	if h.ProtocolVer != 4 {
+	if h.ProtocolVer != 5 {
 		t.Fatalf("hello ver = %d", h.ProtocolVer)
 	}
 	if _, err := c.Op(context.Background(), "ping", nil); err != nil {
@@ -466,7 +466,7 @@ func TestFragmentedBoardWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	if h.ProtocolVer != 4 || h.Role != "controller" {
+	if h.ProtocolVer != 5 || h.Role != "controller" {
 		t.Fatalf("hello = ver %d role %q", h.ProtocolVer, h.Role)
 	}
 

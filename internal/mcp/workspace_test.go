@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io/fs"
 	"net"
 	"os"
@@ -423,37 +422,46 @@ func TestDriverPushAPIDirectiveMissingRefusedLocally(t *testing.T) {
 	}
 }
 
-// TestWorkspacePutAllowsFatFileButPushRefuses: the workspace keeps
-// files above the board's 16384B single-file cap (history is not
-// disposable); the PUSH refuses with the fs_write-style message after
-// the api gate passed.
-func TestWorkspacePutAllowsFatFileButPushRefuses(t *testing.T) {
-	e, reqs, root := newWsEnv(t, []step{capsStep(1)})
+// TestWorkspaceFatFilePushesWholeOverChunkedTransport: the workspace
+// keeps files of any size, and since B10-T1 the PUSH crosses whole —
+// the daemon-side chunked transport (fs.write_part × N + sha-verifying
+// commit) carries payloads above the board's 16384B single-op cap, so
+// a fat .aot-era driver deploys in one push with the read-back verify.
+func TestWorkspaceFatFilePushesWholeOverChunkedTransport(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
 	content := drvBody("--@api 1", 20000)
-	if len(content) <= fsWriteMax {
-		t.Fatalf("test content is %dB, want it above the %dB cap", len(content), fsWriteMax)
+	if len(content) <= 16384 {
+		t.Fatalf("test content is %dB, want it above the 16384B single-op cap", len(content))
 	}
 	mustPut(t, e, "fatdrv", "2.0.0", content) // storing is size-free
 
 	res := e.call("xuansi_driver_push", map[string]any{
 		"board": "d75884", "name": "fatdrv", "version": "2.0.0",
 	})
-	if !res.IsError {
-		t.Fatalf("fat push succeeded: %+v", res)
+	if res.IsError {
+		t.Fatalf("fat push failed: %s", resultText(t, res))
 	}
-	want := fmt.Sprintf("api: fs_write /drv/fatdrv.lua: %d bytes exceeds the %dB single-file cap (refused client-side)", len(content), fsWriteMax)
-	if got := resultText(t, res); got != want {
-		t.Errorf("error text = %q, want exactly %q", got, want)
+	// wire shapes, in pipeline order
+	capsReq := wantReq(t, reqs)
+	if capsReq.Type != "op" || capsReq.Op != "caps" {
+		t.Errorf("first crossing = %+v, want the holder-less op caps", capsReq)
 	}
-	if req := wantReq(t, reqs); req.Type != "op" {
-		t.Errorf("only crossing = %+v, want the caps fetch", req)
+	writeReq := wantReq(t, reqs)
+	if writeReq.Type != "fs_write" || writeReq.Path != "/drv/fatdrv.lua" || writeReq.Holder != "mcp-fixed01" {
+		t.Errorf("fs_write request = %+v, want the held write at /drv/fatdrv.lua", writeReq)
 	}
-	noContact(t, reqs)
+	if len(writeReq.Data) != len(content) {
+		t.Errorf("fs_write carried %d bytes, want the whole %d-byte driver", len(writeReq.Data), len(content))
+	}
+	readReq := wantReq(t, reqs)
+	if readReq.Type != "fs_read" || readReq.Path != "/drv/fatdrv.lua" {
+		t.Errorf("fs_read request = %+v, want the holder-less read-back", readReq)
+	}
 	if _, err := os.Stat(filepath.Join(root, "drivers", "fatdrv@2.0.0.lua")); err != nil {
 		t.Errorf("workspace dropped the fat file: %v", err)
 	}
-	if m := wsManifest(t, root); m.Drivers["fatdrv"].Active != "" {
-		t.Errorf("Active = %q after a size refusal, want none", m.Drivers["fatdrv"].Active)
+	if m := wsManifest(t, root); m.Drivers["fatdrv"].Active != "2.0.0" {
+		t.Errorf("Active = %q after a whole-file push, want 2.0.0", m.Drivers["fatdrv"].Active)
 	}
 }
 

@@ -8,9 +8,11 @@
 //	[u32 BE len][len bytes of UTF-8 JSON]
 //
 // len counts ONLY the JSON payload. Messages above MaxMsgBytes (1 MiB —
-// the largest legitimate payload is an fs_write at the 16 KiB board
-// file cap with ample margin) are a protocol violation: the writer
-// refuses them and the reader drops the connection.
+// the largest legitimate payload is a chunked fs_write: ~786KB of file
+// bytes base64-encoded with ample margin; the board itself carries the
+// file 16 KiB at a time over the v5 chunked transport) are a protocol
+// violation: the writer refuses them and the reader drops the
+// connection.
 //
 // # Message types (the "type" key discriminates)
 //
@@ -51,8 +53,8 @@
 //	submit         {board, code, tag, args?, holder?} → board ack {tag, queued}  (lease required)
 //	script_start   {board, name, code, holder?}  → board ack       (lease required; runs under the LEASE's session namespace — the T10 eval ruling)
 //	script_stop    {board, name, holder?}        → board ack       (lease required)
-//	fs_write       {board, path, data, holder?}  → board ack       (lease required; data = base64 (JSON []byte); ≤16384B enforced daemon-side with class api, mirroring the board's own refusal)
-//	fs_read        {board, path}                 → {data: base64}  (read-only, no lease)
+//	fs_write       {board, path, data, holder?}  → {size}          (lease required; data = base64 (JSON []byte). <=16384B is one verbatim fs.write; above rides the v5 chunked transport — fs.write_part per 16KiB chunk + one fs.write_commit with the payload's sha256 — transparent here: same request, same {size} reply. B10-T1)
+//	fs_read        {board, path}                 → {data: base64}  (read-only, no lease; assembled from fs.read_part windows — files beyond the fw's 16 KiB single-op read cap come back complete; reply shape unchanged. B10-T1)
 //	fs_rm          {board, path, holder?}        → {}              (lease required; the removal path — the board's own fs.rm {path} verbatim, same gate as fs_write; a missing file is the board's api not-found, class/msg unmodified)
 //	session_reset  {board, session?, holder?}    → {stopped:n}     (lease required; session omitted = 0. The board's own session.reset {session} verbatim under eval's gate — releases that session's scripts AND pins. ns-0 is where bare evals claim pins (owner _eval, shared across evals, §2/§3.2): the b7 S4b HIL could only sweep it by the release-lease/re-lease detour because session.* is deliberately outside the ops allowlist (batch-6 ruling) — THIS request type is the dedicated path instead. {stopped:n} counts scripts stopped (a pins-only ns-0 sweep answers 0 while still releasing the pins); board error class/msg crosses unmodified)
 //	watch_events   {board, source?}              → {board}         (subscribes THIS connection; source, when given, is additionally events.subscribe'd board-side)
@@ -246,10 +248,11 @@
 // slot_held (controller arbitration window exhausted — the deliberate
 // USB reboot lease is the caller's explicit last resort), api
 // (daemon-side refusals that deliberately mirror the board's own
-// class: fs_write above the 16 KiB single-file cap, and eval/submit
-// args numbers that cannot cross the int-only args bridge — see the
-// args note above), server (malformed request, unknown type, bad
-// params, bad transport, off-allowlist op).
+// class: eval/submit args numbers that cannot cross the int-only args
+// bridge — see the args note above), server (malformed request, unknown
+// type, bad params, bad transport, off-allowlist op). The fs_write
+// 16 KiB cap refusal is gone (B10-T1): bigger writes ride the chunked
+// transport instead of being refused.
 package server
 
 import (

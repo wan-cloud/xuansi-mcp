@@ -24,8 +24,9 @@ package mcp
 // xuansi_ws_list / xuansi_ws_get read the store back, and
 // xuansi_driver_push runs the gated pipeline
 //
-//	read file → --@api gate → caps → 16384B cap → fs_write
-//	/drv/<name>.lua → fs_read back → sha256 compare → manifest
+//	read file → --@api gate → caps → fs_write (B10-T1: >16KB rides the
+//	chunked transport — fat .aot-era drivers push whole) → fs_read back
+//	→ sha256 compare → manifest
 //
 // The manifest records the push ONLY after the read-back verifies
 // byte-exact — a corrupt board write never becomes history. B8 task 1
@@ -172,7 +173,7 @@ type wsPutIn struct {
 
 type wsPutOut struct {
 	Sha256 string `json:"sha256" jsonschema:"sha256 of the stored content"`
-	Size   int    `json:"size" jsonschema:"stored bytes (the board's 16384B cap applies at push time, not here)"`
+	Size   int    `json:"size" jsonschema:"stored bytes (any size storable; the push rides the chunked transport)"`
 }
 
 type wsListIn struct{}
@@ -390,9 +391,6 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s declares --@api %d but board %s reports bench.api_version %d — the board refuses to load it (exact match, no semver)", file, api, board, want)
 	}
 	path := drvBoardPath(in.Name)
-	if len(content) > fsWriteMax {
-		return nil, driverPushOut{}, errFsTooLarge(path, len(content))
-	}
 
 	// write, read back, verify — then (and only then) the manifest.
 	// The WHOLE cycle rides wsMu (not just the manifest half): a

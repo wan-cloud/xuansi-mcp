@@ -234,7 +234,7 @@ func TestScriptStartStopShapes(t *testing.T) {
 
 // TestFsWriteDecodesBase64: data_b64 is decoded client-side — the
 // daemon sees raw bytes in the data field; the board ack passes
-// through. Exactly 16384B (the cap) still crosses.
+// through. Exactly 16384B (the single-op boundary) still crosses.
 func TestFsWriteDecodesBase64(t *testing.T) {
 	payload := []byte("hello 板上檔案") // multi-byte on purpose
 	e, reqs := newEnv(t, []step{{result: map[string]any{"ok": true}}}, Options{Holder: "mcp-fixed01"})
@@ -254,26 +254,6 @@ func TestFsWriteDecodesBase64(t *testing.T) {
 	}
 	if m := structured(t, res); m["ok"] != true {
 		t.Errorf("fs_write ack = %v, want the board ack verbatim", m)
-	}
-}
-
-// TestFsWriteAtCapCrosses: exactly 16384 decoded bytes is AT the cap,
-// not above it — it crosses to the daemon.
-func TestFsWriteAtCapCrosses(t *testing.T) {
-	data := make([]byte, fsWriteMax)
-	for i := range data {
-		data[i] = byte('0' + i%10)
-	}
-	e, reqs := newEnv(t, []step{{result: map[string]any{"ok": true}}}, Options{Holder: "mcp-fixed01"})
-
-	if res := e.call("xuansi_fs_write", map[string]any{
-		"board": "d75884", "path": "/cap.bin", "data_b64": base64Std(t, data),
-	}); res.IsError {
-		t.Fatalf("fs_write at the cap failed: %s", resultText(t, res))
-	}
-	req := wantReq(t, reqs)
-	if len(req.Data) != fsWriteMax {
-		t.Errorf("fs_write at cap sent %d bytes, want the full %d", len(req.Data), fsWriteMax)
 	}
 }
 

@@ -67,7 +67,7 @@ func newFakeCtl() *fakeCtl {
 	}
 	f.ops["hello"] = func(args map[string]any) (map[string]any, *replclient.OpError) {
 		return map[string]any{
-			"protocol_ver": int64(4), "role": "controller", "fw": "xuansi-fw v0.1.0",
+			"protocol_ver": int64(5), "role": "controller", "fw": "xuansi-fw v0.1.0",
 			"fw_build": "deadbee", "fs": true,
 		}, nil
 	}
@@ -189,7 +189,7 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	f.hellos++
 	f.mu.Unlock()
 	return &replclient.HelloInfo{
-		ProtocolVer: 4, Role: "controller", Fw: "xuansi-fw v0.1.0", FwBuild: "deadbee",
+		ProtocolVer: 5, Role: "controller", Fw: "xuansi-fw v0.1.0", FwBuild: "deadbee",
 	}, nil
 }
 
@@ -881,7 +881,7 @@ func TestCloseWaitsForInflightConnect(t *testing.T) {
 	usb.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		<-release
 		return map[string]any{
-			"protocol_ver": int64(4), "role": "controller", "fw": "xuansi-fw v0.1.0",
+			"protocol_ver": int64(5), "role": "controller", "fw": "xuansi-fw v0.1.0",
 			"fw_build": "deadbee", "fs": true,
 		}, nil
 	})
@@ -1500,23 +1500,28 @@ func TestScriptStartRequiresLease(t *testing.T) {
 	}
 }
 
-// TestFsWriteCapAndFsRead: the 16KB single-file cap is refused
-// daemon-side; fs_read is read-only (no lease needed) and returns the
-// board's bytes.
-func TestFsWriteCapAndFsRead(t *testing.T) {
+// TestFsWriteLeaseGateAndFsRead: fs_write is lease-gated; fs_read is
+// read-only (no lease needed). The 16KB cap refusal is GONE (B10-T1 —
+// bigger writes ride the chunked transport, pinned in
+// fs_chunked_test.go).
+func TestFsWriteLeaseGateAndFsRead(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	newChunkedFake(t, e, "d75884") // fs_read rides fs.read_part since B10-T1
 	c := dialSock(t, e.sock)
-	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "fs"})
-	_ = rep
-
-	big := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", 16385)))
-	rep, _ = c.call(2, map[string]any{"type": "fs_write", "board": "d75884", "path": "/lua/big.lua", "data": big})
+	rep, _ := c.call(1, map[string]any{"type": "fs_write", "board": "d75884", "path": "/lua/x.lua", "data": base64.StdEncoding.EncodeToString([]byte("x"))})
 	er := errOf(t, rep)
-	if asStr(er["class"]) != "api" {
-		t.Fatalf("class = %q, want api (%#v)", er["class"], er)
+	if asStr(er["class"]) != "not_held" {
+		t.Fatalf("class = %q, want not_held", er["class"])
 	}
 
-	rep, _ = c.call(3, map[string]any{"type": "fs_read", "board": "d75884", "path": "/lua/a.lua"})
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "fs"})
+	_ = rep
+	rep, _ = c.call(3, map[string]any{"type": "fs_write", "board": "d75884", "path": "/lua/x.lua", "data": base64.StdEncoding.EncodeToString([]byte("x"))})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("small fs_write: %#v", rep)
+	}
+
+	rep, _ = c.call(4, map[string]any{"type": "fs_read", "board": "d75884", "path": "/lua/x.lua"})
 	if asMap(rep["error"]) != nil {
 		t.Fatalf("fs_read: %#v", rep)
 	}
