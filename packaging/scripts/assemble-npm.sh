@@ -148,6 +148,11 @@ fs.writeFileSync(dest, JSON.stringify({
   name,
   version,
   description: `xuansi daemon binary for ${os}-${cpu} (installed automatically by the xuansi package)`,
+  // repository.url must EXACTLY match the GitHub repo — hard requirement
+  // of npm trusted publishers (OIDC): the registry matches it against
+  // the per-package trusted publisher config. Same value as the two
+  // hand-maintained templates (packaging/npm/*/package.json).
+  repository: { type: 'git', url: 'git+https://github.com/wan-cloud/xuansi-mcp.git' },
   os: [os],
   cpu: [cpu],
   files: ['bin'],

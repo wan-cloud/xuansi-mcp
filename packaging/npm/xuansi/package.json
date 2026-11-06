@@ -2,6 +2,10 @@
   "name": "xuansi",
   "version": "0.0.0",
   "description": "xuansi hardware probe — daemon + MCP stdio face (launcher package; the binary arrives via @xuansi/<platform> optionalDependencies)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wan-cloud/xuansi-mcp.git"
+  },
   "bin": {
     "xuansi": "bin/xuansi.js",
     "xuansi-mcp": "bin/xuansi-mcp.js"
