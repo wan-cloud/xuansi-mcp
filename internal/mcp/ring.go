@@ -8,8 +8,14 @@ package mcp
 // an entry is either fully present or fully gone, never torn, and the
 // per-source dropped count keeps the eviction observable ("丟棄計數可
 // 查"). Ordering inside a source is arrival order (newest last); the
-// merged view across sources (recent) sorts by receive timestamp,
-// stable, so equal-timestamp events keep arrival order too.
+// merged view across sources (recent) sorts by the per-board ARRIVAL
+// SEQUENCE stamped at append — never by the receive timestamp: on
+// Windows the monotonic clock ticks ~15.6ms, so a burst can land
+// entirely inside one tick, and a timestamp sort of equal-Ts entries
+// degenerates to map-iteration concatenation order, misordering the
+// merged view (first CI matrix run finding, 2026-11-06). The arrival
+// counter is assigned under the owning eventState's mutex, so it is
+// the true feed order on every platform.
 
 import (
 	"sort"
@@ -29,7 +35,16 @@ const ringCap = 256
 type ringEvent struct {
 	Source string         `json:"source"`
 	Data   map[string]any `json:"data,omitempty"`
-	Ts     time.Time      `json:"ts"` // when this process received the push
+	Ts     time.Time      `json:"ts"` // when this process received the push (display; ordering rides arr)
+
+	// arr is this event's per-board arrival sequence, stamped by
+	// boardRing.append under the owning eventState's mutex (unexported,
+	// so it never crosses the JSON wire). recent() orders the merged
+	// cross-source view by it — the receive timestamp cannot do that
+	// job on platforms with a coarse monotonic clock (Windows: a burst
+	// can share one tick, and equal-Ts entries would fall back to map
+	// iteration order — see the file comment).
+	arr int64
 }
 
 // boardRing is one board's rings, keyed by source. All access is
@@ -38,6 +53,7 @@ type ringEvent struct {
 type boardRing struct {
 	events  map[string][]ringEvent // source → ring, newest last (arrival order)
 	dropped map[string]int         // source → whole events evicted by overflow
+	arrSeq  int64                  // per-board arrival counter feeding ringEvent.arr
 }
 
 func newBoardRing() *boardRing {
@@ -47,9 +63,12 @@ func newBoardRing() *boardRing {
 	}
 }
 
-// append stores one event in its source's ring, evicting the oldest
-// WHOLE entries beyond ringCap (counted in dropped).
+// append stores one event in its source's ring, stamping the per-board
+// arrival sequence, and evicts the oldest WHOLE entries beyond ringCap
+// (counted in dropped).
 func (r *boardRing) append(ev ringEvent) {
+	r.arrSeq++
+	ev.arr = r.arrSeq
 	ring := append(r.events[ev.Source], ev)
 	if over := len(ring) - ringCap; over > 0 {
 		ring = ring[over:]
@@ -111,7 +130,7 @@ func (r *boardRing) recent(prefix string, limit int) (events []ringEvent, droppe
 		merged = append(merged, ring...)
 		dropped[src] = r.dropped[src]
 	}
-	sort.SliceStable(merged, func(i, j int) bool { return merged[i].Ts.Before(merged[j].Ts) })
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].arr < merged[j].arr })
 	if limit > 0 && len(merged) > limit {
 		merged = merged[len(merged)-limit:]
 		truncated = true
