@@ -411,14 +411,21 @@ func bindDirect(path string) (net.Listener, error) {
 // live adversary, not a race). Any other link error (a filesystem
 // that refuses socket hard-links) falls back to bindDirect, whose
 // conflict classification handles the race the old way. The scratch
-// name costs ~20 bytes of sun_path headroom beside the target — keep
-// target paths comfortably under the 104-byte darwin limit (the tests
-// do, via testutil.ShortSockDir).
+// suffix costs ~11 bytes of sun_path headroom beside the target —
+// keep target paths comfortably under the 104-byte darwin limit (the
+// tests do, via testutil.ShortSockDir).
 func bindClaim(path string) (net.Listener, error) {
 	for attempt := 0; attempt < 3; attempt++ {
-		claim := fmt.Sprintf("%s.claim-%x", path, uint64(os.Getpid())<<24|claimSeq.Add(1))
+		// scratch suffix ".c-" + 8 hex ≈ 11 bytes of sun_path headroom:
+		// pid<<10 | seq packed into 32 bits (processes diverge on pid,
+		// racers in one process on seq — wraps after 1024 claims, and a
+		// collision just costs one EADDRINUSE retry below)
+		claim := fmt.Sprintf("%s.c-%08x", path, uint64(os.Getpid())<<10|uint64(claimSeq.Add(1)&((1<<10)-1)))
 		ln, err := net.Listen("unix", claim)
 		if err != nil {
+			if isAddrInUse(err) && attempt < 2 {
+				continue // scratch-name collision: draw a fresh name
+			}
 			return nil, fmt.Errorf("server: listen claim %s: %w", claim, err)
 		}
 		lerr := os.Link(claim, path)

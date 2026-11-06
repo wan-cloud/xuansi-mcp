@@ -2350,7 +2350,7 @@ func TestNewAlreadyListeningSentinel(t *testing.T) {
 // TestStaleSockFileRemoved: a leftover socket file (dead daemon) is
 // removed and owned anew.
 func TestStaleSockFileRemoved(t *testing.T) {
-	dir := t.TempDir()
+	dir := testutil.ShortSockDir(t) // darwin's 104-byte sun_path: t.TempDir() + the claim scratch overflows (T9 mac)
 	path := filepath.Join(dir, "stale.sock")
 	if err := os.WriteFile(path, []byte("corpse"), 0o600); err != nil {
 		t.Fatalf("write stale: %v", err)
@@ -3001,7 +3001,7 @@ func TestBindSockClaimLeavesNoScratchNames(t *testing.T) {
 		t.Fatalf("read dir: %v", err)
 	}
 	for _, de := range des {
-		if strings.HasPrefix(de.Name(), "d.sock.claim-") {
+		if strings.HasPrefix(de.Name(), "d.sock.c-") {
 			t.Fatalf("scratch claim name %q survived the bind", de.Name())
 		}
 	}
