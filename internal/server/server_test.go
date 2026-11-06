@@ -246,6 +246,39 @@ func newEnvIdle(t *testing.T, idle time.Duration, aliases map[string]string, boa
 	return newEnvFull(t, 10*time.Second, idle, aliases, boards...)
 }
 
+// newTestLogf builds the tests' server-side Log seam: daemon
+// goroutines (conn drops, lease reaper teardowns, refresh loop) log
+// through it, and any of them may still be running when the test body
+// returns and cleanups start — a conn drop triggered by a cleanup's
+// conn.Close, say. A bare t.Logf there is a data race against
+// testing.tRunner's own state, which the testing package deliberately
+// leaves unsynchronized; on this suite it surfaced as the intermittent
+// -race "WARNING: DATA RACE ... newEnvFull.func3" flake (~1 run in 4,
+// reproduced on clean HEAD under repetition — the loaded-hammer
+// ambiguity the final review chased). The seam buffers under a mutex
+// instead, and the cleanup dumps the buffer through t.Logf from the
+// TEST goroutine itself (always legal) when the test failed or under
+// -v — failure evidence kept, live streaming traded away, race gone.
+func newTestLogf(t *testing.T, prefix string) func(format string, args ...any) {
+	var mu sync.Mutex
+	var lines []string
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !t.Failed() && !testing.Verbose() {
+			return
+		}
+		for _, l := range lines {
+			t.Logf("%s", l)
+		}
+	})
+	return func(format string, args ...any) {
+		mu.Lock()
+		lines = append(lines, prefix+fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+}
+
 // newEnvFull is the shared env builder: a custom grace TTL plus the
 // idle-exit window (0 = the disabled default every older test relies on).
 func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string, boards ...discover.Board) *env {
@@ -270,16 +303,18 @@ func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string
 		}),
 	)
 	e.sock = filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srvLog := newTestLogf(t, "srv: ")
+	supLog := newTestLogf(t, "sup: ")
 	srv, err := New(Opts{
 		SockPath:        e.sock,
 		Registry:        reg,
 		GraceTTL:        ttl,  // HIL-short by default; no test waits it out
 		IdleExit:        idle, // 0 = disabled unless an idle-exit test sets it
 		RefreshInterval: -1,   // no background loop; the initial sweep still runs
-		Log:             func(format string, args ...any) { t.Logf("srv: "+format, args...) },
+		Log:             srvLog,
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
-				Log: func(format string, args ...any) { t.Logf("sup: "+format, args...) },
+				Log: supLog,
 				DialTCP: func() (board.Controller, error) {
 					e.dmu.Lock()
 					e.dialed[ref.MAC6]++
@@ -371,10 +406,17 @@ func (c *sockClient) send(v any) {
 	}
 }
 
+// recvDeadline bounds one recv() wait. Generous (15s, final-review
+// minor): the old 4s produced one ambiguous timeout during the
+// reviewer's loaded-machine -race hammer — with the whole suite
+// stressing the box a legal reply can take seconds, and the deadline
+// exists to fail a hung test today, not to police latency.
+var recvDeadline = 15 * time.Second
+
 // recv reads one framed JSON message into a map (deadline-bounded).
 func (c *sockClient) recv() map[string]any {
 	c.t.Helper()
-	c.conn.SetDeadline(time.Now().Add(4 * time.Second))
+	c.conn.SetDeadline(time.Now().Add(recvDeadline))
 	var m map[string]any
 	if err := ReadMsg(c.conn, &m); err != nil {
 		c.t.Fatalf("recv: %v", err)
@@ -943,10 +985,10 @@ func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 		RefreshInterval: -1,
 		RequestTimeout:  400 * time.Millisecond, // bound the dial retry loop
 		AuditTimeout:    200 * time.Millisecond, // the audit's dead-TCP retries must not pin connectMu
-		Log:             func(format string, args ...any) { t.Logf("srv: "+format, args...) },
+		Log:             newTestLogf(t, "srv: "),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
-				Log: func(format string, args ...any) { t.Logf("sup: "+format, args...) },
+				Log: newTestLogf(t, "sup: "),
 				DialTCP: func() (board.Controller, error) {
 					return nil, fmt.Errorf("wifi-dead bench: tcp dial refused")
 				},
@@ -2427,7 +2469,7 @@ func TestEnsureLiveLeaseAdoptFalseGatesOps(t *testing.T) {
 	m := lease.NewManager(lease.Policy{GraceTTL: 100 * time.Millisecond, Clock: clk})
 	m.Close() // reaper out: the read sequence is ours alone
 
-	s := &Server{leases: m, logf: func(format string, args ...any) { t.Logf("srv: "+format, args...) }}
+	s := &Server{leases: m, logf: newTestLogf(t, "srv: ")}
 	if err := m.Acquire("d75884", "edge"); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -2540,7 +2582,7 @@ func TestEnsureLiveLeaseTeardownWindowGated(t *testing.T) {
 		m.Close()
 	})
 
-	s := &Server{leases: m, logf: func(format string, args ...any) { t.Logf("srv: "+format, args...) }}
+	s := &Server{leases: m, logf: newTestLogf(t, "srv: ")}
 	if err := m.Acquire("d75884", "t1"); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -3038,6 +3080,84 @@ func TestBindSockDeadSocketFileIsStale(t *testing.T) {
 	c, err := net.Dial("unix", target)
 	if err != nil {
 		t.Fatalf("dial after re-claim: %v", err)
+	}
+	c.Close()
+}
+
+// TestBindSockSweepsDeadClaimScratch: the bind-time scratch sweep
+// (final-review minor) — a racer killed between its scratch bind and
+// the link leaks a dead path+".c-XXXXXXXX" file forever, so the NEXT
+// bindSock at that path collects it: probe-dial each scratch sibling,
+// remove the dead socket (and any regular file wearing the name),
+// leave a LIVE scratch (an active racer's armed listener) strictly
+// alone, and never touch the main sock path or non-matching names.
+func TestBindSockSweepsDeadClaimScratch(t *testing.T) {
+	if !linkClaimSupported {
+		t.Skip("link-claim unsupported here: bindSock never creates scratch names")
+	}
+	dir := testutil.ShortSockDir(t)
+	target := filepath.Join(dir, "sweep.sock")
+
+	// a dead scratch SOCKET: the crashed-racer shape (file stays after
+	// the listener is gone — the SetUnlinkOnClose trick above)
+	deadSock := target + ".c-0000dead"
+	dln, err := net.Listen("unix", deadSock)
+	if err != nil {
+		t.Fatalf("listen dead scratch: %v", err)
+	}
+	ul, ok := dln.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener is %T", dln)
+	}
+	ul.SetUnlinkOnClose(false)
+	dln.Close()
+
+	// a regular file wearing a scratch name: garbage too
+	deadFile := target + ".c-0000beef"
+	if err := os.WriteFile(deadFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write scratch file: %v", err)
+	}
+
+	// a LIVE scratch: an active racer's armed listener — must survive
+	liveScratch := target + ".c-0000cafe"
+	lln, err := net.Listen("unix", liveScratch)
+	if err != nil {
+		t.Fatalf("listen live scratch: %v", err)
+	}
+	defer lln.Close()
+
+	// near-miss names: not the scratch shape, never swept
+	keepNear := []string{target + ".c-abc", target + ".c-123456789", target + ".c-zzzzzzzz", filepath.Join(dir, "other.sock")}
+	for _, n := range keepNear {
+		if err := os.WriteFile(n, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write near-miss %s: %v", n, err)
+		}
+	}
+
+	ln, err := bindSock(target)
+	if err != nil {
+		t.Fatalf("bindSock: %v", err)
+	}
+	defer ln.Close()
+
+	if _, err := os.Stat(deadSock); !os.IsNotExist(err) {
+		t.Errorf("dead scratch socket %q survived the sweep (err=%v)", deadSock, err)
+	}
+	if _, err := os.Stat(deadFile); !os.IsNotExist(err) {
+		t.Errorf("regular scratch file %q survived the sweep (err=%v)", deadFile, err)
+	}
+	if _, err := os.Stat(liveScratch); err != nil {
+		t.Fatalf("LIVE scratch %q was swept — an active racer's scratch must be left alone: %v", liveScratch, err)
+	}
+	for _, n := range keepNear {
+		if _, err := os.Stat(n); err != nil {
+			t.Errorf("non-scratch name %q was touched by the sweep: %v", n, err)
+		}
+	}
+	// and the claim itself still answers (the sweep broke nothing)
+	c, err := net.Dial("unix", target)
+	if err != nil {
+		t.Fatalf("dial the claimed target: %v", err)
 	}
 	c.Close()
 }

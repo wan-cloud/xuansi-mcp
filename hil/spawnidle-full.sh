@@ -8,7 +8,8 @@
 # survivor audit + bench cleanup -> concurrent spawn race (one winner,
 # loser exit 0, deliberate double-start proof) -> second-cycle smoke ->
 # teardown + sandbox accounting). Failing runs keep their own
-# attempt-N transcript; the canonical results/2026-11-06-spawn-idle-full.log
+# attempt-N-EPOCH transcript (a rerun never overwrites an earlier
+# attempt); the canonical results/2026-11-06-spawn-idle-full.log
 # is written only by the ALL-PASS run. Rerun with ATTEMPT=N after a fix.
 # Batch evidence discipline: ASCII only, no em-dashes.
 set -euo pipefail
@@ -16,7 +17,6 @@ cd "$(dirname "$0")/.."
 mkdir -p results
 run="${RUN:-/tmp/opencode/spawnidle-full}"
 attempt="${ATTEMPT:-1}"
-log="results/2026-11-06-spawn-idle-full-attempt${attempt}.log"
 
 # pre-clean: a failed earlier attempt may have left a detached sandbox
 # serve on this run dir's sock (the dir is wiped below, but the process
@@ -27,6 +27,12 @@ if pkill -f "serve --sock ${run}/runtime" 2>/dev/null; then
 fi
 
 rm -rf "$run"; mkdir -p "$run"
+# epoch suffix on the attempt transcript (final-review minor): reruns
+# must never overwrite earlier attempts even at the same ATTEMPT
+# number -- the T10 rerun's attempt1/2 clobbered T7's, and that
+# evidence now lives only in git history.
+epoch="$(date +%s)"
+log="results/2026-11-06-spawn-idle-full-attempt${attempt}-${epoch}.log"
 exec > >(tee "$log") 2>&1
 echo "capture: $log ($(date -Is))"
 echo "repo HEAD: $(git rev-parse --short HEAD) - dirty files: $(git status --porcelain | wc -l)"
