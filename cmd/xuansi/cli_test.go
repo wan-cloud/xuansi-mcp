@@ -16,6 +16,7 @@ import (
 	"xuansi/internal/discover"
 	"xuansi/internal/replclient"
 	"xuansi/internal/server"
+	"xuansi/internal/testutil"
 )
 
 // cmdFake is the minimal board controller the CLI tests need (the
@@ -93,7 +94,7 @@ func startMockDaemonUSB(t *testing.T) (string, *cmdFake) {
 		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
 	)
 	srv, err := server.New(server.Opts{
-		SockPath:        t.TempDir() + "/d.sock",
+		SockPath:        testutil.ShortSockDir(t) + "/d.sock",
 		Registry:        reg,
 		GraceTTL:        10 * time.Second,
 		RefreshInterval: -1,

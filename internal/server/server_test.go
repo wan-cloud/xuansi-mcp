@@ -30,6 +30,7 @@ import (
 	"xuansi/internal/discover"
 	"xuansi/internal/lease"
 	"xuansi/internal/replclient"
+	"xuansi/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -268,7 +269,7 @@ func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string
 			return boards, nil
 		}),
 	)
-	e.sock = filepath.Join(t.TempDir(), "d.sock")
+	e.sock = filepath.Join(testutil.ShortSockDir(t), "d.sock")
 	srv, err := New(Opts{
 		SockPath:        e.sock,
 		Registry:        reg,
@@ -924,7 +925,7 @@ func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
 		}),
 	)
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(testutil.ShortSockDir(t), "d.sock")
 	srv, err := New(Opts{
 		SockPath:        sock,
 		Registry:        reg,
@@ -2805,7 +2806,7 @@ func TestSupervisorRefCarriesIP(t *testing.T) {
 	)
 	var gotRef board.BoardRef
 	srv, err := New(Opts{
-		SockPath: filepath.Join(t.TempDir(), "d.sock"),
+		SockPath: filepath.Join(testutil.ShortSockDir(t), "d.sock"),
 		Registry: reg,
 		GraceTTL: time.Second,
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
@@ -2845,7 +2846,7 @@ func TestSupervisorRefCarriesIP(t *testing.T) {
 func TestBindSockConcurrentRaceGracefulLosers(t *testing.T) {
 	const rounds = 30
 	for r := 0; r < rounds; r++ {
-		path := filepath.Join(t.TempDir(), "race.sock")
+		path := filepath.Join(testutil.ShortSockDir(t), "race.sock")
 		const n = 6
 		res := make([]error, n)
 		var wg sync.WaitGroup

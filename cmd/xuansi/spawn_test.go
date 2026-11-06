@@ -20,6 +20,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"xuansi/internal/testutil"
 )
 
 // spawnFailHelperEnv carries the log path to the failure-tail helper
@@ -152,7 +154,7 @@ func listenAndHold(t *testing.T, sock string, delay time.Duration) <-chan struct
 func TestEnsureDaemonSpawnsAndDials(t *testing.T) {
 	quietSlog(t)
 	state := sandboxStateDir(t)
-	sock := filepath.Join(t.TempDir(), "spawn.sock")
+	sock := filepath.Join(testutil.ShortSockDir(t), "spawn.sock")
 	shrinkSpawnRetries(t, 10*time.Millisecond, 5*time.Second)
 	bound := listenAndHold(t, sock, 150*time.Millisecond)
 
@@ -183,7 +185,7 @@ func TestEnsureDaemonSpawnsAndDials(t *testing.T) {
 // through — the dial succeeds and serveSpawn must never fire.
 func TestEnsureDaemonNoSpawnWhenAlive(t *testing.T) {
 	sandboxStateDir(t) // even a mistaken spawn must stay off the real state dir
-	sock := filepath.Join(t.TempDir(), "alive.sock")
+	sock := filepath.Join(testutil.ShortSockDir(t), "alive.sock")
 	bound := listenAndHold(t, sock, 0)
 	<-bound // the stand-in daemon is really listening before we probe
 	spawned := false
@@ -212,7 +214,7 @@ func TestEnsureDaemonNoSpawnWhenAlive(t *testing.T) {
 func TestEnsureDaemonFailureTail(t *testing.T) {
 	quietSlog(t)
 	state := sandboxStateDir(t)
-	sock := filepath.Join(t.TempDir(), "dead.sock")
+	sock := filepath.Join(testutil.ShortSockDir(t), "dead.sock")
 	shrinkSpawnRetries(t, 5*time.Millisecond, time.Second)
 
 	overrideSpawn(t, func(sock, logPath string) *exec.Cmd {
@@ -272,7 +274,7 @@ func TestXuansiSpawnFailHelperProcess(t *testing.T) {
 func TestStartServeRetryFlow(t *testing.T) {
 	quietSlog(t)
 	state := sandboxStateDir(t)
-	sock := filepath.Join(t.TempDir(), "flow.sock")
+	sock := filepath.Join(testutil.ShortSockDir(t), "flow.sock")
 	logPath := filepath.Join(state, serveLogName)
 	failing := func(sock, logPath string) *exec.Cmd {
 		return exec.Command(filepath.Join(t.TempDir(), "no-such-xuansi-binary"))
