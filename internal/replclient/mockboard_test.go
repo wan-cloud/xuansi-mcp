@@ -6,10 +6,12 @@ package replclient
 // per-op script. Tests can additionally tell it to deliver frames in
 // fragments (splitting frame headers across writes, §9), to prefix
 // replies with len==0 empty frames (§1 tolerance), to go silent, to park
-// one op's replies for out-of-order delivery, and to emit the fatal §7
+// one op's replies for out-of-order delivery, to emit the fatal §7
 // sequence — exactly one protocol error frame with id=nil followed by
 // permanent silence, which is what the real board does after a
-// frame-layer violation (e.g. a reserved 0x02 type byte).
+// frame-layer violation (e.g. a host→board 0x02 type byte — data frames
+// are board→host only) — and to burst 0x02 data frames between the ctrl
+// frames, in order or with injected chunk gaps.
 
 import (
 	"context"
@@ -150,12 +152,19 @@ func (b *mockBoard) helloHandler(args map[string]any) (map[string]any, *boardErr
 func (b *mockBoard) serve() {
 	fr := newFrameReader(b.conn)
 	for {
-		payload, err := fr.next()
+		f, err := fr.next()
 		if err != nil {
 			if !errors.Is(err, errFatal) {
 				return // pipe closed — normal teardown
 			}
 			b.goFatal(err.Error())
+			b.drain()
+			return
+		}
+		if f.Type == frameTypeData {
+			// Data frames are board→host only: from the host a 0x02 is
+			// still a fatal violation (§7) — play the real board.
+			b.goFatal("frame type 0x02 from host")
 			b.drain()
 			return
 		}
@@ -165,7 +174,7 @@ func (b *mockBoard) serve() {
 			continue // CS_DEAD: input silently discarded
 		}
 		b.mu.Unlock()
-		msg, err := decodeMessage(payload)
+		msg, err := decodeMessage(f.Payload)
 		if err != nil {
 			continue // framed garbage: drop, stay framed
 		}
@@ -217,7 +226,7 @@ func (b *mockBoard) drain() {
 	}
 }
 
-// send writes one framed message, honoring the fragmentation and
+// send writes one framed ctrl message, honoring the fragmentation and
 // zero-len knobs.
 func (b *mockBoard) send(msg map[string]any) {
 	payload, err := encodeMessage(msg)
@@ -228,6 +237,20 @@ func (b *mockBoard) send(msg map[string]any) {
 	if err != nil {
 		return
 	}
+	b.writeWire(f)
+}
+
+// sendData writes one 0x02 data frame as the board (board→host only),
+// through the same fragmentation and zero-len knobs as send — so
+// interleaved data/ctrl bursts, split deliveries, and gap scenarios
+// can all be scripted alike.
+func (b *mockBoard) sendData(ch byte, seq uint32, idx, total uint16, payload []byte) {
+	b.writeWire(dataFrame(ch, seq, idx, total, payload))
+}
+
+// writeWire writes whole frame bytes, honoring the fragmentation and
+// zero-len knobs.
+func (b *mockBoard) writeWire(f []byte) {
 	b.mu.Lock()
 	frag, zero := b.frag, b.zeroLen
 	b.mu.Unlock()
