@@ -415,6 +415,7 @@ func bindDirect(path string) (net.Listener, error) {
 // keep target paths comfortably under the 104-byte darwin limit (the
 // tests do, via testutil.ShortSockDir).
 func bindClaim(path string) (net.Listener, error) {
+	sweepClaimScratch(path)
 	for attempt := 0; attempt < 3; attempt++ {
 		// scratch suffix ".c-" + 8 hex ≈ 11 bytes of sun_path headroom:
 		// pid<<10 | seq packed into 32 bits (processes diverge on pid,
@@ -449,6 +450,62 @@ func bindClaim(path string) (net.Listener, error) {
 		}
 	}
 	return nil, fmt.Errorf("server: claim %s: lost the link race 3 times", path)
+}
+
+// isClaimScratch reports whether name is one of target's claim-scratch
+// names: exactly target + ".c-" + 8 hex digits (bindClaim's shape —
+// the pid<<10|seq packing above). Anything else — the target itself, a
+// short/long/malformed suffix, a different prefix — is not sweepable.
+func isClaimScratch(target, name string) bool {
+	suffix, ok := strings.CutPrefix(name, target+".c-")
+	if !ok || len(suffix) != 8 {
+		return false
+	}
+	for i := 0; i < len(suffix); i++ {
+		c := suffix[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepClaimScratch removes DEAD claim-scratch siblings of path: a
+// racer killed between its scratch bind and the link (or before the
+// post-link scratch remove) leaks its path+".c-XXXXXXXX" socket file
+// forever — this bind-time sweep is the only garbage collector that
+// name shape has (final-review minor). Liveness is a probe-dial: a
+// scratch that CONNECTS is an active racer's armed listener and is
+// left strictly alone; a socket that refuses the dial, or a regular
+// file wearing the name, is garbage and removed. The main sock path
+// never matches the scratch shape, and nothing else in the directory
+// is touched. The tiny bind-but-not-yet-listening window inside a
+// live racer's net.Listen can cost it its scratch file — its link
+// then fails ENOENT, which bindClaim routes to bindDirect, the exact
+// pre-claim conflict handling: degraded, never orphaned.
+func sweepClaimScratch(path string) {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // the MkdirAll/bind below surfaces a real problem
+	}
+	base := filepath.Base(path)
+	for _, e := range entries {
+		if !isClaimScratch(base, e.Name()) {
+			continue
+		}
+		scratch := filepath.Join(dir, e.Name())
+		if fi, ierr := e.Info(); ierr == nil && fi.Mode()&os.ModeSocket != 0 {
+			if c, derr := net.Dial("unix", scratch); derr == nil {
+				c.Close()
+				continue // an active racer still holds this scratch
+			}
+		}
+		os.Remove(scratch)
+	}
 }
 
 // Start launches the serving loops: accept, the initial discovery sweep
