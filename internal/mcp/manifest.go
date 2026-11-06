@@ -104,9 +104,11 @@ func loadManifest(path string) (*Manifest, error) {
 
 // writeDurableFile writes data to path ATOMICALLY (B8 item 5): a temp
 // file in the SAME directory (the rename stays on one filesystem),
-// written, fsynced, chmodded to perm and renamed over the target, then
-// the parent directory fsynced (unix; on windows fsyncDir is a no-op —
-// no POSIX dir-fsync exists there, see fsync_windows.go) — the
+// written, fsynced, chmodded to perm, closed, and renamed over the
+// target (on windows via replaceFile — a bounded retry past transient
+// sharing violations from concurrent readers, see rename_windows.go),
+// then the parent directory fsynced (unix; on windows fsyncDir is a
+// no-op — no POSIX dir-fsync exists there, see fsync_windows.go) — the
 // crash-durability pair (without the file fsync the bytes may be lost
 // on power failure; without the directory fsync the fresh rename can
 // vanish). A concurrent reader
@@ -138,7 +140,7 @@ func writeDurableFile(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := replaceFile(tmpName, path); err != nil {
 		return err
 	}
 	return fsyncDir(filepath.Dir(path))
