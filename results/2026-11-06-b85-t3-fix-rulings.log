@@ -1,0 +1,108 @@
+# B8.5 T3 fix — two controller rulings (branch b85-npm-tail @ b6854c2, 2026-11-06T03:25:26Z)
+
+== gate 1: full launcher smoke suite (8 existing + 4 alias) ==
+ok   - platform map: six exact keys + six stub dry-resolutions
+ok   - unsupported platform: error carries install hint
+ok   - stdio inherit: stdout byte-exact (frame seq), stderr clean
+ok   - exit-code forwarding: fake exit 7 -> launcher 7
+ok   - exit-code forwarding: fake exit 0 -> launcher 0
+ok   - xuansi-mcp: argv forwarded with 'mcp' prepended
+ok   - missing package: install hint on stderr, empty stdout, exit 1
+ok   - SIGTERM forwarding: child saw TERM, exit 9 propagated
+ok   - alias package contract: name xuansi-mcp, bin map, single dep xuansi
+ok   - alias bin: resolves xuansi via node_modules, 'mcp' prepended to argv
+ok   - alias stdio passthrough: stdout byte-exact, stderr clean
+ok   - alias exit forwarding: fake exit 7 -> alias 7
+----
+launcher-test: 12 passed, 0 failed
+smoke exit=0
+
+== gate 2: e2e list via real binary through launcher ==
+time=2026-11-06T11:25:28.028+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/run/user/1000/xuansi/daemon.sock pid=748382 log=/home/wan/.local/state/xuansi/serve.log
+ALIAS  MAC6  SOURCES  HOST  FW
+no boards known yet — the daemon refreshes discovery every 30s
+e2e exit=0
+
+== gate 3: assemble-npm.sh 0.1.0 ==
+== assemble-npm 0.1.0 -> packaging/dist/xuansi-0.1.0
+   main package: xuansi@0.1.0 (optionalDependencies pinned)
+   alias package: xuansi-mcp@0.1.0 (dependency xuansi pinned)
+   NOTE skipped darwin subpackage @xuansi/darwin-arm64: no xuansi-darwin-arm64
+        (expected locally; CI's macos job provides it — see header)
+   NOTE skipped darwin subpackage @xuansi/darwin-x64: no xuansi-darwin-amd64
+        (expected locally; CI's macos job provides it — see header)
+   subpackage: @xuansi/linux-arm64@0.1.0  <- bin/xuansi-linux-arm64
+   subpackage: @xuansi/linux-x64@0.1.0  <- bin/xuansi-linux-amd64
+   subpackage: @xuansi/win32-arm64@0.1.0  <- bin/xuansi-windows-arm64.exe
+   subpackage: @xuansi/win32-x64@0.1.0  <- bin/xuansi-windows-amd64.exe
+== done: /home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-npm/packaging/dist/xuansi-0.1.0
+   (2 darwin subpackage(s) skipped — CI macos job fills the slot)
+assemble exit=0
+-- dist tree --
+linux-arm64
+linux-x64
+win32-arm64
+win32-x64
+xuansi
+xuansi-mcp
+-- alias package.json as assembled --
+{
+  "name": "xuansi-mcp",
+  "version": "0.1.0",
+  "description": "xuansi-mcp — zero-install MCP alias: `npx -y xuansi-mcp` runs the xuansi daemon's MCP stdio face (delegates to the xuansi launcher package)",
+  "bin": {
+    "xuansi-mcp": "bin/xuansi-mcp.js"
+  },
+  "dependencies": {
+    "xuansi": "0.1.0"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
+-- npm pack --dry-run (alias) --
+npm notice
+npm notice 📦  xuansi-mcp@0.1.0
+npm notice Tarball Contents
+npm notice 690B README.md
+npm notice 646B bin/xuansi-mcp.js
+npm notice 379B package.json
+npm notice Tarball Details
+npm notice name: xuansi-mcp
+npm notice version: 0.1.0
+npm notice filename: xuansi-mcp-0.1.0.tgz
+npm notice package size: 1.0 kB
+npm notice unpacked size: 1.7 kB
+npm notice shasum: 91c899fd209ad759a31e07c81c4b2e1f1411ffb2
+npm notice integrity: sha512-mZqlFvPMtcZYV[...]mqEapQ4dkld1A==
+npm notice total files: 3
+npm notice
+xuansi-mcp-0.1.0.tgz
+pack exit=0
+
+== gate 4: make vet + make test ==
+go vet ./...
+vet exit=0
+ok  	xuansi/internal/replclient	1.450s
+ok  	xuansi/internal/server	19.021s
+ok  	xuansi/internal/testutil	0.007s
+test exit=0
+
+== gate 2 (rerun after discovery settled) ==
+ALIAS  MAC6    SOURCES   HOST                                    FW
+-      d75884  usb+mdns  10.1.51.205:7777 (xuansi-d75884.local)  03f634b
+e2e exit=0
+
+== ruling 2 evidence: v-strip at ldflags (HEAD b6854c2, describe: v0.1.0-3-gb6854c2) ==
+-- make variable (strip applied to describe output) --
+VERSION := 0.1.0-3-gb6854c2
+-- plain make build (describe path) --
+0.1.0-3-gb6854c2
+v-prefixed lines: 0
+-- exact-shape build (VERSION=0.1.0; the post-strip CI tag-build shape) --
+gate grep count: 1
+-- T1 TestVersionInjected (go-test path, synthetic v9.9.9-test) --
+ok  	xuansi/cmd/xuansi	0.006s
