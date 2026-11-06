@@ -596,7 +596,14 @@ func TestListBoardsShape(t *testing.T) {
 }
 
 // TestReplyIDPairingUnderConcurrency: two requests in flight on one
-// connection each get the reply carrying their own id.
+// connection each get the reply carrying their own id. The replies may
+// legally complete in EITHER order — the server runs each request's
+// handler independently and the writer serializes bytes, not
+// completion order — so the two requests are pipelined (both sent
+// before either reply is read) and replies are paired centrally by id.
+// The old shape (two concurrent send+read call()s, each reader
+// assuming its own reply arrives first) was the long-known
+// cross-platform flake.
 func TestReplyIDPairingUnderConcurrency(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -607,36 +614,39 @@ func TestReplyIDPairingUnderConcurrency(t *testing.T) {
 		t.Fatalf("lease: %#v", rep)
 	}
 
-	var wg sync.WaitGroup
-	type outcome struct {
-		id   int64
-		code string
-	}
-	out := make(chan outcome, 2)
+	// pipeline: both requests outstanding at once (sends are framed
+	// one Write each — the wire is not a parallel-write surface)
 	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			id := int64(200 + i)
-			code := fmt.Sprintf("return %d", i)
-			rep, _ := c.call(id, map[string]any{"type": "eval", "board": "d75884", "code": code})
-			if asMap(rep["error"]) != nil {
-				t.Errorf("eval %d: %#v", id, rep)
-			}
-			if asInt(rep["id"]) != id {
-				t.Errorf("reply id = %v, want %d", rep["id"], id)
-			}
-			out <- outcome{id: asInt(rep["id"]), code: code}
-		}(i)
+		c.send(map[string]any{
+			"type": "eval", "board": "d75884",
+			"code": fmt.Sprintf("return %d", i),
+			"id":   int64(200 + i),
+		})
 	}
-	wg.Wait()
-	close(out)
-	seen := map[int64]bool{}
-	for o := range out {
-		if seen[o.id] {
-			t.Fatalf("duplicate reply id %d", o.id)
+
+	replies := map[int64]map[string]any{}
+	for len(replies) < 2 {
+		m := c.recv()
+		if m["type"] == "event" || m["type"] == "capture_done" {
+			t.Fatalf("unexpected push during eval pairing: %#v", m)
 		}
-		seen[o.id] = true
+		id := asInt(m["id"])
+		if id != 200 && id != 201 {
+			t.Fatalf("unexpected reply id %d: %#v", id, m)
+		}
+		if _, dup := replies[id]; dup {
+			t.Fatalf("duplicate reply id %d", id)
+		}
+		replies[id] = m
+	}
+	for i := 0; i < 2; i++ {
+		id := int64(200 + i)
+		if asMap(replies[id]["error"]) != nil {
+			t.Errorf("eval %d: %#v", id, replies[id])
+		}
+		if got := asInt(replies[id]["id"]); got != id {
+			t.Errorf("reply id = %v, want %d", got, id)
+		}
 	}
 }
 
