@@ -9,7 +9,9 @@ package server
 // the HIL/smoke's job (results/2026-11-05-b5-t11-*.log).
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -45,6 +47,7 @@ type fakeCtl struct {
 	handlers map[int]evHandler
 	nextHID  int
 	hellos   int
+	sink     replclient.StreamSink // the connection's current 0x02 sink (camera scripting drives it synchronously)
 }
 
 type mockCall struct {
@@ -64,7 +67,7 @@ func newFakeCtl() *fakeCtl {
 	}
 	f.ops["hello"] = func(args map[string]any) (map[string]any, *replclient.OpError) {
 		return map[string]any{
-			"protocol_ver": int64(3), "role": "controller", "fw": "xuansi-fw v0.1.0",
+			"protocol_ver": int64(4), "role": "controller", "fw": "xuansi-fw v0.1.0",
 			"fw_build": "deadbee", "fs": true,
 		}, nil
 	}
@@ -121,6 +124,28 @@ func (f *fakeCtl) got() []mockCall {
 	return out
 }
 
+// markDead flips the liveness flag (a scripted link death under a warm
+// controller — the redial paths' trigger).
+func (f *fakeCtl) markDead() {
+	f.mu.Lock()
+	f.dead = true
+	f.mu.Unlock()
+}
+
+// OnStream stores the connection's 0x02 sink (nil clears).
+func (f *fakeCtl) OnStream(sink replclient.StreamSink) {
+	f.mu.Lock()
+	f.sink = sink
+	f.mu.Unlock()
+}
+
+// sinkSnapshot reads the current sink.
+func (f *fakeCtl) sinkSnapshot() replclient.StreamSink {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sink
+}
+
 // push delivers one board event to the prefix subscribers (the tap).
 func (f *fakeCtl) push(source string, data map[string]any) {
 	f.mu.Lock()
@@ -164,7 +189,7 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	f.hellos++
 	f.mu.Unlock()
 	return &replclient.HelloInfo{
-		ProtocolVer: 3, Role: "controller", Fw: "xuansi-fw v0.1.0", FwBuild: "deadbee",
+		ProtocolVer: 4, Role: "controller", Fw: "xuansi-fw v0.1.0", FwBuild: "deadbee",
 	}, nil
 }
 
@@ -856,7 +881,7 @@ func TestCloseWaitsForInflightConnect(t *testing.T) {
 	usb.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		<-release
 		return map[string]any{
-			"protocol_ver": int64(3), "role": "controller", "fw": "xuansi-fw v0.1.0",
+			"protocol_ver": int64(4), "role": "controller", "fw": "xuansi-fw v0.1.0",
 			"fw_build": "deadbee", "fs": true,
 		}, nil
 	})
@@ -1920,10 +1945,15 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // single-source test below fails when the table, the hOp refusal's
 // rendered list, or either MCP description (pinned separately in
 // internal/mcp) drifts from it. diag.i2cslave joined with b7 — the
-// driver-pipeline loopback's on-board fixture toggle.
+// driver-pipeline loopback's on-board fixture toggle; camera.capture/
+// status/off joined with b9 (the camera face — capture's 0x02 stream
+// is consumed by the dedicated camera_shot request; through op it
+// returns the metadata reply and the stream is dropped daemon-side).
 var opsFaceAllowlistV1 = []string{
-	"budget.get", "budget.set", "caps", "diag.heapinfo", "diag.i2cslave",
-	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup", "wifi.status",
+	"budget.get", "budget.set", "camera.capture", "camera.off",
+	"camera.status", "caps", "diag.heapinfo", "diag.i2cslave",
+	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup",
+	"wifi.status",
 }
 
 // TestOpAllowlistSingleSource: the ops face's allowlist is single-source
@@ -2001,6 +2031,209 @@ func TestOpDiagI2CSlaveForwarded(t *testing.T) {
 	res := asMap(rep["result"])
 	if asInt(res["mode"]) != 1 || asStr(res["state"]) != "on" {
 		t.Fatalf("diag.i2cslave result = %#v, want the board's reply", rep["result"])
+	}
+}
+
+// scriptCamera wires the fake's camera.capture: two SOI/EOI frames
+// streamed as ch=1 two-chunk sequences through the connection's
+// registered sink BEFORE the reply (the fw's frames-then-reply order).
+// gap drops frame 0's second chunk — a daemon-side reassembly loss the
+// board's reply cannot know about (it still reports frames=2).
+func scriptCamera(f *fakeCtl, gap bool) {
+	frames := [][]byte{
+		{0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9},
+		{0xFF, 0xD8, 4, 5, 6, 7, 0xFF, 0xD9},
+	}
+	f.on("camera.capture", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		sink := f.sinkSnapshot()
+		total := int64(0)
+		for i, fr := range frames {
+			half := len(fr) / 2
+			sink(1, uint32(7+i), 0, 2, fr[:half])
+			if !(gap && i == 0) {
+				sink(1, uint32(7+i), 1, 2, fr[half:])
+			}
+			total += int64(len(fr))
+		}
+		return map[string]any{
+			"frames": int64(2), "bytes": total, "w": int64(640), "h": int64(480),
+			"format": "JPEG", "sensor": "GC2145", "seq0": int64(7),
+		}, nil
+	})
+}
+
+// TestCameraShotLandsFiles: the dedicated camera_shot request — lease
+// gate, args shaping, per-frame JPEG landing under the captures root
+// (O_EXCL-unique <epoch>-<mac6>-camera[-N].jpg, one file per frame,
+// sha256/bytes/w/h per file), and the gap path: a lost chunk drops its
+// frame from files and counts in gaps while the call still succeeds.
+func TestCameraShotLandsFiles(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	e.srv.mu.Lock()
+	e.srv.captureRoot = t.TempDir()
+	e.srv.mu.Unlock()
+	c := dialSock(t, e.sock)
+
+	// the lease gate applies — camera.capture is not ro
+	rep, _ := c.call(1, map[string]any{"type": "camera_shot", "board": "d75884"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "not_held" {
+		t.Fatalf("no-lease class = %q, want not_held (%#v)", er["class"], er)
+	}
+
+	// daemon-side validation, before any board contact
+	rep, _ = c.call(2, map[string]any{"type": "camera_shot", "board": "d75884", "framesize": "SVGA"})
+	er = errOf(t, rep)
+	if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "QVGA") || !strings.Contains(asStr(er["msg"]), "VGA") {
+		t.Fatalf("bad framesize = %s: %q, want api naming QVGA and VGA", er["class"], asStr(er["msg"]))
+	}
+	rep, _ = c.call(3, map[string]any{"type": "camera_shot", "board": "d75884", "frames": float64(5)})
+	er = errOf(t, rep)
+	if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "1..4") {
+		t.Fatalf("bad frames = %s: %q, want api naming the 1..4 range", er["class"], asStr(er["msg"]))
+	}
+	for _, call := range e.fakes["d75884"].got() {
+		if call.op == "camera.capture" {
+			t.Fatal("a refused camera_shot reached the board")
+		}
+	}
+
+	rep, _ = c.call(4, map[string]any{"type": "lease", "board": "d75884", "holder": "camshot"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	scriptCamera(e.fakes["d75884"], false)
+	rep, _ = c.call(5, map[string]any{"type": "camera_shot", "board": "d75884", "frames": float64(2), "framesize": "VGA"})
+	res := asMap(rep["result"])
+	if res == nil {
+		t.Fatalf("camera_shot: %#v", rep)
+	}
+	files, _ := res["files"].([]any)
+	if len(files) != 2 {
+		t.Fatalf("files = %d entries, want 2 (%#v)", len(files), res)
+	}
+	if g := asInt(res["gaps"]); g != 0 {
+		t.Fatalf("gaps = %d, want 0", g)
+	}
+	if s := asStr(res["sensor"]); s != "GC2145" {
+		t.Fatalf("sensor = %q, want GC2145", s)
+	}
+	wantBody := [][]byte{
+		{0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9},
+		{0xFF, 0xD8, 4, 5, 6, 7, 0xFF, 0xD9},
+	}
+	root := ""
+	e.srv.mu.Lock()
+	root = e.srv.captureRoot
+	e.srv.mu.Unlock()
+	for i, fe := range files {
+		fm, _ := fe.(map[string]any)
+		path := asStr(fm["path"])
+		wantName := fmt.Sprintf("%d-d75884-camera-%d.jpg", time.Now().Unix(), i+1)
+		if filepath.Base(path) != wantName {
+			t.Fatalf("file[%d] name = %q, want %q", i, filepath.Base(path), wantName)
+		}
+		if !strings.HasPrefix(path, root) {
+			t.Fatalf("file[%d] outside the captures root: %q (root %q)", i, path, root)
+		}
+		body, rerr := os.ReadFile(path)
+		if rerr != nil {
+			t.Fatalf("file[%d] read: %v", i, rerr)
+		}
+		if !bytes.Equal(body, wantBody[i]) {
+			t.Fatalf("file[%d] body = %v, want %v", i, body, wantBody[i])
+		}
+		sum := sha256.Sum256(wantBody[i])
+		if asStr(fm["sha256"]) != fmt.Sprintf("%x", sum) {
+			t.Fatalf("file[%d] sha256 = %q, want %x", i, asStr(fm["sha256"]), sum)
+		}
+		if asInt(fm["bytes"]) != int64(len(wantBody[i])) || asInt(fm["w"]) != 640 || asInt(fm["h"]) != 480 {
+			t.Fatalf("file[%d] bytes/w/h = %d/%d/%d", i, asInt(fm["bytes"]), asInt(fm["w"]), asInt(fm["h"]))
+		}
+	}
+
+	// args crossed as msgpack ints / verbatim strings
+	var camArgs map[string]any
+	for _, call := range e.fakes["d75884"].got() {
+		if call.op == "camera.capture" {
+			camArgs = call.args
+		}
+	}
+	if camArgs == nil {
+		t.Fatal("camera.capture never reached the board")
+	}
+	if v, ok := camArgs["frames"].(int64); !ok || v != 2 {
+		t.Fatalf("args[frames] = %#v, want int64 2", camArgs["frames"])
+	}
+	if v, _ := camArgs["framesize"].(string); v != "VGA" {
+		t.Fatalf("args[framesize] = %#v, want VGA", camArgs["framesize"])
+	}
+
+	// the gap path: frame 0's chunk loss drops that file, counts once,
+	// and the call still succeeds with what landed
+	scriptCamera(e.fakes["d75884"], true)
+	rep, _ = c.call(6, map[string]any{"type": "camera_shot", "board": "d75884"})
+	res = asMap(rep["result"])
+	if res == nil {
+		t.Fatalf("gap camera_shot: %#v", rep)
+	}
+	files, _ = res["files"].([]any)
+	if len(files) != 1 || asInt(res["gaps"]) != 1 {
+		t.Fatalf("gap path: %d files, gaps=%d, want 1 and 1", len(files), asInt(res["gaps"]))
+	}
+	fm, _ := files[0].(map[string]any)
+	body, _ := os.ReadFile(asStr(fm["path"]))
+	if !bytes.Equal(body, wantBody[1]) {
+		t.Fatalf("gap path landed frame = %v, want the intact frame 1", body)
+	}
+}
+
+// TestCameraShotRedialsDeadLink: a dead link under the warm controller
+// costs nothing — the next camera_shot redials (fresh TCP, no reboot),
+// and the retried call's stream sink lands on the FRESH connection
+// before its op (the per-connection sink ruling; a redial's fresh link
+// starts with no sink).
+func TestCameraShotRedialsDeadLink(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	e.srv.mu.Lock()
+	e.srv.captureRoot = t.TempDir()
+	e.srv.mu.Unlock()
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "camredial"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	scriptCamera(e.fakes["d75884"], false)
+	rep, _ = c.call(2, map[string]any{"type": "camera_shot", "board": "d75884"})
+	if asMap(rep["result"]) == nil {
+		t.Fatalf("warm-up camera_shot: %#v", rep)
+	}
+	if e.dialed["d75884"] != 1 {
+		t.Fatalf("dials = %d, want 1 before the death", e.dialed["d75884"])
+	}
+
+	// the link dies; a FRESH fake answers the redial with a working
+	// camera (the sink must register on IT, not the corpse)
+	fresh := newFakeCtl()
+	scriptCamera(fresh, false)
+	e.fakes["d75884"].markDead()
+	e.dmu.Lock()
+	e.fakes["d75884"] = fresh
+	e.dmu.Unlock()
+
+	rep, _ = c.call(3, map[string]any{"type": "camera_shot", "board": "d75884"})
+	res := asMap(rep["result"])
+	if res == nil {
+		t.Fatalf("post-death camera_shot: %#v", rep)
+	}
+	files, _ := res["files"].([]any)
+	if len(files) != 2 || asInt(res["gaps"]) != 0 {
+		t.Fatalf("post-death files=%d gaps=%d, want 2 and 0 (the fresh link's stream consumed)", len(files), asInt(res["gaps"]))
+	}
+	if e.dialed["d75884"] != 2 {
+		t.Fatalf("dials = %d, want exactly one redial", e.dialed["d75884"])
 	}
 }
 

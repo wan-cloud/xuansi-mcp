@@ -72,6 +72,12 @@ type Controller interface {
 	DeadReason() string
 	Close() error
 	OnEvent(sourcePrefix string, fn func(replclient.Event)) (cancel func())
+	// OnStream installs this connection's 0x02 data-frame sink (nil
+	// drops them). Set-only and PER-CONNECTION: a redial's fresh
+	// connection starts with no sink — every consumer registers its
+	// own on the connection it is about to use (camera.go does, once
+	// per call, so a redial retry re-registers on the new link).
+	OnStream(sink replclient.StreamSink)
 }
 
 // SupOpts parameterize a Supervisor; zero values get defaults.

@@ -34,7 +34,7 @@ func (f *cmdFake) Op(ctx context.Context, op string, args map[string]any) (map[s
 	f.mu.Unlock()
 	switch op {
 	case "hello":
-		return map[string]any{"protocol_ver": int64(3), "role": "controller", "fw_build": "deadbee"}, nil
+		return map[string]any{"protocol_ver": int64(4), "role": "controller", "fw_build": "deadbee"}, nil
 	case "eval":
 		if code, _ := args["code"].(string); code == "return {ok=1}" {
 			return map[string]any{"out": "hello\n", "value": map[string]any{"ok": int64(1)}}, nil
@@ -65,12 +65,13 @@ func (f *cmdFake) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	f.mu.Lock()
 	f.hellos++
 	f.mu.Unlock()
-	return &replclient.HelloInfo{ProtocolVer: 3, Role: "controller", FwBuild: "deadbee"}, nil
+	return &replclient.HelloInfo{ProtocolVer: 4, Role: "controller", FwBuild: "deadbee"}, nil
 }
 func (f *cmdFake) Dead() bool                                         { return false }
 func (f *cmdFake) DeadReason() string                                 { return "" }
 func (f *cmdFake) Close() error                                       { return nil }
 func (f *cmdFake) OnEvent(p string, fn func(replclient.Event)) func() { return func() {} }
+func (f *cmdFake) OnStream(sink replclient.StreamSink)                {}
 
 // startMockDaemon serves one fake board on a temp sock; returns the path.
 func startMockDaemon(t *testing.T) string {
