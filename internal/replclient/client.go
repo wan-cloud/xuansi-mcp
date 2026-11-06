@@ -215,6 +215,16 @@ func (c *Client) OnEvent(sourcePrefix string, fn func(Event)) (cancel func()) {
 	return c.rt.onEvent(sourcePrefix, fn)
 }
 
+// OnStream sets the sink receiving every 0x02 data chunk (parsed
+// sub-header plus raw payload) off this connection. The sink runs on
+// the read goroutine — the OnEvent discipline: be quick, no blocking
+// calls back into the client. A nil sink drops data frames. The
+// setting lives on this connection's router only: re-register on any
+// Reconnect successor.
+func (c *Client) OnStream(sink StreamSink) {
+	c.rt.onStream(sink)
+}
+
 // Dead reports whether the connection became unusable: a fatal frame
 // error (§7), the board's nil-id protocol frame, a link failure, or a
 // local Close. The first reason stands.

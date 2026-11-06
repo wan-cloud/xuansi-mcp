@@ -23,6 +23,7 @@ type router struct {
 	replies  map[any]chan map[string]any
 	handlers map[int]eventHandler
 	nextHID  int
+	sink     StreamSink // fed every parsed 0x02 chunk; nil drops them
 
 	closeOnce sync.Once
 	closeErr  error
@@ -51,11 +52,12 @@ func (r *router) start() { go r.run() }
 // run reads until the stream ends: link close or failure, a fatal frame
 // error (§7), or the board's nil-id protocol frame (its CS_DEAD notice
 // — the board goes silent right after, so there is nothing left to
-// read).
+// read). Data frames never end the loop: they detour to the stream
+// sink while ctrl frames keep the reply/event path.
 func (r *router) run() {
 	defer close(r.done)
 	for {
-		payload, err := r.reader.next()
+		f, err := r.reader.next()
 		if err != nil {
 			switch {
 			case errors.Is(err, errFatal):
@@ -67,7 +69,11 @@ func (r *router) run() {
 			}
 			return
 		}
-		msg, err := decodeMessage(payload)
+		if f.Type == frameTypeData {
+			r.dispatchStream(f)
+			continue
+		}
+		msg, err := decodeMessage(f.Payload)
 		if err != nil {
 			continue // malformed payload: drop the frame, sync is intact
 		}
@@ -80,6 +86,22 @@ func (r *router) run() {
 		case "event":
 			r.dispatchEvent(msg)
 		}
+	}
+}
+
+// dispatchStream hands one data frame to the stream sink as a parsed
+// chunk. An unparseable sub-header or an unset sink drops the frame —
+// sync is intact either way, so neither is fatal.
+func (r *router) dispatchStream(f Frame) {
+	ch, seq, idx, total, payload, ok := parseStreamChunk(f.Payload)
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	sink := r.sink
+	r.mu.Unlock()
+	if sink != nil {
+		sink(ch, seq, idx, total, payload)
 	}
 }
 
@@ -168,6 +190,14 @@ func (r *router) onEvent(prefix string, fn func(Event)) (cancel func()) {
 		delete(r.handlers, id)
 		r.mu.Unlock()
 	}
+}
+
+// onStream sets the sink for 0x02 data frames (nil drops them). The
+// swap is atomic: the new sink sees the next frame onward.
+func (r *router) onStream(sink StreamSink) {
+	r.mu.Lock()
+	r.sink = sink
+	r.mu.Unlock()
 }
 
 // close shuts the link down — unblocking the read loop — and waits for

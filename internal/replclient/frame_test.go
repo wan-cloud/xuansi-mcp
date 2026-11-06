@@ -34,19 +34,19 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 }
 
 // readFrames decodes every frame a reader yields, in order, until EOF.
-func readFrames(t *testing.T, r io.Reader) [][]byte {
+func readFrames(t *testing.T, r io.Reader) []Frame {
 	t.Helper()
 	fr := newFrameReader(r)
-	var out [][]byte
+	var out []Frame
 	for {
-		p, err := fr.next()
+		f, err := fr.next()
 		if errors.Is(err, io.EOF) {
 			return out
 		}
 		if err != nil {
 			t.Fatalf("frameReader.next: %v", err)
 		}
-		out = append(out, p)
+		out = append(out, f)
 	}
 }
 
@@ -185,8 +185,11 @@ func TestFrameReaderReassemblesSplitFrames(t *testing.T) {
 			t.Fatalf("chunk %d: decoded %d frames, want %d", chunk, len(got), len(want))
 		}
 		for i := range want {
-			if !bytes.Equal(got[i], want[i]) {
-				t.Fatalf("chunk %d frame %d = %x, want %x", chunk, i, got[i], want[i])
+			if got[i].Type != frameTypeCtrl {
+				t.Fatalf("chunk %d frame %d type = %#x, want ctrl", chunk, i, got[i].Type)
+			}
+			if !bytes.Equal(got[i].Payload, want[i]) {
+				t.Fatalf("chunk %d frame %d = %x, want %x", chunk, i, got[i].Payload, want[i])
 			}
 		}
 	}
@@ -218,8 +221,11 @@ func TestFrameReaderToleratesZeroLen(t *testing.T) {
 		t.Fatalf("decoded %d frames, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if !bytes.Equal(got[i], want[i]) {
-			t.Fatalf("frame %d = %x, want %x", i, got[i], want[i])
+		if got[i].Type != frameTypeCtrl {
+			t.Fatalf("frame %d type = %#x, want ctrl", i, got[i].Type)
+		}
+		if !bytes.Equal(got[i].Payload, want[i]) {
+			t.Fatalf("frame %d = %x, want %x", i, got[i].Payload, want[i])
 		}
 	}
 }
@@ -240,8 +246,9 @@ func TestFrameReaderFatalOversize(t *testing.T) {
 	}
 }
 
-// TestFrameReaderFatalBadType: the reserved type 0x02 is fatal on
-// receipt (§1/§7).
+// TestFrameReaderFatalBadType: a type byte outside the defined set —
+// ctrl 0x01, data 0x02 — is fatal on receipt (§7); 0x03 stands in for
+// every reserved byte.
 func TestFrameReaderFatalBadType(t *testing.T) {
 	payload, err := encodeMessage(map[string]any{"op": "reply"})
 	if err != nil {
@@ -251,10 +258,45 @@ func TestFrameReaderFatalBadType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("frame: %v", err)
 	}
-	f[4] = 0x02
+	f[4] = 0x03
 	fr := newFrameReader(bytes.NewReader(f))
 	if _, err := fr.next(); !errors.Is(err, errFatal) {
 		t.Fatalf("err = %v, want errFatal", err)
+	}
+}
+
+// TestFrameReaderDataFramesSurviveSplitAndZeroLen: 0x02 data frames
+// cross the reader under the same conditions as ctrl frames — headers
+// split across reads, len==0 neighbors — with type and body verbatim.
+// The reader stays a byte mover: it does not interpret the data
+// sub-header, so a body too short to hold one still frames fine (the
+// stream consumer drops it; sync never depended on it).
+func TestFrameReaderDataFramesSurviveSplitAndZeroLen(t *testing.T) {
+	frames := [][]byte{
+		dataFrame(1, 9, 0, 1, []byte("jpeg-bytes")),              // camera single-chunk
+		dataFrame(254, 0xFFFFFFFF, 65535, 65535, nil),            // sub-header only
+		dataFrame(254, 3, 2, 8, bytes.Repeat([]byte{0xA5}, 300)), // a mid-sequence diag chunk
+	}
+	var wire []byte
+	for i, f := range frames {
+		wire = append(wire, f...)
+		if i < len(frames)-1 {
+			wire = append(wire, 0, 0, 0, 0) // empty frame between data frames
+		}
+	}
+	for _, chunk := range []int{1, 3} {
+		got := readFrames(t, &chunkReader{data: append([]byte(nil), wire...), chunk: chunk})
+		if len(got) != len(frames) {
+			t.Fatalf("chunk %d: decoded %d frames, want %d", chunk, len(got), len(frames))
+		}
+		for i := range frames {
+			if got[i].Type != frameTypeData {
+				t.Fatalf("chunk %d frame %d type = %#x, want data", chunk, i, got[i].Type)
+			}
+			if !bytes.Equal(got[i].Payload, frames[i][headerLen:]) {
+				t.Fatalf("chunk %d frame %d body = %x, want %x", chunk, i, got[i].Payload, frames[i][headerLen:])
+			}
+		}
 	}
 }
 
