@@ -2,6 +2,10 @@
   "name": "xuansi-mcp",
   "version": "0.0.0",
   "description": "xuansi-mcp — zero-install MCP alias: `npx -y xuansi-mcp` runs the xuansi daemon's MCP stdio face (delegates to the xuansi launcher package)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wan-cloud/xuansi-mcp.git"
+  },
   "bin": {
     "xuansi-mcp": "bin/xuansi-mcp.js"
   },
