@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# launcher-test.sh — smoke test for the xuansi npm launcher (B8.5 T3).
+# launcher-test.sh — smoke test for the xuansi-mcp npm main package
+# launcher (B8.5 T3; family restructure 2026-11-06: main package IS
+# xuansi-mcp, dual bin, alias hop removed).
 #
 # Posix (Linux/macOS) + node on PATH; hermetic (mktemp scratch, no npm
 # install — the launcher is stdlib-only). Exit 0 iff every check passes.
 #
-# Checks (plan 2026-11-06-b85-npm-publish Task 3 Steps 1-3):
+# Checks (plan 2026-11-06-b85-npm-publish Task 3 Steps 1-3 + Task 5):
 #   1. platform map unit: exactly six keys, values @xuansi/<key>
 #   2. map dry-resolution: each key resolves against a stub node_modules
 #      (proves require.resolve + bin/xuansi(.exe) naming for all six)
@@ -17,19 +19,21 @@
 #   7. missing platform package + no XUANSI_BIN: install hint on stderr,
 #      empty stdout, non-zero exit
 #   8. SIGTERM forwarding: TERM to launcher reaches the child
-#   9. alias package xuansi-mcp contract: name, bin map, exactly one
-#      dependency (xuansi) — what `npx -y xuansi-mcp` resolves against
-#  10. alias bin prepend: installed-shape stub (alias package with its
-#      xuansi dependency stubbed under node_modules/ containing the real
-#      launcher), XUANSI_BIN fake -> argv forwarded with "mcp" first
-#  11. alias stdio passthrough: same stub, fake-cat -> stdout
-#      byte-exact through BOTH require hops, stderr clean
-#  12. alias exit forwarding: fake exit 7 -> alias exit 7
+#   9. main package contract: name xuansi-mcp, DUAL bin map
+#      (xuansi + xuansi-mcp), six @xuansi/* optionalDependencies
+#  10. dual-bin stdio passthrough: bin/xuansi-mcp.js (in-package sibling
+#      require of the launcher — no dependency hop) -> stdout byte-exact
+#      through the programmatic run() call, stderr clean
+#  11. dual-bin exit forwarding: fake exit 7 -> xuansi-mcp bin exit 7
+#  12. placeholder package contract: name "xuansi", version 0.0.1, NO
+#      bin, files README.md only, single dependency xuansi-mcp
+#      (squat-guard — must never grow a bin)
 set -u
 
 TESTDIR=$(cd "$(dirname "$0")" && pwd)
 LAUNCHER="$TESTDIR/../bin/xuansi.js"
 MCP_LAUNCHER="$TESTDIR/../bin/xuansi-mcp.js"
+PLACEHOLDER_SRC=$(cd "$TESTDIR/../../xuansi-placeholder" && pwd)
 SCRATCH=$(mktemp -d /tmp/xuansi-launcher-test.XXXXXX)
 trap 'rm -rf "$SCRATCH"' EXIT
 
@@ -191,59 +195,68 @@ else
   bad "SIGTERM forwarding (rc=$trc, out=$(cat "$SCRATCH/term.out"))"
 fi
 
-# ------------------- 9-11: alias package xuansi-mcp (controller ruling)
-# npx resolves PACKAGE names; `npx -y xuansi-mcp` needs a package by
-# that name. Check 9 pins the package.json contract; 10-11 drive the
-# alias bin in an installed-shape stub — the alias package copied into
-# scratch with its `xuansi` dependency stubbed under node_modules/
-# (containing the REAL launcher), exactly the layout npm installs.
-ALIAS_SRC=$(cd "$TESTDIR/../../xuansi-mcp" && pwd)
-ALIAS_INST="$SCRATCH/alias/xuansi-mcp"
-
-node - "$ALIAS_SRC/package.json" <<'EOF'
+# ------------------ 9: main package contract (family restructure)
+# The main package IS xuansi-mcp: dual bin (xuansi + xuansi-mcp), six
+# @xuansi/* optionalDependencies ("*" in-repo; assemble pins them).
+node - "$TESTDIR/../package.json" <<'EOF'
 const pkg = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
 const errs = [];
 if (pkg.name !== 'xuansi-mcp') errs.push(`name: ${pkg.name}`);
-if (!pkg.bin || pkg.bin['xuansi-mcp'] !== 'bin/xuansi-mcp.js')
+if (!pkg.bin || pkg.bin['xuansi'] !== 'bin/xuansi.js'
+            || pkg.bin['xuansi-mcp'] !== 'bin/xuansi-mcp.js')
   errs.push(`bin map: ${JSON.stringify(pkg.bin)}`);
-const deps = Object.keys(pkg.dependencies || {});
-if (deps.length !== 1 || deps[0] !== 'xuansi' || pkg.dependencies.xuansi !== '*')
-  errs.push(`deps: ${JSON.stringify(pkg.dependencies)}`);
+const opt = Object.keys(pkg.optionalDependencies || {}).sort();
+const want = ['@xuansi/darwin-arm64', '@xuansi/darwin-x64',
+              '@xuansi/linux-arm64', '@xuansi/linux-x64',
+              '@xuansi/win32-arm64', '@xuansi/win32-x64'];
+if (opt.join(',') !== want.join(','))
+  errs.push(`optionalDependencies: ${opt.join(',')}`);
 process.exit(errs.length ? (console.error(errs.join('; ')), 1) : 0);
 EOF
-[ $? -eq 0 ] && ok "alias package contract: name xuansi-mcp, bin map, single dep xuansi" \
-               || bad "alias package contract (see above)"
+[ $? -eq 0 ] && ok "main package contract: name xuansi-mcp, dual bin, six @xuansi/* optionalDeps" \
+               || bad "main package contract (see above)"
 
-mkdir -p "$ALIAS_INST/bin" "$ALIAS_INST/node_modules/xuansi/bin"
-cp "$ALIAS_SRC/package.json" "$ALIAS_INST/package.json"
-cp "$ALIAS_SRC/bin/xuansi-mcp.js" "$ALIAS_INST/bin/xuansi-mcp.js"
-cp "$LAUNCHER" "$ALIAS_INST/node_modules/xuansi/bin/xuansi.js"
-printf '%s\n' '{"name":"xuansi","version":"0.0.0"}' \
-  >"$ALIAS_INST/node_modules/xuansi/package.json"
+# -------- 10-11: dual-bin — bin/xuansi-mcp.js drives the sibling
+# launcher programmatically (require("./xuansi.js").run(["mcp",...]));
+# no dependency hop anymore. Prepend itself is check 6 (same bin); here:
+# stdio byte-exactness and exit forwarding through the programmatic path.
 
-# (check 6's fake-argv pattern: one argv element per line; "mcp" first)
-out=$(XUANSI_BIN="$SCRATCH/fake-argv.sh" node "$ALIAS_INST/bin/xuansi-mcp.js" \
-        --transport stdio extra 2>/dev/null)
-want=$(printf '%s\n' mcp --transport stdio extra)
-if [ "$out" = "$want" ]; then
-  ok "alias bin: resolves xuansi via node_modules, 'mcp' prepended to argv"
-else
-  bad "alias bin prepend (got: $(printf '%s|' $(printf '%s\n' "$out")) )"
-fi
-
-XUANSI_BIN="$SCRATCH/fake-cat.sh" node "$ALIAS_INST/bin/xuansi-mcp.js" \
-  <"$SCRATCH/frames.in" >"$SCRATCH/alias-frames.out" 2>"$SCRATCH/alias-frames.err"
+XUANSI_BIN="$SCRATCH/fake-cat.sh" node "$MCP_LAUNCHER" \
+  <"$SCRATCH/frames.in" >"$SCRATCH/dual-frames.out" 2>"$SCRATCH/dual-frames.err"
 rc=$?
-if [ $rc -eq 0 ] && cmp -s "$SCRATCH/frames.in" "$SCRATCH/alias-frames.out" \
-   && [ ! -s "$SCRATCH/alias-frames.err" ]; then
-  ok "alias stdio passthrough: stdout byte-exact, stderr clean"
+if [ $rc -eq 0 ] && cmp -s "$SCRATCH/frames.in" "$SCRATCH/dual-frames.out" \
+   && [ ! -s "$SCRATCH/dual-frames.err" ]; then
+  ok "dual-bin stdio passthrough: xuansi-mcp bin -> run() -> byte-exact stdout, stderr clean"
 else
-  bad "alias stdio passthrough (rc=$rc; stderr=$(wc -c <"$SCRATCH/alias-frames.err")B)"
+  bad "dual-bin stdio passthrough (rc=$rc; stderr=$(wc -c <"$SCRATCH/dual-frames.err")B)"
 fi
 
-XUANSI_BIN="$SCRATCH/fake-exit.sh" node "$ALIAS_INST/bin/xuansi-mcp.js" >/dev/null 2>&1
-[ $? -eq 7 ] && ok "alias exit forwarding: fake exit 7 -> alias 7" \
-              || bad "alias exit forwarding (expected 7)"
+XUANSI_BIN="$SCRATCH/fake-exit.sh" node "$MCP_LAUNCHER" >/dev/null 2>&1
+[ $? -eq 7 ] && ok "dual-bin exit forwarding: fake exit 7 -> xuansi-mcp bin 7" \
+              || bad "dual-bin exit forwarding (expected 7)"
+
+# ---------------- 12: placeholder package xuansi (squat-guard)
+# Owner ruling 2026-11-06: bare `xuansi` on npm is a defensive
+# placeholder pointing at xuansi-mcp — it must NEVER grow a bin.
+node - "$PLACEHOLDER_SRC/package.json" "$PLACEHOLDER_SRC/README.md" <<'EOF'
+const fs = require('fs');
+const [pkgPath, readmePath] = process.argv.slice(2);
+const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+const errs = [];
+if (pkg.name !== 'xuansi') errs.push(`name: ${pkg.name}`);
+if (pkg.version !== '0.0.1') errs.push(`version: ${pkg.version} (must stay 0.0.1)`);
+if (pkg.bin) errs.push(`must have NO bin: ${JSON.stringify(pkg.bin)}`);
+const deps = Object.keys(pkg.dependencies || {});
+if (deps.length !== 1 || deps[0] !== 'xuansi-mcp')
+  errs.push(`deps: ${JSON.stringify(pkg.dependencies)}`);
+if (JSON.stringify(pkg.files || []) !== '["README.md"]')
+  errs.push(`files: ${JSON.stringify(pkg.files)}`);
+const readme = fs.readFileSync(readmePath, 'utf8');
+if (!/xuansi-mcp/.test(readme)) errs.push('README does not point at xuansi-mcp');
+process.exit(errs.length ? (console.error(errs.join('; ')), 1) : 0);
+EOF
+[ $? -eq 0 ] && ok "placeholder contract: name xuansi, 0.0.1, no bin, dep xuansi-mcp, README pointer" \
+               || bad "placeholder contract (see above)"
 
 echo "----"
 echo "launcher-test: $PASS passed, $FAIL failed"

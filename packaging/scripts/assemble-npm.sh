@@ -2,23 +2,25 @@
 # assemble-npm.sh <version> — assemble the npm publish family from bin/
 # build outputs into packaging/dist/xuansi-<version>/.
 #
-# Layout produced:
+# Layout produced (family restructure 2026-11-06: 7 live packages):
 #   packaging/dist/xuansi-<version>/
-#     xuansi/                 main package: version stamped into package.json,
-#                             optionalDependencies PINNED to <version>
-#                             (in-repo they are "*"), bin/ + README.md
+#     xuansi-mcp/             MAIN package: version stamped into
+#                             package.json, optionalDependencies PINNED
+#                             to <version> (in-repo they are "*"),
+#                             dual bin (xuansi + xuansi-mcp) + README.md
 #     <platform-key>/         one dir per platform subpackage (standalone
 #                             publishable): package.json (os+cpu+files) and
 #                             bin/xuansi (bin/xuansi.exe on win32 keys)
-#     xuansi-mcp/             alias package (controller ruling 2026-11-06):
-#                             version stamped, dependency on xuansi PINNED
-#                             (in-repo "*"), bin/xuansi-mcp.js + README.md
 #
 # Publish order: the six @xuansi/<platform> subpackages FIRST, then the
-# main `xuansi` package, then the alias `xuansi-mcp` LAST — every package
-# must have its pinned dependencies already on the registry at the moment
-# it becomes installable (xuansi pins the subpackages; xuansi-mcp pins
-# xuansi).
+# MAIN `xuansi-mcp` package LAST — 7 publishes; every package must have
+# its pinned dependencies already on the registry at the moment it
+# becomes installable (xuansi-mcp pins the six subpackages).
+#
+# NOT assembled — packaging/npm/xuansi-placeholder/ (the bare `xuansi`
+# squat-guard) is deliberately excluded: it is a one-time MANUAL publish
+# at bootstrap (version stays 0.0.1 forever), never part of the CI
+# release pipeline, and must never appear under dist/.
 #
 # Binary source convention (bin/ at repo root, `make build` outputs):
 #     linux-x64    <- bin/xuansi-linux-amd64
@@ -37,9 +39,9 @@
 # error: run `make build` first.
 #
 # The six platform keys are read from the launcher's platformPackage map
-# (packaging/npm/xuansi/bin/xuansi.js) — single source; a map key without
-# a bin/ artifact mapping below trips this script (and the smoke test
-# checks the map against the same six keys in the other direction).
+# (packaging/npm/xuansi-mcp/bin/xuansi.js) — single source; a map key
+# without a bin/ artifact mapping below trips this script (and the smoke
+# test checks the map against the same six keys in the other direction).
 #
 # Version MUST be bare semver (npm rejects a leading "v"; strip it from
 # the git tag: ${GITHUB_REF_NAME#v}).
@@ -55,7 +57,7 @@ esac
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BIN=$ROOT/bin
-MAIN_SRC=$ROOT/packaging/npm/xuansi
+MAIN_SRC=$ROOT/packaging/npm/xuansi-mcp
 LAUNCHER=$MAIN_SRC/bin/xuansi.js
 DIST=$ROOT/packaging/dist/xuansi-$VERSION
 
@@ -78,13 +80,15 @@ artifact_for() {
 echo "== assemble-npm $VERSION -> ${DIST#"$ROOT"/}"
 
 rm -rf "$DIST"
-mkdir -p "$DIST/xuansi/bin"
+mkdir -p "$DIST/xuansi-mcp/bin"
 
-# ---- main package: launcher bins + README + stamped/pinned package.json
-cp "$MAIN_SRC/bin/xuansi.js" "$MAIN_SRC/bin/xuansi-mcp.js" "$DIST/xuansi/bin/"
-chmod 755 "$DIST/xuansi/bin/xuansi.js" "$DIST/xuansi/bin/xuansi-mcp.js"
-cp "$MAIN_SRC/README.md" "$DIST/xuansi/README.md"
-node - "$MAIN_SRC/package.json" "$DIST/xuansi/package.json" "$VERSION" <<'EOF'
+# ---- main package xuansi-mcp: dual-bin launchers + README + stamped/
+# pinned package.json (bin/xuansi-mcp.js requires the sibling ./xuansi.js
+# in-package — no dependency hop).
+cp "$MAIN_SRC/bin/xuansi.js" "$MAIN_SRC/bin/xuansi-mcp.js" "$DIST/xuansi-mcp/bin/"
+chmod 755 "$DIST/xuansi-mcp/bin/xuansi.js" "$DIST/xuansi-mcp/bin/xuansi-mcp.js"
+cp "$MAIN_SRC/README.md" "$DIST/xuansi-mcp/README.md"
+node - "$MAIN_SRC/package.json" "$DIST/xuansi-mcp/package.json" "$VERSION" <<'EOF'
 const fs = require('fs');
 const [src, dest, version] = process.argv.slice(2);
 const pkg = JSON.parse(fs.readFileSync(src, 'utf8'));
@@ -96,30 +100,7 @@ for (const name of Object.keys(pkg.optionalDependencies || {})) {
 }
 fs.writeFileSync(dest, JSON.stringify(pkg, null, 2) + '\n');
 EOF
-echo "   main package: xuansi@$VERSION (optionalDependencies pinned)"
-
-# ---- alias package xuansi-mcp: npx resolves package names, so the
-# design's `npx -y xuansi-mcp` invocation needs a package published
-# under exactly that name (controller ruling 2026-11-06). Published
-# LAST — it pins a dependency on `xuansi` (see publish order above).
-ALIAS_SRC=$ROOT/packaging/npm/xuansi-mcp
-mkdir -p "$DIST/xuansi-mcp/bin"
-cp "$ALIAS_SRC/bin/xuansi-mcp.js" "$DIST/xuansi-mcp/bin/"
-chmod 755 "$DIST/xuansi-mcp/bin/xuansi-mcp.js"
-cp "$ALIAS_SRC/README.md" "$DIST/xuansi-mcp/README.md"
-node - "$ALIAS_SRC/package.json" "$DIST/xuansi-mcp/package.json" "$VERSION" <<'EOF'
-const fs = require('fs');
-const [src, dest, version] = process.argv.slice(2);
-const pkg = JSON.parse(fs.readFileSync(src, 'utf8'));
-pkg.version = version;
-// Pin the xuansi dependency — in-repo "*" tracks local dev; at publish
-// time the family must move in lockstep.
-for (const name of Object.keys(pkg.dependencies || {})) {
-  pkg.dependencies[name] = version;
-}
-fs.writeFileSync(dest, JSON.stringify(pkg, null, 2) + '\n');
-EOF
-echo "   alias package: xuansi-mcp@$VERSION (dependency xuansi pinned)"
+echo "   main package: xuansi-mcp@$VERSION (dual bin, optionalDependencies pinned)"
 
 # ---- six platform subpackages (keys from the launcher map)
 SKIPPED_DARWIN=0
@@ -147,11 +128,11 @@ const [dest, name, version, os, cpu] = process.argv.slice(2);
 fs.writeFileSync(dest, JSON.stringify({
   name,
   version,
-  description: `xuansi daemon binary for ${os}-${cpu} (installed automatically by the xuansi package)`,
+  description: `xuansi daemon binary for ${os}-${cpu} (installed automatically by the xuansi-mcp package)`,
   // repository.url must EXACTLY match the GitHub repo — hard requirement
   // of npm trusted publishers (OIDC): the registry matches it against
-  // the per-package trusted publisher config. Same value as the two
-  // hand-maintained templates (packaging/npm/*/package.json).
+  // the per-package trusted publisher config. Same value as the
+  // hand-maintained template (packaging/npm/xuansi-mcp/package.json).
   repository: { type: 'git', url: 'git+https://github.com/wan-cloud/xuansi-mcp.git' },
   os: [os],
   cpu: [cpu],
@@ -162,16 +143,20 @@ EOF
 done < <(node -e 'process.stdout.write(Object.keys(require(process.argv[1]).platformPackage).sort().join("\n") + "\n")' "$LAUNCHER")
 
 # ---- sanity: everything assembled is a map key; nothing silently lost
-# (assembled subpackages + darwin skips must equal the map's key count —
-# guards against loop/pipe bugs dropping a platform)
+# ('xuansi-mcp' is the single non-subpackage dist entry; everything else
+# must be a launcher-map key. The bare-`xuansi` PLACEHOLDER must never
+# be here — its presence trips the map-key check below with its own
+# message first.)
 node - "$LAUNCHER" "$DIST" <<'EOF'
 const fs = require('fs');
 const { platformPackage } = require(process.argv[2]);
 const dist = process.argv[3];
 const keys = new Set(Object.keys(platformPackage));
-// 'xuansi' (main) and 'xuansi-mcp' (alias) are the two non-subpackage
-// dist entries; everything else must be a launcher-map key.
-const made = fs.readdirSync(dist).filter((e) => e !== 'xuansi' && e !== 'xuansi-mcp');
+if (fs.existsSync(`${dist}/xuansi`)) {
+  console.error('assemble-npm.sh: placeholder package leaked into dist (xuansi/ present) — it is a manual one-time publish, never assembled');
+  process.exit(1);
+}
+const made = fs.readdirSync(dist).filter((e) => e !== 'xuansi-mcp');
 for (const entry of made) {
   if (!keys.has(entry)) {
     console.error(`assemble-npm.sh: unexpected dist entry '${entry}' (not in launcher map)`);
