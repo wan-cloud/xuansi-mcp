@@ -1,9 +1,11 @@
-# release.yml — tag-driven publish pipeline (B8.5 T4)
+# release.yml — tag-driven publish pipeline (B8.5 T4; family restructure
+# 2026-11-06: 7 live packages)
 #
 # On push of a v* tag: build all six platform binaries, assemble the npm
-# family, publish the 8 packages in dependency order (6 subpackages →
-# main `xuansi` → alias `xuansi-mcp`; documented in packaging/README.md
-# and the assemble-npm.sh header).
+# family, publish the 7 packages in dependency order (6 subpackages →
+# main `xuansi-mcp`; documented in packaging/README.md and the
+# assemble-npm.sh header). The bare-`xuansi` placeholder is NOT here —
+# one-time manual publish at bootstrap.
 #
 # Version shape is load-bearing (irreversible on the registry):
 #   tag vX.Y.Z  ==  binary X.Y.Z (ldflags, v stripped)  ==  npm X.Y.Z
@@ -151,45 +153,44 @@ jobs:
       # Independent read-back of what assemble wrote (its own stamping is
       # from the same argument; this catches path/ordering regressions
       # before anything reaches the registry — review focus #1).
-      - name: Version guard — 8 packages stamped exactly with the tag version
+      - name: Version guard — 7 packages stamped exactly with the tag version
         run: |
           VER="${GITHUB_REF_NAME#v}"
           DIST="packaging/dist/xuansi-$VER"
           node - "$DIST" "$VER" <<'EOF'
           const fs = require('fs');
           const [dist, ver] = process.argv.slice(2);
-          const subs = Object.keys(require('./packaging/npm/xuansi/bin/xuansi.js').platformPackage).sort();
-          const expect = ['xuansi', 'xuansi-mcp', ...subs];
+          const subs = Object.keys(require('./packaging/npm/xuansi-mcp/bin/xuansi.js').platformPackage).sort();
+          const expect = ['xuansi-mcp', ...subs];
           let bad = 0;
           for (const name of expect) {
             const pkg = JSON.parse(fs.readFileSync(`${dist}/${name}/package.json`, 'utf8'));
             if (pkg.version !== ver) { console.error(`${name}: version ${pkg.version} != ${ver}`); bad++; }
           }
-          const main = JSON.parse(fs.readFileSync(`${dist}/xuansi/package.json`, 'utf8'));
+          if (fs.existsSync(`${dist}/xuansi`)) { console.error('placeholder xuansi/ leaked into dist'); bad++; }
+          const main = JSON.parse(fs.readFileSync(`${dist}/xuansi-mcp/package.json`, 'utf8'));
           for (const [k, v] of Object.entries(main.optionalDependencies || {}))
-            if (v !== ver) { console.error(`xuansi: optionalDependency ${k}@${v} != ${ver}`); bad++; }
-          const alias = JSON.parse(fs.readFileSync(`${dist}/xuansi-mcp/package.json`, 'utf8'));
-          for (const [k, v] of Object.entries(alias.dependencies || {}))
-            if (v !== ver) { console.error(`xuansi-mcp: dependency ${k}@${v} != ${ver}`); bad++; }
+            if (v !== ver) { console.error(`xuansi-mcp: optionalDependency ${k}@${v} != ${ver}`); bad++; }
           if (bad) process.exit(1);
           console.log(`version guard OK: ${expect.length} packages @ ${ver}, deps pinned`);
           EOF
       # Publish order is binding (packaging/README.md): the six
       # @xuansi/<platform> subpackages first (their names come from the
-      # launcher map — same single source assemble reads), then the main
-      # `xuansi` (pins all six), then the alias `xuansi-mcp` LAST (pins
-      # xuansi). --access public: scoped packages default restricted.
+      # launcher map — same single source assemble reads), then the MAIN
+      # `xuansi-mcp` LAST (pins all six via optionalDependencies).
+      # --access public: scoped packages default restricted.
       # OIDC trusted publishing: npm ≥11.5.1 auto-detects the Actions
       # identity (id-token: write above) — no NODE_AUTH_TOKEN; each of
-      # the 8 packages has a trusted publisher config on npmjs.com
+      # the 7 packages has a trusted publisher config on npmjs.com
       # (org wan-cloud / repo xuansi-mcp / workflow release.yml /
-      # allow `npm publish`).
-      - name: npm publish (6 subpackages → xuansi → xuansi-mcp)
+      # allow `npm publish`). The bare-`xuansi` placeholder has NO
+      # trusted-publisher entry — it is published manually, once, at
+      # bootstrap (see packaging/README.md).
+      - name: npm publish (6 subpackages → xuansi-mcp)
         run: |
           VER="${GITHUB_REF_NAME#v}"
           DIST="packaging/dist/xuansi-$VER"
-          for key in $(node -e 'process.stdout.write(Object.keys(require("./packaging/npm/xuansi/bin/xuansi.js").platformPackage).sort().join(" "))'); do
+          for key in $(node -e 'process.stdout.write(Object.keys(require("./packaging/npm/xuansi-mcp/bin/xuansi.js").platformPackage).sort().join(" "))'); do
             npm publish --access public "$DIST/$key"
           done
-          npm publish --access public "$DIST/xuansi"
           npm publish --access public "$DIST/xuansi-mcp"
