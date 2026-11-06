@@ -52,23 +52,33 @@ type streamKey struct {
 	seq uint32
 }
 
-// streamBucket is one sequence under assembly. A channel's chunks
-// arrive in strictly increasing (seq, idx) order — one stream, one
-// emitter — so next is both the next expected index and the count
-// already appended.
+// streamBucket is one sequence's state on a channel. Live buckets
+// assemble: a channel's chunks arrive in strictly increasing (seq, idx)
+// order — one stream, one emitter — so next is both the next expected
+// index and the count already appended. A dead bucket is a tombstone:
+// its sequence was abandoned and counted, kept only so late followers
+// are recognized instead of recounted; each first sighting on the
+// channel retires it (bounded to one live bucket plus one tombstone
+// per channel).
 type streamBucket struct {
+	dead  bool
 	total uint16
 	next  uint16
 	data  []byte
 }
 
-// reassembler assembles data chunks back into whole sequences. A chunk
-// whose idx runs past the bucket's next expected index means an earlier
-// chunk was lost; the sequence is abandoned — never delivered — and
-// counted in gaps. Late followers of an abandoned sequence drop without
-// a second count; a sequence whose total reads zero or changes
-// mid-flight is abandoned the same way. gaps is safe to read from any
-// goroutine.
+// reassembler assembles data chunks back into whole sequences. Every
+// abandonment — a lost head (first sighting already past chunk 0), an
+// idx jump (a middle chunk lost), a lost tail (the channel's next
+// first sighting retires the unfinished bucket), a total that reads
+// zero or changes mid-flight — counts exactly one gap, via tombstones
+// and live-bucket retirement; a follower of an already-counted
+// sequence never recounts it. Abandoned sequences are never delivered
+// (no retransmit, no resync — sync lives in the frame layer) and gaps
+// is never escalated to a connection failure. gaps is safe to read
+// from any goroutine. Out-of-contract stragglers — a chunk of a
+// sequence the channel has already retired — count as fresh losses:
+// the counter is a diagnostic, not an invariant over broken emitters.
 type reassembler struct {
 	gaps atomic.Int64
 
@@ -97,18 +107,25 @@ func (r *reassembler) feed(f Frame) (seq uint32, data []byte, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	b := r.buckets[key]
+	if b != nil && b.dead {
+		return 0, nil, false // follower of an abandoned sequence: already counted
+	}
 	if total == 0 {
-		// A zero-chunk sequence can never complete; drop any state it
-		// might have collected and count it as lost.
-		delete(r.buckets, key)
-		r.gaps.Add(1)
+		// A zero-chunk sequence can never complete; count it once and
+		// tombstone whatever state the key had.
+		r.abandon(key, b)
 		return 0, nil, false
 	}
-	b := r.buckets[key]
 	if b == nil {
 		if idx != 0 {
-			// Not a first chunk with no bucket: follower of an abandoned
-			// (or never-seen) sequence — already counted, drop quietly.
+			// First sighting already past chunk 0: the head was lost
+			// and the sequence can never assemble. Tombstone it (the
+			// count happens now, once), then retire the channel's older
+			// in-flight state — this sighting proves those tails can no
+			// longer arrive.
+			r.abandon(key, nil)
+			r.evictStale(key)
 			return 0, nil, false
 		}
 		b = &streamBucket{total: total}
@@ -117,8 +134,7 @@ func (r *reassembler) feed(f Frame) (seq uint32, data []byte, ok bool) {
 	} else if b.total != total {
 		// The emitter disagrees with itself about the chunk count: the
 		// sequence cannot be trusted.
-		delete(r.buckets, key)
-		r.gaps.Add(1)
+		r.abandon(key, b)
 		return 0, nil, false
 	}
 	if idx < b.next {
@@ -127,8 +143,7 @@ func (r *reassembler) feed(f Frame) (seq uint32, data []byte, ok bool) {
 	if idx > b.next {
 		// A jump: an earlier chunk of this sequence was lost. Abandon
 		// the whole sequence; its later chunks drop quietly above.
-		delete(r.buckets, key)
-		r.gaps.Add(1)
+		r.abandon(key, b)
 		return 0, nil, false
 	}
 	b.data = append(b.data, payload...)
@@ -140,17 +155,37 @@ func (r *reassembler) feed(f Frame) (seq uint32, data []byte, ok bool) {
 	return seq, b.data, true
 }
 
-// evictStale drops the channel's other in-flight sequences. Chunks
-// arrive in strictly increasing (seq, idx) order per channel, so once
-// key's first chunk exists, every other bucket on that channel is a
-// lost tail that can never finish; each counts one gap. This bounds
-// the bucket set by the live channel count instead of leaking one
-// bucket per lost tail.
+// abandon counts one gap for key's sequence and leaves a tombstone:
+// the live bucket (b non-nil) is marked dead with its data freed, or a
+// fresh tombstone is planted when none exists — the lost-head case,
+// where the first sighting already proves the sequence unrecoverable.
+// Followers of a tombstoned sequence find it in feed and drop without
+// recounting; the tombstone lives until the channel's next first
+// sighting retires it.
+func (r *reassembler) abandon(key streamKey, b *streamBucket) {
+	if b == nil {
+		r.buckets[key] = &streamBucket{dead: true}
+	} else {
+		b.dead = true
+		b.data = nil
+	}
+	r.gaps.Add(1)
+}
+
+// evictStale retires the channel's other sequences, called when key is
+// first sighted (chunk 0 or a headless sighting — either proves the
+// channel has moved on). Chunks arrive in strictly increasing (seq,
+// idx) order per channel, so every other live bucket is a lost tail
+// counting its one and only gap here; tombstones are already counted
+// and drop silently. This bounds the state to one live bucket plus one
+// tombstone per channel instead of leaking a bucket per lost tail.
 func (r *reassembler) evictStale(key streamKey) {
-	for k := range r.buckets {
+	for k, b := range r.buckets {
 		if k.ch == key.ch && k.seq != key.seq {
+			if !b.dead {
+				r.gaps.Add(1)
+			}
 			delete(r.buckets, k)
-			r.gaps.Add(1)
 		}
 	}
 }

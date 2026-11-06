@@ -328,11 +328,87 @@ func TestClientStreamSinkInterleaved(t *testing.T) {
 	}
 }
 
-// TestClientStreamGapScenario: a gapped burst — chunk 0, then 2 and 3
-// with 1 lost on the wire — reaches the sink frame-intact while the
-// connection stays alive (a gap is never a resync failure), the
-// reassembler counts exactly one gap, and the op reply still lands
-// with len==0 frames sprinkled ahead of every frame.
+// TestReassemblerLostHeadCountsOnce: a sequence whose first sighting
+// is already past chunk 0 (chunk 0 lost on the wire) is counted
+// exactly once — at the sighting — and its followers, recognized via
+// the tombstone, never recount it; the channel's next sequence still
+// delivers.
+func TestReassemblerLostHeadCountsOnce(t *testing.T) {
+	r := newReassembler()
+
+	if _, _, ok := r.feed(streamFrame(1, 7, 1, 3, []byte("b"))); ok {
+		t.Fatal("headless sequence reported complete")
+	}
+	if r.gaps.Load() != 1 {
+		t.Fatalf("gaps after lost head = %d, want 1", r.gaps.Load())
+	}
+	if _, _, ok := r.feed(streamFrame(1, 7, 2, 3, []byte("c"))); ok {
+		t.Fatal("headless sequence completed on a follower")
+	}
+	if r.gaps.Load() != 1 {
+		t.Fatalf("gaps after follower = %d, want 1", r.gaps.Load())
+	}
+	if _, data, ok := r.feed(streamFrame(1, 8, 0, 1, []byte("next"))); !ok || string(data) != "next" {
+		t.Fatalf("sequence after lost head = (%q, %v)", data, ok)
+	}
+	if r.gaps.Load() != 1 {
+		t.Fatalf("gaps after recovery = %d, want 1", r.gaps.Load())
+	}
+}
+
+// TestReassemblerCountsEachLostSequenceOnce: a lost tail (stale live
+// bucket) followed by a lost head — the compounding pattern that once
+// netted zero — counts exactly one gap per lost sequence: sighting the
+// headless sequence retires the stale bucket (its tail counted) and
+// plants a tombstone for itself (its head counted); no follower and no
+// later eviction recounts either.
+func TestReassemblerCountsEachLostSequenceOnce(t *testing.T) {
+	r := newReassembler()
+
+	// seq 10: tail lost — the bucket stays live and unfinished
+	if _, _, ok := r.feed(streamFrame(1, 10, 0, 4, []byte("a"))); ok {
+		t.Fatal("tail-lost sequence completed")
+	}
+	if _, _, ok := r.feed(streamFrame(1, 10, 1, 4, []byte("b"))); ok {
+		t.Fatal("tail-lost sequence completed")
+	}
+	if r.gaps.Load() != 0 {
+		t.Fatalf("gaps before any loss is detected = %d, want 0", r.gaps.Load())
+	}
+
+	// seq 11: head lost — first sighting at idx 2 retires seq 10 (one
+	// gap) and counts itself (one gap)
+	if _, _, ok := r.feed(streamFrame(1, 11, 2, 4, []byte("y"))); ok {
+		t.Fatal("headless sequence completed")
+	}
+	if r.gaps.Load() != 2 {
+		t.Fatalf("gaps after lost tail + lost head = %d, want 2", r.gaps.Load())
+	}
+
+	// a follower of the headless sequence: recognized, not recounted
+	if _, _, ok := r.feed(streamFrame(1, 11, 3, 4, []byte("z"))); ok {
+		t.Fatal("headless follower completed")
+	}
+	if r.gaps.Load() != 2 {
+		t.Fatalf("gaps after follower = %d, want 2", r.gaps.Load())
+	}
+
+	// the channel moves on cleanly; the tombstone retires uncounted
+	if _, data, ok := r.feed(streamFrame(1, 12, 0, 1, []byte("ok"))); !ok || string(data) != "ok" {
+		t.Fatalf("sequence after double loss = (%q, %v)", data, ok)
+	}
+	if r.gaps.Load() != 2 {
+		t.Fatalf("gaps after recovery = %d, want 2", r.gaps.Load())
+	}
+}
+
+// TestClientStreamGapScenario: bursts from the board reach the sink
+// frame-intact while the connection stays alive (a gap is never a
+// resync failure): first a middle gap — chunk 0, then 2 and 3 with 1
+// lost on the wire — then a lost head whose first sighting is idx 1.
+// The reassembler counts exactly one gap per lost sequence and the op
+// replies still land, with len==0 frames sprinkled ahead of every
+// frame.
 func TestClientStreamGapScenario(t *testing.T) {
 	c, b := newTestClient(t)
 	ctx := context.Background()
@@ -342,6 +418,8 @@ func TestClientStreamGapScenario(t *testing.T) {
 		b.sendData(254, 0, 0, 4, []byte("a"))
 		b.sendData(254, 0, 2, 4, []byte("c")) // idx 1 never arrives
 		b.sendData(254, 0, 3, 4, []byte("d"))
+		b.sendData(254, 1, 1, 3, []byte("e")) // seq 1: chunk 0 never arrives
+		b.sendData(254, 1, 2, 3, []byte("f"))
 		return map[string]any{"out": "ok"}, nil
 	})
 
@@ -351,23 +429,23 @@ func TestClientStreamGapScenario(t *testing.T) {
 	})
 
 	if out, _, err := c.Eval(ctx, "return 1", nil); err != nil || out != "ok" {
-		t.Fatalf("eval after gapped burst = (%q, %v)", out, err)
+		t.Fatalf("eval after gapped bursts = (%q, %v)", out, err)
 	}
 	if c.Dead() {
-		t.Fatalf("connection died on a gapped burst: %s", c.DeadReason())
+		t.Fatalf("connection died on gapped bursts: %s", c.DeadReason())
 	}
 
-	waitFor(t, func() bool { return len(chunks) == 3 })
+	waitFor(t, func() bool { return len(chunks) == 5 })
 	r := newReassembler()
 	completed := 0
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		ck := <-chunks
 		if _, _, ok := r.feed(streamFrame(ck.ch, ck.seq, ck.idx, ck.total, ck.payload)); ok {
 			completed++
 		}
 	}
-	if completed != 0 || r.gaps.Load() != 1 {
-		t.Fatalf("gapped burst: completed=%d gaps=%d, want 0/1", completed, r.gaps.Load())
+	if completed != 0 || r.gaps.Load() != 2 {
+		t.Fatalf("gapped bursts: completed=%d gaps=%d, want 0/2 (one per lost sequence)", completed, r.gaps.Load())
 	}
 }
 
