@@ -286,7 +286,8 @@ func (r *Registry) Resolve(selector string) (Board, error) {
 }
 
 // describeBoards renders the candidate list for Resolve errors: mac6,
-// alias when present, host when present, live sources.
+// alias when present, host when present, the mDNS-resolved IP when
+// present (the address the daemon dials first, T10), live sources.
 func describeBoards(boards []Board) string {
 	parts := make([]string, len(boards))
 	for i, b := range boards {

@@ -61,6 +61,7 @@ func runStatus(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 		srcs = strings.Join(parts, "+")
 	}
 	host, _ := bm["host"].(string)
+	ip, _ := bm["ip"].(string)
 	port, _ := bm["port"].(float64)
 	usb, _ := bm["usb_path"].(string)
 	fw, _ := bm["fw"].(string)
@@ -74,8 +75,10 @@ func runStatus(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 
 	fmt.Fprintf(stdout, "board:     %s\n", name)
 	fmt.Fprintf(stdout, "sources:   %s\n", srcs)
-	if host != "" {
-		fmt.Fprintf(stdout, "tcp:       %s:%d\n", host, int64(port))
+	// the tcp line shows the DIALED endpoint — the mDNS-resolved IP
+	// first (T10), the hostname in parens when both are known
+	if host != "" || ip != "" {
+		fmt.Fprintf(stdout, "tcp:       %s\n", dialEndpoint(host, ip, port))
 	}
 	if usb != "" {
 		fmt.Fprintf(stdout, "usb:       %s\n", usb)
