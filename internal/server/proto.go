@@ -59,6 +59,7 @@
 //	op             {board, op, args?, holder?}   → board reply result  (the ops face — see below)
 //	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; see the capture section below)
 //	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}
+//	camera_shot    {board, frames?, framesize?, holder?} → {files:[{path,bytes,sha256,w,h}], gaps, sensor}  (lease required; see the camera section)
 //
 // eval/submit/op args numbers: the fw args bridge is int-only (v3 §4),
 // so the daemon validates the args tree BEFORE any board contact — an
@@ -79,13 +80,22 @@
 // shape, not each op's). The allowlist (server.go's opAllowlist — the
 // single source; every rendered listing is sorted from it):
 //
-//	budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave,
-//	diag.pins, diag.stats, log.read, wifi.off, wifi.setup, wifi.status
+//	budget.get, budget.set, camera.capture, camera.off, camera.status,
+//	caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats,
+//	log.read, wifi.off, wifi.setup, wifi.status
 //
 // diag.i2cslave toggles the board's INTERNAL I2C echo-slave loopback
 // fixture ({mode:-1..1} = status/off/on) — the b7 driver-pipeline
 // loopback's sparring partner; it crosses under the same uniform gate
 // and args walk as every other op.
+//
+// camera.capture / camera.status / camera.off joined with b9 (the
+// camera face). They cross under the same uniform gate — but note the
+// asymmetry: through op, camera.capture returns the board's metadata
+// reply ({frames, bytes, w, h, …}) while its 0x02 stream frames are
+// DROPPED daemon-side (nothing consumed them); the dedicated
+// camera_shot request is the stream-consuming face that lands the
+// JPEGs. status/off have no stream and ride op normally.
 //
 // budget.get is the one assembled view: the frozen wire has no getter
 // op (budget.set refuses its no-keys form), so the daemon reads caps —
@@ -146,6 +156,35 @@
 // BOARD selectors are mac6 / alias / hostname prefixes resolved by the
 // discovery registry (T9 Resolve): unique prefix hits, ambiguity or no
 // match is a structured error listing candidates.
+//
+// # Camera (the 0x02 stream face — lands with b9 task 5)
+//
+//	camera_shot {board, frames?, framesize?, holder?}
+//	            → {files:[{path,bytes,sha256,w,h}], gaps, sensor}
+//
+// One synchronous camera.capture under the lease: the board streams
+// each frame as 0x02 ch=1 chunks to the requesting connection (the
+// daemon's warm controller) BEFORE its op reply, so the daemon
+// registers a stream sink for the call, issues the op, and reads what
+// the sink collected when the reply lands (the ordered TCP stream
+// guarantees every chunk preceded it). frames clamps 1..4 (0/omitted
+// = the board default 1); framesize is "QVGA" (320x240) or "VGA"
+// (640x480, the default) — anything else is an api-class refusal
+// naming the list, before any board contact. The assembled JPEGs land
+// one file per frame under the captures root as
+// <UTC epoch>-<mac6>-camera.jpg (single frame) or
+// <epoch>-<mac6>-camera-N.jpg (a burst's Nth frame), O_CREAT|O_EXCL —
+// never truncates; a same-second collision bumps the epoch until the
+// open succeeds. gaps counts reassembly losses (a chunk idx jump
+// abandons that frame and counts exactly once): the call still
+// succeeds, files lists what landed, and each entry carries its
+// absolute path, byte count, hex sha256, and the board-reported
+// geometry. Captures of one board serialize daemon-side: two
+// concurrent calls would interleave their ch=1 chunks into each
+// other's collectors. A dead link under the capture costs one redial
+// (fresh TCP, no reboot): the retried call re-registers its sink on
+// the fresh connection (the sink is per-connection state — T2's
+// ruling).
 //
 // # Transport (the lease request's deliberate USB route)
 //
@@ -258,6 +297,11 @@ type Request struct {
 	// Dest overrides a capture's filename (a bare basename inside the
 	// captures root — path separators are refused daemon-side).
 	Dest string `json:"dest,omitempty"`
+	// Frames / Framesize parameterize camera_shot: frames clamps 1..4
+	// (0 = the board default 1) and framesize is "QVGA" | "VGA"
+	// ("" = the default VGA). See the camera contract above.
+	Frames    int    `json:"frames,omitempty"`
+	Framesize string `json:"framesize,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.

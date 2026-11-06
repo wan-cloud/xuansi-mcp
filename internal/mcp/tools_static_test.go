@@ -556,13 +556,73 @@ func TestSessionResetHolderLadder(t *testing.T) {
 	}
 }
 
+// TestCameraShotShapeAndMapping: the held camera_shot request carries
+// frames/framesize/holder; the reply's files array maps entry-by-entry
+// (path/bytes/sha256/w/h) with gaps and sensor alongside. A zero-frames
+// call still sends the field positions the daemon clamps (frames 0 =
+// the board default).
+func TestCameraShotShapeAndMapping(t *testing.T) {
+	e, reqs := newEnv(t, []step{{result: map[string]any{
+		"files": []any{
+			map[string]any{"path": "/xdg/xuansi/captures/1791000000-d75884-camera.jpg",
+				"bytes": 2048.0, "sha256": "ab12", "w": 640.0, "h": 480.0},
+		},
+		"gaps":   0.0,
+		"sensor": "GC2145",
+	}}}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_camera_shot", map[string]any{"board": "d75884", "frames": 2, "framesize": "QVGA"})
+	if res.IsError {
+		t.Fatalf("camera_shot failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Type != "camera_shot" || req.Board != "d75884" || req.Holder != "mcp-fixed01" ||
+		req.Frames != 2 || req.Framesize != "QVGA" {
+		t.Errorf("camera_shot request = %+v, want camera_shot/d75884/frames 2/QVGA under the holder", req)
+	}
+
+	m := structured(t, res)
+	files, ok := m["files"].([]any)
+	if !ok || len(files) != 1 {
+		t.Fatalf("files = %#v, want the one-file list", m["files"])
+	}
+	f0, _ := files[0].(map[string]any)
+	if f0["path"] != "/xdg/xuansi/captures/1791000000-d75884-camera.jpg" ||
+		f0["bytes"] != 2048.0 || f0["sha256"] != "ab12" || f0["w"] != 640.0 || f0["h"] != 480.0 {
+		t.Errorf("file[0] = %v, want every field mapped", f0)
+	}
+	if m["gaps"] != 0.0 || m["sensor"] != "GC2145" {
+		t.Errorf("gaps/sensor = %v/%v, want 0/GC2145", m["gaps"], m["sensor"])
+	}
+}
+
+// TestCameraShotDefaultsSendOmittedFields: omitting frames/framesize
+// crosses as the zero values (the daemon's board defaults apply) —
+// the call is not refused client-side for missing options.
+func TestCameraShotDefaultsSendOmittedFields(t *testing.T) {
+	e, reqs := newEnv(t, []step{{result: map[string]any{
+		"files": []any{}, "gaps": 0.0, "sensor": "GC2145",
+	}}}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_camera_shot", map[string]any{"board": "d75884"})
+	if res.IsError {
+		t.Fatalf("bare camera_shot failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Frames != 0 || req.Framesize != "" {
+		t.Errorf("bare camera_shot request = %+v, want zero frames/framesize", req)
+	}
+}
+
 // opsFaceAllowlistPinned mirrors the ops face's frozen allowlist
 // (transcribed independently of the daemon's table — server_test.go
 // holds the table-side pin; a shared typo survives only if both copies
 // are wrong the same way).
 var opsFaceAllowlistPinned = []string{
-	"budget.get", "budget.set", "caps", "diag.heapinfo", "diag.i2cslave",
-	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup", "wifi.status",
+	"budget.get", "budget.set", "camera.capture", "camera.off",
+	"camera.status", "caps", "diag.heapinfo", "diag.i2cslave",
+	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup",
+	"wifi.status",
 }
 
 // spanList extracts the comma-separated op list between two anchors —
@@ -645,6 +705,7 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_fs_rm":         {"board", "path"},
 	"xuansi_driver_pull":   {"board", "name"},
 	"xuansi_session_reset": {"board"},
+	"xuansi_camera_shot":   {"board"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
