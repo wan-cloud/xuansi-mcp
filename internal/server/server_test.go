@@ -2237,6 +2237,49 @@ func TestCameraShotRedialsDeadLink(t *testing.T) {
 	}
 }
 
+// TestOpCameraCaptureForwarded: camera.capture crosses the ops face
+// like every allowlisted op — uniform lease gate, args through the
+// shared walk — under the camera mutex hold (its 0x02 chunks ride the
+// warm connection with no sink registered on this path, so nothing
+// lands and nothing interleaves; the board's metadata reply is the
+// result). The mutex is the b9-review minor-4 hardening: a concurrent
+// camera_shot must never share its connection with op-path chunks.
+func TestOpCameraCaptureForwarded(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "op", "board": "d75884", "op": "camera.capture"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "not_held" {
+		t.Fatalf("no-lease class = %q, want not_held (%#v)", er["class"], er)
+	}
+
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "camop"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	var gotFrames any
+	e.fakes["d75884"].on("camera.capture", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		gotFrames = args["frames"]
+		return map[string]any{"frames": args["frames"], "bytes": int64(1234), "w": int64(640), "h": int64(480), "sensor": "GC2145"}, nil
+	})
+	rep, _ = c.call(3, map[string]any{
+		"type": "op", "board": "d75884", "op": "camera.capture",
+		"args": map[string]any{"frames": float64(2)},
+	})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op camera.capture: %#v", rep)
+	}
+	if v, ok := gotFrames.(int64); !ok || v != 2 {
+		t.Fatalf("args[frames] crossed as %#v, want int64 2", gotFrames)
+	}
+	res := asMap(rep["result"])
+	if asStr(res["sensor"]) != "GC2145" || asInt(res["frames"]) != 2 {
+		t.Fatalf("camera.capture result = %#v, want the board's metadata reply", rep["result"])
+	}
+}
+
 // TestOutboundQueueEvictionPolicy pins the delivery policy on one
 // connection's queue: a full queue drops an incoming EVENT
 // (fire-and-forget, unchanged) but a REPLY is never dropped — the

@@ -42,7 +42,7 @@ func TestDialTCPHelloFirstFrame(t *testing.T) {
 		t.Fatalf("hello: %v", err)
 	}
 	if h.ProtocolVer != 4 || h.Role != "controller" {
-		t.Fatalf("hello = ver %d role %q, want 3/controller", h.ProtocolVer, h.Role)
+		t.Fatalf("hello = ver %d role %q, want 4/controller", h.ProtocolVer, h.Role)
 	}
 	if lat := time.Since(start); lat > time.Second {
 		t.Fatalf("hello took %v — first frame was not answered directly", lat)
