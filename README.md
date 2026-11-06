@@ -88,12 +88,11 @@ stderr, `--verbose` for debug level.
                          + capture scripts → results/
     results/             committed evidence (ASCII filenames)
 
-## Docs (mgmt repo)
+## Documentation
 
-- Plan: ../../docs/superpowers/plans/2026-11-04-v1批次5-fw前置與daemon核心.md
-- Spec: ../../docs/資料/懸絲設計文件.md (§6 script lifecycle/teardown, §8 daemon & MCP face)
-- Protocol: ../../docs/資料/v1-repl-協議.md (§6 per-op silence bounds = client timeout table)
-- Rulings: ../../docs/資料/v1執行裁決與遺留.md
+Protocol behavior, design decisions, and the frozen REPL contract are
+documented in comments and tests throughout this repo. Design docs and
+planning records are maintained separately (not public).
 
 ## Firmware
 
