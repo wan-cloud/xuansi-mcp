@@ -1,12 +1,11 @@
 package mcp
 
 // benchschema.go — the frozen bench.* per-primitive signature table,
-// transcribed entry-by-entry from the v1 bench API page (§7 batch-2
-// primitives + §3.2 gpio — docs/資料/v1-bench-API.md, api_version=1,
-// frozen 2026-11-03, fw HEAD b310378 era). This is the schema source
-// tools_dynamic.go expands per-board typed tools from; the transcription
-// is locked by benchschema_test.go, which spells the page's table
-// independently.
+// transcribed entry-by-entry from the frozen v1 bench API (§7 batch-2
+// primitives + §3.2 gpio; api_version=1, frozen 2026-11-03 against the
+// fw of that era). This is the schema source tools_dynamic.go expands
+// per-board typed tools from; the transcription is locked by
+// benchschema_test.go, which spells the same table independently.
 //
 // Param kinds: int (Lua integer), str, bool, bin (byte-string —
 // base64 in the tool input, raw bytes on the wire), table (free-form

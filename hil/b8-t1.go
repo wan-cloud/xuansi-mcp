@@ -58,7 +58,7 @@ import (
 
 const (
 	b8Board   = "d75884"  // the bench board
-	b8FwBuild = "775ecaa" // flashed fw (b6/b7 binding, unchanged)
+	b8FwBuild = "c366c0a" // B9-T4 canonical re-flash (ver 4, the 0x02 overlay era)
 	b8Holder  = "b8-t1"   // custom lease holder for this run
 	b8TCPEndp = "xuansi-d75884.local:7777"
 	b8TmpPath = "/drv/b8tmp.lua"  // the S2 fs-face target
