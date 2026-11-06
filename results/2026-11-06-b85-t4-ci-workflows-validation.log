@@ -1,0 +1,95 @@
+
+===== actionlint =====
+actionlint: clean
+
+===== test.yml go-test leg: go vet ./... =====
+VET-OK
+
+===== test.yml go-test leg: go test ./... =====
+ok  	xuansi/cmd/xuansi	(cached)
+ok  	xuansi/hil	(cached)
+ok  	xuansi/internal/apiclient	(cached)
+ok  	xuansi/internal/board	(cached)
+ok  	xuansi/internal/discover	(cached)
+ok  	xuansi/internal/lease	(cached)
+ok  	xuansi/internal/mcp	(cached)
+ok  	xuansi/internal/paths	(cached)
+ok  	xuansi/internal/replclient	(cached)
+ok  	xuansi/internal/server	(cached)
+ok  	xuansi/internal/testutil	(cached)
+TEST-OK
+
+===== test.yml make-gate leg: make vet =====
+go vet ./...
+MAKE-VET-OK
+
+===== test.yml make-gate leg: make matrix =====
+== matrix GOOS=linux GOARCH=amd64 (CGO_ENABLED=0): vet + build ==
+== matrix GOOS=linux GOARCH=arm64 (CGO_ENABLED=0): vet + build ==
+== matrix GOOS=windows GOARCH=amd64 (CGO_ENABLED=0): vet + build ==
+== matrix GOOS=windows GOARCH=arm64 (CGO_ENABLED=0): vet + build ==
+MAKE-MATRIX-OK
+
+===== test.yml make-gate leg: go test -race ./... =====
+ok  	xuansi/cmd/xuansi	(cached)
+ok  	xuansi/hil	(cached)
+ok  	xuansi/internal/apiclient	(cached)
+ok  	xuansi/internal/board	(cached)
+ok  	xuansi/internal/discover	(cached)
+ok  	xuansi/internal/lease	(cached)
+ok  	xuansi/internal/mcp	(cached)
+ok  	xuansi/internal/paths	(cached)
+ok  	xuansi/internal/replclient	(cached)
+ok  	xuansi/internal/server	(cached)
+ok  	xuansi/internal/testutil	(cached)
+RACE-OK
+
+===== release.yml build-linux: make build VERSION=0.1.0 (CI shape: tag describe -> v-strip -> 0.1.0) =====
+mkdir -p bin
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-X main.Version=0.1.0" -o bin/xuansi-linux-amd64 ./cmd/xuansi
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-X main.Version=0.1.0" -o bin/xuansi-linux-arm64 ./cmd/xuansi
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-X main.Version=0.1.0" -o bin/xuansi-windows-amd64.exe ./cmd/xuansi
+GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-X main.Version=0.1.0" -o bin/xuansi-windows-arm64.exe ./cmd/xuansi
+BUILD-OK
+
+===== release.yml build-linux: stamp guard (VER=0.1.0) =====
+STAMP-GUARD-OK
+
+===== release.yml build-darwin: stub the two darwin slot binaries (CI macos job provides real ones) =====
+
+===== release.yml publish: six-binary presence guard + chmod =====
+total 55764
+-rwxrwxr-x 1 wan wan       34 Nov  6 11:39 xuansi-darwin-amd64
+-rwxrwxr-x 1 wan wan       34 Nov  6 11:39 xuansi-darwin-arm64
+-rwxrwxr-x 1 wan wan 14686721 Nov  6 11:39 xuansi-linux-amd64
+-rwxrwxr-x 1 wan wan 13658063 Nov  6 11:39 xuansi-linux-arm64
+-rwxrwxr-x 1 wan wan 14984704 Nov  6 11:39 xuansi-windows-amd64.exe
+-rwxrwxr-x 1 wan wan 13756928 Nov  6 11:39 xuansi-windows-arm64.exe
+
+===== release.yml publish: assemble-npm.sh 0.1.0 =====
+== assemble-npm 0.1.0 -> packaging/dist/xuansi-0.1.0
+   main package: xuansi@0.1.0 (optionalDependencies pinned)
+   alias package: xuansi-mcp@0.1.0 (dependency xuansi pinned)
+   subpackage: @xuansi/darwin-arm64@0.1.0  <- bin/xuansi-darwin-arm64
+   subpackage: @xuansi/darwin-x64@0.1.0  <- bin/xuansi-darwin-amd64
+   subpackage: @xuansi/linux-arm64@0.1.0  <- bin/xuansi-linux-arm64
+   subpackage: @xuansi/linux-x64@0.1.0  <- bin/xuansi-linux-amd64
+   subpackage: @xuansi/win32-arm64@0.1.0  <- bin/xuansi-windows-arm64.exe
+   subpackage: @xuansi/win32-x64@0.1.0  <- bin/xuansi-windows-amd64.exe
+== done: /home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-npm/packaging/dist/xuansi-0.1.0
+
+===== release.yml publish: version guard node script (verbatim from workflow) =====
+version guard OK: 8 packages @ 0.1.0, deps pinned
+VERSION-GUARD-OK
+
+===== release.yml publish: npm publish --dry-run in workflow order (6 subs -> xuansi -> xuansi-mcp) =====
+dry-run OK: darwin-arm64
+dry-run OK: darwin-x64
+dry-run OK: linux-arm64
+dry-run OK: linux-x64
+dry-run OK: win32-arm64
+dry-run OK: win32-x64
+dry-run OK: xuansi
+dry-run OK: xuansi-mcp
+
+===== ALL T4 LOCAL VALIDATION LEGS PASSED =====
