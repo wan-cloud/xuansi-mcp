@@ -1,0 +1,112 @@
+# B8.5 T3 npm pack --dry-run evidence — 2026-11-06T03:09:59Z
+# assembled by: packaging/scripts/assemble-npm.sh 0.1.0
+{
+  "name": "xuansi",
+  "version": "0.1.0",
+  "description": "xuansi hardware probe — daemon + MCP stdio face (launcher package; the binary arrives via @xuansi/<platform> optionalDependencies)",
+  "bin": {
+    "xuansi": "bin/xuansi.js",
+    "xuansi-mcp": "bin/xuansi-mcp.js"
+  },
+  "optionalDependencies": {
+    "@xuansi/linux-x64": "0.1.0",
+    "@xuansi/linux-arm64": "0.1.0",
+    "@xuansi/win32-x64": "0.1.0",
+    "@xuansi/win32-arm64": "0.1.0",
+    "@xuansi/darwin-x64": "0.1.0",
+    "@xuansi/darwin-arm64": "0.1.0"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
+== npm pack --dry-run: xuansi
+npm notice
+npm notice 📦  xuansi@0.1.0
+npm notice Tarball Contents
+npm notice 1.7kB README.md
+npm notice 395B bin/xuansi-mcp.js
+npm notice 4.5kB bin/xuansi.js
+npm notice 594B package.json
+npm notice Tarball Details
+npm notice name: xuansi
+npm notice version: 0.1.0
+npm notice filename: xuansi-0.1.0.tgz
+npm notice package size: 3.1 kB
+npm notice unpacked size: 7.2 kB
+npm notice shasum: f5c1fbc4546a696b25ff86161ca790d8381e9ab4
+npm notice integrity: sha512-UZMlIpjKrVZ3O[...]aqx+Rmg3eedUg==
+npm notice total files: 4
+npm notice
+xuansi-0.1.0.tgz
+== npm pack --dry-run: linux-x64
+npm notice
+npm notice 📦  @xuansi/linux-x64@0.1.0
+npm notice Tarball Contents
+npm notice 14.7MB bin/xuansi
+npm notice 240B package.json
+npm notice Tarball Details
+npm notice name: @xuansi/linux-x64
+npm notice version: 0.1.0
+npm notice filename: xuansi-linux-x64-0.1.0.tgz
+npm notice package size: 7.9 MB
+npm notice unpacked size: 14.7 MB
+npm notice shasum: 27aefbb2f4f352d72bc0d90af9f4e6e7a6935c11
+npm notice integrity: sha512-Ir7DVaemrAgfY[...]2d4Wcks4RlqFA==
+npm notice total files: 2
+npm notice
+xuansi-linux-x64-0.1.0.tgz
+== npm pack --dry-run: linux-arm64
+npm notice
+npm notice 📦  @xuansi/linux-arm64@0.1.0
+npm notice Tarball Contents
+npm notice 13.7MB bin/xuansi
+npm notice 246B package.json
+npm notice Tarball Details
+npm notice name: @xuansi/linux-arm64
+npm notice version: 0.1.0
+npm notice filename: xuansi-linux-arm64-0.1.0.tgz
+npm notice package size: 7.2 MB
+npm notice unpacked size: 13.7 MB
+npm notice shasum: 0b1ec957f4685956c9c7833d105ea49c66b9f5ee
+npm notice integrity: sha512-rUXwQSbZMw55C[...]VLVae6e2sgDHA==
+npm notice total files: 2
+npm notice
+xuansi-linux-arm64-0.1.0.tgz
+== npm pack --dry-run: win32-x64
+npm notice
+npm notice 📦  @xuansi/win32-x64@0.1.0
+npm notice Tarball Contents
+npm notice 15.0MB bin/xuansi.exe
+npm notice 240B package.json
+npm notice Tarball Details
+npm notice name: @xuansi/win32-x64
+npm notice version: 0.1.0
+npm notice filename: xuansi-win32-x64-0.1.0.tgz
+npm notice package size: 8.0 MB
+npm notice unpacked size: 15.0 MB
+npm notice shasum: f7d8ab41811c95ad4a129edc22e405fa2415345f
+npm notice integrity: sha512-YPNrsgWtlVe3r[...]3G6ZAPnUqutCg==
+npm notice total files: 2
+npm notice
+xuansi-win32-x64-0.1.0.tgz
+== npm pack --dry-run: win32-arm64
+npm notice
+npm notice 📦  @xuansi/win32-arm64@0.1.0
+npm notice Tarball Contents
+npm notice 13.8MB bin/xuansi.exe
+npm notice 246B package.json
+npm notice Tarball Details
+npm notice name: @xuansi/win32-arm64
+npm notice version: 0.1.0
+npm notice filename: xuansi-win32-arm64-0.1.0.tgz
+npm notice package size: 7.3 MB
+npm notice unpacked size: 13.8 MB
+npm notice shasum: 285cfde1375fa0ad3162f98bd757d6a2171bceb8
+npm notice integrity: sha512-c8ol5QirvX/4j[...]ZDX0XmaYDX6DA==
+npm notice total files: 2
+npm notice
+xuansi-win32-arm64-0.1.0.tgz
