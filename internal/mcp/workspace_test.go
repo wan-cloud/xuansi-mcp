@@ -261,7 +261,7 @@ func TestWriteDurableFileNeverTorn(t *testing.T) {
 					return
 				default:
 				}
-				got, err := os.ReadFile(path)
+				got, err := readFileShared(path) // share-delete read: the contract reader never blocks the atomic replace (windows; os.ReadFile holds without FILE_SHARE_DELETE — CI matrix round 4)
 				if errors.Is(err, fs.ErrNotExist) {
 					continue // absent is legal (absent-or-complete)
 				}
