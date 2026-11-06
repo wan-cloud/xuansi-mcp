@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -325,8 +326,14 @@ func isAddrInUse(err error) bool {
 		errors.Is(err, syscall.EEXIST)
 }
 
+// claimSeq makes every racer's claim name unique inside one process
+// (the hammer test's goroutines share a pid); combined with the pid it
+// is unique across processes on the machine.
+var claimSeq atomic.Uint64
+
 // bindSock probes for a live daemon, clears a stale sock file, and
-// listens.
+// claims the listen path — ATOMICALLY on linux/darwin (bindClaim:
+// bind-temp + link), by the direct bind on windows (bindDirect).
 func bindSock(path string) (net.Listener, error) {
 	if fi, err := os.Stat(path); err == nil {
 		if fi.Mode()&os.ModeSocket != 0 {
@@ -348,15 +355,23 @@ func bindSock(path string) (net.Listener, error) {
 			return nil, fmt.Errorf("server: mkdir %s: %w", dir, err)
 		}
 	}
+	if !linkClaimSupported {
+		return bindDirect(path)
+	}
+	return bindClaim(path)
+}
+
+// bindDirect is the plain bind: net.Listen, and on a bind-conflict
+// errno (isAddrInUse — the three-platform family) re-probe before
+// erroring: a live daemon is the graceful already-listening refusal;
+// a dead file is stale, clear it and bind once more. Windows's whole
+// path (linkClaimSupported is false there), and the fallback for any
+// link-incapable filesystem on linux/darwin.
+func bindDirect(path string) (net.Listener, error) {
 	ln, err := net.Listen("unix", path)
 	if err == nil {
 		return ln, nil
 	}
-	// The bind-race window: the sock file can appear between the
-	// stale-check above and the bind (the concurrent-spawn shape — both
-	// racing serves stat'd no file, then one lost the bind). Re-probe
-	// before erroring: a live daemon = the graceful exit-0 loser path;
-	// a dead file = stale, clear it and bind once more.
 	if isAddrInUse(err) {
 		if c, derr := net.Dial("unix", path); derr == nil {
 			c.Close()
@@ -369,6 +384,64 @@ func bindSock(path string) (net.Listener, error) {
 		}
 	}
 	return nil, fmt.Errorf("server: listen %s: %w", path, err)
+}
+
+// bindClaim claims the socket path atomically (linux/darwin): bind a
+// UNIQUE scratch name beside the target and fully arm it (bind+listen
+// both done — the listener answers connects), and only then
+// os.Link(scratch, target): the target name materializes for an
+// already-listening socket, exactly once — link fails EEXIST if
+// another racer's claim landed first.
+//
+// WHY (the darwin TOCTOU, T9 live finding): with a direct bind the
+// socket FILE exists from the bind while listen() may not be armed
+// yet; a racing prober's dial on darwin gets ECONNREFUSED inside that
+// window, misjudges the socket stale, REMOVES the winner's file and
+// binds its own — two winners, the first orphaned on an unlinked
+// inode, unreachable forever (and with no connection, never
+// idle-exits). Linux hides the window (connect succeeds against the
+// backlog), but the defect was portable; only the exposure was
+// darwin's. A unix socket is its inode, so the listener keeps
+// answering on the linked target after the scratch name is dropped
+// (pinned by TestHardLinkedSocketNameAnswers).
+//
+// EEXIST (lost the link race): re-probe the target — alive is the
+// graceful ErrAlreadyListening loser path; dead is stale garbage,
+// removed, claim retried (bounded — three lost races in a row is a
+// live adversary, not a race). Any other link error (a filesystem
+// that refuses socket hard-links) falls back to bindDirect, whose
+// conflict classification handles the race the old way. The scratch
+// name costs ~20 bytes of sun_path headroom beside the target — keep
+// target paths comfortably under the 104-byte darwin limit (the tests
+// do, via testutil.ShortSockDir).
+func bindClaim(path string) (net.Listener, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		claim := fmt.Sprintf("%s.claim-%x", path, uint64(os.Getpid())<<24|claimSeq.Add(1))
+		ln, err := net.Listen("unix", claim)
+		if err != nil {
+			return nil, fmt.Errorf("server: listen claim %s: %w", claim, err)
+		}
+		lerr := os.Link(claim, path)
+		if lerr == nil {
+			// the scratch name has done its job; the target answers now
+			os.Remove(claim)
+			return ln, nil
+		}
+		ln.Close() // also drops the scratch name
+		if !errors.Is(lerr, syscall.EEXIST) {
+			// socket hard-links unavailable here: the direct bind
+			return bindDirect(path)
+		}
+		// lost the link race — the target exists; probe it
+		if c, derr := net.Dial("unix", path); derr == nil {
+			c.Close()
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
+		}
+		if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+			return nil, fmt.Errorf("server: remove stale sock %s: %w", path, rerr)
+		}
+	}
+	return nil, fmt.Errorf("server: claim %s: lost the link race 3 times", path)
 }
 
 // Start launches the serving loops: accept, the initial discovery sweep

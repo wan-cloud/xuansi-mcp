@@ -2936,3 +2936,108 @@ func TestIsAddrInUseClassification(t *testing.T) {
 		}
 	}
 }
+
+// TestHardLinkedSocketNameAnswers pins the OS capability bindClaim
+// builds on: a hard link to a bound unix socket's file is another live
+// name for the SAME listener — connects through the linked name land
+// in the accept queue even after the original name is dropped. A unix
+// socket is its inode. (Verified on linux here; the controller runs
+// it on darwin. On a host where socket hard-links do not work the
+// test skips — bindClaim's own fallback covers that shape.)
+func TestHardLinkedSocketNameAnswers(t *testing.T) {
+	dir := testutil.ShortSockDir(t)
+	claim := filepath.Join(dir, "c.sock")
+	target := filepath.Join(dir, "t.sock")
+
+	ln, err := net.Listen("unix", claim)
+	if err != nil {
+		t.Fatalf("listen claim: %v", err)
+	}
+	defer ln.Close()
+	if err := os.Link(claim, target); err != nil {
+		t.Skipf("socket hard-links unsupported on this host: %v", err)
+	}
+	os.Remove(claim)
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			close(accepted)
+			return
+		}
+		accepted <- c
+	}()
+	c, err := net.Dial("unix", target) // the LINKED name, original dropped
+	if err != nil {
+		t.Fatalf("dial through the linked name: %v", err)
+	}
+	c.Close()
+	ac, ok := <-accepted
+	if ok {
+		ac.Close()
+	} else {
+		t.Fatal("connect through the linked name never reached the accept queue")
+	}
+}
+
+// TestBindSockClaimLeavesNoScratchNames: a successful bindSock leaves
+// ONLY the target socket in its directory — no .claim-* scratch names
+// — and the target really answers (the claim linked an armed
+// listener). Runs on every platform: windows never claims (direct
+// bind), so the no-scratch property holds trivially there.
+func TestBindSockClaimLeavesNoScratchNames(t *testing.T) {
+	dir := testutil.ShortSockDir(t)
+	target := filepath.Join(dir, "d.sock")
+
+	ln, err := bindSock(target)
+	if err != nil {
+		t.Fatalf("bindSock: %v", err)
+	}
+	defer ln.Close()
+
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, de := range des {
+		if strings.HasPrefix(de.Name(), "d.sock.claim-") {
+			t.Fatalf("scratch claim name %q survived the bind", de.Name())
+		}
+	}
+	c, err := net.Dial("unix", target)
+	if err != nil {
+		t.Fatalf("dial the claimed target: %v", err)
+	}
+	c.Close()
+}
+
+// TestBindSockDeadSocketFileIsStale: a socket file nobody listens on
+// (a crashed daemon's leftover — made by closing a listener without
+// unlinking) is stale: bindSock removes it and claims the path.
+func TestBindSockDeadSocketFileIsStale(t *testing.T) {
+	dir := testutil.ShortSockDir(t)
+	target := filepath.Join(dir, "dead.sock")
+
+	ln, err := net.Listen("unix", target)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ul, ok := ln.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener is %T", ln)
+	}
+	ul.SetUnlinkOnClose(false) // the crashed-daemon shape: file stays
+	ln.Close()
+
+	ln2, err := bindSock(target)
+	if err != nil {
+		t.Fatalf("bindSock over a dead sock file: %v", err)
+	}
+	defer ln2.Close()
+	c, err := net.Dial("unix", target)
+	if err != nil {
+		t.Fatalf("dial after re-claim: %v", err)
+	}
+	c.Close()
+}
