@@ -81,7 +81,12 @@ func TestResolveUSBDeviceDirectAndUnknown(t *testing.T) {
 	if err == nil {
 		t.Fatal("unknown device resolved without error")
 	}
-	for _, want := range []string{"usb-No_Such_Device-if00", byIDDir} {
+	// The fallback candidate is printed the way the product builds it —
+	// filepath.Join(byIDDir, base) — which on windows Cleans the
+	// separators ("\\dev\\serial\\by-id\\…"); asserting the joined form
+	// (not a literal unix spelling) keeps the check portable and pinned
+	// to the construction under test (first CI matrix round 3 finding).
+	for _, want := range []string{"usb-No_Such_Device-if00", filepath.Join(byIDDir, "usb-No_Such_Device-if00")} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention candidate %q", err, want)
 		}
