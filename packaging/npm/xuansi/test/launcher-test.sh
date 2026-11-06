@@ -17,6 +17,14 @@
 #   7. missing platform package + no XUANSI_BIN: install hint on stderr,
 #      empty stdout, non-zero exit
 #   8. SIGTERM forwarding: TERM to launcher reaches the child
+#   9. alias package xuansi-mcp contract: name, bin map, exactly one
+#      dependency (xuansi) — what `npx -y xuansi-mcp` resolves against
+#  10. alias bin prepend: installed-shape stub (alias package with its
+#      xuansi dependency stubbed under node_modules/ containing the real
+#      launcher), XUANSI_BIN fake -> argv forwarded with "mcp" first
+#  11. alias stdio passthrough: same stub, fake-cat -> stdout
+#      byte-exact through BOTH require hops, stderr clean
+#  12. alias exit forwarding: fake exit 7 -> alias exit 7
 set -u
 
 TESTDIR=$(cd "$(dirname "$0")" && pwd)
@@ -182,6 +190,60 @@ if [ $trc -eq 9 ] && grep -q 'TERM-FORWARDED' "$SCRATCH/term.out"; then
 else
   bad "SIGTERM forwarding (rc=$trc, out=$(cat "$SCRATCH/term.out"))"
 fi
+
+# ------------------- 9-11: alias package xuansi-mcp (controller ruling)
+# npx resolves PACKAGE names; `npx -y xuansi-mcp` needs a package by
+# that name. Check 9 pins the package.json contract; 10-11 drive the
+# alias bin in an installed-shape stub — the alias package copied into
+# scratch with its `xuansi` dependency stubbed under node_modules/
+# (containing the REAL launcher), exactly the layout npm installs.
+ALIAS_SRC=$(cd "$TESTDIR/../../xuansi-mcp" && pwd)
+ALIAS_INST="$SCRATCH/alias/xuansi-mcp"
+
+node - "$ALIAS_SRC/package.json" <<'EOF'
+const pkg = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
+const errs = [];
+if (pkg.name !== 'xuansi-mcp') errs.push(`name: ${pkg.name}`);
+if (!pkg.bin || pkg.bin['xuansi-mcp'] !== 'bin/xuansi-mcp.js')
+  errs.push(`bin map: ${JSON.stringify(pkg.bin)}`);
+const deps = Object.keys(pkg.dependencies || {});
+if (deps.length !== 1 || deps[0] !== 'xuansi' || pkg.dependencies.xuansi !== '*')
+  errs.push(`deps: ${JSON.stringify(pkg.dependencies)}`);
+process.exit(errs.length ? (console.error(errs.join('; ')), 1) : 0);
+EOF
+[ $? -eq 0 ] && ok "alias package contract: name xuansi-mcp, bin map, single dep xuansi" \
+               || bad "alias package contract (see above)"
+
+mkdir -p "$ALIAS_INST/bin" "$ALIAS_INST/node_modules/xuansi/bin"
+cp "$ALIAS_SRC/package.json" "$ALIAS_INST/package.json"
+cp "$ALIAS_SRC/bin/xuansi-mcp.js" "$ALIAS_INST/bin/xuansi-mcp.js"
+cp "$LAUNCHER" "$ALIAS_INST/node_modules/xuansi/bin/xuansi.js"
+printf '%s\n' '{"name":"xuansi","version":"0.0.0"}' \
+  >"$ALIAS_INST/node_modules/xuansi/package.json"
+
+# (check 6's fake-argv pattern: one argv element per line; "mcp" first)
+out=$(XUANSI_BIN="$SCRATCH/fake-argv.sh" node "$ALIAS_INST/bin/xuansi-mcp.js" \
+        --transport stdio extra 2>/dev/null)
+want=$(printf '%s\n' mcp --transport stdio extra)
+if [ "$out" = "$want" ]; then
+  ok "alias bin: resolves xuansi via node_modules, 'mcp' prepended to argv"
+else
+  bad "alias bin prepend (got: $(printf '%s|' $(printf '%s\n' "$out")) )"
+fi
+
+XUANSI_BIN="$SCRATCH/fake-cat.sh" node "$ALIAS_INST/bin/xuansi-mcp.js" \
+  <"$SCRATCH/frames.in" >"$SCRATCH/alias-frames.out" 2>"$SCRATCH/alias-frames.err"
+rc=$?
+if [ $rc -eq 0 ] && cmp -s "$SCRATCH/frames.in" "$SCRATCH/alias-frames.out" \
+   && [ ! -s "$SCRATCH/alias-frames.err" ]; then
+  ok "alias stdio passthrough: stdout byte-exact, stderr clean"
+else
+  bad "alias stdio passthrough (rc=$rc; stderr=$(wc -c <"$SCRATCH/alias-frames.err")B)"
+fi
+
+XUANSI_BIN="$SCRATCH/fake-exit.sh" node "$ALIAS_INST/bin/xuansi-mcp.js" >/dev/null 2>&1
+[ $? -eq 7 ] && ok "alias exit forwarding: fake exit 7 -> alias 7" \
+              || bad "alias exit forwarding (expected 7)"
 
 echo "----"
 echo "launcher-test: $PASS passed, $FAIL failed"

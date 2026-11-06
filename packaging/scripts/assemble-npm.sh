@@ -10,6 +10,15 @@
 #     <platform-key>/         one dir per platform subpackage (standalone
 #                             publishable): package.json (os+cpu+files) and
 #                             bin/xuansi (bin/xuansi.exe on win32 keys)
+#     xuansi-mcp/             alias package (controller ruling 2026-11-06):
+#                             version stamped, dependency on xuansi PINNED
+#                             (in-repo "*"), bin/xuansi-mcp.js + README.md
+#
+# Publish order: the six @xuansi/<platform> subpackages FIRST, then the
+# main `xuansi` package, then the alias `xuansi-mcp` LAST — every package
+# must have its pinned dependencies already on the registry at the moment
+# it becomes installable (xuansi pins the subpackages; xuansi-mcp pins
+# xuansi).
 #
 # Binary source convention (bin/ at repo root, `make build` outputs):
 #     linux-x64    <- bin/xuansi-linux-amd64
@@ -89,6 +98,29 @@ fs.writeFileSync(dest, JSON.stringify(pkg, null, 2) + '\n');
 EOF
 echo "   main package: xuansi@$VERSION (optionalDependencies pinned)"
 
+# ---- alias package xuansi-mcp: npx resolves package names, so the
+# design's `npx -y xuansi-mcp` invocation needs a package published
+# under exactly that name (controller ruling 2026-11-06). Published
+# LAST — it pins a dependency on `xuansi` (see publish order above).
+ALIAS_SRC=$ROOT/packaging/npm/xuansi-mcp
+mkdir -p "$DIST/xuansi-mcp/bin"
+cp "$ALIAS_SRC/bin/xuansi-mcp.js" "$DIST/xuansi-mcp/bin/"
+chmod 755 "$DIST/xuansi-mcp/bin/xuansi-mcp.js"
+cp "$ALIAS_SRC/README.md" "$DIST/xuansi-mcp/README.md"
+node - "$ALIAS_SRC/package.json" "$DIST/xuansi-mcp/package.json" "$VERSION" <<'EOF'
+const fs = require('fs');
+const [src, dest, version] = process.argv.slice(2);
+const pkg = JSON.parse(fs.readFileSync(src, 'utf8'));
+pkg.version = version;
+// Pin the xuansi dependency — in-repo "*" tracks local dev; at publish
+// time the family must move in lockstep.
+for (const name of Object.keys(pkg.dependencies || {})) {
+  pkg.dependencies[name] = version;
+}
+fs.writeFileSync(dest, JSON.stringify(pkg, null, 2) + '\n');
+EOF
+echo "   alias package: xuansi-mcp@$VERSION (dependency xuansi pinned)"
+
 # ---- six platform subpackages (keys from the launcher map)
 SKIPPED_DARWIN=0
 while IFS= read -r key; do
@@ -132,7 +164,9 @@ const fs = require('fs');
 const { platformPackage } = require(process.argv[2]);
 const dist = process.argv[3];
 const keys = new Set(Object.keys(platformPackage));
-const made = fs.readdirSync(dist).filter((e) => e !== 'xuansi');
+// 'xuansi' (main) and 'xuansi-mcp' (alias) are the two non-subpackage
+// dist entries; everything else must be a launcher-map key.
+const made = fs.readdirSync(dist).filter((e) => e !== 'xuansi' && e !== 'xuansi-mcp');
 for (const entry of made) {
   if (!keys.has(entry)) {
     console.error(`assemble-npm.sh: unexpected dist entry '${entry}' (not in launcher map)`);

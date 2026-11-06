@@ -23,7 +23,7 @@ exactly one `@xuansi/<platform>` subpackage matching your OS/arch
 Zero-install via npx:
 
     npx -y xuansi list
-    npx -y -p xuansi xuansi-mcp
+    npx -y xuansi-mcp        # alias package — same as `xuansi mcp`
 
 ## Environment
 
@@ -46,4 +46,4 @@ Zero-install via npx:
 
 Point your MCP client at the `xuansi-mcp` command, e.g. for OpenCode:
 
-    { "mcp": { "xuansi": { "type": "local", "command": ["npx", "-y", "-p", "xuansi", "xuansi-mcp"] } } }
+    { "mcp": { "xuansi": { "type": "local", "command": ["npx", "-y", "xuansi-mcp"] } } }
