@@ -79,7 +79,7 @@ func (m *Manifest) entry(name string) DriverEntry {
 // being overwritten on the next write — the workspace's history is
 // not disposable.
 func loadManifest(path string) (*Manifest, error) {
-	b, err := os.ReadFile(path)
+	b, err := readFileShared(path) // share-delete on windows: must not block a concurrent atomic replace
 	if os.IsNotExist(err) {
 		return &Manifest{Drivers: map[string]DriverEntry{}}, nil
 	}
