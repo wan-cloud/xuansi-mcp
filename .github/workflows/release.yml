@@ -110,12 +110,26 @@ jobs:
   publish:
     needs: [build-linux, build-darwin]
     runs-on: ubuntu-latest
+    # OIDC trusted publishing (npm docs): job-level block widens ONLY this
+    # job (workflow-level stays contents: read). id-token: write lets npm
+    # mint the OIDC token the registry matches against each package's
+    # trusted publisher config (org wan-cloud / repo xuansi-mcp /
+    # workflow release.yml / allow `npm publish`; see packaging/README.md).
+    # No NPM_TOKEN secret is involved anywhere.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Node 24 ships npm ≥11.5.1, which auto-detects the Actions OIDC
+      # identity (with id-token: write above) — no NODE_AUTH_TOKEN.
+      # Release builds never restore a package-manager cache (npm docs);
+      # package-manager-cache input exists from setup-node@v5.
+      - uses: actions/setup-node@v5
         with:
-          node-version: '22'
-          registry-url: https://registry.npmjs.org/
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       # Both bin-* artifacts merge into bin/ (zip roots are the files
       # themselves — each upload packed the whole bin/ directory).
       - uses: actions/download-artifact@v4
@@ -165,10 +179,12 @@ jobs:
       # launcher map — same single source assemble reads), then the main
       # `xuansi` (pins all six), then the alias `xuansi-mcp` LAST (pins
       # xuansi). --access public: scoped packages default restricted.
-      # The token is never echoed: it only travels via NODE_AUTH_TOKEN.
+      # OIDC trusted publishing: npm ≥11.5.1 auto-detects the Actions
+      # identity (id-token: write above) — no NODE_AUTH_TOKEN; each of
+      # the 8 packages has a trusted publisher config on npmjs.com
+      # (org wan-cloud / repo xuansi-mcp / workflow release.yml /
+      # allow `npm publish`).
       - name: npm publish (6 subpackages → xuansi → xuansi-mcp)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VER="${GITHUB_REF_NAME#v}"
           DIST="packaging/dist/xuansi-$VER"

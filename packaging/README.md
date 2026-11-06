@@ -44,3 +44,42 @@ How the xuansi npm package family is assembled and published.
   registry at the moment it becomes installable.
 - `packaging/dist/` is gitignored; `results/` holds acceptance
   transcripts (ASCII filenames).
+
+## Registry access — npm Trusted Publishers (OIDC)
+
+Publishing authenticates via OIDC trusted publishing — there is **no
+`NPM_TOKEN` secret** (removed, owner-directed). The `publish` job in
+`.github/workflows/release.yml` carries `permissions: id-token: write`
+(job-level; workflow-level stays `contents: read`); Node 24 ships
+npm ≥ 11.5.1, which auto-detects the Actions OIDC identity — no
+`NODE_AUTH_TOKEN` env on any publish step.
+
+One-time setup on npmjs.com — a trusted publisher entry per package,
+**8 packages total** (`xuansi`, `xuansi-mcp`, and the six
+`@xuansi/<platform>` subpackages). Every entry gets the same fields:
+
+| Field        | Value               |
+|--------------|---------------------|
+| Repository   | `wan-cloud/xuansi-mcp` |
+| Workflow     | `release.yml`       |
+| Environment  | *(none — leave empty; the job declares no environment)* |
+| Command      | `npm publish` (allowed) |
+
+Notes:
+
+- **`repository.url` is load-bearing**: every published package.json
+  carries `"repository": {"type":"git","url":"git+https://github.com/wan-cloud/xuansi-mcp.git"}`
+  — it must EXACTLY match the GitHub repo the trusted publisher names.
+  The two hand-maintained templates (`packaging/npm/xuansi/`,
+  `packaging/npm/xuansi-mcp/`) and the subpackage generator in
+  `packaging/scripts/assemble-npm.sh` (single source for the six
+  generated package.jsons) all stamp the same value.
+- **First-publish validation window**: a trusted publisher created for a
+  package name that does not exist on the registry yet enters a ~2-day
+  validation window before it can be used — create all 8 entries at
+  least two days before pushing the first release tag, or the first
+  publish 403s.
+- **Private repo ⇒ no provenance**: npm provenance attestations require
+  a public repository. If `wan-cloud/xuansi-mcp` is (or goes) private,
+  OIDC publishes still work but no provenance statement is generated.
+
