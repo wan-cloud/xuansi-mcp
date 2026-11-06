@@ -3,8 +3,12 @@ GO ?= go
 # Version stamped into every `make build` binary via -X main.Version
 # (B8.5 T1): single source = git describe; override with `make build
 # VERSION=vX.Y.Z`. `make matrix` deliberately does NOT inject — it stays
-# a pure vet/build gate.
+# a pure vet/build gate. The leading "v" is stripped right below so
+# tag vX.Y.Z = npm X.Y.Z = binary X.Y.Z — one version shape across the
+# whole release (controller ruling 2026-11-06; mcp initialize reports
+# serverInfo.version, which must be bare semver like the npm side).
 VERSION ?= $(shell git describe --tags --always --dirty)
+VERSION := $(VERSION:v%=%)
 
 # Cross-compile matrix: linux/windows × amd64/arm64, pure Go
 # (CGO_ENABLED=0 — the project has no cgo). darwin is deliberately
