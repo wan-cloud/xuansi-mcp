@@ -3,9 +3,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"syscall"
 	"time"
 )
 
@@ -56,6 +58,15 @@ const transitionGrace = 500 * time.Millisecond
 // holder's transition.
 const lockPoll = 2 * time.Millisecond
 
+// windows contention errnos on the lock claim: ERROR_ACCESS_DENIED (5)
+// surfaces while the previous holder's lock file is being DELETED (or
+// held by a scanner), ERROR_SHARING_VIOLATION (32) while a handle on
+// it is mid-close — neither is a lost cause, both mean "contended".
+const (
+	accessDenied     = syscall.Errno(5)
+	sharingViolation = syscall.Errno(32)
+)
+
 // bindSockPlatform (windows): the transition-lock claim protocol above.
 func bindSockPlatform(path string) (net.Listener, error) {
 	lock := path + sockLockSuffix
@@ -69,11 +80,24 @@ func bindSockPlatform(path string) (net.Listener, error) {
 			os.Remove(lock) // release; best-effort — a crashed release self-heals via stale recovery
 			return ln, berr
 		}
-		if !os.IsExist(err) {
+		// What does a failed claim mean?
+		//   EEXIST                        — a holder owns the lock.
+		//   ACCESS_DENIED / SHARING_VIOL  — the DELETION window: the
+		//     previous holder is between close-handle and delete (or a
+		//     scanner briefly holds the lock file). Windows surfaces a
+		//     concurrent delete as ERROR_ACCESS_DENIED, NOT EEXIST —
+		//     treating it as fatal cost the CI hammer a bare loser
+		//     (round 13, matrix round 4). Contention either way: fall
+		//     through to the same bounded wait.
+		//   anything else                 — a real failure.
+		var errno syscall.Errno
+		if !os.IsExist(err) &&
+			!(errors.As(err, &errno) && (errno == accessDenied || errno == sharingViolation)) {
 			return nil, fmt.Errorf("server: claim transition lock %s: %w", lock, err)
 		}
-		// someone holds the transition: wait it out — alive is the
-		// graceful loser path, a released lock means retry the claim
+		// someone holds (or is dropping) the transition: wait it out —
+		// alive is the graceful loser path, a released lock means retry
+		// the claim
 		deadline := time.Now().Add(transitionGrace)
 		for time.Now().Before(deadline) {
 			if sockAlive(path) {
