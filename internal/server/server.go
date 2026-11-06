@@ -1556,6 +1556,10 @@ func (s *Server) hFsRead(ctx context.Context, req *Request) (any, error) {
 	}
 	var out []byte
 	err := s.withController(ctx, b, func(ctl board.Controller) error {
+		out = out[:0] // a redial attempt restarts at off=0 — drop any partial
+		// prefix the dead attempt appended (fix round 1: without this the
+		// retry would duplicate the whole file onto the partial prefix and
+		// return the corruption as success)
 		var off uint32
 		for {
 			res, err := ctl.Op(ctx, "fs.read_part", map[string]any{

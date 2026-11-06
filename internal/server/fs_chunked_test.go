@@ -271,3 +271,73 @@ func TestFsWriteChunkShaVerifiedByFake(t *testing.T) {
 		t.Fatal("committed file not byte-exact (fake sha gate would have refused)")
 	}
 }
+
+// TestFsReadRedialDoesNotDuplicate: a link death mid-assembly (after a
+// partial first window) redials once and restarts at off=0 — the
+// accumulator must DROP the dead attempt's partial prefix (fix round
+// 1: without the reset the retry appended the whole file onto the
+// prefix and returned the corruption as success). Deterministic: the
+// dying fake serves window 1, then atomically swaps itself out for the
+// fresh fake and dies, so window 2 hits ErrDead and the redial dials
+// the fresh fake — no sleeps, no races.
+func TestFsReadRedialDoesNotDuplicate(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	want := makePattern(33280)
+
+	// attempt 2 (the redial target): a FRESH fake serving the whole file.
+	fresh := newFakeCtl()
+	served := 0
+	fresh.on("fs.read_part", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		off, _ := args["off"].(int)
+		length, _ := args["len"].(int)
+		end := off + length
+		if end > len(want) {
+			end = len(want)
+		}
+		served++
+		return map[string]any{
+			"data":  append([]byte{}, want[off:end]...),
+			"total": int64(len(want)),
+			"eof":   end >= len(want),
+		}, nil
+	})
+
+	// attempt 1: serves a 100B partial first window (eof=false), then
+	// swaps in the fresh fake and dies — the next window call returns
+	// ErrDead, withController redials, and the redial must restart the
+	// accumulator, not append onto the partial prefix.
+	dying := e.fakes["d75884"]
+	e.fakes["d75884"].on("fs.read_part", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		e.dmu.Lock()
+		e.fakes["d75884"] = fresh
+		e.dmu.Unlock()
+		dying.markDead()
+		return map[string]any{
+			"data":  append([]byte{}, want[:100]...),
+			"total": int64(len(want)),
+			"eof":   false,
+		}, nil
+	})
+
+	rep, _ := dialSock(t, e.sock).call(1, map[string]any{
+		"type": "fs_read", "board": "d75884", "path": "/drv/mod.aot",
+	})
+	res := asMap(rep["result"])
+	if res == nil {
+		t.Fatalf("fs_read: %#v", rep)
+	}
+	b64, _ := res["data"].(string)
+	got, derr := base64.StdEncoding.DecodeString(b64)
+	if derr != nil {
+		t.Fatalf("decode: %v", derr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("fs_read after redial = %d bytes, want exactly the %d-byte file (no duplicated prefix)", len(got), len(want))
+	}
+	if served == 0 {
+		t.Fatal("the fresh fake never served — the redial path did not run")
+	}
+	if e.dialedTCP("d75884") < 2 {
+		t.Fatalf("dials = %d, want the one redial", e.dialedTCP("d75884"))
+	}
+}
