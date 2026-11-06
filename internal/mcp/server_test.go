@@ -632,29 +632,30 @@ func TestDaemonDeathIsToolErrorNamingConnectionLoss(t *testing.T) {
 	}
 }
 
-// TestFsWriteClientSideCapRefusal: a decoded payload above the 16384B
-// single-file cap is refused HERE — api class, message mirroring the
-// daemon's own refusal shape — with ZERO daemon contact; the boundary
-// itself (exactly 16384B) crosses normally.
-func TestFsWriteClientSideCapRefusal(t *testing.T) {
-	e, reqs := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+// TestFsWriteAboveCapNowCrosses: a decoded payload above the board's
+// 16384B single-op cap CROSSES to the daemon whole (B10-T1: the former
+// client-side refusal is gone — the daemon chunks it onto the board);
+// exactly 16384B still crosses too.
+func TestFsWriteAboveCapNowCrosses(t *testing.T) {
+	for _, n := range []int{16384, 16385, 40000} {
+		data := make([]byte, n)
+		for i := range data {
+			data[i] = byte('a' + i%26)
+		}
+		e, reqs := newEnv(t, []step{{result: map[string]any{"size": float64(n)}}}, Options{Holder: "mcp-fixed01"})
 
-	data := make([]byte, fsWriteMax+1)
-	for i := range data {
-		data[i] = byte('a' + i%26)
+		res := e.call("xuansi_fs_write", map[string]any{
+			"board": "d75884", "path": "/big.bin",
+			"data_b64": base64Std(t, data),
+		})
+		if res.IsError {
+			t.Fatalf("n=%d: fs_write failed: %s", n, resultText(t, res))
+		}
+		req := wantReq(t, reqs)
+		if req.Type != "fs_write" || len(req.Data) != n {
+			t.Fatalf("n=%d: daemon saw %d bytes (type %s), want the whole payload", n, len(req.Data), req.Type)
+		}
 	}
-	res := e.call("xuansi_fs_write", map[string]any{
-		"board": "d75884", "path": "/big.bin",
-		"data_b64": base64Std(t, data),
-	})
-	if !res.IsError {
-		t.Fatalf("oversized fs_write did not surface as a tool error: %+v", res)
-	}
-	want := "api: fs_write /big.bin: 16385 bytes exceeds the 16384B single-file cap (refused client-side)"
-	if got := resultText(t, res); got != want {
-		t.Errorf("error text = %q, want exactly %q", got, want)
-	}
-	noContact(t, reqs) // the refusal never reached the daemon
 }
 
 // TestFsWriteInvalidBase64RefusedLocally: a data_b64 that does not

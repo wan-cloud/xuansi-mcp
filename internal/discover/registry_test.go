@@ -113,7 +113,7 @@ func TestRefreshSourceDisappearDowngrade(t *testing.T) {
 	if err := r.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh 1: %v", err)
 	}
-	hello := &replclient.HelloInfo{ProtocolVer: 4, FwBuild: "b310378"}
+	hello := &replclient.HelloInfo{ProtocolVer: 5, FwBuild: "b310378"}
 	r.Enrich("d75884", hello)
 
 	f.set([]Board{usbA}, nil) // wifi off: mdns sweep finds nothing
@@ -261,7 +261,7 @@ func TestEnrichLazyHello(t *testing.T) {
 	if b := r.Snapshot()[0]; b.Hello != nil {
 		t.Fatalf("Hello must be nil until someone dials, got %#v", b.Hello)
 	}
-	hello := &replclient.HelloInfo{ProtocolVer: 4, FwBuild: "b310378"}
+	hello := &replclient.HelloInfo{ProtocolVer: 5, FwBuild: "b310378"}
 	r.Enrich("d75884", hello)
 	if b := r.Snapshot()[0]; b.Hello != hello {
 		t.Errorf("Enrich not recorded: %#v", b.Hello)

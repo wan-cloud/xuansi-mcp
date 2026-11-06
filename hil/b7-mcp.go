@@ -86,7 +86,7 @@ import (
 
 const (
 	b7Board    = "d75884"  // the bench board (echo fixture I2C0 8/9 <-> I2C1 10/11 @0x28; SPI self-loop 12<->13, sclk 14)
-	b7FwBuild  = "c366c0a" // B9-T4 canonical re-flash: fw repo main HEAD (ver 4, the 0x02 overlay era)
+	b7FwBuild  = "9dce098" // B10-T1 canonical re-flash: fw repo main HEAD (ver 5, the chunked-transport era)
 	b7Holder   = "b7-hil"  // custom lease holder for this run
 	b7TCPEndp  = "xuansi-d75884.local:7777"
 	b7Resource = "xuansi://boards/" + b7Board + "/events"

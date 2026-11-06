@@ -83,7 +83,7 @@ func TestReconnectReHellosWithPreviousRole(t *testing.T) {
 		t.Fatalf("reconnect: %v", err)
 	}
 	t.Cleanup(func() { nc.Close() })
-	if h.Role != "controller" || h.ProtocolVer != 4 {
+	if h.Role != "controller" || h.ProtocolVer != 5 {
 		t.Fatalf("reconnect hello = role %q ver %d", h.Role, h.ProtocolVer)
 	}
 	if *f.dials != 1 {

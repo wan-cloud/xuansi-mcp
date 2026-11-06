@@ -99,7 +99,7 @@ import (
 
 const (
 	b6Board    = "d75884"  // the bench board (pin map v1: GPIO1<->GPIO2 wired)
-	b6FwBuild  = "c366c0a" // B9-T4 canonical re-flash (ver 4, the 0x02 overlay era)
+	b6FwBuild  = "9dce098" // B10-T1 canonical re-flash (ver 5, the chunked-transport era)
 	b6Holder   = "b6-hil"  // custom lease holder for this run
 	b6TCPEndp  = "xuansi-d75884.local:7777"
 	b6Resource = "xuansi://boards/" + b6Board + "/events"

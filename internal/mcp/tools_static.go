@@ -136,7 +136,7 @@ type scriptStopIn struct {
 type fsWriteIn struct {
 	Board   string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
 	Path    string `json:"path" jsonschema:"absolute file path on the board's filesystem"`
-	DataB64 string `json:"data_b64" jsonschema:"the file's full CONTENTS, standard base64 — decoded before sending; a decoded size above 16384 bytes (the board's single-file cap) is refused right here without contacting the daemon"`
+	DataB64 string `json:"data_b64" jsonschema:"the file's full CONTENTS, standard base64 — decoded before sending; any size up to the internal wire's 1 MiB frame cap crosses (the daemon chunks >16KB payloads onto the board automatically)"`
 	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
@@ -345,7 +345,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_fs_write",
-		Description: "Write a whole file to the board's filesystem under the lease. data_b64 decodes client-side; a decoded size above 16384 bytes (the board's single-file cap) is refused locally with an api-class error without contacting the daemon. Holder semantics: " + holderDesc + ".",
+		Description: "Write a whole file to the board's filesystem under the lease. data_b64 decodes client-side; payloads above the board's 16KB single-op cap ride the chunked transport transparently (fs.write_part chunks + a sha256-verifying commit — B10-T1), bounded only by the internal wire's 1 MiB frame cap. Holder semantics: " + holderDesc + ".",
 	}, ts.fsWrite)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -370,7 +370,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_ws_put",
-		Description: "Store one driver VERSION into the daemon-side workspace (drivers/<name>@<version>.lua + its manifest checksum entry). Storing is NOT activating — nothing reaches a board until xuansi_driver_push. The workspace keeps the full file: the board's 16384B single-file cap is a PUSH-time concern, so a fat version can sit here until it slims. Keep every version you may re-deploy — the workspace is the rollback history.",
+		Description: "Store one driver VERSION into the daemon-side workspace (drivers/<name>@<version>.lua + its manifest checksum entry). Storing is NOT activating — nothing reaches a board until xuansi_driver_push. The workspace keeps the full file; pushes of any size ride the chunked transport (B10-T1), so fat .aot-era versions deploy whole. Keep every version you may re-deploy — the workspace is the rollback history.",
 	}, ts.wsPut)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -385,7 +385,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_driver_push",
-		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.lua (the board knows nothing of versions). Gated BEFORE the flash write: the file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one), and the file must fit the board's 16384B single-file cap. The write is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
+		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.lua (the board knows nothing of versions). Gated BEFORE the flash write: the file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one). The write rides the chunked transport for any size (B10-T1) and is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
 	}, ts.driverPush)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -524,9 +524,8 @@ func (ts *toolset) fsWrite(ctx context.Context, _ *mcpsdk.CallToolRequest, in fs
 	if derr != nil {
 		return nil, boardAckOut{}, errFsNotBase64(in.Path, derr)
 	}
-	if len(data) > fsWriteMax {
-		return nil, boardAckOut{}, errFsTooLarge(in.Path, len(data))
-	}
+	// No client-side size cap (B10-T1): >16KB payloads ride the daemon's
+	// chunked transport; the bound is the internal wire's 1 MiB frame.
 	res, err := ts.callHeld(ctx, server.Request{Type: "fs_write", Board: in.Board, Holder: in.Holder, Path: in.Path, Data: data})
 	if err != nil {
 		return nil, boardAckOut{}, err

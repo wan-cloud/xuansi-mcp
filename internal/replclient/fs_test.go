@@ -9,8 +9,9 @@ import (
 )
 
 // TestFsWriteSendsBinAndEnforcesCap: fs.write carries the bytes as one
-// msgpack bin with the path, and data above the 16384B single-file cap
-// is refused client-side — the board sees no request at all.
+// msgpack bin with the path; data above the 16384B single-op cap is
+// refused client-side pointing at the chunked face — the board sees no
+// request at all.
 func TestFsWriteSendsBinAndEnforcesCap(t *testing.T) {
 	c, b := newTestClient(t)
 	var gotPath string
@@ -32,7 +33,7 @@ func TestFsWriteSendsBinAndEnforcesCap(t *testing.T) {
 	before := len(b.got())
 	err := c.FsWrite(context.Background(), "/lua/big.tmp", make([]byte, 16385))
 	if err == nil {
-		t.Fatal("16385B write accepted")
+		t.Fatal("16385B single-op write accepted")
 	}
 	if !strings.Contains(err.Error(), "16384") {
 		t.Fatalf("cap error = %v, want it to name the 16384B cap", err)

@@ -10,6 +10,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,8 +41,12 @@ const (
 	defaultAuditTimeout    = 20 * time.Second // per-board startup orphan audit bound
 	defaultTeardownTimeout = 30 * time.Second // board-side lease teardown bound
 	defaultRequestTimeout  = 60 * time.Second // one request's total budget
-	// fsFileMax mirrors the fw single-file cap (XS_FILE_MAX = 16384B,
-	// caps limits.file_max); fs_write is refused daemon-side above it.
+	// fsFileMax mirrors the fw per-CHUNK cap (XS_FILE_MAX = 16384B, caps
+	// limits.file_max): one fs.write / fs.write_part / fs.read_part
+	// carries at most this many bytes. fs_write payloads above it ride
+	// the v5 chunked transport (B10-T1): fs.write_part × N + one
+	// sha256-verifying fs.write_commit — transparent to internal-API
+	// clients (the request type and reply shape are unchanged).
 	fsFileMax = 16384
 	// outboundQ is the per-connection event/reply buffer. A full queue
 	// drops an incoming EVENT (fire-and-forget, fw §8 style); a REPLY
@@ -1484,6 +1490,17 @@ func (s *Server) hScriptStop(ctx context.Context, cc *clientConn, req *Request) 
 	return s.boardOp(ctx, b, "script.stop", map[string]any{"name": req.Name})
 }
 
+// hFsWrite writes a whole file to the board under the lease. At or
+// below the fw's per-op cap (16384B) it is verbatim fs.write — the
+// pre-B10 wire, zero change. Above it the v5 chunked transport carries
+// the file: fs.write_part per 16384B chunk + one fs.write_commit
+// carrying the payload's sha256 (the board hashes chunk-by-chunk as it
+// writes and verifies at commit; the rename that lands the file is
+// atomic). A dead link under the stream redials ONCE and restarts at
+// off=0 — the .part reopen truncates and the board-side hash ledger
+// restarts, so a restart is always idempotent (§13 redial ≠ reboot).
+// The reply is the commit's {size} — the same shape fs.write returns,
+// so internal-API clients see no difference (B10-T1).
 func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -1492,21 +1509,90 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
 		return nil, err
 	}
-	if len(req.Data) > fsFileMax {
-		return nil, &RPCError{
-			Class: "api",
-			Msg:   fmt.Sprintf("fs_write %s: %d bytes exceeds the %dB single-file cap (refused daemon-side)", req.Path, len(req.Data), fsFileMax),
-		}
+	if len(req.Data) <= fsFileMax {
+		return s.boardOp(ctx, b, "fs.write", map[string]any{"path": req.Path, "data": req.Data})
 	}
-	return s.boardOp(ctx, b, "fs.write", map[string]any{"path": req.Path, "data": req.Data})
+	sum := sha256.Sum256(req.Data)
+	shaHex := hex.EncodeToString(sum[:])
+	var res map[string]any
+	err := s.withController(ctx, b, func(ctl board.Controller) error {
+		for off := 0; off < len(req.Data); off += fsFileMax {
+			end := off + fsFileMax
+			if end > len(req.Data) {
+				end = len(req.Data)
+			}
+			if _, err := ctl.Op(ctx, "fs.write_part", map[string]any{
+				"path": req.Path, "off": off, "data": req.Data[off:end],
+			}); err != nil {
+				return err
+			}
+		}
+		r, err := ctl.Op(ctx, "fs.write_commit", map[string]any{
+			"path": req.Path, "expected_len": len(req.Data), "sha256": shaHex,
+		})
+		if err != nil {
+			return err
+		}
+		res = r
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
+// hFsRead reads a whole board file back through the v5 chunked read
+// face: fs.read_part windows of 16384B assembled until eof (a file at
+// or below the cap completes in one call; bigger files loop — the
+// frozen fs.read op still refuses them). The reply shape is unchanged
+// ({data: base64}); a missing file surfaces as the board's own api
+// error. The stream redials once on a dead link and restarts at off=0
+// (reads are stateless on the board, so a restart is trivially safe).
 func (s *Server) hFsRead(ctx context.Context, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
 		return nil, rerr
 	}
-	return s.boardOp(ctx, b, "fs.read", map[string]any{"path": req.Path})
+	var out []byte
+	err := s.withController(ctx, b, func(ctl board.Controller) error {
+		var off uint32
+		for {
+			res, err := ctl.Op(ctx, "fs.read_part", map[string]any{
+				"path": req.Path, "off": int(off), "len": fsFileMax,
+			})
+			if err != nil {
+				return err
+			}
+			data, _ := res["data"].([]byte)
+			total, _ := resU64(res, "total")
+			eof, _ := res["eof"].(bool)
+			out = append(out, data...)
+			off += uint32(len(data))
+			if eof || len(data) == 0 || (total > 0 && uint64(off) >= total) {
+				return nil
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"data": out}, nil
+}
+
+// resU64 reads an integral result field across the fake (int/int64) and
+// the msgpack-decoded (int64) shapes.
+func resU64(res map[string]any, key string) (uint64, bool) {
+	switch v := res[key].(type) {
+	case int64:
+		return uint64(v), v >= 0
+	case int:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	}
+	return 0, false
 }
 
 // hFsRm removes one board file (op fs.rm) under fs_write's lease gate
@@ -1696,6 +1782,36 @@ func (s *Server) boardOp(ctx context.Context, b discover.Board, op string, args 
 		db.connectMu.Unlock()
 	}
 	return nil, fmt.Errorf("board %s: %s after redial: %w", b.MAC6, op, lastErr)
+}
+
+// withController runs fn over the board's warm controller, redialing
+// ONCE when the link died under it (§13: redial ≠ reboot — boardOp's
+// multi-op sibling for the v5 chunked streams, B10-T1). fn must restart
+// its own board-side stream on the retry: the chunked writers restart
+// at off=0 (the .part reopen truncates and the board-side hash ledger
+// restarts — idempotent), reads restart at off=0 trivially.
+func (s *Server) withController(ctx context.Context, b discover.Board, fn func(ctl board.Controller) error) error {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		ctl, err := s.warmController(ctx, b)
+		if err != nil {
+			return err
+		}
+		err = fn(ctl)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !errors.Is(err, replclient.ErrDead) {
+			return err // board error or caller ctx — no retry
+		}
+		s.logf("server: board %s: chunked stream hit a dead link (%v) — redialing once, stream restarts at off=0", b.MAC6, err)
+		db := s.supervisor(b)
+		db.connectMu.Lock()
+		db.sup.Close() // drop the corpse so the next Connect redials
+		db.connectMu.Unlock()
+	}
+	return fmt.Errorf("board %s: chunked stream after redial: %w", b.MAC6, lastErr)
 }
 
 // leaseTeardown is the lease manager's board-side action, bounded so a

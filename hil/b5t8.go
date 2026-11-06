@@ -1,6 +1,6 @@
 // Command hil is the task-8 hardware-in-the-loop runner: it drives the
-// live bench board (Goouuu ESP32-S3-CAM, mac6 d75884, fw c366c0a,
-// protocol_ver 4 — the B9-T4 canonical rebind) through both transports and prints a check-by-check
+// live bench board (Goouuu ESP32-S3-CAM, mac6 d75884, fw 9dce098,
+// protocol_ver 5 — the B10-T1 canonical rebind) through both transports and prints a check-by-check
 // transcript for capture into results/.
 //
 //	scenario usb — drain/reboot semantics (§2): eval string + structured
@@ -36,8 +36,8 @@ import (
 )
 
 const (
-	expectProtocolVer = int64(4) // B9-T4: 0x02 data-frame overlay era
-	expectFwBuild     = "c366c0a" // fw repo main HEAD at the B9 canonical re-flash
+	expectProtocolVer = int64(5) // B10-T1: fs chunked-transport overlay era
+	expectFwBuild     = "9dce098" // fw repo main HEAD at the B10-T1 canonical re-flash
 	usbByID           = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00"
 	tcpEndpoint       = "xuansi-d75884.local:7777"
 )
@@ -125,7 +125,7 @@ func logHello(tag string, h *replclient.HelloInfo) {
 }
 
 // bindHello asserts the evidence binding — the run must be against the
-// flashed c366c0a speaking protocol_ver 4 (the B9-T4 canonical build);
+// flashed 9dce098 speaking protocol_ver 5 (the B10-T1 canonical build);
 // anything else means the board is not the build this task was
 // validated for: STOP.
 func bindHello(h *harness, tag string, info *replclient.HelloInfo) bool {

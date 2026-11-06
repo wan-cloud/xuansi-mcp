@@ -12,9 +12,10 @@ package mcp
 //   - transport-level trouble is a plain error; a dead daemon is
 //     reworded so an agent reading the tool error can tell "the
 //     daemon connection is gone" from "the daemon refused this";
-//   - fs_write's client-side cap refusal mirrors the daemon's own
-//     api-class message shape (errors.go's fs helpers) so the refusal
-//     reads identically wherever it happened.
+//   - fs_write's former client-side 16 KiB cap refusal is GONE (B10-T1):
+//     the daemon now rides the v5 chunked transport for bigger payloads,
+//     so the MCP face forwards them whole (bounded only by the internal
+//     wire's 1 MiB frame cap).
 
 import (
 	"context"
@@ -39,22 +40,6 @@ func invoke(ctx context.Context, c *apiclient.Client, req server.Request) (map[s
 		return nil, rerr // Error() renders exactly "<class>: <msg>"
 	}
 	return res, nil
-}
-
-// fsWriteMax mirrors the fw single-file cap (XS_FILE_MAX = 16384B) and
-// the daemon's own fsFileMax refusal. The MCP face refuses ABOVE it
-// before contacting the daemon — the daemon would refuse the same
-// payload one hop later, so the agent learns it one hop earlier.
-const fsWriteMax = 16384
-
-// errFsTooLarge is the client-side mirror of the daemon's fs_write cap
-// refusal (internal/server): same api class, same message shape —
-// path, byte count, cap — with "client-side" marking where it fired.
-func errFsTooLarge(path string, n int) error {
-	return &server.RPCError{
-		Class: "api",
-		Msg:   fmt.Sprintf("fs_write %s: %d bytes exceeds the %dB single-file cap (refused client-side)", path, n, fsWriteMax),
-	}
 }
 
 // errFsNotBase64 refuses a data_b64 that does not decode — the MCP

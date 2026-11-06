@@ -242,7 +242,7 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 		role = f.helloSeq[f.helloN]
 	}
 	f.helloN++
-	return &replclient.HelloInfo{ProtocolVer: 4, FwBuild: "b310378", Role: role}, nil
+	return &replclient.HelloInfo{ProtocolVer: 5, FwBuild: "b310378", Role: role}, nil
 }
 
 func (f *fakeCtl) Dead() bool {
