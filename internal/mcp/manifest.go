@@ -105,9 +105,11 @@ func loadManifest(path string) (*Manifest, error) {
 // writeDurableFile writes data to path ATOMICALLY (B8 item 5): a temp
 // file in the SAME directory (the rename stays on one filesystem),
 // written, fsynced, chmodded to perm and renamed over the target, then
-// the parent directory fsynced — the crash-durability pair (without
-// the file fsync the bytes may be lost on power failure; without the
-// directory fsync the fresh rename can vanish). A concurrent reader
+// the parent directory fsynced (unix; on windows fsyncDir is a no-op —
+// no POSIX dir-fsync exists there, see fsync_windows.go) — the
+// crash-durability pair (without the file fsync the bytes may be lost
+// on power failure; without the directory fsync the fresh rename can
+// vanish). A concurrent reader
 // ever only sees the old or the new whole file, never a torn mid-write
 // (the pre-B8 in-place O_TRUNC write was durable but tearable: caught
 // mid-write, the manifest's old sha disagreed with the half-written
@@ -146,14 +148,9 @@ func writeDurableFile(path string, data []byte, perm os.FileMode) error {
 // storage — the other half of writeDurableFile, and of an atomic
 // rename: without it the rename itself may be unrecorded after a
 // crash. Same code-review-only verification note as writeDurableFile.
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
+// Platform split: see fsync_unix.go / fsync_windows.go (Windows has no
+// POSIX dir-fsync — the first CI matrix run caught the unix body
+// failing there with Access is denied).
 
 // writeManifestAtomic writes m to path atomically — the same
 // temp+Sync+rename+dir-fsync writeDurableFile performs (B8 item 5
