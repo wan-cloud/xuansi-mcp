@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 	"xuansi/internal/discover"
 	"xuansi/internal/lease"
 	"xuansi/internal/replclient"
+	"xuansi/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -234,6 +237,51 @@ func newEnv(t *testing.T, aliases map[string]string, boards ...discover.Board) *
 // newEnvTTL is newEnv with a custom lease grace TTL (the boundary tests
 // run the real expiry path with a short window).
 func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, boards ...discover.Board) *env {
+	return newEnvFull(t, ttl, 0, aliases, boards...)
+}
+
+// newEnvIdle is newEnv with the idle-exit window set (0 = disabled; the
+// idle-exit tests inject their own timer seam via afterFunc).
+func newEnvIdle(t *testing.T, idle time.Duration, aliases map[string]string, boards ...discover.Board) *env {
+	return newEnvFull(t, 10*time.Second, idle, aliases, boards...)
+}
+
+// newTestLogf builds the tests' server-side Log seam: daemon
+// goroutines (conn drops, lease reaper teardowns, refresh loop) log
+// through it, and any of them may still be running when the test body
+// returns and cleanups start — a conn drop triggered by a cleanup's
+// conn.Close, say. A bare t.Logf there is a data race against
+// testing.tRunner's own state, which the testing package deliberately
+// leaves unsynchronized; on this suite it surfaced as the intermittent
+// -race "WARNING: DATA RACE ... newEnvFull.func3" flake (~1 run in 4,
+// reproduced on clean HEAD under repetition — the loaded-hammer
+// ambiguity the final review chased). The seam buffers under a mutex
+// instead, and the cleanup dumps the buffer through t.Logf from the
+// TEST goroutine itself (always legal) when the test failed or under
+// -v — failure evidence kept, live streaming traded away, race gone.
+func newTestLogf(t *testing.T, prefix string) func(format string, args ...any) {
+	var mu sync.Mutex
+	var lines []string
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !t.Failed() && !testing.Verbose() {
+			return
+		}
+		for _, l := range lines {
+			t.Logf("%s", l)
+		}
+	})
+	return func(format string, args ...any) {
+		mu.Lock()
+		lines = append(lines, prefix+fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+}
+
+// newEnvFull is the shared env builder: a custom grace TTL plus the
+// idle-exit window (0 = the disabled default every older test relies on).
+func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string, boards ...discover.Board) *env {
 	t.Helper()
 	e := &env{
 		t:         t,
@@ -254,16 +302,19 @@ func newEnvTTL(t *testing.T, ttl time.Duration, aliases map[string]string, board
 			return boards, nil
 		}),
 	)
-	e.sock = filepath.Join(t.TempDir(), "d.sock")
+	e.sock = filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srvLog := newTestLogf(t, "srv: ")
+	supLog := newTestLogf(t, "sup: ")
 	srv, err := New(Opts{
 		SockPath:        e.sock,
 		Registry:        reg,
-		GraceTTL:        ttl, // HIL-short by default; no test waits it out
-		RefreshInterval: -1,  // no background loop; the initial sweep still runs
-		Log:             func(format string, args ...any) { t.Logf("srv: "+format, args...) },
+		GraceTTL:        ttl,  // HIL-short by default; no test waits it out
+		IdleExit:        idle, // 0 = disabled unless an idle-exit test sets it
+		RefreshInterval: -1,   // no background loop; the initial sweep still runs
+		Log:             srvLog,
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
-				Log: func(format string, args ...any) { t.Logf("sup: "+format, args...) },
+				Log: supLog,
 				DialTCP: func() (board.Controller, error) {
 					e.dmu.Lock()
 					e.dialed[ref.MAC6]++
@@ -355,10 +406,17 @@ func (c *sockClient) send(v any) {
 	}
 }
 
+// recvDeadline bounds one recv() wait. Generous (15s, final-review
+// minor): the old 4s produced one ambiguous timeout during the
+// reviewer's loaded-machine -race hammer — with the whole suite
+// stressing the box a legal reply can take seconds, and the deadline
+// exists to fail a hung test today, not to police latency.
+var recvDeadline = 15 * time.Second
+
 // recv reads one framed JSON message into a map (deadline-bounded).
 func (c *sockClient) recv() map[string]any {
 	c.t.Helper()
-	c.conn.SetDeadline(time.Now().Add(4 * time.Second))
+	c.conn.SetDeadline(time.Now().Add(recvDeadline))
 	var m map[string]any
 	if err := ReadMsg(c.conn, &m); err != nil {
 		c.t.Fatalf("recv: %v", err)
@@ -580,7 +638,14 @@ func TestListBoardsShape(t *testing.T) {
 }
 
 // TestReplyIDPairingUnderConcurrency: two requests in flight on one
-// connection each get the reply carrying their own id.
+// connection each get the reply carrying their own id. The replies may
+// legally complete in EITHER order — the server runs each request's
+// handler independently and the writer serializes bytes, not
+// completion order — so the two requests are pipelined (both sent
+// before either reply is read) and replies are paired centrally by id.
+// The old shape (two concurrent send+read call()s, each reader
+// assuming its own reply arrives first) was the long-known
+// cross-platform flake.
 func TestReplyIDPairingUnderConcurrency(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -591,36 +656,39 @@ func TestReplyIDPairingUnderConcurrency(t *testing.T) {
 		t.Fatalf("lease: %#v", rep)
 	}
 
-	var wg sync.WaitGroup
-	type outcome struct {
-		id   int64
-		code string
-	}
-	out := make(chan outcome, 2)
+	// pipeline: both requests outstanding at once (sends are framed
+	// one Write each — the wire is not a parallel-write surface)
 	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			id := int64(200 + i)
-			code := fmt.Sprintf("return %d", i)
-			rep, _ := c.call(id, map[string]any{"type": "eval", "board": "d75884", "code": code})
-			if asMap(rep["error"]) != nil {
-				t.Errorf("eval %d: %#v", id, rep)
-			}
-			if asInt(rep["id"]) != id {
-				t.Errorf("reply id = %v, want %d", rep["id"], id)
-			}
-			out <- outcome{id: asInt(rep["id"]), code: code}
-		}(i)
+		c.send(map[string]any{
+			"type": "eval", "board": "d75884",
+			"code": fmt.Sprintf("return %d", i),
+			"id":   int64(200 + i),
+		})
 	}
-	wg.Wait()
-	close(out)
-	seen := map[int64]bool{}
-	for o := range out {
-		if seen[o.id] {
-			t.Fatalf("duplicate reply id %d", o.id)
+
+	replies := map[int64]map[string]any{}
+	for len(replies) < 2 {
+		m := c.recv()
+		if m["type"] == "event" || m["type"] == "capture_done" {
+			t.Fatalf("unexpected push during eval pairing: %#v", m)
 		}
-		seen[o.id] = true
+		id := asInt(m["id"])
+		if id != 200 && id != 201 {
+			t.Fatalf("unexpected reply id %d: %#v", id, m)
+		}
+		if _, dup := replies[id]; dup {
+			t.Fatalf("duplicate reply id %d", id)
+		}
+		replies[id] = m
+	}
+	for i := 0; i < 2; i++ {
+		id := int64(200 + i)
+		if asMap(replies[id]["error"]) != nil {
+			t.Errorf("eval %d: %#v", id, replies[id])
+		}
+		if got := asInt(replies[id]["id"]); got != id {
+			t.Errorf("reply id = %v, want %d", got, id)
+		}
 	}
 }
 
@@ -909,7 +977,7 @@ func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
 		}),
 	)
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(testutil.ShortSockDir(t), "d.sock")
 	srv, err := New(Opts{
 		SockPath:        sock,
 		Registry:        reg,
@@ -917,10 +985,10 @@ func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 		RefreshInterval: -1,
 		RequestTimeout:  400 * time.Millisecond, // bound the dial retry loop
 		AuditTimeout:    200 * time.Millisecond, // the audit's dead-TCP retries must not pin connectMu
-		Log:             func(format string, args ...any) { t.Logf("srv: "+format, args...) },
+		Log:             newTestLogf(t, "srv: "),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
-				Log: func(format string, args ...any) { t.Logf("sup: "+format, args...) },
+				Log: newTestLogf(t, "sup: "),
 				DialTCP: func() (board.Controller, error) {
 					return nil, fmt.Errorf("wifi-dead bench: tcp dial refused")
 				},
@@ -2296,10 +2364,35 @@ func TestNewRefusesWhenSockAlive(t *testing.T) {
 	}
 }
 
+// TestNewAlreadyListeningSentinel: New against a sock a live listener
+// owns classifies the refusal as ErrAlreadyListening — the sentinel
+// serve.go keys its spawn-race exit-0 on. A raw listener is enough:
+// the probe only dials, it never speaks the protocol.
+func TestNewAlreadyListeningSentinel(t *testing.T) {
+	dir := testutil.ShortSockDir(t) // darwin's 104-byte sun_path: t.TempDir() overflows (T9 mac)
+	path := filepath.Join(dir, "live.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
+	)
+	_, err = New(Opts{SockPath: path, Registry: reg, RefreshInterval: -1})
+	if !errors.Is(err, ErrAlreadyListening) {
+		t.Fatalf("New error = %v, want ErrAlreadyListening in the chain", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("error does not name the socket path: %v", err)
+	}
+}
+
 // TestStaleSockFileRemoved: a leftover socket file (dead daemon) is
 // removed and owned anew.
 func TestStaleSockFileRemoved(t *testing.T) {
-	dir := t.TempDir()
+	dir := testutil.ShortSockDir(t) // darwin's 104-byte sun_path: t.TempDir() + the claim scratch overflows (T9 mac)
 	path := filepath.Join(dir, "stale.sock")
 	if err := os.WriteFile(path, []byte("corpse"), 0o600); err != nil {
 		t.Fatalf("write stale: %v", err)
@@ -2376,7 +2469,7 @@ func TestEnsureLiveLeaseAdoptFalseGatesOps(t *testing.T) {
 	m := lease.NewManager(lease.Policy{GraceTTL: 100 * time.Millisecond, Clock: clk})
 	m.Close() // reaper out: the read sequence is ours alone
 
-	s := &Server{leases: m, logf: func(format string, args ...any) { t.Logf("srv: "+format, args...) }}
+	s := &Server{leases: m, logf: newTestLogf(t, "srv: ")}
 	if err := m.Acquire("d75884", "edge"); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -2489,7 +2582,7 @@ func TestEnsureLiveLeaseTeardownWindowGated(t *testing.T) {
 		m.Close()
 	})
 
-	s := &Server{leases: m, logf: func(format string, args ...any) { t.Logf("srv: "+format, args...) }}
+	s := &Server{leases: m, logf: newTestLogf(t, "srv: ")}
 	if err := m.Acquire("d75884", "t1"); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -2523,4 +2616,548 @@ func TestEnsureLiveLeaseTeardownWindowGated(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("entry never removed after teardown: %+v", m.Snapshot())
+}
+
+// ---------------------------------------------------------------------------
+// idle exit (Opts.IdleExit): the last-client self-exit state machine.
+// ---------------------------------------------------------------------------
+
+// idleSeam replaces the package afterFunc seam: every arming is RECORDED
+// (closure + the window it asked for) and the returned timer is inert —
+// the test fires the captured closure by hand, so "the timer went off"
+// happens on the test's cue, deterministically, never the scheduler's.
+type idleSeam struct {
+	mu sync.Mutex
+	fn func()
+	d  time.Duration
+	n  int // arms so far (each arm is a fresh afterFunc call)
+}
+
+// installIdleSeam swaps afterFunc for the recorder and restores it at
+// test end.
+func installIdleSeam(t *testing.T) *idleSeam {
+	t.Helper()
+	s := &idleSeam{}
+	prev := afterFunc
+	afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		s.mu.Lock()
+		s.fn, s.d, s.n = fn, d, s.n+1
+		s.mu.Unlock()
+		tm := time.NewTimer(time.Hour) // inert stand-in: Stop() disarms cleanly
+		tm.Stop()
+		return tm
+	}
+	t.Cleanup(func() { afterFunc = prev })
+	return s
+}
+
+// armed returns the latest arming's closure and window (nil when never
+// armed) plus the arm count so far.
+func (s *idleSeam) armed() (fn func(), d time.Duration, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fn, s.d, s.n
+}
+
+// waitConns polls the live-connection count under the server lock until
+// it reaches want (bounded; loud on timeout). Observing the count under
+// the lock is also the arm barrier: the conn-delete hook arms INSIDE the
+// same critical section that made the count zero.
+func waitConns(t *testing.T, srv *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.mu.Lock()
+		n := len(srv.conns)
+		srv.mu.Unlock()
+		if n == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("live conn count never reached %d", want)
+}
+
+// assertNoIdleExit asserts the idle-exit channel stays open for the
+// given window (the never-triggers cases).
+func assertNoIdleExit(t *testing.T, srv *Server, wait time.Duration) {
+	t.Helper()
+	select {
+	case <-srv.IdleExited():
+		t.Fatalf("IdleExited() closed, want it still open (no idle exit)")
+	case <-time.After(wait):
+	}
+}
+
+// TestIdleExitFiresWhenLastConnLeaves: with two live connections, the
+// FIRST departure arms nothing; the LAST one arms the timer for the FULL
+// IdleExit window, and its firing (no conns, no captures) closes
+// IdleExited() exactly once.
+func TestIdleExitFiresWhenLastConnLeaves(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c1 := dialSock(t, e.sock)
+	c2 := dialSock(t, e.sock)
+	waitConns(t, e.srv, 2)
+
+	c1.conn.Close()
+	waitConns(t, e.srv, 1)
+	if fn, _, n := seam.armed(); fn != nil || n != 0 {
+		t.Fatal("idle timer armed while a connection still lives")
+	}
+
+	c2.conn.Close()
+	waitConns(t, e.srv, 0)
+	fn, d, n := seam.armed()
+	if fn == nil || n != 1 {
+		t.Fatal("the last disconnect never armed the idle timer")
+	}
+	if d != 50*time.Millisecond {
+		t.Fatalf("armed window = %s, want the FULL IdleExit 50ms", d)
+	}
+
+	fn() // the timer goes off
+	select {
+	case <-e.srv.IdleExited():
+	case <-time.After(2 * time.Second):
+		t.Fatal("IdleExited() never closed after the window fired with no clients")
+	}
+}
+
+// TestIdleExitKeptAliveByRemainingConn: closing one of two connections
+// never arms (let alone fires) the idle exit — the survivor holds the
+// daemon open.
+func TestIdleExitKeptAliveByRemainingConn(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c1 := dialSock(t, e.sock)
+	c2 := dialSock(t, e.sock)
+	waitConns(t, e.srv, 2)
+
+	c1.conn.Close()
+	waitConns(t, e.srv, 1)
+	if fn, _, n := seam.armed(); fn != nil || n != 0 {
+		t.Fatal("idle timer armed while a connection still lives")
+	}
+	// the survivor is still served — the daemon is not winding down
+	rep, _ := c2.call(9, map[string]any{"type": "list_boards"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("survivor's request refused: %#v", rep)
+	}
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+}
+
+// TestIdleExitDisarmedByReconnect: a reconnection inside the window
+// disarms the armed timer — and even the already-spent closure racing in
+// after the disarm (Stop() returned false) must be refused by the
+// locked re-check, not close the channel.
+func TestIdleExitDisarmedByReconnect(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c1 := dialSock(t, e.sock)
+	waitConns(t, e.srv, 1)
+	c1.conn.Close()
+	waitConns(t, e.srv, 0)
+	fn, _, n := seam.armed()
+	if fn == nil || n != 1 {
+		t.Fatal("the last disconnect never armed the idle timer")
+	}
+
+	c2 := dialSock(t, e.sock) // the reconnect disarms the pending window
+	waitConns(t, e.srv, 1)
+	fn() // the stale closure fires anyway (the Stop()-returned-false race)
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+	// the reconnected client is still served — no shutdown happened
+	rep, _ := c2.call(9, map[string]any{"type": "list_boards"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("reconnected client's request refused: %#v", rep)
+	}
+}
+
+// TestIdleExitDisabledByZero: IdleExit=0 disables the whole face — no
+// arming ever happens, and the channel stays open past the point where
+// an armed window would long have fired.
+func TestIdleExitDisabledByZero(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 0, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	waitConns(t, e.srv, 1)
+	c.conn.Close()
+	waitConns(t, e.srv, 0)
+	if fn, _, n := seam.armed(); fn != nil || n != 0 {
+		t.Fatal("IdleExit=0 armed a timer — zero must disable the face entirely")
+	}
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+}
+
+// TestIdleExitBlockedByLiveCapture: a live capture session outlives the
+// clients — the armed timer's firing is REFUSED while the capture runs,
+// and the capture's own ending re-arms the window; only then does the
+// next firing close the channel.
+func TestIdleExitBlockedByLiveCapture(t *testing.T) {
+	seam := installIdleSeam(t)
+	e := newEnvIdle(t, 50*time.Millisecond, nil, mkBoard("d75884", "192.168.7.1"))
+	e.srv.mu.Lock()
+	e.srv.captureRoot = t.TempDir()
+	e.srv.mu.Unlock()
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "h1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	res := captureStart(t, c, 2, map[string]any{"board": "d75884", "source": "gpio.1", "max_seconds": 1})
+	capID := asStr(res["capture_id"])
+	if capID == "" {
+		t.Fatalf("capture_start result = %#v", res)
+	}
+
+	// every client leaves while the capture is live
+	c.conn.Close()
+	waitConns(t, e.srv, 0)
+	fn1, _, n := seam.armed()
+	if fn1 == nil || n != 1 {
+		t.Fatal("the last disconnect never armed the idle timer")
+	}
+	fn1() // fires inside the capture's lifetime → must NOT trigger
+	assertNoIdleExit(t, e.srv, 150*time.Millisecond)
+
+	// the capture ends on its own deadline (no client asked) → re-arm
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, n := seam.armed(); n >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fn2, _, n := seam.armed()
+	if fn2 == nil || n < 2 {
+		t.Fatal("the capture's ending never re-armed the idle timer")
+	}
+	fn2() // fires again, now with no conns AND no captures → trigger
+	select {
+	case <-e.srv.IdleExited():
+	case <-time.After(2 * time.Second):
+		t.Fatal("IdleExited() never closed after the post-capture window fired")
+	}
+}
+
+// TestSupervisorRefCarriesIP: T10 — the daemon's warm-controller dial
+// chain must carry the browse-resolved IP from the registry into the
+// BoardRef (BoardRef.TCPAddr dials it first; CGO=0 cannot resolve
+// .local). The default wiring is asserted here so the IP cannot be
+// dropped between discover and board without a test failing.
+func TestSupervisorRefCarriesIP(t *testing.T) {
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			return []discover.Board{{
+				MAC6: "d75884", Sources: []string{discover.SourceMDNS},
+				Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777,
+			}}, nil
+		}),
+	)
+	var gotRef board.BoardRef
+	srv, err := New(Opts{
+		SockPath: filepath.Join(testutil.ShortSockDir(t), "d.sock"),
+		Registry: reg,
+		GraceTTL: time.Second,
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			gotRef = ref
+			return board.NewSupervisor(ref, board.SupOpts{})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Close()
+	if err := reg.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	b, rerr := reg.Resolve("d75884")
+	if rerr != nil {
+		t.Fatalf("Resolve: %v", rerr)
+	}
+	srv.supervisor(b) // the lazy per-board construction the board paths ride
+	if gotRef.IP != "10.1.51.205" || gotRef.Host != "xuansi-d75884.local" || gotRef.Port != 7777 {
+		t.Errorf("BoardRef = %#v, want IP 10.1.51.205 carried from the registry entry", gotRef)
+	}
+	if addr := gotRef.TCPAddr(); addr != "10.1.51.205:7777" {
+		t.Errorf("BoardRef.TCPAddr() = %q, want 10.1.51.205:7777 (IP first)", addr)
+	}
+}
+
+// TestBindSockConcurrentRaceGracefulLosers: the spawn-race contract at
+// the bind level (task-2's promise, pinned after a task-10 HIL rerun
+// caught the narrow window): N servers binding the same sock path at
+// once leave exactly ONE listener, and EVERY loser gets the graceful
+// ErrAlreadyListening — including a loser whose stale-check ran before
+// the winner created the file (the stat-miss → bind-EADDRINUSE window
+// that used to die with a bare "address already in use" exit-1). The
+// hammer repeats the race; the property holds in every interleaving
+// with the fix and is violated in some without it.
+func TestBindSockConcurrentRaceGracefulLosers(t *testing.T) {
+	const rounds = 30
+	for r := 0; r < rounds; r++ {
+		path := filepath.Join(testutil.ShortSockDir(t), "race.sock")
+		const n = 6
+		res := make([]error, n)
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ln, err := bindSock(path)
+				if err == nil {
+					t.Cleanup(func() { ln.Close() })
+				}
+				res[i] = err
+			}(i)
+		}
+		wg.Wait()
+		winners, graceful, bare := 0, 0, 0
+		for _, err := range res {
+			switch {
+			case err == nil:
+				winners++
+			case errors.Is(err, ErrAlreadyListening):
+				graceful++
+			default:
+				bare++
+				t.Logf("round %d: non-graceful loser: %v", r, err)
+			}
+		}
+		if winners != 1 || bare != 0 || graceful != n-1 {
+			t.Fatalf("round %d: winners=%d graceful=%d bare=%d, want 1/%d/0", r, winners, graceful, bare, n-1)
+		}
+	}
+}
+
+// TestIsAddrInUseClassification pins the bind-conflict classifier for
+// ALL THREE supported platforms' errnos directly (the hammer test
+// above is the behavioral coverage, but it can only ever fire the host
+// platform's form): Linux's EADDRINUSE, Windows' WSAEADDRINUSE 10048,
+// and darwin's EEXIST — each raw and wrapped in the exact
+// net.OpError → os.SyscallError chain net.Listen produces — must
+// classify as a conflict (the T9 findings were the WSA and EEXIST
+// forms dying bare). Near-miss errnos and non-socket errors must NOT
+// match, or a genuine failure would be misread as a lost race.
+func TestIsAddrInUseClassification(t *testing.T) {
+	// listenChain rebuilds the error shape net.Listen returns on a
+	// failed bind: *net.OpError wrapping *os.SyscallError wrapping the
+	// raw errno (the Windows T9 evidence text "listen unix <path>:
+	// bind: Only one usage of each socket address ..." is exactly
+	// this chain around Errno(10048)).
+	listenChain := func(raw syscall.Errno) error {
+		return &net.OpError{
+			Op: "listen", Net: "unix",
+			Err: os.NewSyscallError("bind", raw),
+		}
+	}
+	conflicts := map[string]error{
+		"linux EADDRINUSE (raw)":              syscall.EADDRINUSE,
+		"linux EADDRINUSE (listen wrap)":      listenChain(syscall.EADDRINUSE),
+		"windows WSAEADDRINUSE (raw)":         wsaeaddrinuse,
+		"windows WSAEADDRINUSE (listen wrap)": listenChain(wsaeaddrinuse),
+		"darwin EEXIST (raw)":                 syscall.EEXIST,
+		"darwin EEXIST (listen wrap)":         listenChain(syscall.EEXIST),
+	}
+	for name, err := range conflicts {
+		if !isAddrInUse(err) {
+			t.Errorf("isAddrInUse(%s) = false, want true — a spawn-race loser in this dress would die bare instead of re-probing", name)
+		}
+	}
+	others := map[string]error{
+		"plain error":            errors.New("server: listen C:\\x.sock: something else"),
+		"wrapped non-conflict":   fmt.Errorf("listen: %w", os.NewSyscallError("bind", syscall.EACCES)),
+		"ECONNREFUSED (raw)":     syscall.ECONNREFUSED,
+		"ECONNREFUSED (wrapped)": listenChain(syscall.ECONNREFUSED),
+	}
+	for name, err := range others {
+		if isAddrInUse(err) {
+			t.Errorf("isAddrInUse(%s) = true, want false — not every listen failure is a lost race", name)
+		}
+	}
+}
+
+// TestHardLinkedSocketNameAnswers pins the OS capability bindClaim
+// builds on: a hard link to a bound unix socket's file is another live
+// name for the SAME listener — connects through the linked name land
+// in the accept queue even after the original name is dropped. A unix
+// socket is its inode. (Verified on linux here; the controller runs
+// it on darwin. On a host where socket hard-links do not work the
+// test skips — bindClaim's own fallback covers that shape.)
+func TestHardLinkedSocketNameAnswers(t *testing.T) {
+	dir := testutil.ShortSockDir(t)
+	claim := filepath.Join(dir, "c.sock")
+	target := filepath.Join(dir, "t.sock")
+
+	ln, err := net.Listen("unix", claim)
+	if err != nil {
+		t.Fatalf("listen claim: %v", err)
+	}
+	defer ln.Close()
+	if err := os.Link(claim, target); err != nil {
+		t.Skipf("socket hard-links unsupported on this host: %v", err)
+	}
+	os.Remove(claim)
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			close(accepted)
+			return
+		}
+		accepted <- c
+	}()
+	c, err := net.Dial("unix", target) // the LINKED name, original dropped
+	if err != nil {
+		t.Fatalf("dial through the linked name: %v", err)
+	}
+	c.Close()
+	ac, ok := <-accepted
+	if ok {
+		ac.Close()
+	} else {
+		t.Fatal("connect through the linked name never reached the accept queue")
+	}
+}
+
+// TestBindSockClaimLeavesNoScratchNames: a successful bindSock leaves
+// ONLY the target socket in its directory — no .claim-* scratch names
+// — and the target really answers (the claim linked an armed
+// listener). Runs on every platform: windows never claims (direct
+// bind), so the no-scratch property holds trivially there.
+func TestBindSockClaimLeavesNoScratchNames(t *testing.T) {
+	dir := testutil.ShortSockDir(t)
+	target := filepath.Join(dir, "d.sock")
+
+	ln, err := bindSock(target)
+	if err != nil {
+		t.Fatalf("bindSock: %v", err)
+	}
+	defer ln.Close()
+
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, de := range des {
+		if strings.HasPrefix(de.Name(), "d.sock.c-") {
+			t.Fatalf("scratch claim name %q survived the bind", de.Name())
+		}
+	}
+	c, err := net.Dial("unix", target)
+	if err != nil {
+		t.Fatalf("dial the claimed target: %v", err)
+	}
+	c.Close()
+}
+
+// TestBindSockDeadSocketFileIsStale: a socket file nobody listens on
+// (a crashed daemon's leftover — made by closing a listener without
+// unlinking) is stale: bindSock removes it and claims the path.
+func TestBindSockDeadSocketFileIsStale(t *testing.T) {
+	dir := testutil.ShortSockDir(t)
+	target := filepath.Join(dir, "dead.sock")
+
+	ln, err := net.Listen("unix", target)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ul, ok := ln.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener is %T", ln)
+	}
+	ul.SetUnlinkOnClose(false) // the crashed-daemon shape: file stays
+	ln.Close()
+
+	ln2, err := bindSock(target)
+	if err != nil {
+		t.Fatalf("bindSock over a dead sock file: %v", err)
+	}
+	defer ln2.Close()
+	c, err := net.Dial("unix", target)
+	if err != nil {
+		t.Fatalf("dial after re-claim: %v", err)
+	}
+	c.Close()
+}
+
+// TestBindSockSweepsDeadClaimScratch: the bind-time scratch sweep
+// (final-review minor) — a racer killed between its scratch bind and
+// the link leaks a dead path+".c-XXXXXXXX" file forever, so the NEXT
+// bindSock at that path collects it: probe-dial each scratch sibling,
+// remove the dead socket (and any regular file wearing the name),
+// leave a LIVE scratch (an active racer's armed listener) strictly
+// alone, and never touch the main sock path or non-matching names.
+func TestBindSockSweepsDeadClaimScratch(t *testing.T) {
+	if !linkClaimSupported {
+		t.Skip("link-claim unsupported here: bindSock never creates scratch names")
+	}
+	dir := testutil.ShortSockDir(t)
+	target := filepath.Join(dir, "sweep.sock")
+
+	// a dead scratch SOCKET: the crashed-racer shape (file stays after
+	// the listener is gone — the SetUnlinkOnClose trick above)
+	deadSock := target + ".c-0000dead"
+	dln, err := net.Listen("unix", deadSock)
+	if err != nil {
+		t.Fatalf("listen dead scratch: %v", err)
+	}
+	ul, ok := dln.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener is %T", dln)
+	}
+	ul.SetUnlinkOnClose(false)
+	dln.Close()
+
+	// a regular file wearing a scratch name: garbage too
+	deadFile := target + ".c-0000beef"
+	if err := os.WriteFile(deadFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write scratch file: %v", err)
+	}
+
+	// a LIVE scratch: an active racer's armed listener — must survive
+	liveScratch := target + ".c-0000cafe"
+	lln, err := net.Listen("unix", liveScratch)
+	if err != nil {
+		t.Fatalf("listen live scratch: %v", err)
+	}
+	defer lln.Close()
+
+	// near-miss names: not the scratch shape, never swept
+	keepNear := []string{target + ".c-abc", target + ".c-123456789", target + ".c-zzzzzzzz", filepath.Join(dir, "other.sock")}
+	for _, n := range keepNear {
+		if err := os.WriteFile(n, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write near-miss %s: %v", n, err)
+		}
+	}
+
+	ln, err := bindSock(target)
+	if err != nil {
+		t.Fatalf("bindSock: %v", err)
+	}
+	defer ln.Close()
+
+	if _, err := os.Stat(deadSock); !os.IsNotExist(err) {
+		t.Errorf("dead scratch socket %q survived the sweep (err=%v)", deadSock, err)
+	}
+	if _, err := os.Stat(deadFile); !os.IsNotExist(err) {
+		t.Errorf("regular scratch file %q survived the sweep (err=%v)", deadFile, err)
+	}
+	if _, err := os.Stat(liveScratch); err != nil {
+		t.Fatalf("LIVE scratch %q was swept — an active racer's scratch must be left alone: %v", liveScratch, err)
+	}
+	for _, n := range keepNear {
+		if _, err := os.Stat(n); err != nil {
+			t.Errorf("non-scratch name %q was touched by the sweep: %v", n, err)
+		}
+	}
+	// and the claim itself still answers (the sweep broke nothing)
+	c, err := net.Dial("unix", target)
+	if err != nil {
+		t.Fatalf("dial the claimed target: %v", err)
+	}
+	c.Close()
 }

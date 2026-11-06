@@ -16,6 +16,7 @@ import (
 	"xuansi/internal/discover"
 	"xuansi/internal/replclient"
 	"xuansi/internal/server"
+	"xuansi/internal/testutil"
 )
 
 // cmdFake is the minimal board controller the CLI tests need (the
@@ -86,14 +87,14 @@ func startMockDaemonUSB(t *testing.T) (string, *cmdFake) {
 	usbFake := &cmdFake{}
 	boards := []discover.Board{{
 		MAC6: "d75884", Sources: []string{discover.SourceUSB, discover.SourceMDNS},
-		Host: "xuansi-d75884.local", Port: 7777,
+		Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777,
 	}}
 	reg := discover.NewRegistry(map[string]string{"d75884": "bench"},
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
 		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
 	)
 	srv, err := server.New(server.Opts{
-		SockPath:        t.TempDir() + "/d.sock",
+		SockPath:        testutil.ShortSockDir(t) + "/d.sock",
 		Registry:        reg,
 		GraceTTL:        10 * time.Second,
 		RefreshInterval: -1,
@@ -118,7 +119,9 @@ func startMockDaemonUSB(t *testing.T) (string, *cmdFake) {
 
 // TestListPrintsColumns: list renders the documented columns —
 // alias?/mac6/sources/host/fw — as plain aligned text (fw appears once
-// the startup audit's hello enrichment lands; polled).
+// the startup audit's hello enrichment lands; polled). The HOST column
+// shows the DIALED endpoint: the mDNS-resolved IP with the hostname in
+// parens (T10 — the daemon dials the IP; final-review minor).
 func TestListPrintsColumns(t *testing.T) {
 	sock := startMockDaemon(t)
 	var out, errb strings.Builder
@@ -136,9 +139,31 @@ func TestListPrintsColumns(t *testing.T) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	for _, want := range []string{"bench", "d75884", "usb+mdns", "xuansi-d75884.local", "deadbee"} {
+	for _, want := range []string{"bench", "d75884", "usb+mdns", "10.1.51.205:7777 (xuansi-d75884.local)", "deadbee"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("list output missing %q: %q", want, got)
+		}
+	}
+}
+
+// TestDialEndpoint pins the HOST-column renderer: IP-first (the T10
+// dialed address) with the hostname in parens, hostname-only fallback,
+// and "-" when neither is known.
+func TestDialEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		host, ip string
+		port     float64
+		want     string
+	}{
+		{"ip and host", "xuansi-d75884.local", "10.1.51.205", 7777, "10.1.51.205:7777 (xuansi-d75884.local)"},
+		{"host only", "xuansi-d75884.local", "", 7777, "xuansi-d75884.local:7777"},
+		{"ip only", "", "10.1.51.205", 7777, "10.1.51.205:7777"},
+		{"neither", "", "", 7777, "-"},
+	}
+	for _, c := range cases {
+		if got := dialEndpoint(c.host, c.ip, c.port); got != c.want {
+			t.Errorf("%s: dialEndpoint(%q,%q,%d) = %q, want %q", c.name, c.host, c.ip, int64(c.port), got, c.want)
 		}
 	}
 }
@@ -274,14 +299,16 @@ func TestLeaseUSBPrintsRebootWarning(t *testing.T) {
 	}
 }
 
-// TestStatusPrintsBlock: status shows the composed view.
+// TestStatusPrintsBlock: status shows the composed view, the tcp line
+// carrying the DIALED endpoint — the mDNS-resolved IP first, the
+// hostname in parens (T10; final-review minor).
 func TestStatusPrintsBlock(t *testing.T) {
 	sock := startMockDaemon(t)
 	var out, errb strings.Builder
 	if code := run(strings.NewReader(""), &out, &errb, []string{"status", "--sock", sock, "d75884"}); code != 0 {
 		t.Fatalf("status exit=%d: %q %q", code, out.String(), errb.String())
 	}
-	for _, want := range []string{"d75884", "bench", "connected"} {
+	for _, want := range []string{"d75884", "bench", "connected", "tcp:       10.1.51.205:7777 (xuansi-d75884.local)"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("status output missing %q: %q", want, out.String())
 		}
@@ -290,6 +317,13 @@ func TestStatusPrintsBlock(t *testing.T) {
 
 // TestDaemonDownIsCleanError: no daemon → one clear stderr line, exit 1.
 func TestDaemonDownIsCleanError(t *testing.T) {
+	// no-op the auto-spawn seam (preflight ruling): this test pins the
+	// PLAIN dial failure; with the real ensureDaemon it would spawn a
+	// serve and burn the retry window first.
+	orig := ensureBeforeDial
+	ensureBeforeDial = func(string) error { return nil }
+	t.Cleanup(func() { ensureBeforeDial = orig })
+
 	var out, errb strings.Builder
 	code := run(strings.NewReader(""), &out, &errb, []string{"list", "--sock", t.TempDir() + "/missing.sock"})
 	if code != 1 {
@@ -297,5 +331,20 @@ func TestDaemonDownIsCleanError(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "daemon") {
 		t.Fatalf("stderr does not mention the daemon: %q", errb.String())
+	}
+}
+
+// TestServeAlreadyListeningExitsZero: a second serve against a live
+// daemon's socket is the spawn-race loser (or a deliberate double
+// start) — one clear line, exit 0, harmless.
+func TestServeAlreadyListeningExitsZero(t *testing.T) {
+	sock := startMockDaemon(t)
+	var out, errb strings.Builder
+	code := run(strings.NewReader(""), &out, &errb, []string{"serve", "--sock", sock})
+	if code != exitOK {
+		t.Fatalf("serve exit=%d, want %d (stdout %q stderr %q)", code, exitOK, out.String(), errb.String())
+	}
+	if !strings.Contains(errb.String(), "xuansi serve: another daemon is already listening — leaving") {
+		t.Fatalf("stderr missing the leaving line: %q", errb.String())
 	}
 }

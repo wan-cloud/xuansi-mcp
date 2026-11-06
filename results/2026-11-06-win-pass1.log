@@ -1,0 +1,80 @@
+=== xuansi T9 Windows pass 1 — 2026-11-05T23:48:25Z — heung@10.1.50.100 (Win11 26300, amd64) ===
+--- S1: cold spawn via list, session exits immediately (breakaway test) ---
+time=2026-11-06T07:48:26.097+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=C:\Users\heung\AppData\Local\xuansi\daemon.sock pid=1128 log=C:\Users\heung\AppData\Local\xuansi\state\serve.log
+ALIAS  MAC6  SOURCES  HOST  FW
+no boards known yet — the daemon refreshes discovery every 30s
+--- S2: separate session — daemon survived, sweep+audit done, board listed ---
+xuansi-windows-amd64.exe      1128 Services                   0     17,512 K
+ALIAS  MAC6    SOURCES   HOST                      FW
+-      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+time=2026-11-06T07:48:26.110+08:00 level=INFO msg="server: serving C:\\Users\\heung\\AppData\\Local\\xuansi\\daemon.sock (grace_ttl=5m0s)"
+xuansi daemon serving C:\Users\heung\AppData\Local\xuansi\daemon.sock (grace-ttl 5m0s, Ctrl-C to stop)
+time=2026-11-06T07:48:26.215+08:00 level=INFO msg="server: conn dropped (holder=conn-1)"
+time=2026-11-06T07:48:26.215+08:00 level=INFO msg="server: conn dropped (holder=conn-2)"
+time=2026-11-06T07:48:29.420+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
+time=2026-11-06T07:48:29.471+08:00 level=INFO msg="tcp: connected 10.1.50.100:58415 → 10.1.51.205:7777 (no reboot, no drain window — §13; keepalive 3s/1s×3 ≈6s verdict)"
+time=2026-11-06T07:48:29.483+08:00 level=INFO msg="board d75884: controller warm connection up (fw=03f634b protocol_ver=3)"
+time=2026-11-06T07:48:29.975+08:00 level=INFO msg="board d75884: resync scripts=[] survived=[] started=[] gone=[] pins=0 (cold=true) wifi_state=up [diag.pins raw 1306B]"
+time=2026-11-06T07:48:29.975+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[] pins=0 wifi_state=up (orphans listed, not killed)"
+time=2026-11-06T07:48:41.819+08:00 level=INFO msg="server: conn dropped (holder=conn-3)"
+time=2026-11-06T07:48:41.819+08:00 level=INFO msg="server: conn dropped (holder=conn-4)"
+--- S3: idle-exit live (manual serve --idle-exit 15s, client visit, window passes) ---
+xuansi daemon serving C:\Users\heung\AppData\Local\xuansi\daemon.sock (grace-ttl 15s, Ctrl-C to stop)
+ALIAS  MAC6    SOURCES   HOST                      FW
+-      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+xuansi: idle exit (no clients for 15s)
+xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running — the next start's audit lists them)
+xuansi: shutdown complete
+tasklist-after-window: 
+serve-log: 
+time=2026-11-06T07:49:10.974+08:00 level=INFO msg="idle exit: no clients for 15s"
+--- S4: USB lease loop (reboots board per T10 last-resort ruling) ---
+time=2026-11-06T07:49:15.653+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=C:\Users\heung\AppData\Local\xuansi\daemon.sock pid=28180 log=C:\Users\heung\AppData\Local\xuansi\state\serve.log
+xuansi lease: no_board: discover: no board matches "d75884" — candidates: (none known — refresh first)
+xuansi eval: no_board: discover: no board matches "d75884" — candidates: (none known — refresh first)
+xuansi release: no_board: discover: no board matches "d75884" — candidates: (none known — refresh first)
+ALIAS  MAC6    SOURCES   HOST                      FW
+-      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+--- S4b: USB lease loop, board known (reboots board per T10 last-resort ruling) ---
+leased d75884 holder=conn-10 session=1793922556 transport=usb
+WARNING: USB transport: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)
+(holder generated — re-supply `--holder conn-10` on later commands to keep/adopt this lease)
+xuansi eval: held: lease: board d75884 held by conn-10 since 2026-11-06T07:49:29+08:00 — holder gone, grace-expiring at 2026-11-06T07:54:34+08:00
+xuansi release: not_held: lease: release d75884 by conn-8: lease: board not held by that holder
+final: 
+ALIAS  MAC6    SOURCES   HOST                      FW
+-      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+--- S4c: eval+release under the actual holder ---
+42
+value: 42
+released d75884 (holder=conn-10; board session reset to safe state)
+=== COM ports now ===
+COM1
+=== list after ~12s ===
+ALIAS  MAC6    SOURCES  HOST                      FW
+-      d75884  stale    xuansi-d75884.local:7777  03f634b
+=== list after ~40s (past refresh) ===
+ALIAS  MAC6    SOURCES  HOST                      FW
+-      d75884  stale    xuansi-d75884.local:7777  03f634b
+=== replug: COM ports ===
+COM1
+COM8
+=== list after ~15s ===
+ALIAS  MAC6    SOURCES   HOST                      FW
+-      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+=== list after ~45s ===
+ALIAS  MAC6    SOURCES   HOST                      FW
+-      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+=== round2 unplug: COM ports ===
+COM1
+=== list after ~12s ===
+ALIAS  MAC6    SOURCES  HOST                      FW
+-      d75884  stale    xuansi-d75884.local:7777  03f634b
+=== round2 replug: COM ports ===
+COM1
+COM8
+=== list after ~15s ===
+ALIAS  MAC6    SOURCES   HOST                      FW
+-      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+=== FINAL: full log evidence copy ===
+62

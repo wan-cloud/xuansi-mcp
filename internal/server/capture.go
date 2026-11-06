@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"xuansi/internal/paths"
 	"xuansi/internal/replclient"
 )
 
@@ -90,17 +91,12 @@ func captureFormatFor(source string) (captureFormat, *RPCError) {
 
 // capturesRoot is the default capture root: $XDG_DATA_HOME/xuansi/
 // captures, or ~/.local/share/xuansi/captures when XDG_DATA_HOME is
-// unset — the same XDG data convention the MCP workspace uses. Tests
-// inject their root through Opts.CaptureRoot, never the environment.
+// unset — the same XDG data convention the MCP workspace uses; the
+// per-OS data-dir resolution lives in internal/paths (byte-identical
+// on Linux). Tests inject their root through Opts.CaptureRoot, never
+// the environment.
 func capturesRoot() string {
-	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
-		return filepath.Join(d, "xuansi", "captures")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".local", "share", "xuansi", "captures")
-	}
-	return filepath.Join(home, ".local", "share", "xuansi", "captures")
+	return filepath.Join(paths.DataDir(), "captures")
 }
 
 // osCreateCapture is the default capture-file opener: O_CREAT|O_EXCL —
@@ -415,6 +411,12 @@ func (s *Server) captureEnd(cs *captureSession, reason string, notify bool) {
 		}
 		s.mu.Lock()
 		delete(s.captures, cs.id)
+		// idle-exit hook: a capture that outlived the clients kept the
+		// armed timer stood down (idleFire's re-check refused it); its
+		// ending re-arms the window when no connection is left to serve
+		if len(s.conns) == 0 {
+			s.idleArmLocked()
+		}
 		s.mu.Unlock()
 		close(cs.exited)
 		if notify {

@@ -22,11 +22,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"xuansi/internal/board"
 	"xuansi/internal/discover"
 	"xuansi/internal/lease"
+	"xuansi/internal/paths"
 	"xuansi/internal/replclient"
 )
 
@@ -57,6 +60,17 @@ const (
 // errUnreachable wraps dial/hello failures for the error taxonomy.
 var errUnreachable = errors.New("board unreachable")
 
+// afterFunc is the idle-exit timer seam (production: time.AfterFunc;
+// tests swap it to capture and fire the arming deterministically).
+var afterFunc = time.AfterFunc
+
+// ErrAlreadyListening is bindSock's spawn-race sentinel: the dial probe
+// found a live daemon owning the socket. The loser of a launcher spawn
+// race (or a deliberate double start) is a harmless no-op — serve.go
+// keys its exit-0 "leaving" path on this; the wrapped error still
+// names the socket path.
+var ErrAlreadyListening = errors.New("server: another daemon is already listening")
+
 // USBRebootWarning is the honest label the deliberate USB-transport
 // lease route must state everywhere it succeeds — in the API reply's
 // result (key "warning"), in the daemon log, and on the CLI's stdout
@@ -66,12 +80,11 @@ const USBRebootWarning = "USB transport: opening the port REBOOTS the board — 
 
 // DefaultSockPath is the daemon socket: $XDG_RUNTIME_DIR/xuansi/daemon.sock,
 // falling back to /tmp/xuansi-daemon.sock when XDG_RUNTIME_DIR is unset
-// (e.g. a systemd unit without the env, or a manual run).
+// (e.g. a systemd unit without the env, or a manual run). Resolution
+// lives in internal/paths (per-OS; this delegation is byte-identical
+// on Linux).
 func DefaultSockPath() string {
-	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		return filepath.Join(x, "xuansi", "daemon.sock")
-	}
-	return "/tmp/xuansi-daemon.sock"
+	return paths.SockPath()
 }
 
 // defaultBoardsFile is the zero-config boards.conf location.
@@ -107,6 +120,14 @@ type Opts struct {
 	// $XDG_DATA_HOME/xuansi/captures — capturesRoot; tests inject a
 	// temp root).
 	CaptureRoot string
+	// IdleExit, when positive, is the self-exit window: the LAST API
+	// connection's departure arms a timer for the FULL duration, any new
+	// connection disarms it, and a firing with no connections AND no
+	// live captures closes IdleExited() — the serve main loop then walks
+	// its existing graceful shutdown path (the server never Closes
+	// itself). A live capture at fire time stands the timer down; the
+	// capture's own ending re-arms it. 0 = disabled (the default).
+	IdleExit time.Duration
 }
 
 // Server is the daemon's API face. New binds the socket; Start serves;
@@ -137,6 +158,16 @@ type Server struct {
 	// file; tests swap a failing writer). Both read under mu.
 	captureRoot string
 	captureOpen func(path string) (io.WriteCloser, error)
+
+	// idle-exit state (all under mu; Opts.IdleExit > 0 enables): the
+	// conn-register hook disarms, the last conn-delete / capture-remove
+	// arms, and the fire closure re-verifies emptiness under the lock
+	// before the one-line log + close-once idleCh.
+	idleExit   time.Duration
+	idleTimer  *time.Timer
+	idleCh     chan struct{}
+	idleFired  bool // idleCh closed — never triggers again
+	idleHalted bool // Close started — the idle exit stands down
 
 	auditCancel context.CancelFunc
 
@@ -217,6 +248,9 @@ func New(o Opts) (*Server, error) {
 	if o.CaptureRoot == "" {
 		o.CaptureRoot = capturesRoot()
 	}
+	if o.IdleExit < 0 {
+		o.IdleExit = 0 // negative is not a window; only 0 disables and positives arm
+	}
 
 	reg := o.Registry
 	if reg == nil {
@@ -252,6 +286,8 @@ func New(o Opts) (*Server, error) {
 		captures:    map[string]*captureSession{},
 		captureRoot: o.CaptureRoot,
 		captureOpen: osCreateCapture,
+		idleExit:    o.IdleExit,
+		idleCh:      make(chan struct{}),
 		closed:      make(chan struct{}),
 		done:        make(chan struct{}),
 	}
@@ -263,14 +299,47 @@ func New(o Opts) (*Server, error) {
 	return s, nil
 }
 
+// wsaeaddrinuse is Windows' bind-conflict errno (WSAEADDRINUSE 10048,
+// text "Only one usage of each socket address (protocol/network
+// address/port) is normally permitted."). Go's syscall.EADDRINUSE on
+// Windows is an invented APPLICATION_ERROR-offset value real Winsock
+// calls never return (there is no stdlib errno mapping for it), so the
+// race-loser classification below must know the WSA form too — the
+// T9 Windows real-machine finding. On Linux the constant is inert: the
+// kernel never reports an errno that high.
+const wsaeaddrinuse = syscall.Errno(10048)
+
+// isAddrInUse reports whether err is a bind conflict in any supported
+// platform's dress — the errno family a spawn-race loser's bind fails
+// with when the winner created the socket file between the loser's
+// stat and its bind: Linux EADDRINUSE, Windows WSAEADDRINUSE (10048),
+// darwin EEXIST ("file exists"). Matching EEXIST everywhere is safe:
+// Linux bind conflicts report EADDRINUSE, so EEXIST cannot
+// false-positive there; on darwin it IS the conflict form (the T9 mac
+// finding — unclassified losers died bare instead of re-probing into
+// the graceful exit). All sides of the spawn race — winner and loser —
+// must classify the same conflict so the loser re-probes into the
+// graceful ErrAlreadyListening exit instead of a bare exit-1.
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) ||
+		errors.Is(err, wsaeaddrinuse) ||
+		errors.Is(err, syscall.EEXIST)
+}
+
+// claimSeq makes every racer's claim name unique inside one process
+// (the hammer test's goroutines share a pid); combined with the pid it
+// is unique across processes on the machine.
+var claimSeq atomic.Uint64
+
 // bindSock probes for a live daemon, clears a stale sock file, and
-// listens.
+// claims the listen path — ATOMICALLY on linux/darwin (bindClaim:
+// bind-temp + link), by the direct bind on windows (bindDirect).
 func bindSock(path string) (net.Listener, error) {
 	if fi, err := os.Stat(path); err == nil {
 		if fi.Mode()&os.ModeSocket != 0 {
 			if c, derr := net.Dial("unix", path); derr == nil {
 				c.Close()
-				return nil, fmt.Errorf("server: %s: another daemon is already listening", path)
+				return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
 			}
 			if err := os.Remove(path); err != nil {
 				return nil, fmt.Errorf("server: remove stale sock %s: %w", path, err)
@@ -286,11 +355,157 @@ func bindSock(path string) (net.Listener, error) {
 			return nil, fmt.Errorf("server: mkdir %s: %w", dir, err)
 		}
 	}
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, fmt.Errorf("server: listen %s: %w", path, err)
+	if !linkClaimSupported {
+		return bindDirect(path)
 	}
-	return ln, nil
+	return bindClaim(path)
+}
+
+// bindDirect is the plain bind: net.Listen, and on a bind-conflict
+// errno (isAddrInUse — the three-platform family) re-probe before
+// erroring: a live daemon is the graceful already-listening refusal;
+// a dead file is stale, clear it and bind once more. Windows's whole
+// path (linkClaimSupported is false there), and the fallback for any
+// link-incapable filesystem on linux/darwin.
+func bindDirect(path string) (net.Listener, error) {
+	ln, err := net.Listen("unix", path)
+	if err == nil {
+		return ln, nil
+	}
+	if isAddrInUse(err) {
+		if c, derr := net.Dial("unix", path); derr == nil {
+			c.Close()
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
+		}
+		if rerr := os.Remove(path); rerr == nil {
+			if ln2, lerr := net.Listen("unix", path); lerr == nil {
+				return ln2, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("server: listen %s: %w", path, err)
+}
+
+// bindClaim claims the socket path atomically (linux/darwin): bind a
+// UNIQUE scratch name beside the target and fully arm it (bind+listen
+// both done — the listener answers connects), and only then
+// os.Link(scratch, target): the target name materializes for an
+// already-listening socket, exactly once — link fails EEXIST if
+// another racer's claim landed first.
+//
+// WHY (the darwin TOCTOU, T9 live finding): with a direct bind the
+// socket FILE exists from the bind while listen() may not be armed
+// yet; a racing prober's dial on darwin gets ECONNREFUSED inside that
+// window, misjudges the socket stale, REMOVES the winner's file and
+// binds its own — two winners, the first orphaned on an unlinked
+// inode, unreachable forever (and with no connection, never
+// idle-exits). Linux hides the window (connect succeeds against the
+// backlog), but the defect was portable; only the exposure was
+// darwin's. A unix socket is its inode, so the listener keeps
+// answering on the linked target after the scratch name is dropped
+// (pinned by TestHardLinkedSocketNameAnswers).
+//
+// EEXIST (lost the link race): re-probe the target — alive is the
+// graceful ErrAlreadyListening loser path; dead is stale garbage,
+// removed, claim retried (bounded — three lost races in a row is a
+// live adversary, not a race). Any other link error (a filesystem
+// that refuses socket hard-links) falls back to bindDirect, whose
+// conflict classification handles the race the old way. The scratch
+// suffix costs ~11 bytes of sun_path headroom beside the target —
+// keep target paths comfortably under the 104-byte darwin limit (the
+// tests do, via testutil.ShortSockDir).
+func bindClaim(path string) (net.Listener, error) {
+	sweepClaimScratch(path)
+	for attempt := 0; attempt < 3; attempt++ {
+		// scratch suffix ".c-" + 8 hex ≈ 11 bytes of sun_path headroom:
+		// pid<<10 | seq packed into 32 bits (processes diverge on pid,
+		// racers in one process on seq — wraps after 1024 claims, and a
+		// collision just costs one EADDRINUSE retry below)
+		claim := fmt.Sprintf("%s.c-%08x", path, uint64(os.Getpid())<<10|uint64(claimSeq.Add(1)&((1<<10)-1)))
+		ln, err := net.Listen("unix", claim)
+		if err != nil {
+			if isAddrInUse(err) && attempt < 2 {
+				continue // scratch-name collision: draw a fresh name
+			}
+			return nil, fmt.Errorf("server: listen claim %s: %w", claim, err)
+		}
+		lerr := os.Link(claim, path)
+		if lerr == nil {
+			// the scratch name has done its job; the target answers now
+			os.Remove(claim)
+			return ln, nil
+		}
+		ln.Close() // also drops the scratch name
+		if !errors.Is(lerr, syscall.EEXIST) {
+			// socket hard-links unavailable here: the direct bind
+			return bindDirect(path)
+		}
+		// lost the link race — the target exists; probe it
+		if c, derr := net.Dial("unix", path); derr == nil {
+			c.Close()
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
+		}
+		if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+			return nil, fmt.Errorf("server: remove stale sock %s: %w", path, rerr)
+		}
+	}
+	return nil, fmt.Errorf("server: claim %s: lost the link race 3 times", path)
+}
+
+// isClaimScratch reports whether name is one of target's claim-scratch
+// names: exactly target + ".c-" + 8 hex digits (bindClaim's shape —
+// the pid<<10|seq packing above). Anything else — the target itself, a
+// short/long/malformed suffix, a different prefix — is not sweepable.
+func isClaimScratch(target, name string) bool {
+	suffix, ok := strings.CutPrefix(name, target+".c-")
+	if !ok || len(suffix) != 8 {
+		return false
+	}
+	for i := 0; i < len(suffix); i++ {
+		c := suffix[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepClaimScratch removes DEAD claim-scratch siblings of path: a
+// racer killed between its scratch bind and the link (or before the
+// post-link scratch remove) leaks its path+".c-XXXXXXXX" socket file
+// forever — this bind-time sweep is the only garbage collector that
+// name shape has (final-review minor). Liveness is a probe-dial: a
+// scratch that CONNECTS is an active racer's armed listener and is
+// left strictly alone; a socket that refuses the dial, or a regular
+// file wearing the name, is garbage and removed. The main sock path
+// never matches the scratch shape, and nothing else in the directory
+// is touched. The tiny bind-but-not-yet-listening window inside a
+// live racer's net.Listen can cost it its scratch file — its link
+// then fails ENOENT, which bindClaim routes to bindDirect, the exact
+// pre-claim conflict handling: degraded, never orphaned.
+func sweepClaimScratch(path string) {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // the MkdirAll/bind below surfaces a real problem
+	}
+	base := filepath.Base(path)
+	for _, e := range entries {
+		if !isClaimScratch(base, e.Name()) {
+			continue
+		}
+		scratch := filepath.Join(dir, e.Name())
+		if fi, ierr := e.Info(); ierr == nil && fi.Mode()&os.ModeSocket != 0 {
+			if c, derr := net.Dial("unix", scratch); derr == nil {
+				c.Close()
+				continue // an active racer still holds this scratch
+			}
+		}
+		os.Remove(scratch)
+	}
 }
 
 // Start launches the serving loops: accept, the initial discovery sweep
@@ -325,6 +540,44 @@ func (s *Server) Leases() *lease.Manager { return s.leases }
 // Done closes once every server goroutine has exited after Close.
 func (s *Server) Done() <-chan struct{} { return s.done }
 
+// IdleExited closes (exactly once) when the idle-exit window fired with
+// no API connections and no live captures — Opts.IdleExit > 0 enables
+// the face. The server NEVER Closes itself on idle: serve's main loop
+// selects on this and walks its existing graceful shutdown path.
+func (s *Server) IdleExited() <-chan struct{} { return s.idleCh }
+
+// idleArmLocked arms the idle-exit timer for the FULL window (caller
+// holds mu and has verified no live conns). Live captures do not block
+// the arming: the fire closure re-checks them under the lock — a
+// capture alive at fire time stands the timer down, and the capture's
+// own ending re-arms (captureEnd's hook).
+func (s *Server) idleArmLocked() {
+	if s.idleExit <= 0 || s.idleFired || s.idleHalted || s.idleTimer != nil {
+		return
+	}
+	s.idleTimer = afterFunc(s.idleExit, s.idleFire)
+}
+
+// idleFire is the armed timer's closure: re-verify under the lock that
+// the daemon is truly idle (a client may have re-registered after the
+// arming; a capture may outlive the window) and only then trigger — one
+// log line and the close-once idleCh. Anything else stands the timer
+// down silently; whichever ending re-empties the daemon re-arms it.
+func (s *Server) idleFire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idleTimer = nil // this arming is spent either way
+	if s.idleExit <= 0 || s.idleFired || s.idleHalted {
+		return
+	}
+	if len(s.conns) > 0 || len(s.captures) > 0 {
+		return // a client returned or a capture outlives the window
+	}
+	s.idleFired = true
+	s.logf("idle exit: no clients for %s", s.idleExit)
+	close(s.idleCh)
+}
+
 // Close shuts the daemon down gracefully: stop accepting, drop every
 // API connection (agent-gone), stop the lease reaper, close every
 // board controller connection (TCP close releases the board's
@@ -337,6 +590,18 @@ func (s *Server) Close() {
 			s.auditCancel()
 		}
 		s.ln.Close()
+
+		// the idle exit stands down for good, BEFORE any ending below
+		// can re-arm it: stopCapturesShutdown's capture endings and the
+		// conn drops both hook into idleArmLocked, and a window armed
+		// mid-shutdown would log a bogus "idle exit" on its way out
+		s.mu.Lock()
+		s.idleHalted = true
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+			s.idleTimer = nil
+		}
+		s.mu.Unlock()
 
 		// live captures end deliberately at shutdown (files closed,
 		// done pushes "stopped" — best effort toward connections that
@@ -420,6 +685,13 @@ func (s *Server) handleConn(c net.Conn) {
 		replyWait: defaultReplyWait,
 	}
 	s.conns[cc] = struct{}{}
+	// idle-exit hook: a live connection disarms the pending window (a
+	// client returned; the fire closure re-checks under this same lock,
+	// so a Stop()-too-late race is still refused)
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
 	s.mu.Unlock()
 
 	s.wg.Add(2)
@@ -479,6 +751,12 @@ func (cc *clientConn) drop() {
 			if len(set) == 0 {
 				delete(s.watchers, mac6)
 			}
+		}
+		// idle-exit hook: the LAST departure arms the window (captures
+		// do not block arming — the fire closure re-checks them under
+		// this lock and a live capture stands it down instead)
+		if len(s.conns) == 0 {
+			s.idleArmLocked()
 		}
 		s.mu.Unlock()
 
@@ -788,6 +1066,7 @@ func boardView(b discover.Board) map[string]any {
 		"alias":    b.Alias,
 		"sources":  b.Sources,
 		"host":     b.Host,
+		"ip":       b.IP, // browse-resolved A/AAAA — the address the daemon dials first
 		"port":     b.Port,
 		"usb_path": b.USBPath,
 	}
@@ -1311,6 +1590,7 @@ func (s *Server) supervisor(b discover.Board) *daemonBoard {
 	db.sup = s.opts.NewSupervisor(board.BoardRef{
 		MAC6:    b.MAC6,
 		Host:    b.Host,
+		IP:      b.IP, // browse-resolved address — TCPAddr dials it first (CGO=0 cannot resolve .local)
 		Port:    b.Port,
 		USBPath: b.USBPath,
 	})

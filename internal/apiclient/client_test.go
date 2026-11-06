@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"xuansi/internal/server"
+	"xuansi/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -33,7 +34,7 @@ type fakeDaemon struct {
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "d.sock")
+	path := filepath.Join(testutil.ShortSockDir(t), "d.sock")
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("fake daemon listen: %v", err)
