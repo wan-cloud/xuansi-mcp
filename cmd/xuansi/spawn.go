@@ -101,6 +101,9 @@ func startServe(sockPath, logPath string, rebuild func(sock, logPath string, att
 	cmd := serveSpawn(sockPath, logPath)
 	err := cmd.Start()
 	if err == nil || spawnRetryOnStartErr == nil || !spawnRetryOnStartErr(err) {
+		if err == nil {
+			reapSpawnedServe(cmd)
+		}
 		return cmd, err
 	}
 	closeServeLogHandles(cmd)
@@ -109,7 +112,22 @@ func startServe(sockPath, logPath string, rebuild func(sock, logPath string, att
 		closeServeLogHandles(cmd)
 		return cmd, err
 	}
+	reapSpawnedServe(cmd)
 	return cmd, nil
+}
+
+// reapSpawnedServe parks a background Wait on a spawn that actually
+// started (final-review minor): the serve is detached and outlives its
+// spawner, but a LONG-LIVED client — an `xuansi mcp` session parked
+// for hours — would otherwise hold the serve's corpse as a zombie from
+// the moment it dies (idle exit included) until the client itself
+// exits, because nothing ever Waits a cmd ensureDaemon drops on the
+// floor. The goroutine is fire-and-forget by design: bind-as-lock
+// means the exit status was never interesting ("leaving" is exit 0
+// either way), and a cmd whose Start failed never gets here — no
+// process, nothing to reap.
+func reapSpawnedServe(cmd *exec.Cmd) {
+	go func() { _ = cmd.Wait() }()
 }
 
 // closeServeLogHandles closes the parent's copies of a spawn

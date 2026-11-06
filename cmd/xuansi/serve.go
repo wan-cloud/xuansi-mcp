@@ -13,7 +13,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -68,7 +67,7 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 			return exitOK
 		}
 		fmt.Fprintf(stderr, "xuansi serve: %v\n", err)
-		if strings.Contains(err.Error(), "10047") { // WSAEAFNOSUPPORT: AF_UNIX needs Windows 10 1803+
+		if isAFNXUnsupported(err) { // WSAEAFNOSUPPORT: AF_UNIX needs Windows 10 1803+ (typed, afnxcheck_windows.go)
 			fmt.Fprint(stderr, "requires Windows 10 1803+ (AF_UNIX)\n")
 		}
 		return 1
