@@ -13,7 +13,8 @@
 //   2. @xuansi/<platform> optionalDependency — npm auto-installs only the
 //      subpackage matching the host (os+cpu fields in each subpackage).
 //
-// B8.5 Task 3; platform map is the single source consumed by
+// B8.5 Task 3 (family restructure 2026-11-06: this launcher lives in the
+// MAIN package xuansi-mcp); platform map is the single source consumed by
 // packaging/scripts/assemble-npm.sh (drift trips that script).
 
 'use strict';
@@ -35,7 +36,7 @@ const platformPackage = {
 };
 
 const INSTALL_HINT =
-  'install the matching @xuansi/<platform> package (npm install xuansi), ' +
+  'install the matching @xuansi/<platform> package (npm install xuansi-mcp), ' +
   'or set XUANSI_BIN=/path/to/xuansi-binary';
 
 class BinaryResolutionError extends Error {}
@@ -122,7 +123,8 @@ function run(argv) {
 }
 
 // Test seam: the map and resolver are importable; the CLI runs only when
-// executed directly (bin/xuansi-mcp.js reuses run() with "mcp" prepended).
+// executed directly (the sibling bin/xuansi-mcp.js reuses run() with
+// "mcp" prepended).
 module.exports = { platformPackage, resolveBinaryPath, INSTALL_HINT, run };
 
 if (require.main === module) {
