@@ -459,10 +459,31 @@ func (s *spSandbox) logTail(n int) string {
 
 // --------------------------------------------------------------- parsing --
 
+// spSplitRow splits one tabwriter-padded list line into its 5 LOGICAL
+// columns, nil for any other shape. The HOST column carries the DIALED
+// endpoint (final-fixwave item-6 ripple): "10.1.51.205:7777
+// (xuansi-d75884.local)" — six whitespace fields with the hostname in
+// parens — beside the space-free forms "<addr>:<port>" and "-" (five
+// fields). Tabwriter pads with spaces, so whitespace is the only
+// column grammar; the strict closed shape IS the pollution check.
+func spSplitRow(ln string) []string {
+	f := strings.Fields(ln)
+	switch len(f) {
+	case 5:
+		return f // header, "-" or bare endpoint in the HOST column
+	case 6:
+		if strings.HasPrefix(f[4], "(") && strings.HasSuffix(f[4], ")") {
+			return []string{f[0], f[1], f[2], f[3] + " " + f[4], f[5]}
+		}
+	}
+	return nil
+}
+
 // spCleanListTable asserts a `xuansi list` stdout is PROTOCOL-CLEAN:
-// the tabwriter header first, every line a 5-column row, and zero log
-// noise (slog lines or spawn notices must never leak into stdout -
-// spawn.go's whole redirect discipline).
+// the tabwriter header first, every line a well-formed 5-column row
+// (spSplitRow — the HOST column may carry the paren-hostname form),
+// and zero log noise (slog lines or spawn notices must never leak into
+// stdout - spawn.go's whole redirect discipline).
 func spCleanListTable(h *harness, out, label string) bool {
 	lines := []string{}
 	if strings.TrimSpace(out) != "" {
@@ -470,13 +491,13 @@ func spCleanListTable(h *harness, out, label string) bool {
 	}
 	headOK := len(lines) >= 1
 	if headOK {
-		f := strings.Fields(lines[0])
+		f := spSplitRow(lines[0])
 		headOK = len(f) == 5 && f[0] == "ALIAS" && f[1] == "MAC6" && f[2] == "SOURCES" && f[3] == "HOST" && f[4] == "FW"
 	}
 	noise := 0
 	colsOK := true
 	for _, ln := range lines {
-		if len(strings.Fields(ln)) != 5 {
+		if spSplitRow(ln) == nil {
 			colsOK = false
 		}
 		if strings.Contains(ln, "level=") || strings.Contains(ln, "msg=") ||
@@ -490,12 +511,25 @@ func spCleanListTable(h *harness, out, label string) bool {
 	return pass
 }
 
+// spExpectEndpoint is the canonical HOST-column value this driver pins
+// for the bench board: the mDNS-resolved IP with the port, hostname in
+// parens - exactly what the daemon's dialEndpoint emits now that the
+// display shows the DIALED address (T10 / final-fixwave item-6).
+func spExpectEndpoint(boardIP string) string {
+	host, _, err := net.SplitHostPort(spTCPEndp)
+	if err != nil {
+		return boardIP + ":7777"
+	}
+	return boardIP + ":7777 (" + host + ")"
+}
+
 // spListRow extracts one board's row fields from a list stdout, nil if
-// the board is not listed yet.
+// the board is not listed yet. Returns the 5 logical columns
+// (spSplitRow), so index 3 is the full dialEndpoint and index 4 the fw
+// build whatever shape the HOST column took.
 func spListRow(out, mac6 string) []string {
 	for _, ln := range strings.Split(out, "\n") {
-		f := strings.Fields(ln)
-		if len(f) >= 5 && f[1] == mac6 {
+		if f := spSplitRow(ln); f != nil && f[1] == mac6 && f[0] != "ALIAS" {
 			return f
 		}
 	}
@@ -607,6 +641,8 @@ func runSpawnIdle(attempt int, daemonBin, runDir string) int {
 	h.check(ok, fmt.Sprintf("S0 list shows %s with fw populated (%s)", spBoard, last))
 	if row != nil {
 		h.check(row[2] == "usb+mdns", fmt.Sprintf("S0 dual-source merged usb+mdns (sources=%s)", row[2]))
+		h.check(row[3] == spExpectEndpoint(boardIP),
+			fmt.Sprintf("S0 HOST column pins the dialed endpoint %q (got %q) - IP first, hostname in parens (item-6 dialEndpoint)", spExpectEndpoint(boardIP), row[3]))
 		h.note("fw build in the row: %s (binding recorded in-log)", row[4])
 	}
 	h.check(s.logCountAll("daemon serving "+s.sock) == 1,
@@ -891,7 +927,12 @@ func runSpawnIdle(attempt int, daemonBin, runDir string) int {
 	h.check(code == 0 && !strings.Contains(err7, "spawned"),
 		fmt.Sprintf("S7 list against the live winner: exit 0, no respawn (code=%d)", code))
 	spCleanListTable(h, out7, "S7 list")
-	h.check(spListRow(out7, spBoard) != nil, fmt.Sprintf("S7 the board is listed by the winner daemon (row=%v)", spListRow(out7, spBoard)))
+	row7 := spListRow(out7, spBoard)
+	h.check(row7 != nil, fmt.Sprintf("S7 the board is listed by the winner daemon (row=%v)", row7))
+	if row7 != nil {
+		h.check(row7[3] == spExpectEndpoint(boardIP),
+			fmt.Sprintf("S7 HOST column pins the dialed endpoint %q (got %q) - IP first, hostname in parens (item-6 dialEndpoint)", spExpectEndpoint(boardIP), row7[3]))
+	}
 	ok, _ = s.waitServes(h, 1, 5*time.Second)
 	h.check(ok, "S7 still exactly one serve (no respawn needed)")
 	code, lout, _ := s.cli(h, "lease-c2", "lease", "--holder", spC2, spBoard)

@@ -1,17 +1,18 @@
-capture: results/2026-11-06-spawn-idle-full-attempt2.log (2026-11-06T05:52:29+08:00)
-repo HEAD: ad4d620 - dirty files: 12
+capture: results/2026-11-06-spawn-idle-full-attempt2-1793928896.log (2026-11-06T09:34:56+08:00)
+repo HEAD: 1f24d45 - dirty files: 3
 attempt: 2 (honest count - failures keep their own transcript)
 --- unit gates (must be green before the board is touched) ---
-ok  	xuansi/cmd/xuansi	2.989s
-ok  	xuansi/hil	0.007s
-ok  	xuansi/internal/apiclient	0.719s
+ok  	xuansi/cmd/xuansi	2.995s
+ok  	xuansi/hil	0.006s
+ok  	xuansi/internal/apiclient	0.717s
 ok  	xuansi/internal/board	0.507s
-ok  	xuansi/internal/discover	0.009s
-ok  	xuansi/internal/lease	0.006s
-ok  	xuansi/internal/mcp	7.236s
-ok  	xuansi/internal/paths	0.003s
-ok  	xuansi/internal/replclient	1.445s
-ok  	xuansi/internal/server	18.634s
+ok  	xuansi/internal/discover	0.010s
+ok  	xuansi/internal/lease	0.008s
+ok  	xuansi/internal/mcp	7.190s
+ok  	xuansi/internal/paths	0.004s
+ok  	xuansi/internal/replclient	1.446s
+ok  	xuansi/internal/server	19.020s
+ok  	xuansi/internal/testutil	0.006s
 --- build the daemon binary fresh at HEAD ---
 mkdir -p bin
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o bin/xuansi-linux-amd64 ./cmd/xuansi
@@ -20,13 +21,13 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o bin/xuansi-windows
 GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o bin/xuansi-windows-arm64.exe ./cmd/xuansi
 bin/xuansi-linux-amd64: go1.27.3
 	path	xuansi/cmd/xuansi
-	mod	xuansi	v0.0.0-20261105211549-ad4d62030502+dirty	
+	mod	xuansi	v0.0.0-20261106012546-1f24d4583c51+dirty	
 	dep	github.com/cenkalti/backoff	v2.2.1+incompatible	h1:tNowT99t7UNflLxfYYSlKYsBpXdEet03Pg2g16Swow4=
 	dep	github.com/google/jsonschema-go	v0.4.3	h1:/DBOLZTfDow7pe2GmaJNhltueGTtDKICi8V8p+DQPd0=
 	dep	github.com/grandcat/zeroconf	v1.0.0	h1:uHhahLBKqwWBV6WZUDAT71044vwOTL+McW0mBJvo6kE=
 	dep	github.com/miekg/dns	v1.1.27	h1:aEH/kqUzUxGJ/UHcEKdJY+ugH6WEzsEBBSPa8zuy1aM=
 	dep	github.com/modelcontextprotocol/go-sdk	v1.8.0	h1:KIvahhYqwtbeniWVPs3TcXEA7b8jEtwfBpOTAI+Urx4=
-=== task-7 spawn/idle full HIL - 2026-11-06T05:53:00+08:00 ===
+=== task-7 spawn/idle full HIL - 2026-11-06T09:35:19+08:00 ===
 attempt: 2 (honest count - any failure is fixed and the WHOLE capture rerun)
 board: d75884 (TCP xuansi-d75884.local:7777; GPIO1<->GPIO2 wired pair; USB by-id present, never opened)
 story: S0 cold auto-spawn -> S1 resident holder -> S2 kill client -> S3 adopt in window -> S4 idle self-exit (15s real) ->
@@ -41,10 +42,10 @@ discipline: default sock resolution through the sandbox XDG env (no --sock flag 
   [note] sandbox: XDG_RUNTIME_DIR=/tmp/opencode/spawnidle-full/runtime (sock /tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock)
   [note]           XDG_STATE_HOME=/tmp/opencode/spawnidle-full/state (serve.log /tmp/opencode/spawnidle-full/state/xuansi/serve.log)
   [note]           XDG_DATA_HOME=/tmp/opencode/spawnidle-full/data, XDG_CONFIG_HOME=/tmp/opencode/spawnidle-full/config (zero-config boards.conf)
-  [list-1] started pid=455093 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [list-1 err] time=2026-11-06T05:53:03.796+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=455099 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
-  [list-1 err] no boards known yet - the daemon refreshes discovery every 30s
+  [list-1] started pid=673827 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [list-1 err] time=2026-11-06T09:35:22.124+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=673833 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
   [list-1 out] ALIAS  MAC6  SOURCES  HOST  FW
+  [list-1 err] no boards known yet - the daemon refreshes discovery every 30s
   [PASS] S0 first `xuansi list` (cold, no daemon) exit 0 (code=0)
   [PASS] S0 client stderr carries the spawn notice (the auto-spawn path fired; it rides stderr, never stdout)
   [PASS] S0 list #1: stdout protocol-clean (header=true cols=true, 0 noise line(s) over 1 line(s))
@@ -52,44 +53,48 @@ discipline: default sock resolution through the sandbox XDG env (no --sock flag 
   [PASS] S0 auto-spawned serve process exists, exactly one (1 serve(s) alive (want 1))
   [PASS] S0 serve.log (sandbox StateDir) carries the serving line naming our sock (serve.log: serving line)
   [PASS] S0 initial discovery sweep found the board (serve.log: sweep line)
-  [list-2] started pid=455109 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [list-2 out] ALIAS  MAC6    SOURCES   HOST                      FW
-  [list-2 out] -      d75884  usb+mdns  xuansi-d75884.local:7777  -
+  [list-2] started pid=673844 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [list-2 out] ALIAS  MAC6    SOURCES   HOST                                    FW
+  [list-2 out] -      d75884  usb+mdns  10.1.51.205:7777 (xuansi-d75884.local)  -
   [PASS] S0 second list dials through without spawning again (code=0, spawn notice absent=true)
   [PASS] S0 list #2: stdout protocol-clean (header=true cols=true, 0 noise line(s) over 2 line(s))
   [PASS] S0 still exactly one serve after the second client (1 serve(s) alive (want 1))
-  [list-poll] started pid=455115 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [list-poll out] ALIAS  MAC6    SOURCES   HOST                      FW
-  [list-poll out] -      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+  [list-poll] started pid=673850 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [list-poll out] ALIAS  MAC6    SOURCES   HOST                                    FW
+  [list-poll out] -      d75884  usb+mdns  10.1.51.205:7777 (xuansi-d75884.local)  -
+  [list-poll] started pid=673855 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [list-poll out] ALIAS  MAC6    SOURCES   HOST                                    FW
+  [list-poll out] -      d75884  usb+mdns  10.1.51.205:7777 (xuansi-d75884.local)  03f634b
   [PASS] S0 list poll: stdout protocol-clean (header=true cols=true, 0 noise line(s) over 2 line(s))
-  [PASS] S0 list shows d75884 with fw populated (row [- d75884 usb+mdns xuansi-d75884.local:7777 03f634b])
+  [PASS] S0 list shows d75884 with fw populated (row [- d75884 usb+mdns 10.1.51.205:7777 (xuansi-d75884.local) 03f634b])
   [PASS] S0 dual-source merged usb+mdns (sources=usb+mdns)
+  [PASS] S0 HOST column pins the dialed endpoint "10.1.51.205:7777 (xuansi-d75884.local)" (got "10.1.51.205:7777 (xuansi-d75884.local)") - IP first, hostname in parens (item-6 dialEndpoint)
   [note] fw build in the row: 03f634b (binding recorded in-log)
   [PASS] S0 exactly ONE serving banner so far (count=1 - nobody double-started)
 
 - S1: lease holder=spawn-h1, script_start spawnkeep, resident eval client holds ns-0 -
-  [PASS] lease holder=spawn-h1 session=1793915584 (raw apiConn; rerr=<nil> err=<nil>)
+  [PASS] lease holder=spawn-h1 session=1793928923 (raw apiConn; rerr=<nil> err=<nil>)
   [PASS] script_start spawnkeep acked (200ms counter, lease session ns; reply {"name":"spawnkeep"})
   [PASS] counter reads n1=4 through the lease (script resident and counting; rerr=<nil> err=<nil>)
   [PASS] [prelude] budget.set eval_ms=4000 event_ms=500 for the resident hold (reply eval_ms=4000 event_ms=500; rerr=<nil> err=<nil>)
   [note] apiConn #1 closed - lease enters grace (one-shot client semantics); the resident eval client walks back in next
-  [resident] started pid=455120 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "eval" "--holder" "spawn-h1" "d75884" "bench.gpio.mode(1,\"out\") local t=os.clock() while os.clock()-t < 3.5 do end return \"resident-done\""]
+  [resident] started pid=673860 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "eval" "--holder" "spawn-h1" "d75884" "bench.gpio.mode(1,\"out\") local t=os.clock() while os.clock()-t < 3.5 do end return \"resident-done\""]
   [PASS] S1 resident client's eval ADOPTED the grace lease on its way in (serve.log: adopt line)
 
 - S2: SIGKILL the resident client mid-eval - conn dies, grace window opens -
-  [note] driver: SIGKILLing the still-running resident (pid=455120)
+  [note] driver: SIGKILLing the still-running resident (pid=673860)
   [note] resident client SIGKILLed 1.2s after launch (mid-eval; the daemon notices the dead conn when its in-flight request returns, so the agent-gone line can trail the kill by the eval's residual time)
   [PASS] S2 the resident eval was still INSIDE the board's eval budget when killed (no `budget: cpu budget exceeded` on its stderr - a real mid-eval kill)
   [PASS] S2 daemon saw the client die: agent-gone holder=spawn-h1 logged, grace window open (serve.log: agent-gone line)
   [PASS] S2 the killed client never received its eval value (killed mid-eval, stdout carries no result)
-  [status-grace] started pid=455125 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "status" "d75884"]
+  [status-grace] started pid=673867 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "status" "d75884"]
   [status-grace out] board:     d75884
   [status-grace out] sources:   usb+mdns
-  [status-grace out] tcp:       xuansi-d75884.local:7777
+  [status-grace out] tcp:       10.1.51.205:7777 (xuansi-d75884.local)
   [status-grace out] usb:       /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00
   [status-grace out] fw:        03f634b
   [status-grace out] connected: yes
-  [status-grace out] lease:     holder=spawn-h1 session=1793915584 since=2026-11-06T05:53:07+08:00 - holder gone, grace-expiring at 2026-11-06T05:58:11+08:00 (re-supply --holder spawn-h1 to adopt)
+  [status-grace out] lease:     holder=spawn-h1 session=1793928923 since=2026-11-06T09:35:26+08:00 - holder gone, grace-expiring at 2026-11-06T09:40:30+08:00 (re-supply --holder spawn-h1 to adopt)
   [status-grace out] scripts:   spawnkeep
   [PASS] S2 `xuansi status` during grace prints holder=spawn-h1 grace-expiring (code=0)
   [PASS] S2 status still lists the resident script during grace (board state KEPT; scripts line contains spawnkeep)
@@ -107,27 +112,27 @@ discipline: default sock resolution through the sandbox XDG env (no --sock flag 
   [PASS] S4 auto-spawned daemon: sock file removed at exit (stat err=stat /tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock: no such file or directory)
   [PASS] S4 the daemon's shutdown message names the surviving-scripts semantics (what S5 proves)
   [PASS] S4 SIGINT shutdown completed cleanly (final log line)
-  [idle-serve] started pid=455132 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock" "--idle-exit" "15s" "--grace-ttl" "15s"]
-  [idle-serve err] time=2026-11-06T05:53:11.789+08:00 level=INFO msg="server: serving /tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock (grace_ttl=15s)"
+  [idle-serve] started pid=673874 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock" "--idle-exit" "15s" "--grace-ttl" "15s"]
   [idle-serve out] xuansi daemon serving /tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock (grace-ttl 15s, Ctrl-C to stop)
+  [idle-serve err] time=2026-11-06T09:35:31.128+08:00 level=INFO msg="server: serving /tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock (grace_ttl=15s)"
   [PASS] S4 staged serve (idle-exit 15s) bound the sock (sock dialable)
   [PASS] S4 staged serve's serving line in serve.log (via the tee)
-  [idle-serve err] time=2026-11-06T05:53:12.085+08:00 level=INFO msg="server: conn dropped (holder=conn-1)"
-  [list-idle] started pid=455144 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [idle-serve err] time=2026-11-06T05:53:12.090+08:00 level=INFO msg="server: conn dropped (holder=conn-2)"
+  [idle-serve err] time=2026-11-06T09:35:31.426+08:00 level=INFO msg="server: conn dropped (holder=conn-1)"
+  [list-idle] started pid=673885 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [idle-serve err] time=2026-11-06T09:35:31.430+08:00 level=INFO msg="server: conn dropped (holder=conn-2)"
   [list-idle err] no boards known yet - the daemon refreshes discovery every 30s
   [list-idle out] ALIAS  MAC6  SOURCES  HOST  FW
-  [idle-serve err] time=2026-11-06T05:53:12.091+08:00 level=INFO msg="server: conn dropped (holder=conn-3)"
+  [idle-serve err] time=2026-11-06T09:35:31.431+08:00 level=INFO msg="server: conn dropped (holder=conn-3)"
   [PASS] S4 one client against the staged serve: `xuansi list` exit 0 (code=0)
   [PASS] S0-style protocol check (list against staged serve): stdout protocol-clean (header=true cols=true, 0 noise line(s) over 1 line(s))
-  [idle-serve err] time=2026-11-06T05:53:14.794+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
-  [idle-serve err] time=2026-11-06T05:53:14.814+08:00 level=INFO msg="tcp: connected 10.1.50.200:32856 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
-  [idle-serve err] time=2026-11-06T05:53:14.832+08:00 level=INFO msg="board d75884: controller warm connection up (fw=03f634b protocol_ver=3)"
-  [idle-serve err] time=2026-11-06T05:53:14.955+08:00 level=INFO msg="board d75884: resync scripts=[spawnkeep] survived=[] started=[] gone=[] pins=1 (cold=true) wifi_state=up [diag.pins raw 69B]"
-  [idle-serve err] time=2026-11-06T05:53:14.955+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[spawnkeep] pins=1 wifi_state=up (orphans listed, not killed)"
+  [idle-serve err] time=2026-11-06T09:35:34.135+08:00 level=INFO msg="server: initial discovery sweep: 1 board(s)"
+  [idle-serve err] time=2026-11-06T09:35:34.163+08:00 level=INFO msg="tcp: connected 10.1.50.200:39610 - 10.1.51.205:7777 (no reboot, no drain window - -13; keepalive 3s/1s-3 -6s verdict)"
+  [idle-serve err] time=2026-11-06T09:35:34.210+08:00 level=INFO msg="board d75884: controller warm connection up (fw=03f634b protocol_ver=3)"
+  [idle-serve err] time=2026-11-06T09:35:34.301+08:00 level=INFO msg="board d75884: resync scripts=[spawnkeep] survived=[] started=[] gone=[] pins=1 (cold=true) wifi_state=up [diag.pins raw 69B]"
+  [idle-serve err] time=2026-11-06T09:35:34.301+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[spawnkeep] pins=1 wifi_state=up (orphans listed, not killed)"
   [idle-serve out] xuansi: idle exit (no clients for 15s)
   [idle-serve out] xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)
-  [idle-serve err] time=2026-11-06T05:53:27.101+08:00 level=INFO msg="idle exit: no clients for 15s"
+  [idle-serve err] time=2026-11-06T09:35:46.442+08:00 level=INFO msg="idle exit: no clients for 15s"
   [idle-serve out] xuansi: shutdown complete
   [PASS] S4 idle self-exit: staged serve exited on its own after the window (waited 15.011s, code=0 waitErr=<nil>)
   [PASS] S4 no serve process left (0 serve(s) alive (want 0))
@@ -135,23 +140,23 @@ discipline: default sock resolution through the sandbox XDG env (no --sock flag 
   [PASS] S4 serve.log tail carries the idle-exit line (the window fired with no clients)
   [PASS] S4 idle shutdown walked the graceful path (shutdown complete)
   [note] S4 serve.log tail (last 6 lines):
-    time=2026-11-06T05:53:14.955+08:00 level=INFO msg="board d75884: resync scripts=[spawnkeep] survived=[] started=[] gone=[] pins=1 (cold=true) wifi_state=up [diag.pins raw 69B]"-    time=2026-11-06T05:53:14.955+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[spawnkeep] pins=1 wifi_state=up (orphans listed, not killed)"-    xuansi: idle exit (no clients for 15s)-    xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)-    time=2026-11-06T05:53:27.101+08:00 level=INFO msg="idle exit: no clients for 15s"-    xuansi: shutdown complete
+    time=2026-11-06T09:35:34.301+08:00 level=INFO msg="board d75884: resync scripts=[spawnkeep] survived=[] started=[] gone=[] pins=1 (cold=true) wifi_state=up [diag.pins raw 69B]"-    time=2026-11-06T09:35:34.301+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[spawnkeep] pins=1 wifi_state=up (orphans listed, not killed)"-    xuansi: idle exit (no clients for 15s)-    xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)-    time=2026-11-06T09:35:46.442+08:00 level=INFO msg="idle exit: no clients for 15s"-    xuansi: shutdown complete
 
 - S5: spawn #2's startup audit lists the surviving script; then the bench is cleaned -
-  [list-3] started pid=455151 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [list-3 err] time=2026-11-06T05:53:27.150+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=455157 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
-  [list-3 err] no boards known yet - the daemon refreshes discovery every 30s
+  [list-3] started pid=673899 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [list-3 err] time=2026-11-06T09:35:46.495+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=673905 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
   [list-3 out] ALIAS  MAC6  SOURCES  HOST  FW
+  [list-3 err] no boards known yet - the daemon refreshes discovery every 30s
   [PASS] S5 cold again: `xuansi list` auto-spawned serve #2 (code=0, spawn notice present)
   [PASS] S5 exactly one serve alive (1 serve(s) alive (want 1))
   [PASS] S5 spawn #2's startup orphan audit LISTS spawnkeep - the board-side script ran through BOTH daemon deaths (audit line with the survivor listed)
   [PASS] S5 the audit also counts pins=1 - the resident eval's ns-0 GPIO1 claim survived too (owner _eval, session 0)
-  [status-audit] started pid=455167 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "status" "d75884"]
+  [status-audit] started pid=673920 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "status" "d75884"]
   [status-audit out] board:     d75884
   [status-audit out] sources:   usb+mdns
-  [status-audit out] tcp:       xuansi-d75884.local:7777
+  [status-audit out] tcp:       10.1.51.205:7777 (xuansi-d75884.local)
   [status-audit out] usb:       /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00
-  [status-audit out] fw:        -
+  [status-audit out] fw:        03f634b
   [status-audit out] connected: yes
   [status-audit out] lease:     (free)
   [status-audit out] scripts:   spawnkeep
@@ -159,9 +164,9 @@ discipline: default sock resolution through the sandbox XDG env (no --sock flag 
   [note] S5 status view:
 board:     d75884
     sources:   usb+mdns
-    tcp:       xuansi-d75884.local:7777
+    tcp:       10.1.51.205:7777 (xuansi-d75884.local)
     usb:       /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00
-    fw:        -
+    fw:        03f634b
     connected: yes
     lease:     (free)
     scripts:   spawnkeep
@@ -172,10 +177,10 @@ board:     d75884
   [PASS] S5 GPIO1 freed by the sweep: write-reject probe (class=rt msg=eval:1: pin 1 not configured as output (call bench.gpio.mode - b5full S8's safe-state shape)
   [PASS] S5 budget restored eval_ms=200 event_ms=50 (board as found; reply eval_ms=200 event_ms=50)
   [PASS] S5 cleanup release holder=spawn-fin (bench back to free; rerr=<nil> err=<nil>)
-  [status-clean] started pid=455172 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "status" "d75884"]
+  [status-clean] started pid=673925 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "status" "d75884"]
   [status-clean out] board:     d75884
   [status-clean out] sources:   usb+mdns
-  [status-clean out] tcp:       xuansi-d75884.local:7777
+  [status-clean out] tcp:       10.1.51.205:7777 (xuansi-d75884.local)
   [status-clean out] usb:       /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00
   [status-clean out] fw:        03f634b
   [status-clean out] connected: yes
@@ -185,45 +190,46 @@ board:     d75884
 - S6: kill the daemon, TWO clients the same instant - one winner, loser exits 0 -
   [PASS] S6 daemon #2: SIGINT -> detached daemon gone within 20s (0 serve(s) alive (want 0))
   [PASS] S6 daemon #2: sock file removed at exit (stat err=stat /tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock: no such file or directory)
-  [race-a] started pid=455179 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [race-b] started pid=455180 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [race-a err] time=2026-11-06T05:53:30.561+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=455190 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
-  [race-b err] time=2026-11-06T05:53:30.561+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=455192 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
-  [race-a err] no boards known yet - the daemon refreshes discovery every 30s
-  [race-a out] ALIAS  MAC6  SOURCES  HOST  FW
+  [race-a] started pid=673932 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [race-b] started pid=673933 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [race-b err] time=2026-11-06T09:35:50.596+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=673943 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
+  [race-a err] time=2026-11-06T09:35:50.597+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock pid=673945 log=/tmp/opencode/spawnidle-full/state/xuansi/serve.log
   [race-b out] ALIAS  MAC6  SOURCES  HOST  FW
   [race-b err] no boards known yet - the daemon refreshes discovery every 30s
+  [race-a out] ALIAS  MAC6  SOURCES  HOST  FW
+  [race-a err] no boards known yet - the daemon refreshes discovery every 30s
   [PASS] S6 BOTH concurrent clients succeeded (a: waited=true code=0, b: waited=true code=0)
   [note] S6 2 of the 2 racing clients took the spawn path (both spawn = a real bind race; 1 = the winner bound before the loser probed)
   [PASS] S6 exactly ONE serve survived the race (1 serve(s) alive (want 1))
   [PASS] S6 the winner's serving line is in serve.log
   [PASS] S6 the racing loser serve logged `already listening ... leaving` in serve.log (the exit-0 path; its own exit code is unreapable - detached, reparented - so the deliberate double-start below proves the code)
   [PASS] S6 no double-bind crash shape in serve.log (the bind-as-lock window held)
-  [double-start] started pid=455207 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock"]
+  [double-start] started pid=673959 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "serve" "--sock" "/tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock"]
   [double-start err] xuansi serve: another daemon is already listening - leaving (spawn race or double start)
   [PASS] S6 deliberate double-start against the winner: exit code 0 (waited=true code=0 err=<nil>)
   [PASS] S6 the loser's own stderr carries the `already listening ... leaving` line (task 2's ErrAlreadyListening exit-0 path)
   [PASS] S6 still exactly one serve after the double-start (1 serve(s) alive (want 1))
   [PASS] S6 the winner's own startup audit shows the board CLEAN after the S5 teardown (scripts=[] in serve.log; audit: clean board)
-  [note] S6 audit line context: time=2026-11-06T05:53:33.776+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[] pins=0 wifi_state=up (orphans listed, not killed)"
+  [note] S6 audit line context: time=2026-11-06T09:35:53.849+08:00 level=INFO msg="server: startup audit board d75884: cold=true scripts=[] pins=0 wifi_state=up (orphans listed, not killed)"
 
 - S7: second cycle against the race's winner - list, lease, eval, release -
-  [list-4] started pid=455218 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
-  [list-4 out] ALIAS  MAC6    SOURCES   HOST                      FW
-  [list-4 out] -      d75884  usb+mdns  xuansi-d75884.local:7777  03f634b
+  [list-4] started pid=673967 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "list"]
+  [list-4 out] ALIAS  MAC6    SOURCES   HOST                                    FW
+  [list-4 out] -      d75884  usb+mdns  10.1.51.205:7777 (xuansi-d75884.local)  03f634b
   [PASS] S7 list against the live winner: exit 0, no respawn (code=0)
   [PASS] S7 list: stdout protocol-clean (header=true cols=true, 0 noise line(s) over 2 line(s))
-  [PASS] S7 the board is listed by the winner daemon (row=[- d75884 usb+mdns xuansi-d75884.local:7777 03f634b])
+  [PASS] S7 the board is listed by the winner daemon (row=[- d75884 usb+mdns 10.1.51.205:7777 (xuansi-d75884.local) 03f634b])
+  [PASS] S7 HOST column pins the dialed endpoint "10.1.51.205:7777 (xuansi-d75884.local)" (got "10.1.51.205:7777 (xuansi-d75884.local)") - IP first, hostname in parens (item-6 dialEndpoint)
   [PASS] S7 still exactly one serve (no respawn needed)
-  [lease-c2] started pid=455224 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "lease" "--holder" "spawn-c2" "d75884"]
-  [lease-c2 out] leased d75884 holder=spawn-c2 session=1793915611
-  [PASS] S7 lease --holder spawn-c2 through a fresh CLI process (code=0 out=leased d75884 holder=spawn-c2 session=1793915611)
-  [eval-c2] started pid=455229 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "eval" "--holder" "spawn-c2" "d75884" "return 6*7"]
+  [lease-c2] started pid=673973 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "lease" "--holder" "spawn-c2" "d75884"]
+  [lease-c2 out] leased d75884 holder=spawn-c2 session=1793928951
+  [PASS] S7 lease --holder spawn-c2 through a fresh CLI process (code=0 out=leased d75884 holder=spawn-c2 session=1793928951)
+  [eval-c2] started pid=673978 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "eval" "--holder" "spawn-c2" "d75884" "return 6*7"]
   [eval-c2 out] 42
   [eval-c2 out] value: 42
   [PASS] S7 eval 6*7 -> `value: 42` (code=0 out=42
 value: 42)
-  [release-c2] started pid=455234 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "release" "--holder" "spawn-c2" "d75884"]
+  [release-c2] started pid=673983 argv=["/home/wan/work/Project/xuansi-hardware-probe/code/xuansi-daemon-wt-autospawn/bin/xuansi-linux-amd64" "release" "--holder" "spawn-c2" "d75884"]
   [release-c2 out] released d75884 (holder=spawn-c2; board session reset to safe state)
   [PASS] S7 release leaves the bench free (code=0 out=released d75884 (holder=spawn-c2; board session reset to saf)
 
@@ -232,11 +238,11 @@ value: 42)
   [PASS] S7 winner daemon: sock file removed at exit (stat err=stat /tmp/opencode/spawnidle-full/runtime/xuansi/daemon.sock: no such file or directory)
   [PASS] final daemon shutdown complete (graceful, socket removed)
   [PASS] no serve processes left anywhere (0 serve(s) alive (want 0))
-  [note] serve.log total 10674B, 4 serving banner(s), 4 shutdown(s)
+  [note] serve.log total 10853B, 4 serving banner(s), 4 shutdown(s)
   [note] final serve.log tail (last 6 lines):
-    time=2026-11-06T05:53:34.421+08:00 level=INFO msg="board d75884: session.reset(1793915611) stopped=0"-    time=2026-11-06T05:53:34.445+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"-    time=2026-11-06T05:53:34.445+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=spawn-c2 session=1793915611 sessions=[1793915611 0] err=<nil> took=58ms"-    time=2026-11-06T05:53:34.446+08:00 level=INFO msg="server: conn dropped (holder=spawn-c2)"-    xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)-    xuansi: shutdown complete
+    time=2026-11-06T09:35:54.475+08:00 level=INFO msg="board d75884: session.reset(1793928951) stopped=0"-    time=2026-11-06T09:35:54.494+08:00 level=INFO msg="board d75884: session.reset(0) stopped=0"-    time=2026-11-06T09:35:54.494+08:00 level=INFO msg="lease: teardown reason=released board=d75884 holder=spawn-c2 session=1793928951 sessions=[1793928951 0] err=<nil> took=46ms"-    time=2026-11-06T09:35:54.495+08:00 level=INFO msg="server: conn dropped (holder=spawn-c2)"-    xuansi: shutting down (socket removed, board connections closed; board-side scripts keep running - the next start's audit lists them)-    xuansi: shutdown complete
   [note] board left in its default state: no lease (released at S5/S7), no scripts (stopped at S5), pins swept (session_reset 0 + write-reject proof), budget restored to as-found 200/50 at S5
   [note] sandbox accounting: everything under /tmp/opencode/spawnidle-full (runtime/state/data/config) - the real user XDG state was never touched
-=== spawnidle: 79 pass, 0 fail ===
+=== spawnidle: 81 pass, 0 fail ===
 === ALL PASS - task-7 spawn/idle story: cold auto-spawn, kill+adopt in window, idle self-exit, concurrent race, second cycle (attempt 2, S0..S7) ===
 driver exit: 0
