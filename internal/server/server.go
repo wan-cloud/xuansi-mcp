@@ -1534,6 +1534,13 @@ func (s *Server) hFsRm(ctx context.Context, cc *clientConn, req *Request) (any, 
 // the alternative, not an allowlist exception). Session omitted = 0;
 // the board's {stopped:n} reply and error class/msg cross verbatim.
 // The lease itself is untouched (its teardown keeps its own sweep).
+// Negative sessions are refused daemon-side (whole-branch final
+// review, Critical): -1 is the board's INTERNAL op-face pin sentinel
+// (XS_PIN_SESSION_OPFACE — the camera's 14 slots), never a user
+// namespace; crossing it would sweep those slots while the camera
+// stays logically active, reopening dual-drive. The fw refuses it too
+// (belt on both sides); refusing here keeps the daemon from ever
+// putting the request on the wire.
 func (s *Server) hSessionReset(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -1541,6 +1548,10 @@ func (s *Server) hSessionReset(ctx context.Context, cc *clientConn, req *Request
 	}
 	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
 		return nil, err
+	}
+	if req.Session < 0 {
+		return nil, &RPCError{Class: "api",
+			Msg: fmt.Sprintf("session_reset: session %d refused — -1 is the board's internal op-face pin sentinel (never a user namespace); session must be 0 or positive", req.Session)}
 	}
 	return s.boardOp(ctx, b, "session.reset", map[string]any{"session": req.Session})
 }

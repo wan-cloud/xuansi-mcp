@@ -10,6 +10,7 @@ package server
 // same shape fs_rm pinned in task 1.
 
 import (
+	"strings"
 	"testing"
 
 	"xuansi/internal/replclient"
@@ -102,5 +103,41 @@ func TestSessionResetBoardErrorVerbatim(t *testing.T) {
 	er := errOf(t, rep)
 	if asStr(er["class"]) != "api" || asStr(er["msg"]) != want {
 		t.Fatalf("error = %q/%q, want api/%q verbatim", er["class"], er["msg"], want)
+	}
+}
+
+// TestSessionResetNegativeSessionRefusedDaemonSide (whole-branch final
+// review, Critical): -1 is the board's INTERNAL op-face pin sentinel
+// (XS_PIN_SESSION_OPFACE - the camera's 14 slots), never a user
+// namespace. Crossing it would sweep those slots while the camera
+// stays logically active (dual-drive), so the daemon refuses any
+// negative session UNDER the lease (the gate order the lease tests
+// pin) and never puts the request on the wire - the fake board seeing
+// no session.reset at all is the proof.
+func TestSessionResetNegativeSessionRefusedDaemonSide(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "sr"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	rep, _ = c.call(2, map[string]any{"type": "session_reset", "board": "d75884", "session": -1})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "api" {
+		t.Fatalf("class = %q, want api", er["class"])
+	}
+	msg := asStr(er["msg"])
+	if !strings.Contains(msg, "op-face pin sentinel") || !strings.Contains(msg, "0 or positive") {
+		t.Fatalf("msg = %q, want the op-face sentinel + 0-or-positive reason named", msg)
+	}
+	for _, call := range e.fakes["d75884"].got() {
+		if call.op == "session.reset" && asInt(call.args["session"]) < 0 {
+			t.Fatalf("negative session crossed to the board: %+v", call)
+		}
+	}
+	// The lease survives the refusal (only the bad request died).
+	if _, ok := e.srv.leases.Session("d75884"); !ok {
+		t.Fatalf("lease lost after a refused session_reset")
 	}
 }
