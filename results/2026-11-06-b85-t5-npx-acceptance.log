@@ -1,0 +1,9 @@
+=== B8.5 T5 npx acceptance — 2026-11-06T11:00:50Z ===
+--- npx -p xuansi-mcp xuansi list（板應現身）---
+time=2026-11-06T19:01:14.718+08:00 level=INFO msg="spawned a detached xuansi serve; waiting for it to listen" sock=/run/user/1000/xuansi/daemon.sock pid=837728 log=/home/wan/.local/state/xuansi/serve.log
+ALIAS  MAC6  SOURCES  HOST  FW
+no boards known yet — the daemon refreshes discovery every 30s
+ALIAS  MAC6    SOURCES   HOST                                    FW
+-      d75884  usb+mdns  10.1.51.205:7777 (xuansi-d75884.local)  03f634b
+--- MCP initialize 握手（npx -y xuansi-mcp@0.1.0，斷言 version==0.1.0）---
+serverInfo: {"name":"xuansi","version":"0.1.0"}
