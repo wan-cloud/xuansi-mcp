@@ -37,7 +37,7 @@
 //	     nothing; the full wedge→reboot→resync chain is in the pre-fix
 //	     run's R4 (results/2026-11-05-b5-t10-teardown.log).
 //
-// Every hello binds protocol_ver=3/fw b310378 in-log (evidence binding);
+// Every hello binds protocol_ver/fw_build in-log (evidence binding;
 // a mismatch aborts the scenario.
 package main
 

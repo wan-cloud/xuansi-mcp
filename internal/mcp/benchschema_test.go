@@ -1,12 +1,11 @@
 package mcp
 
 // benchschema_test.go — the transcription self-check: BenchSchema(1)
-// must match the frozen v1 bench API page entry-by-entry (§7 batch-2
-// primitives + §3.2 gpio; docs/資料/v1-bench-API.md, api_version=1).
-// The expected table below is transcribed from the page INDEPENDENTLY
-// of benchschema.go — a shared typo survives only if both copies are
-// wrong the same way, and the per-prim op lists are additionally
-// pinned to the §8 caps schema's ops arrays.
+// must match the frozen v1 bench API entry-by-entry (§7 batch-2
+// primitives + §3.2 gpio; api_version=1). The expected table below is
+// transcribed INDEPENDENTLY of benchschema.go — a shared typo survives
+// only if both copies are wrong the same way, and the per-prim op
+// lists are additionally pinned to the §8 caps schema's ops arrays.
 
 import (
 	"fmt"

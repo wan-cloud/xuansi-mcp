@@ -68,7 +68,7 @@ import (
 
 const (
 	b8t2Board   = "d75884"  // the bench board
-	b8t2FwBuild = "775ecaa" // flashed fw (b6/b7/b8-t1 binding, unchanged)
+	b8t2FwBuild = "c366c0a" // B9-T4 canonical re-flash (ver 4, the 0x02 overlay era)
 	b8t2Holder  = "b8-t2"   // custom lease holder for this run
 	b8t2TCPEndp = "xuansi-d75884.local:7777"
 	b8t2Script  = "b8t2res" // the S3 resident script's name
