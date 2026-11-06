@@ -1,0 +1,179 @@
+# release.yml — tag-driven publish pipeline (B8.5 T4)
+#
+# On push of a v* tag: build all six platform binaries, assemble the npm
+# family, publish the 8 packages in dependency order (6 subpackages →
+# main `xuansi` → alias `xuansi-mcp`; documented in packaging/README.md
+# and the assemble-npm.sh header).
+#
+# Version shape is load-bearing (irreversible on the registry):
+#   tag vX.Y.Z  ==  binary X.Y.Z (ldflags, v stripped)  ==  npm X.Y.Z
+# The linux job relies on the Makefile's own git-describe → v-strip (no
+# VERSION override — an explicit `VERSION=v…` BYPASSES the strip, T3
+# ruling); the darwin job has no make target and passes the bare version
+# explicitly. Both legs are string-guarded before anything ships.
+name: release
+
+"on":
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+# A publish must never be cancelled mid-flight; a re-pushed tag queues
+# behind the run of the same ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the Makefile derives VERSION from
+          # `git describe --tags --always --dirty`; on the tagged commit
+          # with tags fetched that is exactly "vX.Y.Z" (Makefile strips
+          # the v). A shallow clone would fall back to a bare SHA via
+          # --always and ship the wrong version.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+      # Plain `make build` — deliberately NO VERSION override: on the
+      # tag, git describe gives vX.Y.Z and the Makefile strips the v
+      # itself. `make build VERSION=v…` would bypass that strip.
+      - name: make build (linux/windows × amd64/arm64, CGO_ENABLED=0)
+        run: make build
+      - name: Stamp guard — binaries carry the bare tag version
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          for b in bin/xuansi-linux-amd64 bin/xuansi-linux-arm64 \
+                   bin/xuansi-windows-amd64.exe bin/xuansi-windows-arm64.exe; do
+            strings "$b" | grep -q "$VER" \
+              || { echo "stamp '$VER' not found in $b (git describe surprise?)" >&2; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux
+          path: bin
+          if-no-files-found: error
+
+  build-darwin:
+    # ONE macos runner builds both darwin arches (choice per T4 brief):
+    # arm64 natively, amd64 as an Apple-clang cross build — go passes
+    # -arch x86_64 to clang and the macOS SDK is universal, so
+    # cross-cgo needs no extra toolchain. This halves macOS runner
+    # minutes vs two native runners (macos-13 x64 + macos-14 arm64).
+    # Fallback if a runner image ever breaks the cross leg: split into
+    # two runners, one native build each, same artifact names.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+      # The Makefile has no darwin target (darwin is cgo-only and never
+      # cross-compiled from Linux), so build directly with the same
+      # flags the Makefile uses. VERSION is derived from the tag with
+      # the leading v stripped — the same shape the linux job's
+      # git-describe → v-strip produces. NEVER pass `VERSION=v…` to
+      # make anywhere in this pipeline.
+      - name: Build darwin arm64 (native) + amd64 (cross cgo)
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -trimpath \
+            -ldflags "-X main.Version=$VER" -o bin/xuansi-darwin-arm64 ./cmd/xuansi
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -trimpath \
+            -ldflags "-X main.Version=$VER" -o bin/xuansi-darwin-amd64 ./cmd/xuansi
+      # Paths are fixed by the assemble script's darwin slot convention:
+      # bin/xuansi-darwin-amd64 / bin/xuansi-darwin-arm64.
+      - name: Stamp guard — binaries carry the bare tag version
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          for b in bin/xuansi-darwin-arm64 bin/xuansi-darwin-amd64; do
+            strings "$b" | grep -q "$VER" \
+              || { echo "stamp '$VER' not found in $b" >&2; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-darwin
+          path: bin
+          if-no-files-found: error
+
+  publish:
+    needs: [build-linux, build-darwin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org/
+      # Both bin-* artifacts merge into bin/ (zip roots are the files
+      # themselves — each upload packed the whole bin/ directory).
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bin
+          merge-multiple: true
+      - name: All six binaries present (artifact zips drop the exec bit)
+        run: |
+          chmod +x bin/xuansi-*
+          for b in bin/xuansi-linux-amd64 bin/xuansi-linux-arm64 \
+                   bin/xuansi-windows-amd64.exe bin/xuansi-windows-arm64.exe \
+                   bin/xuansi-darwin-amd64 bin/xuansi-darwin-arm64; do
+            test -f "$b" || { echo "missing $b" >&2; exit 1; }
+          done
+          ls -l bin
+      - name: Assemble npm family (bare version from the tag)
+        run: packaging/scripts/assemble-npm.sh "${GITHUB_REF_NAME#v}"
+      # Independent read-back of what assemble wrote (its own stamping is
+      # from the same argument; this catches path/ordering regressions
+      # before anything reaches the registry — review focus #1).
+      - name: Version guard — 8 packages stamped exactly with the tag version
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          DIST="packaging/dist/xuansi-$VER"
+          node - "$DIST" "$VER" <<'EOF'
+          const fs = require('fs');
+          const [dist, ver] = process.argv.slice(2);
+          const subs = Object.keys(require('./packaging/npm/xuansi/bin/xuansi.js').platformPackage).sort();
+          const expect = ['xuansi', 'xuansi-mcp', ...subs];
+          let bad = 0;
+          for (const name of expect) {
+            const pkg = JSON.parse(fs.readFileSync(`${dist}/${name}/package.json`, 'utf8'));
+            if (pkg.version !== ver) { console.error(`${name}: version ${pkg.version} != ${ver}`); bad++; }
+          }
+          const main = JSON.parse(fs.readFileSync(`${dist}/xuansi/package.json`, 'utf8'));
+          for (const [k, v] of Object.entries(main.optionalDependencies || {}))
+            if (v !== ver) { console.error(`xuansi: optionalDependency ${k}@${v} != ${ver}`); bad++; }
+          const alias = JSON.parse(fs.readFileSync(`${dist}/xuansi-mcp/package.json`, 'utf8'));
+          for (const [k, v] of Object.entries(alias.dependencies || {}))
+            if (v !== ver) { console.error(`xuansi-mcp: dependency ${k}@${v} != ${ver}`); bad++; }
+          if (bad) process.exit(1);
+          console.log(`version guard OK: ${expect.length} packages @ ${ver}, deps pinned`);
+          EOF
+      # Publish order is binding (packaging/README.md): the six
+      # @xuansi/<platform> subpackages first (their names come from the
+      # launcher map — same single source assemble reads), then the main
+      # `xuansi` (pins all six), then the alias `xuansi-mcp` LAST (pins
+      # xuansi). --access public: scoped packages default restricted.
+      # The token is never echoed: it only travels via NODE_AUTH_TOKEN.
+      - name: npm publish (6 subpackages → xuansi → xuansi-mcp)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          DIST="packaging/dist/xuansi-$VER"
+          for key in $(node -e 'process.stdout.write(Object.keys(require("./packaging/npm/xuansi/bin/xuansi.js").platformPackage).sort().join(" "))'); do
+            npm publish --access public "$DIST/$key"
+          done
+          npm publish --access public "$DIST/xuansi"
+          npm publish --access public "$DIST/xuansi-mcp"
