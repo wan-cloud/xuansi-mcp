@@ -76,7 +76,7 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintf(stderr, "xuansi serve: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "xuansi daemon serving %s (grace-ttl %s, Ctrl-C to stop)\n", srv.SockPath(), *graceTTL)
+	fmt.Fprintf(stdout, "xuansi daemon serving %s (v%s, grace-ttl %s, Ctrl-C to stop)\n", srv.SockPath(), Version, *graceTTL)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
