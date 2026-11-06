@@ -898,7 +898,7 @@ func b7CleanupDRV(h *harness, ctx context.Context) {
 		return
 	}
 	defer c.Close()
-	h.check(info.FwBuild == b7FwBuild && info.ProtocolVer == 4,
+	h.check(info.FwBuild == b7FwBuild && info.ProtocolVer == 5,
 		fmt.Sprintf("cleanup REPL hello binds fw_build=%s protocol_ver=%d role=%s", info.FwBuild, info.ProtocolVer, info.Role))
 
 	rmTargets := []string{"/drv/i2cecho.lua", "/drv/spiloop.lua"}
