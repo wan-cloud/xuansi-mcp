@@ -261,7 +261,16 @@ func TestWriteDurableFileNeverTorn(t *testing.T) {
 					return
 				default:
 				}
-				got, err := os.ReadFile(path)
+				// Inter-read gap (CI matrix round 5, final): a real
+				// reader never zero-gap loops — and on windows the
+				// writer's MoveFileEx-replace still needs an instant
+				// with the target unopened even against share-delete
+				// readers, so a ~99%-duty hammer loop starves it.
+				// 2ms per reader leaves ample rename windows while the
+				// 100-write storm still runs under continuous
+				// contention; the torn assertions are unchanged.
+				time.Sleep(2 * time.Millisecond)
+				got, err := readFileShared(path) // share-delete read + transient-contention retry (windows; see readshared_windows.go)
 				if errors.Is(err, fs.ErrNotExist) {
 					continue // absent is legal (absent-or-complete)
 				}

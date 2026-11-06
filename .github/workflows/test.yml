@@ -1,0 +1,62 @@
+# test.yml — push/PR gate (B8.5 T4)
+#
+# Three-OS matrix runs the plain go commands DIRECTLY. Do not copy the
+# plan's literal `make vet test -race`: GNU make mis-parses "-race" as
+# its own option (task-1 ruling; see also the T4 carry-over in the SDD
+# ledger). Race coverage lives in the ubuntu gate job below as an
+# explicit `go test -race ./...`.
+#
+# macos needs no cgo setup: CGO is on by default there and the serial
+# enumerator's darwin backend is cgo-only — plain `go test ./...` links
+# it fine against the runner's clang/SDK.
+name: test
+
+"on": [push, pull_request]
+
+permissions:
+  contents: read
+
+# Superseded runs on the same ref cancel; different refs never collide.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-test:
+    name: vet + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+      # shell: bash on all three OS => identical fail-fast semantics for
+      # both lines (pwsh, the windows default, would NOT stop after a
+      # failed `go vet`). bash is git-bash on windows runners.
+      - name: go vet + go test
+        shell: bash
+        run: |
+          go vet ./...
+          go test ./...
+
+  # ubuntu extra gate: the Makefile cross-compile matrix (linux/windows
+  # × amd64/arm64, all CGO_ENABLED=0) plus make vet and a race pass.
+  make-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+      - name: make vet
+        run: make vet
+      - name: make matrix (4-target CGO=0 cross-compile gate)
+        run: make matrix
+      - name: go test -race (race pass, explicit — never `make test -race`)
+        run: go test -race ./...

@@ -311,7 +311,7 @@ func (ts *toolset) wsGet(_ context.Context, _ *mcpsdk.CallToolRequest, in wsGetI
 	if !wsVerRe.MatchString(in.Version) {
 		return nil, wsGetOut{}, errWs("xuansi_ws_get: version must match [a-z0-9.]+, got %q", in.Version)
 	}
-	b, err := os.ReadFile(ts.ws.driverPath(in.Name, in.Version))
+	b, err := readFileShared(ts.ws.driverPath(in.Name, in.Version)) // share-delete read (windows replace contract)
 	if os.IsNotExist(err) {
 		return nil, wsGetOut{}, errWs("xuansi_ws_get: %s@%s.lua is not in the workspace — xuansi_ws_put it first", in.Name, in.Version)
 	}
@@ -366,7 +366,7 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 
 	file := in.Name + "@" + ver + ".lua"
-	content, err := os.ReadFile(ts.ws.driverPath(in.Name, ver))
+	content, err := readFileShared(ts.ws.driverPath(in.Name, ver)) // share-delete read (windows replace contract)
 	if os.IsNotExist(err) {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s is not in the workspace — xuansi_ws_put it first", file)
 	}

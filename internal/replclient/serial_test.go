@@ -60,61 +60,50 @@ func TestMac6FromByID(t *testing.T) {
 	}
 }
 
-// TestResolveUSBDevice: by-id basename and full path both resolve
-// through the by-id dir (symlink canonicalized to the real tty node); a
-// direct existing path is used as-is; an unknown name errors naming
-// both tried candidates.
-func TestResolveUSBDevice(t *testing.T) {
-	dir := t.TempDir()
-	old := byIDDir
-	byIDDir = filepath.Join(dir, "serial", "by-id")
-	t.Cleanup(func() { byIDDir = old })
-
-	// fixture tree: by-id/usb-…-if00 → ../../ttyACM0 (relative symlink,
-	// shaped like the real udev layout)
-	byIDPath := filepath.Join(byIDDir, "usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00")
-	if err := os.MkdirAll(byIDDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ttyPath := filepath.Join(dir, "ttyACM0")
+// TestResolveUSBDevice: the by-id symlink leg lives in
+// serial_unix_test.go (//go:build !windows — udev by-id names carry
+// MAC colons, invalid in NTFS filenames, and by-id symlink trees are
+// unix device-manager semantics; first CI matrix run 42158718976).
+// The portable legs (direct path, unknown name) are here and run on
+// every platform: a direct existing path is returned as-is and an
+// unknown name errors naming both tried candidates.
+func TestResolveUSBDeviceDirectAndUnknown(t *testing.T) {
+	ttyPath := filepath.Join(t.TempDir(), "ttyACM0")
 	if err := os.WriteFile(ttyPath, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("../../ttyACM0", byIDPath); err != nil {
-		t.Fatal(err)
+	wantTty := canonical(t, ttyPath)
+	path, _, err := resolveUSBDevice(wantTty)
+	if err != nil || path != wantTty {
+		t.Fatalf("direct path: (%q, %v), want (%q, nil)", path, err, wantTty)
 	}
-
-	base := filepath.Base(byIDPath)
-	for _, in := range []string{byIDPath, base} {
-		path, mac6, err := resolveUSBDevice(in)
-		if err != nil {
-			t.Fatalf("resolveUSBDevice(%q): %v", in, err)
-		}
-		if path != ttyPath {
-			t.Errorf("resolveUSBDevice(%q) path = %q, want canonical %q", in, path, ttyPath)
-		}
-		if mac6 != "d75884" {
-			t.Errorf("resolveUSBDevice(%q) mac6 = %q, want d75884", in, mac6)
-		}
-	}
-
-	// a direct existing path is used as-is (canonicalization is a
-	// no-op on a plain node)
-	path, _, err := resolveUSBDevice(ttyPath)
-	if err != nil || path != ttyPath {
-		t.Fatalf("direct path: (%q, %v), want (%q, nil)", path, err, ttyPath)
-	}
-
-	// unknown name: error names both candidates
 	_, _, err = resolveUSBDevice("usb-No_Such_Device-if00")
 	if err == nil {
 		t.Fatal("unknown device resolved without error")
 	}
-	for _, want := range []string{"usb-No_Such_Device-if00", "serial"} {
+	// The fallback candidate is printed the way the product builds it —
+	// filepath.Join(byIDDir, base) — which on windows Cleans the
+	// separators ("\\dev\\serial\\by-id\\…"); asserting the joined form
+	// (not a literal unix spelling) keeps the check portable and pinned
+	// to the construction under test (first CI matrix round 3 finding).
+	for _, want := range []string{"usb-No_Such_Device-if00", filepath.Join(byIDDir, "usb-No_Such_Device-if00")} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention candidate %q", err, want)
 		}
 	}
+}
+
+// canonical resolves symlinks in p the way the product does — the
+// expected-value twin of resolveUSBDevice's EvalSymlinks (darwin's
+// /var→/private/var temp roots are the case that matters; on windows
+// and plain linux dirs it is the identity).
+func canonical(t *testing.T, p string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
 }
 
 // TestDialOptsDrainWindow: zero Drain → the 4.5s CDC default; explicit

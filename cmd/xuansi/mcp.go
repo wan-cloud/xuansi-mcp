@@ -39,9 +39,14 @@ import (
 	xumcp "xuansi/internal/mcp"
 )
 
-// daemonVersion is the version the MCP server advertises. The daemon
-// has no version scheme yet; "dev" until one exists.
-const daemonVersion = "dev"
+// Version is the daemon's version string — the single source (B8.5)
+// the serve banner and this server's initialize handshake print. "dev"
+// in bare builds; release builds overwrite it at link time with
+// -ldflags "-X main.Version=$(git describe --tags --always --dirty)"
+// (Makefile build target), so every shipped binary says where it came
+// from. The npm packages carry the same string (CI pins tag == npm ==
+// injected at publish time; TestVersionInjected proves the seam).
+var Version = "dev"
 
 func runMCP(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
@@ -78,7 +83,7 @@ func runMCP(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	// NewServer (not the bare SDK constructor): arms the resource-
 	// subscription handlers the event face's per-board resources need
 	// (internal/mcp.NewServer documents the wiring).
-	srv := xumcp.NewServer(&mcp.Implementation{Name: "xuansi", Version: daemonVersion})
+	srv := xumcp.NewServer(&mcp.Implementation{Name: "xuansi", Version: Version})
 	stopTools := xumcp.RegisterTools(srv, c, xumcp.Options{
 		Refresh: xumcp.DynRefreshDefault,
 		// the refresh loop's operational notes (e.g. alias truncation,
