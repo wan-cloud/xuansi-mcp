@@ -86,7 +86,7 @@ import (
 
 const (
 	b7Board    = "d75884"  // the bench board (echo fixture I2C0 8/9 <-> I2C1 10/11 @0x28; SPI self-loop 12<->13, sclk 14)
-	b7FwBuild  = "29378a6" // B10-T7 final canonical (connection guarantee: conn floor + one-shot reserve valve)
+	b7FwBuild  = "db1fd12" // T8 fix round canonical (camera switch self-deadlock fix + settle + silent-panic + RTC WDT backstop)
 	b7Holder   = "b7-hil"  // custom lease holder for this run
 	b7TCPEndp  = "xuansi-d75884.local:7777"
 	b7Resource = "xuansi://boards/" + b7Board + "/events"

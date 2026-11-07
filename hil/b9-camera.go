@@ -85,7 +85,7 @@ import (
 
 const (
 	b9Board   = "d75884"  // the bench board (GC2145 camera on the 14-pin gate)
-	b9FwBuild = "29378a6" // B10-T7 final canonical (connection guarantee: conn floor + one-shot reserve valve)
+	b9FwBuild = "db1fd12" // T8 fix round canonical (camera switch self-deadlock fix + settle + silent-panic + RTC WDT backstop)
 	b9Holder  = "b9-t5"   // custom lease holder for this run
 	b9TCPEndp = "xuansi-d75884.local:7777"
 )
