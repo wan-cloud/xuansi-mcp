@@ -895,6 +895,16 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 		sort.Strings(vers)
 		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s: version %q not in index (have %s)", in.Name, in.Version, strings.Join(vers, ", "))
 	}
+	// the index-selected version re-gates against the same whitelist an
+	// explicit input passed — the omitted-version path's chosen.Version
+	// comes STRAIGHT from the index, and driverPath would ride it into
+	// the commit (Review fix round 1: "1.0/../../evil" must never reach
+	// a path, the same threat fetchRefPathOK blocks for file paths; an
+	// explicit version is transitively safe — chosen only matches an
+	// already-gated in.Version — but the single gate covers both).
+	if !wsVerRe.MatchString(chosen.Version) {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s: index version %q fails the [a-z0-9.]+ gate — refusing (a hostile index must not steer workspace paths)", in.Name, chosen.Version)
+	}
 	if len(chosen.Files) == 0 {
 		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: index entry lists no files", in.Name, chosen.Version)
 	}
