@@ -36,10 +36,18 @@ import (
 )
 
 const (
-	expectProtocolVer = int64(5) // B10-T1: fs chunked-transport overlay era
-	expectFwBuild     = "9dce098" // fw repo main HEAD at the B10-T1 canonical re-flash
-	usbByID           = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00"
-	tcpEndpoint       = "xuansi-d75884.local:7777"
+	expectProtocolVer = int64(5)  // B10-T1: fs chunked-transport overlay era
+	expectFwBuild     = "0c7440b" // fw repo main HEAD at the B10-T1 fix-round-1 canonical re-flash
+
+	// HOUSE RULE (B10-T1 fix rounds 1-2): a fw canonical bump rebinds EVERY
+	// *FwBuild constant in hil/ IN THE SAME COMMIT — expectFwBuild/b6FwBuild/
+	// b7FwBuild/b8FwBuild/b8t2FwBuild/b9FwBuild. These bind at RUNTIME against
+	// hello's fw_build; a stale one false-FAILs the next HIL run of that suite
+	// against the freshly flashed board (found twice: ver constants in round 1,
+	// fw_build constants in round 2 — same failure class both times).
+
+	usbByID     = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00"
+	tcpEndpoint = "xuansi-d75884.local:7777"
 )
 
 func main() {
