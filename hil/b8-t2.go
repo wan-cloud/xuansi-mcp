@@ -68,7 +68,7 @@ import (
 
 const (
 	b8t2Board   = "d75884"  // the bench board
-	b8t2FwBuild = "29378a6" // B10-T7 final canonical (connection guarantee: conn floor + one-shot reserve valve)
+	b8t2FwBuild = "db1fd12" // T8 fix round canonical (camera switch self-deadlock fix + settle + silent-panic + RTC WDT backstop)
 	b8t2Holder  = "b8-t2"   // custom lease holder for this run
 	b8t2TCPEndp = "xuansi-d75884.local:7777"
 	b8t2Script  = "b8t2res" // the S3 resident script's name
