@@ -58,7 +58,7 @@ import (
 
 const (
 	b8Board   = "d75884"  // the bench board
-	b8FwBuild = "f944927" // B10-T6 canonical (fast-interp explicit pin; behavior identical to c38b08c)
+	b8FwBuild = "f33577f" // B10-T7 fix canonical (internal-RAM right-sizing: wasm staging buffers to PSRAM)
 	b8Holder  = "b8-t1"   // custom lease holder for this run
 	b8TCPEndp = "xuansi-d75884.local:7777"
 	b8TmpPath = "/drv/b8tmp.lua"  // the S2 fs-face target
