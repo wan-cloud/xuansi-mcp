@@ -68,7 +68,7 @@ import (
 
 const (
 	b8t2Board   = "d75884"  // the bench board
-	b8t2FwBuild = "9dce098" // B10-T1 canonical re-flash (ver 5, the chunked-transport era)
+	b8t2FwBuild = "0c7440b" // B10-T1 fix-round-1 canonical re-flash (ver 5, the chunked-transport era)
 	b8t2Holder  = "b8-t2"   // custom lease holder for this run
 	b8t2TCPEndp = "xuansi-d75884.local:7777"
 	b8t2Script  = "b8t2res" // the S3 resident script's name
