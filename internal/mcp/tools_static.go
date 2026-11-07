@@ -392,17 +392,17 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_ws_get",
-		Description: "Read one stored driver version back (content + sha256) — old versions stay retrievable for inspection and rollback.",
+		Description: "Read one stored driver version back (content + sha256) — old versions stay retrievable for inspection and rollback. The artifact resolves with the same priority a bare push deploys (.lua → .wasm → .aot): a Lua driver returns verbatim text; a binary artifact fetched by xuansi_driver_fetch returns standard base64 with encoding=\"base64\" (sha256 of the decoded bytes, matching the manifest).",
 	}, ts.wsGet)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_driver_push",
-		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.lua (the board knows nothing of versions). Gated BEFORE the flash write: the file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one). The write rides the chunked transport for any size (B10-T1) and is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
+		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.<ext> (ext = the stored artifact's: .lua for ws_put drivers, .wasm/.aot for fetched modules — first stored extension wins; the board knows nothing of versions). Gated BEFORE the flash write: a Lua file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one); a binary module gates on the module magic the fw's wasm loader itself validates. The write rides the chunked transport for any size (B10-T1) and is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
 	}, ts.driverPush)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_driver_pull",
-		Description: "Remove a board's effective driver file /drv/<name>.lua through the pipeline (fs_rm under the lease — take it with xuansi_lease) and clear the manifest's ACTIVE version for that driver. History is never rewritten: every stored version and its per-board push footprints STAY in the workspace and the manifest, so rollback is simply re-pushing the version explicitly. A driver whose board file is already gone surfaces the board's own api not-found verbatim (the manifest is untouched in that case). Holder semantics: " + holderDesc + ".",
+		Description: "Remove a board's driver files /drv/<name>.<lua|wasm|aot> through the pipeline (fs_rm under the lease — take it with xuansi_lease; every extension slot a push could have written is swept, the first removed path reported) and clear the manifest's ACTIVE version for that driver. History is never rewritten: every stored version and its per-board push footprints STAY in the workspace and the manifest, so rollback is simply re-pushing the version explicitly. A driver whose board files are all already gone surfaces the board's own api not-found verbatim (the manifest is untouched in that case). Holder semantics: " + holderDesc + ".",
 	}, ts.driverPull)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
