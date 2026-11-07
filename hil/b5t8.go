@@ -57,6 +57,12 @@ func main() {
 	attempt := flag.Int("attempt", 1, "full: honest attempt number recorded in the capture header")
 	daemonBin := flag.String("daemon", "bin/xuansi-linux-amd64", "full: daemon binary the orchestration drives as a subprocess")
 	runDir := flag.String("run", "/tmp/opencode/b5-full", "full: scratch dir for the daemon sock + boards.conf")
+	// b10t7 (closed loop): aim-round number, JPEG evidence dir, geometry
+	// reference "x,y,w,h" + tolerance px for the loop's pairing check
+	round := flag.Int("round", 1, "b10t7aim: aim round number (recorded in the JPEG names + verdict)")
+	outDir := flag.String("outdir", "", "b10t7: dir the aim/loop JPEG evidence copies land in")
+	refGeom := flag.String("ref", "", "b10t7: reference screen bbox x,y,w,h from a converged aim round (empty = honest red: pairing must fail)")
+	tolPx := flag.Int("tol", 20, "b10t7: geometry pairing tolerance in pixels")
 	flag.Parse()
 	switch *scenario {
 	case "usb":
@@ -81,10 +87,14 @@ func main() {
 		os.Exit(runB9Camera(*attempt, *daemonBin, *runDir))
 	case "b10t5":
 		os.Exit(runB10T5(*attempt, *daemonBin, *runDir))
+	case "b10t7aim":
+		os.Exit(runB10T7Aim(*round, *daemonBin, *runDir, *outDir))
+	case "b10t7":
+		os.Exit(runB10T7Loop(*attempt, *daemonBin, *runDir, *outDir, *refGeom, *tolPx))
 	case "spawnidle":
 		os.Exit(runSpawnIdle(*attempt, *daemonBin, *runDir))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|spawnidle [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR]")
+		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|b10t7aim|b10t7|spawnidle [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR] [-round N] [-outdir DIR] [-ref x,y,w,h] [-tol PX]")
 		os.Exit(2)
 	}
 }
