@@ -85,7 +85,7 @@ import (
 
 const (
 	b9Board   = "d75884"  // the bench board (GC2145 camera on the 14-pin gate)
-	b9FwBuild = "fbfef59" // B10-T8b canonical (hello boot identity + settle + silent-panic + RTC WDT backstop; supersedes the T8 fix round)
+	b9FwBuild = "0b6cc4e" // B10-T8c canonical (fw_version semver + CI build proof; supersedes the T8b canonical)
 	b9Holder  = "b9-t5"   // custom lease holder for this run
 	b9TCPEndp = "xuansi-d75884.local:7777"
 )

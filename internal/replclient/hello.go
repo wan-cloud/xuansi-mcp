@@ -17,6 +17,7 @@ type HelloInfo struct {
 	APIVersion  int64
 	Fw          string
 	FwBuild     string
+	FwVersion   string // B10-T8c: fw semver (esp_app_desc == project VERSION, aligned with the npm wave version); empty on older fw
 	Idf         string
 	Chip        string
 	Lua         string
@@ -47,6 +48,7 @@ func parseHello(res map[string]any) *HelloInfo {
 	h.APIVersion, _ = res["api_version"].(int64)
 	h.Fw, _ = res["fw"].(string)
 	h.FwBuild, _ = res["fw_build"].(string)
+	h.FwVersion, _ = res["fw_version"].(string)
 	h.Idf, _ = res["idf"].(string)
 	h.Chip, _ = res["chip"].(string)
 	h.Lua, _ = res["lua"].(string)

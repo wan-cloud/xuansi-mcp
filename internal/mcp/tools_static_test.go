@@ -39,6 +39,7 @@ func TestListBoardsShapeAndMapping(t *testing.T) {
 				"sources": []any{"usb", "mdns"},
 				"host":    "xuansi-d75884.local", "port": 8266.0,
 				"usb_path": "/dev/serial/by-id/usb-1", "fw": "fw-2026-10-01",
+				"fw_version": "0.2.0",
 			},
 			map[string]any{"mac6": "aabbcc", "sources": []any{"mdns"}},
 		},
@@ -60,8 +61,8 @@ func TestListBoardsShapeAndMapping(t *testing.T) {
 		t.Fatalf("boards = %#v, want the two-board list", m["boards"])
 	}
 	b0, _ := boards[0].(map[string]any)
-	if b0["mac6"] != "d75884" || b0["alias"] != "bench1" || b0["fw"] != "fw-2026-10-01" {
-		t.Errorf("board[0] = %v, want identity fields mapped", b0)
+	if b0["mac6"] != "d75884" || b0["alias"] != "bench1" || b0["fw"] != "fw-2026-10-01" || b0["fw_version"] != "0.2.0" {
+		t.Errorf("board[0] = %v, want identity fields mapped (incl. fw_version)", b0)
 	}
 	if src, _ := b0["sources"].([]any); !reflect.DeepEqual(src, []any{"usb", "mdns"}) {
 		t.Errorf("board[0].sources = %v, want [usb mdns]", b0["sources"])

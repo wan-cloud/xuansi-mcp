@@ -37,7 +37,7 @@ import (
 
 const (
 	expectProtocolVer = int64(5)  // B10-T1: fs chunked-transport overlay era
-	expectFwBuild     = "fbfef59" // B10-T8b canonical (hello boot identity + settle + silent-panic + RTC WDT backstop; supersedes the T8 fix round)
+	expectFwBuild     = "0b6cc4e" // B10-T8c canonical (fw_version semver + CI build proof; supersedes the T8b canonical)
 
 	// HOUSE RULE (B10-T1 fix rounds 1-2): a fw canonical bump rebinds EVERY
 	// *FwBuild constant in hil/ IN THE SAME COMMIT — expectFwBuild/b6FwBuild/

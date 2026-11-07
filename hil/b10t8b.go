@@ -61,7 +61,7 @@ import (
 
 const (
 	b10t8bBoard   = "d75884"
-	b10t8bFwBuild = "fbfef59" // B10-T8b canonical (hello boot identity; HOUSE RULE: same commit as the other hil constants)
+	b10t8bFwBuild = "0b6cc4e" // B10-T8c canonical (fw_version semver); HOUSE RULE: same commit as the other hil constants
 	b10t8bHolder  = "b10t8b-hil"
 	b10t8bTCPEndp = "xuansi-d75884.local:7777"
 	b10t8bUSBByID = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:0F:02:D7:58:84-if00"

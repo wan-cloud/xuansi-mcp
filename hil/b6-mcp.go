@@ -99,7 +99,7 @@ import (
 
 const (
 	b6Board    = "d75884"  // the bench board (pin map v1: GPIO1<->GPIO2 wired)
-	b6FwBuild  = "fbfef59" // B10-T8b canonical (hello boot identity + settle + silent-panic + RTC WDT backstop; supersedes the T8 fix round)
+	b6FwBuild  = "0b6cc4e" // B10-T8c canonical (fw_version semver + CI build proof; supersedes the T8b canonical)
 	b6Holder   = "b6-hil"  // custom lease holder for this run
 	b6TCPEndp  = "xuansi-d75884.local:7777"
 	b6Resource = "xuansi://boards/" + b6Board + "/events"

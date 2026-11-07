@@ -61,7 +61,7 @@ import (
 
 const (
 	b10t5Board   = "d75884"
-	b10t5FwBuild = "fbfef59" // B10-T8b canonical (hello boot identity; HOUSE RULE: same commit as the other hil constants)
+	b10t5FwBuild = "0b6cc4e" // B10-T8c canonical (fw_version semver); HOUSE RULE: same commit as the other hil constants
 	b10t5Holder  = "b10t5-hil"
 	b10t5TCPEndp = "xuansi-d75884.local:7777"
 
