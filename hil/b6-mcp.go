@@ -99,7 +99,7 @@ import (
 
 const (
 	b6Board    = "d75884"  // the bench board (pin map v1: GPIO1<->GPIO2 wired)
-	b6FwBuild  = "f33577f" // B10-T7 fix canonical (internal-RAM right-sizing: wasm staging buffers to PSRAM)
+	b6FwBuild  = "29378a6" // B10-T7 final canonical (connection guarantee: conn floor + one-shot reserve valve)
 	b6Holder   = "b6-hil"  // custom lease holder for this run
 	b6TCPEndp  = "xuansi-d75884.local:7777"
 	b6Resource = "xuansi://boards/" + b6Board + "/events"
