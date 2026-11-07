@@ -85,7 +85,7 @@ import (
 
 const (
 	b9Board   = "d75884"  // the bench board (GC2145 camera on the 14-pin gate)
-	b9FwBuild = "f944927" // B10-T6 canonical (fast-interp explicit pin; behavior identical to c38b08c)
+	b9FwBuild = "f33577f" // B10-T7 fix canonical (internal-RAM right-sizing: wasm staging buffers to PSRAM)
 	b9Holder  = "b9-t5"   // custom lease holder for this run
 	b9TCPEndp = "xuansi-d75884.local:7777"
 )

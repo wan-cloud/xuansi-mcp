@@ -68,7 +68,7 @@ import (
 
 const (
 	b8t2Board   = "d75884"  // the bench board
-	b8t2FwBuild = "f944927" // B10-T6 canonical (fast-interp explicit pin; behavior identical to c38b08c)
+	b8t2FwBuild = "f33577f" // B10-T7 fix canonical (internal-RAM right-sizing: wasm staging buffers to PSRAM)
 	b8t2Holder  = "b8-t2"   // custom lease holder for this run
 	b8t2TCPEndp = "xuansi-d75884.local:7777"
 	b8t2Script  = "b8t2res" // the S3 resident script's name
