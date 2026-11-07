@@ -81,7 +81,7 @@ import (
 
 const (
 	b10t7Board   = "d75884"
-	b10t7FwBuild = "db1fd12" // T8 fix round canonical (HOUSE RULE: same commit as the other hil constants)
+	b10t7FwBuild = "fbfef59" // B10-T8b canonical (hello boot identity; HOUSE RULE: same commit as the other hil constants)
 	b10t7Holder  = "b10t7-hil"
 	b10t7TCPEndp = "xuansi-d75884.local:7777"
 

@@ -181,16 +181,41 @@ func (f *fakeCtl) Op(ctx context.Context, op string, args map[string]any) (map[s
 }
 
 func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, error) {
-	_, err := f.Op(context.Background(), "hello", map[string]any{"client": name, "observer": observer})
+	res, err := f.Op(context.Background(), "hello", map[string]any{"client": name, "observer": observer})
 	if err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
 	f.hellos++
 	f.mu.Unlock()
-	return &replclient.HelloInfo{
+	// B10-T8b: the hello info now derives from the SCRIPTED op reply
+	// (epoch/reset_reason/fw_build must be scriptable per test) with
+	// the same defaults the old fixed struct carried.
+	h := &replclient.HelloInfo{
 		ProtocolVer: 5, Role: "controller", Fw: "xuansi-fw v0.1.0", FwBuild: "deadbee",
-	}, nil
+	}
+	if v, ok := res["protocol_ver"].(int64); ok {
+		h.ProtocolVer = v
+	}
+	if v, ok := res["role"].(string); ok {
+		h.Role = v
+	}
+	if v, ok := res["fw_build"].(string); ok {
+		h.FwBuild = v
+	}
+	if v, ok := res["reset"].(string); ok {
+		h.Reset = v
+	}
+	if v, ok := res["reset_reason"].(string); ok {
+		h.ResetReason = v
+	}
+	if v, ok := res["boot_epoch"].(int64); ok && v >= 0 && v <= math.MaxUint32 {
+		h.BootEpoch = uint32(v)
+	}
+	if h.ResetReason == "" {
+		h.ResetReason = h.Reset
+	}
+	return h, nil
 }
 
 func (f *fakeCtl) Dead() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.dead }
