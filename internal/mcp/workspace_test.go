@@ -16,9 +16,12 @@ package mcp
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -813,6 +816,547 @@ func TestWorkspaceListAndGetRoundTrip(t *testing.T) {
 	if !res.IsError || !strings.Contains(resultText(t, res), "ads1115@9.9.9.lua") {
 		t.Errorf("ws_get missing = %v, want a refusal naming the file", res)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// xuansi_driver_fetch (B10 task 5: the fetch leg — index → workspace)
+
+// fetchFileSpec is one fake-index file: what the index DECLARES
+// (sha256/bytes — may lie) and what the server SERVES (body, or a
+// non-200 status to simulate a mid-download failure).
+type fetchFileSpec struct {
+	path   string
+	sha256 string
+	bytes  int
+	body   []byte
+	status int
+}
+
+// fetchModSpec is one fake-index module entry.
+type fetchModSpec struct {
+	name, kind, version string
+	files               []fetchFileSpec
+}
+
+// fetchSpec builds an honest file spec (declared sha/bytes match the
+// body); lieSha overrides the declared sha for mismatch tests.
+func fetchSpec(t *testing.T, path string, body []byte, lieSha string) fetchFileSpec {
+	t.Helper()
+	sha := sha256hex(body)
+	if lieSha != "" {
+		sha = lieSha
+	}
+	return fetchFileSpec{path: path, sha256: sha, bytes: len(body), body: body}
+}
+
+// newFetchIndex serves a fake T3-shaped index plus its module files
+// and returns the index URL. hits counts every request so local
+// refusals can prove zero HTTP contact.
+func newFetchIndex(t *testing.T, mods []fetchModSpec) (idxURL string, hits *atomic.Int64) {
+	t.Helper()
+	type fileEnt struct {
+		Path   string `json:"path"`
+		Sha256 string `json:"sha256"`
+		Bytes  int    `json:"bytes"`
+	}
+	type modEnt struct {
+		Name    string    `json:"name"`
+		Kind    string    `json:"kind"`
+		Version string    `json:"version"`
+		ABI     int       `json:"abi"`
+		Files   []fileEnt `json:"files"`
+	}
+	modsJ := make([]modEnt, 0, len(mods))
+	for _, m := range mods {
+		me := modEnt{Name: m.name, Kind: m.kind, Version: m.version, ABI: 1}
+		for _, f := range m.files {
+			me.Files = append(me.Files, fileEnt{Path: f.path, Sha256: f.sha256, Bytes: f.bytes})
+		}
+		modsJ = append(modsJ, me)
+	}
+	idxJ, err := json.Marshal(map[string]any{"index_ver": 1, "modules": modsJ})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	var n atomic.Int64
+	mux.HandleFunc("/index.json", func(w http.ResponseWriter, _ *http.Request) {
+		n.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(idxJ)
+	})
+	for _, m := range mods {
+		for _, f := range m.files {
+			f := f
+			mux.HandleFunc("/"+f.path, func(w http.ResponseWriter, _ *http.Request) {
+				n.Add(1)
+				if f.status != 0 {
+					w.WriteHeader(f.status)
+					return
+				}
+				_, _ = w.Write(f.body)
+			})
+		}
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL + "/index.json", &n
+}
+
+// fetchWasmBody builds a deterministic fake wasm artifact (real magic).
+func fetchWasmBody(n int) []byte {
+	b := append([]byte(nil), wasmMagic[:]...)
+	b = append(b, 0x01, 0x00, 0x00, 0x00) // a version dword, like the real files
+	for len(b) < n {
+		b = append(b, byte('w'))
+	}
+	return b
+}
+
+// fetchAotBody builds a deterministic fake AOT artifact (real magic).
+func fetchAotBody(n int) []byte {
+	b := append([]byte(nil), aotMagic[:]...)
+	b = append(b, 0x04, 0x00, 0x00, 0x00)
+	for len(b) < n {
+		b = append(b, byte('a'))
+	}
+	return b
+}
+
+// TestDriverFetchTwoFilesKindAndManifest: the happy fetch — a two-file
+// index entry (wasm delivery + aot auxiliary) lands BOTH artifacts
+// byte-exact under drivers/, the manifest persists the index's Kind,
+// and the version's FileMeta records the artifact a bare push deploys
+// (.wasm — the .lua > .wasm > .aot priority with no .lua stored).
+// Fetching never crosses to the daemon.
+func TestDriverFetchTwoFilesKindAndManifest(t *testing.T) {
+	e, reqs, root := newWsEnv(t, nil)
+	wbody, abody := fetchWasmBody(64), fetchAotBody(48)
+	url, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "fakemod", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{
+			fetchSpec(t, "modules/fakemod/1.0.0/fakemod.wasm", wbody, ""),
+			fetchSpec(t, "modules/fakemod/1.0.0/fakemod.aot", abody, ""),
+		},
+	}})
+
+	res := e.call("xuansi_driver_fetch", map[string]any{
+		"name": "fakemod", "version": "1.0.0", "index_url": url,
+	})
+	if res.IsError {
+		t.Fatalf("driver_fetch failed: %s", resultText(t, res))
+	}
+	noContact(t, reqs) // the fetch leg never touches the daemon
+
+	m := structured(t, res)
+	if m["name"] != "fakemod" || m["version"] != "1.0.0" || m["kind"] != "driver" {
+		t.Errorf("fetch result identity = %v, want fakemod/1.0.0/driver", m)
+	}
+	if tot, _ := m["bytes"].(float64); int(tot) != len(wbody)+len(abody) {
+		t.Errorf("fetch bytes = %v, want %d (the total)", m["bytes"], len(wbody)+len(abody))
+	}
+	files, _ := m["files"].([]any)
+	if len(files) != 2 {
+		t.Fatalf("files = %v, want the two artifacts", m["files"])
+	}
+	for i, want := range []struct {
+		path string
+		sha  string
+		n    int
+	}{
+		{"drivers/fakemod@1.0.0.wasm", sha256hex(wbody), len(wbody)},
+		{"drivers/fakemod@1.0.0.aot", sha256hex(abody), len(abody)},
+	} {
+		f, _ := files[i].(map[string]any)
+		if f["path"] != want.path || f["sha256"] != want.sha || int(f["bytes"].(float64)) != want.n {
+			t.Errorf("files[%d] = %v, want %s with the verified checksum", i, f, want.path)
+		}
+	}
+
+	// both artifacts on disk, byte-exact
+	for _, want := range []struct {
+		path string
+		body []byte
+	}{{"drivers/fakemod@1.0.0.wasm", wbody}, {"drivers/fakemod@1.0.0.aot", abody}} {
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(want.path)))
+		if err != nil || !bytes.Equal(b, want.body) {
+			t.Errorf("workspace %s = %d bytes, %v; want the downloaded body verbatim", want.path, len(b), err)
+		}
+	}
+
+	// manifest: Kind persisted, FileMeta = the push-deployed artifact
+	// (.wasm), Active untouched (storing is NOT activating)
+	mf := wsManifest(t, root)
+	ent := mf.Drivers["fakemod"]
+	if ent.Kind != "driver" {
+		t.Errorf("manifest Kind = %q, want driver", ent.Kind)
+	}
+	fm := ent.Files["1.0.0"]
+	if fm.Sha256 != sha256hex(wbody) || fm.Size != len(wbody) {
+		t.Errorf("Files[1.0.0] = %+v, want the .wasm's sha/size (the bare-push artifact)", fm)
+	}
+	if ent.Active != "" {
+		t.Errorf("Active = %q after a fetch, want none (a push activates)", ent.Active)
+	}
+}
+
+// TestDriverFetchShaMismatchRefusedZeroWrites: a file whose sha256
+// disagrees with the index is refused, and NOTHING is written — no
+// manifest, no drivers/ dir (the download is staged and verified in
+// memory before the first durable write).
+func TestDriverFetchShaMismatchRefusedZeroWrites(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	body := fetchWasmBody(32)
+	url, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "fakemod", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{fetchSpec(t, "modules/fakemod/1.0.0/fakemod.wasm", body, sha256hex(fetchWasmBody(33)))},
+	}})
+
+	res := e.call("xuansi_driver_fetch", map[string]any{
+		"name": "fakemod", "version": "1.0.0", "index_url": url,
+	})
+	if !res.IsError {
+		t.Fatalf("mismatched-sha fetch succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "sha256", "modules/fakemod/1.0.0/fakemod.wasm", sha256hex(body)} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
+		t.Errorf("manifest.json exists after a refused fetch: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "drivers")); !os.IsNotExist(err) {
+		t.Errorf("drivers/ dir exists after a refused fetch: %v", err)
+	}
+}
+
+// TestDriverFetchNameAbsentRefused: a name the index does not carry is
+// a typed refusal naming the index; exactly ONE HTTP request happened
+// (the index itself); nothing written.
+func TestDriverFetchNameAbsentRefused(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	url, hits := newFetchIndex(t, []fetchModSpec{{
+		name: "hello", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{fetchSpec(t, "modules/hello/1.0.0/hello.wasm", fetchWasmBody(16), "")},
+	}})
+
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "nosuch", "index_url": url})
+	if !res.IsError {
+		t.Fatalf("absent-name fetch succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	if !strings.HasPrefix(got, "api:") || !strings.Contains(got, "nosuch") || !strings.Contains(got, url) {
+		t.Errorf("error text = %q, want an api-class refusal naming the module and index", got)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("HTTP hits = %d, want exactly 1 (the index; no file download for an absent name)", n)
+	}
+	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
+		t.Errorf("manifest.json exists after a refused fetch: %v", err)
+	}
+}
+
+// TestDriverFetchMidDownload404Atomic (Review Focus #5,
+// download-atomicity): a TWO-file entry whose SECOND file 404s mid-
+// download leaves ZERO manifest writes and no half state — the first
+// (already verified) file never touched the workspace either.
+func TestDriverFetchMidDownload404Atomic(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	wbody := fetchWasmBody(64)
+	url, hits := newFetchIndex(t, []fetchModSpec{{
+		name: "fakemod", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{
+			fetchSpec(t, "modules/fakemod/1.0.0/fakemod.wasm", wbody, ""),
+			{path: "modules/fakemod/1.0.0/fakemod.aot", sha256: sha256hex(fetchAotBody(48)), bytes: 48, status: 404},
+		},
+	}})
+
+	res := e.call("xuansi_driver_fetch", map[string]any{
+		"name": "fakemod", "version": "1.0.0", "index_url": url,
+	})
+	if !res.IsError {
+		t.Fatalf("fetch with a dying second file succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "fakemod.aot", "404"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	if n := hits.Load(); n != 3 {
+		t.Errorf("HTTP hits = %d, want 3 (index + file1 + the 404)", n)
+	}
+	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
+		t.Errorf("manifest.json exists after a mid-download failure: %v (zero manifest writes promised)", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "drivers")); !os.IsNotExist(err) {
+		t.Errorf("drivers/ dir exists after a mid-download failure: %v (no half workspace state promised)", err)
+	}
+}
+
+// TestDriverFetchIdempotent: fetching the same version twice re-verifies
+// and re-writes the same bytes — one driver, one version entry, one
+// file on disk each, manifest stable.
+func TestDriverFetchIdempotent(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	body := fetchWasmBody(40)
+	url, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "fakemod", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{fetchSpec(t, "modules/fakemod/1.0.0/fakemod.wasm", body, "")},
+	}})
+	for i := 0; i < 2; i++ {
+		res := e.call("xuansi_driver_fetch", map[string]any{
+			"name": "fakemod", "version": "1.0.0", "index_url": url,
+		})
+		if res.IsError {
+			t.Fatalf("fetch %d failed: %s", i+1, resultText(t, res))
+		}
+	}
+	m := wsManifest(t, root)
+	ent := m.Drivers["fakemod"]
+	if len(ent.Files) != 1 || ent.Files["1.0.0"].Sha256 != sha256hex(body) {
+		t.Errorf("manifest after re-fetch = %+v, want exactly the one version entry", ent)
+	}
+	b, err := os.ReadFile(filepath.Join(root, "drivers", "fakemod@1.0.0.wasm"))
+	if err != nil || !bytes.Equal(b, body) {
+		t.Errorf("workspace file after re-fetch = %d bytes, %v; want the same body", len(b), err)
+	}
+	listRes := e.call("xuansi_ws_list", nil)
+	if listRes.IsError {
+		t.Fatalf("ws_list failed: %s", resultText(t, listRes))
+	}
+	drivers, _ := structured(t, listRes)["drivers"].([]any)
+	if len(drivers) != 1 {
+		t.Errorf("ws_list drivers = %v, want the one entry", drivers)
+	}
+}
+
+// TestDriverFetchVersionDefaultHighest: an omitted version picks the
+// index's HIGHEST for the name (dotted-numeric order: 1.2.0 > 1.10.0?
+// no — 1.10.0 > 1.2.0, numeric segments); an explicit version picks
+// exactly it; an absent version names what the index has.
+func TestDriverFetchVersionDefaultHighest(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	b100, b110, b120 := fetchWasmBody(16), fetchWasmBody(17), fetchWasmBody(18)
+	url, _ := newFetchIndex(t, []fetchModSpec{
+		{name: "fakemod", kind: "driver", version: "1.2.0",
+			files: []fetchFileSpec{fetchSpec(t, "modules/fakemod/1.2.0/fakemod.wasm", b120, "")}},
+		{name: "fakemod", kind: "driver", version: "1.10.0",
+			files: []fetchFileSpec{fetchSpec(t, "modules/fakemod/1.10.0/fakemod.wasm", b110, "")}},
+		{name: "fakemod", kind: "driver", version: "1.0.0",
+			files: []fetchFileSpec{fetchSpec(t, "modules/fakemod/1.0.0/fakemod.wasm", b100, "")}},
+	})
+
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "fakemod", "index_url": url})
+	if res.IsError {
+		t.Fatalf("default-version fetch failed: %s", resultText(t, res))
+	}
+	if m := structured(t, res); m["version"] != "1.10.0" {
+		t.Errorf("default version = %v, want the highest 1.10.0 (numeric segments, not lexical)", m["version"])
+	}
+	if _, err := os.Stat(filepath.Join(root, "drivers", "fakemod@1.10.0.wasm")); err != nil {
+		t.Errorf("highest-version artifact not stored: %v", err)
+	}
+
+	if res := e.call("xuansi_driver_fetch", map[string]any{
+		"name": "fakemod", "version": "1.0.0", "index_url": url,
+	}); res.IsError {
+		t.Fatalf("explicit-version fetch failed: %s", resultText(t, res))
+	} else if m := structured(t, res); m["version"] != "1.0.0" {
+		t.Errorf("explicit version = %v, want 1.0.0", m["version"])
+	}
+
+	res = e.call("xuansi_driver_fetch", map[string]any{
+		"name": "fakemod", "version": "9.9.9", "index_url": url,
+	})
+	if !res.IsError {
+		t.Fatalf("absent-version fetch succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"9.9.9", "1.0.0", "1.2.0", "1.10.0"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to name %q among the available versions", got, want)
+		}
+	}
+}
+
+// TestDriverFetchLocalRefusalsZeroContact: name/version/scheme
+// refusals happen BEFORE any HTTP (hits stay at the running count);
+// a garbage or future-index_ver index is a typed refusal too.
+func TestDriverFetchLocalRefusalsZeroContact(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	url, hits := newFetchIndex(t, []fetchModSpec{{
+		name: "fakemod", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{fetchSpec(t, "modules/fakemod/1.0.0/fakemod.wasm", fetchWasmBody(16), "")},
+	}})
+	base := hits.Load()
+
+	// local refusals: zero HTTP contact
+	for _, args := range []map[string]any{
+		{"name": "../evil", "index_url": url},
+		{"name": "A!", "index_url": url},
+		{"name": "fakemod", "version": "1/x", "index_url": url},
+		{"name": "fakemod", "index_url": "ftp://example.com/index.json"},
+		{"name": "fakemod", "index_url": "not a url"},
+	} {
+		res := e.call("xuansi_driver_fetch", args)
+		if !res.IsError || !strings.HasPrefix(resultText(t, res), "api:") {
+			t.Errorf("fetch %v = %v, want a local api-class refusal", args["name"], res)
+		}
+	}
+	if n := hits.Load(); n != base {
+		t.Errorf("HTTP hits moved %d → %d on purely-local refusals", base, n)
+	}
+	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
+		t.Errorf("manifest.json exists after only refusals: %v", err)
+	}
+
+	// garbage index body: one HTTP hit, typed refusal
+	garbage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("not json at all"))
+	}))
+	t.Cleanup(garbage.Close)
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "fakemod", "index_url": garbage.URL + "/index.json"})
+	if !res.IsError || !strings.Contains(resultText(t, res), "not valid JSON") {
+		t.Errorf("garbage-index fetch = %v (%v), want a not-valid-JSON refusal", res, resultText(t, res))
+	}
+}
+
+// TestDriverPushWasmArtifactMagicGated: the B10 push gate branches by
+// artifact — a stored .wasm pushes to /drv/<name>.wasm with NO caps
+// crossing (the wasm track's compatibility axis is the module ABI the
+// loader checks, not bench.api_version), read-back verified, manifest
+// Active set; a garbage-magic .wasm is refused locally with zero
+// crossings. Binary artifacts are stored out-of-band (ws_put's content
+// is a JSON string — the fetch tool is the binary-safe storer).
+func TestDriverPushWasmArtifactMagicGated(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
+	body := fetchWasmBody(96)
+	drvDir := filepath.Join(root, "drivers")
+	if err := os.MkdirAll(drvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wasmPath := filepath.Join(drvDir, "hellow@1.0.0.wasm")
+	if err := os.WriteFile(wasmPath, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "hellow", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("wasm push failed: %s", resultText(t, res))
+	}
+	// pipeline: fs_write FIRST (no op caps for a wasm artifact), then the read-back
+	writeReq := wantReq(t, reqs)
+	if writeReq.Type != "fs_write" || writeReq.Path != "/drv/hellow.wasm" || writeReq.Holder != "mcp-fixed01" {
+		t.Errorf("first crossing = %+v, want the held fs_write at /drv/hellow.wasm (no caps for the wasm track)", writeReq)
+	}
+	if !bytes.Equal(writeReq.Data, body) {
+		t.Errorf("fs_write data = %d bytes, want the artifact verbatim", len(writeReq.Data))
+	}
+	readReq := wantReq(t, reqs)
+	if readReq.Type != "fs_read" || readReq.Path != "/drv/hellow.wasm" {
+		t.Errorf("read-back = %+v, want fs_read at /drv/hellow.wasm", readReq)
+	}
+	noContact(t, reqs)
+	if out := structured(t, res); out["path"] != "/drv/hellow.wasm" || out["sha256"] != sha256hex(body) {
+		t.Errorf("push result = %v, want the wasm path + verified sha", out)
+	}
+	if m := wsManifest(t, root); m.Drivers["hellow"].Active != "1.0.0" {
+		t.Errorf("Active = %q after the wasm push, want 1.0.0", m.Drivers["hellow"].Active)
+	}
+
+	// garbage magic: refused locally, zero crossings, manifest Active untouched
+	garbage := []byte("GARBAGE-not-a-module-at-all--------")
+	if err := os.WriteFile(wasmPath, garbage, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res = e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "hellow", "version": "1.0.0",
+	})
+	if !res.IsError {
+		t.Fatalf("garbage-magic push succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "hellow@1.0.0.wasm", "magic"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	noContact(t, reqs)
+}
+
+// TestDriverPushAotArtifactAndLuaPriority: an .aot artifact pushes to
+// /drv/<name>.aot under the AOT magic gate; and when BOTH a .lua and a
+// binary artifact are stored, the classic .lua wins the push —
+// pre-B10 workspaces behave exactly as before.
+func TestDriverPushAotArtifactAndLuaPriority(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
+	abody := fetchAotBody(64)
+	drvDir := filepath.Join(root, "drivers")
+	if err := os.MkdirAll(drvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// the .aot leg
+	if err := os.WriteFile(filepath.Join(drvDir, "watchaot@1.0.0.aot"), abody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "watchaot", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("aot push failed: %s", resultText(t, res))
+	}
+	writeReq := wantReq(t, reqs)
+	if writeReq.Type != "fs_write" || writeReq.Path != "/drv/watchaot.aot" {
+		t.Errorf("aot push crossing = %+v, want fs_write at /drv/watchaot.aot", writeReq)
+	}
+	wantReq(t, reqs) // the read-back
+
+	// the priority leg: .lua + .wasm both stored → the .lua deploys
+	// (caps crossing first — the --@api gate unchanged)
+	luaBody := "--@api 1\n-- classic wins\nreturn {}\n"
+	mustPut(t, e, "mixmod", "1.0.0", luaBody)
+	if err := os.WriteFile(filepath.Join(drvDir, "mixmod@1.0.0.wasm"), fetchWasmBody(32), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res = e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "mixmod", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("mixed-artifact push failed: %s", resultText(t, res))
+	}
+	if req := wantReq(t, reqs); req.Type != "op" || req.Op != "caps" {
+		t.Errorf("mixed push first crossing = %+v, want op caps (the .lua gate runs)", req)
+	}
+	if req := wantReq(t, reqs); req.Type != "fs_write" || req.Path != "/drv/mixmod.lua" || !bytes.Equal(req.Data, []byte(luaBody)) {
+		t.Errorf("mixed push write = %+v, want the .lua artifact at /drv/mixmod.lua", req)
+	}
+	wantReq(t, reqs) // the read-back
+}
+
+// TestDriverPushMissingArtifactRefusalNamesCandidates: a version with
+// NO stored artifact under any extension is the classic refusal, now
+// also pointing at the fetch tool.
+func TestDriverPushMissingArtifactRefusalNamesCandidates(t *testing.T) {
+	e, reqs, _ := newWsEnv(t, nil)
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "ghost", "version": "9.9.9",
+	})
+	if !res.IsError {
+		t.Fatalf("artifact-less push succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "ghost@9.9.9.lua", "xuansi_driver_fetch"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	noContact(t, reqs)
 }
 
 // ---------------------------------------------------------------------------

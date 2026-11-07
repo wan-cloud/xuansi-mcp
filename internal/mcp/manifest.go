@@ -42,9 +42,14 @@ type Manifest struct {
 }
 
 // DriverEntry is one driver's record: the active version ("" until a
-// push activates one) and the per-version file metadata.
+// push activates one) and the per-version file metadata. Kind (B10
+// task 5) carries the fetch index's module kind ("driver",
+// "algorithm") for fetch-stored versions — additive: pre-B10
+// manifests without it load unchanged, and hand-put versions simply
+// leave it empty.
 type DriverEntry struct {
 	Active string              `json:"active,omitempty"`
+	Kind   string              `json:"kind,omitempty"`
 	Files  map[string]FileMeta `json:"files"`
 }
 
