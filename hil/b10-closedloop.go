@@ -822,10 +822,24 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	rbRatio, evBlue := 0.0, 0.0
 	evRed := 0.0
 	var sigs []bool // DECISIVE signals (>=2x): true = faithful color mapping (drawn color measured as drawn)
-	if sigRed >= 0 {
-		sigs = append(sigs, sigRed == 1)
+	// B10-T7 fix1: the MEASURED settled ratio ALWAYS feeds evRed (the
+	// fix-round finding: a decisive-only assignment left the 0.00
+	// initializer in the machine line - reading as "zero red", a
+	// swapped-direction number inside the exact line automation greps).
+	// sigRed stays the decisiveness tri-state; the print marks the field.
+	redTag := "(unmeasured)"
+	if screen.r > 0 || screen.b > 0 {
 		evRed = screen.r / maxF(screen.b, 1)
-		rbDetail = fmt.Sprintf("clearRED@S3 r/b=%.2f", evRed)
+		if sigRed >= 0 {
+			sigs = append(sigs, sigRed == 1)
+			redTag = ""
+			rbDetail = fmt.Sprintf("clearRED@S3 r/b=%.2f", evRed)
+		} else {
+			redTag = "(dir-only,tri-state)" // AWB-crushed: direction recorded, not counted
+			rbDetail = fmt.Sprintf("clearRED@S3 r/b=%.2f(dir-only,tri-state)", evRed)
+		}
+	} else {
+		rbDetail = "clearRED@S3 unmeasured"
 	}
 	// S4a: red_rect — the brief's primary: the lit region IS the drawn red
 	// (black surround; a dark-room AE can wash the panel's black above the
@@ -943,8 +957,8 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	h.check(rbVerdict != "AMBIGUOUS",
 		fmt.Sprintf("S4 R/B VERDICT from %d decisive signal(s) %v + %d directional corroboration(s) (clearRED=%.2f red_rect=%.2f clearBLUE=%.2f): %s",
 			len(sigs), sigs, len(dirs), evRed, rbRatio, evBlue, rbVerdict))
-	fmt.Printf("RB_VERDICT: %s %s | red_rect r/b=%.2f | clear-RED r/b=%.2f | clear-BLUE r/b=%.2f\n",
-		rbVerdict, rbDetail, rbRatio, evRed, evBlue)
+	fmt.Printf("RB_VERDICT: %s %s | red_rect r/b=%.2f | clear-RED r/b=%.2f%s | clear-BLUE r/b=%.2f\n",
+		rbVerdict, rbDetail, rbRatio, evRed, redTag, evBlue)
 
 	fmt.Println("\n- S5: hands - GPIO1(out) -> GPIO2(in) wired pair, drive+readback x5 -")
 	v, text, okLua = b10t7Lua(b, ctx, `bench.gpio.mode(1,"out") bench.gpio.mode(2,"in") return "modes-set"`)
