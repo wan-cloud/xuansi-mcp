@@ -58,7 +58,7 @@ import (
 
 const (
 	b8Board   = "d75884"  // the bench board
-	b8FwBuild = "c38b08c" // B10-T2 fix-round-1 canonical (interp delivery; VM-before-wifi boot fix)
+	b8FwBuild = "f944927" // B10-T6 canonical (fast-interp explicit pin; behavior identical to c38b08c)
 	b8Holder  = "b8-t1"   // custom lease holder for this run
 	b8TCPEndp = "xuansi-d75884.local:7777"
 	b8TmpPath = "/drv/b8tmp.lua"  // the S2 fs-face target
