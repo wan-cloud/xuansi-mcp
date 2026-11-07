@@ -232,6 +232,25 @@ func TestManifestLoadWriteRoundTrip(t *testing.T) {
 	}
 }
 
+// TestManifestLoadsKindlessOldManifest (fix round 1, minor a): a
+// pre-B10 manifest JSON without the kind field loads unchanged and
+// Kind reads "" — the additive field must never break old workspaces.
+func TestManifestLoadsKindlessOldManifest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	old := `{"drivers":{"ads1115":{"active":"1.3.0","files":{"1.3.0":{"sha256":"abc","size":42}}}}}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := loadManifest(path)
+	if err != nil {
+		t.Fatalf("loadManifest(kindless) = %v, want a clean load", err)
+	}
+	e := m.Drivers["ads1115"]
+	if e.Active != "1.3.0" || e.Kind != "" || e.Files["1.3.0"].Sha256 != "abc" {
+		t.Errorf("kindless entry = %+v, want Active/Files back and Kind \"\"", e)
+	}
+}
+
 // TestWriteDurableFileNeverTorn (B8 item 5 red unit): the atomic
 // (temp+Sync+rename+dir-fsync) write means the final path is always
 // absent-or-COMPLETE under concurrent readers — a reader loop hammering
@@ -1182,6 +1201,51 @@ func TestDriverFetchVersionDefaultHighest(t *testing.T) {
 	}
 }
 
+// TestDriverFetchHostileVersionRefusedZeroWrites (fix round 1): a
+// version chosen FROM the index is re-gated against wsVerRe before any
+// path or manifest use — a hostile index carrying "1.0/../../evil"
+// must be a typed refusal with zero writes (the omission-version path
+// was the exploitable one; the explicit path is gated at input).
+func TestDriverFetchHostileVersionRefusedZeroWrites(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	url, hits := newFetchIndex(t, []fetchModSpec{{
+		name: "fakemod", kind: "driver", version: "1.0/../../evil",
+		files: []fetchFileSpec{fetchSpec(t, "modules/fakemod/1.0/../../evil/fakemod.wasm", fetchWasmBody(16), "")},
+	}})
+
+	// the omitted-version path: the index's chosen version is the attack
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "fakemod", "index_url": url})
+	if !res.IsError {
+		t.Fatalf("hostile-version fetch succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "1.0/../../evil", "[a-z0-9.]+"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("HTTP hits = %d, want exactly 1 (the index; no file downloads for a refused version)", n)
+	}
+	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
+		t.Errorf("manifest.json exists after a hostile-version refusal: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "drivers")); !os.IsNotExist(err) {
+		t.Errorf("drivers/ dir exists after a hostile-version refusal: %v", err)
+	}
+
+	// the explicit-version path: refused at the input gate, ZERO HTTP
+	res = e.call("xuansi_driver_fetch", map[string]any{
+		"name": "fakemod", "version": "1.0/../../evil", "index_url": url,
+	})
+	if !res.IsError || !strings.HasPrefix(resultText(t, res), "api:") {
+		t.Errorf("explicit hostile version = %v (%v), want a local api-class refusal", res, resultText(t, res))
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("HTTP hits moved to %d on the explicit refusal (want unchanged at 1 — refused before any HTTP)", n)
+	}
+}
+
 // TestDriverFetchLocalRefusalsZeroContact: name/version/scheme
 // refusals happen BEFORE any HTTP (hits stay at the running count);
 // a garbage or future-index_ver index is a typed refusal too.
@@ -1337,6 +1401,37 @@ func TestDriverPushAotArtifactAndLuaPriority(t *testing.T) {
 		t.Errorf("mixed push write = %+v, want the .lua artifact at /drv/mixmod.lua", req)
 	}
 	wantReq(t, reqs) // the read-back
+}
+
+// TestDriverPushShortArtifactMagicRefused (fix round 1, minor b): a
+// below-4-byte .wasm/.aot artifact cannot carry the magic — refused
+// locally with zero crossings, same as garbage magic.
+func TestDriverPushShortArtifactMagicRefused(t *testing.T) {
+	e, reqs, root := newWsPushEnv(t, 1, false)
+	drvDir := filepath.Join(root, "drivers")
+	if err := os.MkdirAll(drvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(drvDir, "shorty@1.0.0.wasm"), []byte{0x00, 0x61}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(drvDir, "shorty@1.0.0.aot"), []byte{0x00, 0x61, 0x6f}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range []string{"wasm", "aot"} {
+		res := e.call("xuansi_driver_push", map[string]any{
+			"board": "d75884", "name": "shorty", "version": "1.0.0",
+		})
+		if !res.IsError {
+			t.Errorf("short .%s push succeeded, want a local refusal", ext)
+			continue
+		}
+		got := resultText(t, res)
+		if !strings.HasPrefix(got, "api:") || !strings.Contains(got, "magic") {
+			t.Errorf("short .%s error = %q, want an api-class magic refusal", ext, got)
+		}
+	}
+	noContact(t, reqs)
 }
 
 // TestDriverPushMissingArtifactRefusalNamesCandidates: a version with
