@@ -405,7 +405,7 @@ func b10t7Teardown(h *harness, b *b6Client, ctx context.Context, deep bool) {
 		if isErr && !deep {
 			h.note("fs_rm /drv/%s.wasm (shallow teardown - pipeline never completed): %.50s", n, text)
 		} else {
-			h.check(!isErr, fmt.Sprintf("fs_rm /drv/%s.wasm (driver_pull is .lua-scoped by design; text=%.50s)", n, text))
+			h.check(!isErr, fmt.Sprintf("fs_rm /drv/%s.wasm (direct fs_rm rather than driver_pull to keep this teardown lease-lean; driver_pull sweeps it too since B10-T8; text=%.50s)", n, text))
 		}
 	}
 	if deep {

@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
@@ -830,10 +831,78 @@ func TestWorkspaceListAndGetRoundTrip(t *testing.T) {
 		t.Errorf("ws_get = %v, want the stored v1.2.0 content + checksum", g)
 	}
 
-	// a version that is not there says so
+	// a version that is not there says so, naming both storing paths
 	res = e.call("xuansi_ws_get", map[string]any{"name": "ads1115", "version": "9.9.9"})
-	if !res.IsError || !strings.Contains(resultText(t, res), "ads1115@9.9.9.lua") {
-		t.Errorf("ws_get missing = %v, want a refusal naming the file", res)
+	got := resultText(t, res)
+	if !res.IsError || !strings.Contains(got, "ads1115@9.9.9") || !strings.Contains(got, "xuansi_ws_put") || !strings.Contains(got, "xuansi_driver_fetch") {
+		t.Errorf("ws_get missing = %v (%v), want a refusal naming the version and both storing tools", res, got)
+	}
+}
+
+// TestWsGetBinaryArtifactAndPriority: ws_get resolves the stored
+// artifact with the SAME first-extension-wins priority a bare push
+// deploys (the B10-T8 generalization): a .lua version returns
+// verbatim text with encoding ABSENT (the pre-B10 face
+// byte-identical), a binary .wasm artifact — storable only through
+// xuansi_driver_fetch — returns standard base64 with
+// encoding="base64" and sha256 of the DECODED bytes (a JSON string
+// would mangle invalid UTF-8; fs_read's data_b64 is the precedent),
+// and when both slots hold the same version the .lua serves.
+func TestWsGetBinaryArtifactAndPriority(t *testing.T) {
+	e, _, root := newWsEnv(t, nil)
+	luaSrc := "--@api 1\n-- wg v1.0.0\nreturn {}\n"
+	mustPut(t, e, "wg", "1.0.0", luaSrc)
+	body := fetchWasmBody(48) // opens with the \0asm module magic, like a fetched artifact
+	drvDir := filepath.Join(root, "drivers")
+	if err := os.WriteFile(filepath.Join(drvDir, "wg@2.0.0.wasm"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// the .lua face: verbatim text, encoding absent, artifact named
+	res := e.call("xuansi_ws_get", map[string]any{"name": "wg", "version": "1.0.0"})
+	if res.IsError {
+		t.Fatalf("ws_get lua failed: %s", resultText(t, res))
+	}
+	g := structured(t, res)
+	if g["content"] != luaSrc || g["sha256"] != sha256hex([]byte(luaSrc)) {
+		t.Errorf("ws_get lua = %v, want verbatim content + checksum", g)
+	}
+	if enc, _ := g["encoding"].(string); enc != "" {
+		t.Errorf("ws_get lua encoding = %q, want absent", enc)
+	}
+	if g["artifact"] != "drivers/wg@1.0.0.lua" {
+		t.Errorf("ws_get lua artifact = %v, want drivers/wg@1.0.0.lua", g["artifact"])
+	}
+
+	// the binary face: base64 content, decoded sha, artifact named
+	res = e.call("xuansi_ws_get", map[string]any{"name": "wg", "version": "2.0.0"})
+	if res.IsError {
+		t.Fatalf("ws_get wasm failed: %s", resultText(t, res))
+	}
+	g = structured(t, res)
+	if g["encoding"] != "base64" || g["artifact"] != "drivers/wg@2.0.0.wasm" {
+		t.Errorf("ws_get wasm envelope = %v, want encoding=base64 + the wasm artifact", g)
+	}
+	dec, derr := base64.StdEncoding.DecodeString(fmt.Sprint(g["content"]))
+	if derr != nil || !bytes.Equal(dec, body) {
+		t.Errorf("ws_get wasm content does not decode to the stored bytes (err=%v, got %d bytes, want %d)", derr, len(dec), len(body))
+	}
+	if g["sha256"] != sha256hex(body) {
+		t.Errorf("ws_get wasm sha256 = %v, want the DECODED bytes' checksum", g["sha256"])
+	}
+
+	// priority: both slots at one version — the .lua serves, like a bare push deploys
+	mustPut(t, e, "wg", "3.0.0", luaSrc)
+	if err := os.WriteFile(filepath.Join(drvDir, "wg@3.0.0.wasm"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res = e.call("xuansi_ws_get", map[string]any{"name": "wg", "version": "3.0.0"})
+	if res.IsError {
+		t.Fatalf("ws_get both-slots failed: %s", resultText(t, res))
+	}
+	g = structured(t, res)
+	if g["content"] != luaSrc || g["artifact"] != "drivers/wg@3.0.0.lua" {
+		t.Errorf("ws_get both-slots = %v, want the .lua slot serving (pushExts priority)", g)
 	}
 }
 
@@ -1479,9 +1548,15 @@ func TestDriverPullClearsActiveKeepsFootprints(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("pull failed: %s", resultText(t, res))
 	}
-	rmReq := wantReq(t, reqs)
-	if rmReq.Type != "fs_rm" || rmReq.Path != "/drv/b8pull.lua" || rmReq.Holder != "mcp-fixed01" {
-		t.Errorf("fs_rm request = %+v, want the held removal at /drv/b8pull.lua", rmReq)
+	// the sweep (B10-T8): one held fs_rm per extension slot a push could
+	// have written — .lua, .wasm, .aot in pushExts order (the board file
+	// for this driver is the .lua one; the other slots ack their
+	// absence, which the lenient push env answers as removals)
+	for i, ext := range []string{"lua", "wasm", "aot"} {
+		rmReq := wantReq(t, reqs)
+		if rmReq.Type != "fs_rm" || rmReq.Path != "/drv/b8pull."+ext || rmReq.Holder != "mcp-fixed01" {
+			t.Errorf("fs_rm request %d = %+v, want the held removal at /drv/b8pull.%s", i, rmReq, ext)
+		}
 	}
 	out := structured(t, res)
 	if v, _ := out["pulled"].(bool); !v || out["path"] != "/drv/b8pull.lua" {
@@ -1540,7 +1615,9 @@ func TestDriverPullBoardErrorVerbatimAndManifestUntouched(t *testing.T) {
 		capsStep(1),                          // push: caps
 		{result: map[string]any{"ok": true}}, // push: fs_write
 		{result: map[string]any{"data": base64.StdEncoding.EncodeToString([]byte(content))}}, // push: fs_read back
-		{rerr: &server.RPCError{Class: "api", Msg: want}},                                    // pull: fs_rm refused
+		{rerr: &server.RPCError{Class: "api", Msg: want}},                                              // pull: fs_rm .lua refused
+		{rerr: &server.RPCError{Class: "api", Msg: "rm '/drv/ghost.wasm' failed (No such file or directory)"}}, // pull: .wasm slot equally absent
+		{rerr: &server.RPCError{Class: "api", Msg: "rm '/drv/ghost.aot' failed (No such file or directory)"}}, // pull: .aot slot equally absent
 	})
 	mustPut(t, e, "ghost", "1.0.0", content)
 	if res := e.call("xuansi_driver_push", map[string]any{
@@ -1557,11 +1634,12 @@ func TestDriverPullBoardErrorVerbatimAndManifestUntouched(t *testing.T) {
 		t.Fatalf("pull of an absent file succeeded: %+v", res)
 	}
 	if got := resultText(t, res); got != "api: "+want {
-		t.Errorf("error text = %q, want exactly %q", got, "api: "+want)
+		t.Errorf("error text = %q, want exactly %q (the FIRST slot's refusal — the .lua probe)", got, "api: "+want)
 	}
-	rmReq := wantReq(t, reqs)
-	if rmReq.Type != "fs_rm" || rmReq.Path != "/drv/ghost.lua" {
-		t.Errorf("fs_rm request = %+v, want the removal at /drv/ghost.lua", rmReq)
+	for i, p := range []string{"/drv/ghost.lua", "/drv/ghost.wasm", "/drv/ghost.aot"} {
+		if req := wantReq(t, reqs); req.Type != "fs_rm" || req.Path != p {
+			t.Errorf("fs_rm request %d = %+v, want the sweep reaching %s", i, req, p)
+		}
 	}
 
 	m := wsManifest(t, root)
@@ -1596,8 +1674,10 @@ func TestDriverPullUnknownNameNoManifestNoise(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("pull of a never-stored name failed: %s", resultText(t, res))
 	}
-	if req := wantReq(t, reqs); req.Type != "fs_rm" || req.Path != "/drv/leftover.lua" {
-		t.Errorf("fs_rm request = %+v, want the removal at /drv/leftover.lua", req)
+	for i, ext := range []string{"lua", "wasm", "aot"} { // the full sweep, all auto-acked by this env
+		if req := wantReq(t, reqs); req.Type != "fs_rm" || req.Path != "/drv/leftover."+ext {
+			t.Errorf("fs_rm request %d = %+v, want the sweep at /drv/leftover.%s", i, req, ext)
+		}
 	}
 	if out := structured(t, res); out["pulled"] != true || out["path"] != "/drv/leftover.lua" {
 		t.Errorf("pull result = %v, want {pulled:true, path:/drv/leftover.lua}", out)
@@ -1634,7 +1714,7 @@ func TestDriverPullConcurrentWithPush(t *testing.T) {
 			t.Fatalf("concurrent pull/push failed: %s", resultText(t, res))
 		}
 	}
-	for i := 0; i < 4; i++ { // pull: fs_rm; push: caps + write + read-back
+	for i := 0; i < 6; i++ { // pull: fs_rm ×3 (the sweep); push: caps + write + read-back
 		wantReq(t, reqs)
 	}
 
@@ -1652,5 +1732,64 @@ func TestDriverPullConcurrentWithPush(t *testing.T) {
 	}
 	if ent.Active != "" && ent.Active != "1.0.0" {
 		t.Fatalf("Active = %q, want exactly one of the two outcomes (\"\" or 1.0.0)", ent.Active)
+	}
+}
+
+// TestDriverPullRemovesFetchedWasmBoardFile: the generalized pull
+// sweeps EVERY extension slot a push could have written (B10-T8): a
+// fetched .wasm deployed to /drv/<name>.wasm is removed through the
+// .wasm slot's held fs_rm while the ABSENT .lua/.aot slots' api
+// not-found refusals are tolerated, the reported path names the .wasm
+// (the first REMOVED slot), and the manifest's Active clears with the
+// Files history kept verbatim.
+func TestDriverPullRemovesFetchedWasmBoardFile(t *testing.T) {
+	body := fetchWasmBody(64)
+	nf := func(p string) *server.RPCError {
+		return &server.RPCError{Class: "api", Msg: "rm '" + p + "' failed (No such file or directory)"}
+	}
+	e, reqs, root := newWsEnv(t, []step{
+		{result: map[string]any{"ok": true}},                                      // push: fs_write (wasm track: no caps crossing)
+		{result: map[string]any{"data": base64.StdEncoding.EncodeToString(body)}}, // push: fs_read back
+		{rerr: nf("/drv/wbmod.lua")},                                              // pull: .lua slot absent — tolerated
+		{result: map[string]any{}},                                                // pull: .wasm slot removed
+		{rerr: nf("/drv/wbmod.aot")},                                              // pull: .aot slot absent — tolerated
+	})
+	drvDir := filepath.Join(root, "drivers")
+	if err := os.MkdirAll(drvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(drvDir, "wbmod@1.0.0.wasm"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := e.call("xuansi_driver_push", map[string]any{"board": "d75884", "name": "wbmod", "version": "1.0.0"})
+	if res.IsError {
+		t.Fatalf("wasm push failed: %s", resultText(t, res))
+	}
+	for i := 0; i < 2; i++ { // push: fs_write + fs_read-back
+		wantReq(t, reqs)
+	}
+
+	res = e.call("xuansi_driver_pull", map[string]any{"board": "d75884", "name": "wbmod"})
+	if res.IsError {
+		t.Fatalf("pull failed: %s", resultText(t, res))
+	}
+	for i, p := range []string{"/drv/wbmod.lua", "/drv/wbmod.wasm", "/drv/wbmod.aot"} {
+		if req := wantReq(t, reqs); req.Type != "fs_rm" || req.Path != p || req.Holder != "mcp-fixed01" {
+			t.Errorf("fs_rm request %d = %+v, want the held sweep at %s", i, req, p)
+		}
+	}
+	if out := structured(t, res); out["pulled"] != true || out["path"] != "/drv/wbmod.wasm" {
+		t.Errorf("pull result = %v, want {pulled:true, path:/drv/wbmod.wasm} (the removed slot)", out)
+	}
+
+	// the manifest: Active cleared, the wasm version's history kept
+	m := wsManifest(t, root)
+	ent := m.Drivers["wbmod"]
+	if ent.Active != "" {
+		t.Errorf("Active = %q after the wasm pull, want \"\"", ent.Active)
+	}
+	if fm := ent.Files["1.0.0"]; fm.Sha256 != sha256hex(body) || fm.Size != len(body) {
+		t.Errorf("Files[1.0.0] = %+v, want the wasm history kept verbatim", fm)
 	}
 }

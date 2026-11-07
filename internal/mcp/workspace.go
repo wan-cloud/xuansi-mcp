@@ -253,13 +253,15 @@ type wsGetIn struct {
 }
 
 type wsGetOut struct {
-	Content string `json:"content" jsonschema:"the stored driver source, verbatim"`
-	Sha256  string `json:"sha256" jsonschema:"sha256 of the returned content"`
+	Content  string `json:"content" jsonschema:"the stored artifact's content: verbatim text for a .lua driver; standard base64 for a binary .wasm/.aot artifact (encoding says which)"`
+	Encoding string `json:"encoding,omitempty" jsonschema:"absent for a .lua driver (content is verbatim text); \"base64\" when the stored artifact is binary (.wasm/.aot — content is standard base64, sha256 of the DECODED bytes, matching the manifest footprint)"`
+	Artifact string `json:"artifact,omitempty" jsonschema:"the workspace file that served the read (drivers/<name>@<ver>.<lua|wasm|aot>) — same artifact priority a bare xuansi_driver_push deploys"`
+	Sha256   string `json:"sha256" jsonschema:"sha256 of the stored bytes"`
 }
 
 type driverPushIn struct {
 	Board   string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Name    string `json:"name" jsonschema:"driver name, lowercase [a-z0-9_-]+ — the board's effective file /drv/<name>.lua is overwritten"`
+	Name    string `json:"name" jsonschema:"driver name, lowercase [a-z0-9_-]+ — the board's effective file /drv/<name>.<ext> is overwritten (ext = the stored artifact's: .lua, or .wasm/.aot from a fetch)"`
 	Version string `json:"version,omitempty" jsonschema:"omit to re-deploy the manifest's ACTIVE version (error when none is active). Rollback = push the older version explicitly; fleet = push each board"`
 	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
@@ -273,13 +275,13 @@ type driverPushOut struct {
 
 type driverPullIn struct {
 	Board  string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Name   string `json:"name" jsonschema:"driver name, lowercase [a-z0-9_-]+ — the board's effective file /drv/<name>.lua is removed"`
+	Name   string `json:"name" jsonschema:"driver name, lowercase [a-z0-9_-]+ — the board's files /drv/<name>.<lua|wasm|aot> are removed"`
 	Holder string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
 type driverPullOut struct {
-	Pulled bool   `json:"pulled" jsonschema:"true when the board file was removed and the manifest's Active cleared"`
-	Path   string `json:"path" jsonschema:"the board's effective driver file that was removed"`
+	Pulled bool   `json:"pulled" jsonschema:"true when a board file was removed and the manifest's Active cleared"`
+	Path   string `json:"path" jsonschema:"the first board driver file that was removed (/drv/<name>.<lua|wasm|aot> — every extension slot a push could have written is swept)"`
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +359,15 @@ func (ts *toolset) wsList(_ context.Context, _ *mcpsdk.CallToolRequest, _ wsList
 }
 
 // wsGet reads one stored version back — the workspace keeps every
-// version, so rollback's older file stays retrievable.
+// version, so rollback's older file stays retrievable. The artifact
+// resolves with the SAME first-extension-wins priority a bare push
+// deploys with (pushExts: .lua → .wasm → .aot): a .lua returns
+// verbatim text (the pre-B10 face byte-identical), while a binary
+// .wasm/.aot — storable only through xuansi_driver_fetch — rides
+// standard base64 (a JSON string would mangle invalid UTF-8; fs_read's
+// data_b64 is the precedent), with encoding marking the shape and
+// sha256 staying of the DECODED bytes, the value the manifest's
+// footprint records.
 func (ts *toolset) wsGet(_ context.Context, _ *mcpsdk.CallToolRequest, in wsGetIn) (*mcpsdk.CallToolResult, wsGetOut, error) {
 	if !wsNameRe.MatchString(in.Name) {
 		return nil, wsGetOut{}, errWs("xuansi_ws_get: name must match [a-z0-9_-]+, got %q", in.Name)
@@ -365,14 +375,23 @@ func (ts *toolset) wsGet(_ context.Context, _ *mcpsdk.CallToolRequest, in wsGetI
 	if !wsVerRe.MatchString(in.Version) {
 		return nil, wsGetOut{}, errWs("xuansi_ws_get: version must match [a-z0-9.]+, got %q", in.Version)
 	}
-	b, err := readFileShared(ts.ws.driverPath(in.Name, in.Version, "lua")) // share-delete read (windows replace contract)
-	if os.IsNotExist(err) {
-		return nil, wsGetOut{}, errWs("xuansi_ws_get: %s@%s.lua is not in the workspace — xuansi_ws_put it first", in.Name, in.Version)
+	for _, ext := range pushExts {
+		b, err := readFileShared(ts.ws.driverPath(in.Name, in.Version, ext)) // share-delete read (windows replace contract)
+		if err == nil {
+			out := wsGetOut{Artifact: "drivers/" + in.Name + "@" + in.Version + "." + ext, Sha256: sha256hex(b)}
+			if ext == "lua" {
+				out.Content = string(b)
+			} else {
+				out.Content = base64.StdEncoding.EncodeToString(b)
+				out.Encoding = "base64"
+			}
+			return nil, out, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, wsGetOut{}, errWs("xuansi_ws_get: %v", err)
+		}
 	}
-	if err != nil {
-		return nil, wsGetOut{}, errWs("xuansi_ws_get: %v", err)
-	}
-	return nil, wsGetOut{Content: string(b), Sha256: sha256hex(b)}, nil
+	return nil, wsGetOut{}, errWs("xuansi_ws_get: %s@%s has no stored artifact (.lua/.wasm/.aot) — xuansi_ws_put stores a Lua driver, xuansi_driver_fetch stores .wasm/.aot", in.Name, in.Version)
 }
 
 // driverPush deploys one workspace version onto a board (the pipeline
@@ -545,34 +564,56 @@ func (ts *toolset) boardAPIVersion(ctx context.Context, board string, resolved b
 	return ver, nil
 }
 
-// driverPull removes the board's effective /drv/<name>.lua through the
-// fs_rm request (B8: the pipeline's removal path — the b7 HIL cleaned
-// /drv out-of-pipeline) and clears the manifest's Active: the board has
-// no effective driver to deploy anymore. History is never rewritten —
-// the Files entries and per-board push footprints STAY (rollback =
-// re-push the version explicitly), and the whole read-modify-write
-// rides wsMu like every other manifest cycle, so a pull racing a push
-// serializes instead of tearing the file. A board file that is already
-// absent surfaces the board's api not-found VERBATIM and rewrites
-// nothing (the pull did not remove anything, so Active stays).
+// driverPull removes the board's driver files through the fs_rm
+// request (B8: the pipeline's removal path — the b7 HIL cleaned /drv
+// out-of-pipeline; B10-T8: generalized off the .lua-only scope) and
+// clears the manifest's Active: the board has no effective driver to
+// deploy anymore. The fs_rm path is type-agnostic board-side, so the
+// pull walks EVERY extension slot a push could have written
+// (pushExts: .lua → .wasm → .aot) — a push only ever wrote the
+// resolved artifact's ext, so at most one slot holds the file and the
+// other slots' api not-found refusals are expected noise, tolerated
+// when any slot removed; the FIRST removed path is the reported one.
+// History is never rewritten — the Files entries and per-board push
+// footprints STAY (rollback = re-push the version explicitly), and
+// the whole removal batch + manifest cycle rides wsMu like every
+// other manifest cycle, so a pull racing a push serializes instead of
+// tearing the file. A driver whose board files are ALL already absent
+// surfaces the board's api not-found VERBATIM (the .lua slot's, the
+// first probed) and rewrites nothing (the pull did not remove
+// anything, so Active stays).
 func (ts *toolset) driverPull(ctx context.Context, _ *mcpsdk.CallToolRequest, in driverPullIn) (*mcpsdk.CallToolResult, driverPullOut, error) {
 	if !wsNameRe.MatchString(in.Name) {
 		return nil, driverPullOut{}, errWs("xuansi_driver_pull: name must match [a-z0-9_-]+, got %q", in.Name)
 	}
-	path := drvBoardPath(in.Name, "lua")
 
-	// the removal first: only a file the board actually removed clears
-	// Active (its error — the api not-found on an absent file — crosses
-	// verbatim and the manifest below never runs). The removal rides
-	// wsMu TOGETHER with the manifest cycle: a concurrent driver_push's
-	// fs_write + fs_read-back of the same path must not interleave with
-	// this fs_rm (the read-back would see the removal and fail) — the
-	// whole board-file mutation + manifest cycle is one serialized unit
-	// (the contract TestDriverPullConcurrentWithPush pins).
+	// the removals first: only a file the board actually removed clears
+	// Active (when no slot held the file, the FIRST slot's error — the
+	// api not-found on an absent file — crosses verbatim and the
+	// manifest below never runs). The batch rides wsMu TOGETHER with
+	// the manifest cycle: a concurrent driver_push's fs_write +
+	// fs_read-back of the same path must not interleave with these
+	// fs_rms (the read-back would see the removal and fail) — the whole
+	// board-file mutation + manifest cycle is one serialized unit (the
+	// contract TestDriverPullConcurrentWithPush pins).
 	wsMu.Lock()
 	defer wsMu.Unlock()
-	if _, err := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: in.Board, Path: path, Holder: in.Holder}); err != nil {
-		return nil, driverPullOut{}, err
+	var removed string
+	var firstErr error
+	for _, ext := range pushExts {
+		path := drvBoardPath(in.Name, ext)
+		if _, err := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: in.Board, Path: path, Holder: in.Holder}); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if removed == "" {
+			removed = path
+		}
+	}
+	if removed == "" {
+		return nil, driverPullOut{}, firstErr
 	}
 
 	m, err := loadManifest(ts.ws.manifestPath())
@@ -589,5 +630,5 @@ func (ts *toolset) driverPull(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 	// no manifest entry: the board file is gone and there was no Active
 	// to clear — writing an empty entry would be noise, not history.
-	return nil, driverPullOut{Pulled: true, Path: path}, nil
+	return nil, driverPullOut{Pulled: true, Path: removed}, nil
 }
