@@ -58,7 +58,7 @@ import (
 
 const (
 	b8Board   = "d75884"  // the bench board
-	b8FwBuild = "0c7440b" // B10-T1 fix-round-1 canonical re-flash (ver 5, the chunked-transport era)
+	b8FwBuild = "36df04a" // B10-T2 canonical (interp delivery; wasm track)
 	b8Holder  = "b8-t1"   // custom lease holder for this run
 	b8TCPEndp = "xuansi-d75884.local:7777"
 	b8TmpPath = "/drv/b8tmp.lua"  // the S2 fs-face target
