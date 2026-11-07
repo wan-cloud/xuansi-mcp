@@ -58,7 +58,7 @@ import (
 
 const (
 	b8Board   = "d75884"  // the bench board
-	b8FwBuild = "fbfef59" // B10-T8b canonical (hello boot identity + settle + silent-panic + RTC WDT backstop; supersedes the T8 fix round)
+	b8FwBuild = "0b6cc4e" // B10-T8c canonical (fw_version semver + CI build proof; supersedes the T8b canonical)
 	b8Holder  = "b8-t1"   // custom lease holder for this run
 	b8TCPEndp = "xuansi-d75884.local:7777"
 	b8TmpPath = "/drv/b8tmp.lua"  // the S2 fs-face target

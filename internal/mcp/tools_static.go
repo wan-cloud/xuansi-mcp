@@ -195,13 +195,14 @@ type cameraShotIn struct {
 
 // boardInfo is one board's identity view (the daemon's boardView).
 type boardInfo struct {
-	MAC6    string   `json:"mac6"`
-	Alias   string   `json:"alias,omitempty" jsonschema:"configured alias, when the daemon matched one"`
-	Sources []string `json:"sources,omitempty" jsonschema:"discovery sources that saw the board (usb, mdns)"`
-	Host    string   `json:"host,omitempty"`
-	Port    int      `json:"port,omitempty"`
-	USBPath string   `json:"usb_path,omitempty"`
-	Fw      string   `json:"fw,omitempty" jsonschema:"firmware build, when the daemon enriched the board"`
+	MAC6      string   `json:"mac6"`
+	Alias     string   `json:"alias,omitempty" jsonschema:"configured alias, when the daemon matched one"`
+	Sources   []string `json:"sources,omitempty" jsonschema:"discovery sources that saw the board (usb, mdns)"`
+	Host      string   `json:"host,omitempty"`
+	Port      int      `json:"port,omitempty"`
+	USBPath   string   `json:"usb_path,omitempty"`
+	Fw        string   `json:"fw,omitempty" jsonschema:"firmware build id (git short hash), when the daemon enriched the board"`
+	FwVersion string   `json:"fw_version,omitempty" jsonschema:"firmware semantic version (aligned with the npm wave version), when the daemon enriched the board"`
 }
 
 type listBoardsOut struct {
@@ -421,7 +422,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 	}, ts.cameraShot)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "xuansi_driver_fetch",
+		Name:        "xuansi_driver_fetch",
 		Description: "Fetch one driver-module version from a public module index (task 3's layout: index.json + modules/<name>/<ver>/ artifacts; default " + defaultIndexURL + ") into the daemon-side driver workspace — the fetch half of the module pipeline, xuansi_driver_push deploys what this stores. Every file is downloaded and verified (sha256 + byte count against the index) BEFORE anything is written: a mid-download failure leaves the workspace untouched. Stores drivers/<name>@<version>.<ext> plus one manifest entry (kind from the index; NOT activating — a fresh fetch has no active version, so state version explicitly on its first push). Binary-safe — this is the storing path for .wasm/.aot artifacts (xuansi_ws_put's content field is a JSON string, fit for Lua text only). version omitted = the index's highest for the name.",
 	}, ts.driverFetch)
 
@@ -444,13 +445,14 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			continue // a non-object entry is daemon drift; keep the rest
 		}
 		out.Boards = append(out.Boards, boardInfo{
-			MAC6:    str(m, "mac6"),
-			Alias:   str(m, "alias"),
-			Sources: strSlice(m["sources"]),
-			Host:    str(m, "host"),
-			Port:    num(m, "port"),
-			USBPath: str(m, "usb_path"),
-			Fw:      str(m, "fw"),
+			MAC6:      str(m, "mac6"),
+			Alias:     str(m, "alias"),
+			Sources:   strSlice(m["sources"]),
+			Host:      str(m, "host"),
+			Port:      num(m, "port"),
+			USBPath:   str(m, "usb_path"),
+			Fw:        str(m, "fw"),
+			FwVersion: str(m, "fw_version"),
 		})
 	}
 	return nil, out, nil

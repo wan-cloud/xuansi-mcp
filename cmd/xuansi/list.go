@@ -90,8 +90,12 @@ func runList(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 		port, _ := bm["port"].(float64)
 		hp := dialEndpoint(host, ip, port)
 		fw, _ := bm["fw"].(string)
+		fwVer, _ := bm["fw_version"].(string)
 		if fw == "" {
 			fw = "-"
+		}
+		if fwVer != "" { // B10-T8c: semver beside the build id
+			fw = fwVer + "@" + fw
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", alias, mac6, srcs, hp, fw)
 	}

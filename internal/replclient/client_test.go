@@ -72,7 +72,7 @@ func TestHelloParsesAndCachesCaps(t *testing.T) {
 	if h.Role != "controller" {
 		t.Fatalf("role = %q, want controller", h.Role)
 	}
-	if h.Fw != "xuansi-fw v0.1.0" || h.FwBuild != "deadbee" || h.Chip != "ESP32-S3" || h.Lua != "Lua 5.4.9" || h.Idf != "v5.5.5" {
+	if h.Fw != "xuansi-fw v0.1.0" || h.FwBuild != "deadbee" || h.FwVersion != "0.2.0" || h.Chip != "ESP32-S3" || h.Lua != "Lua 5.4.9" || h.Idf != "v5.5.5" {
 		t.Fatalf("identity fields wrong: %#v", h)
 	}
 	if h.Reset != "usb" || !h.Fs {

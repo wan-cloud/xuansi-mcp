@@ -110,6 +110,7 @@ func defaultHello() map[string]any {
 		"api_version":  int64(1),
 		"fw":           "xuansi-fw v0.1.0",
 		"fw_build":     "deadbee",
+		"fw_version":   "0.2.0",
 		"idf":          "v5.5.5",
 		"chip":         "ESP32-S3",
 		"lua":          "Lua 5.4.9",

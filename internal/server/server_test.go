@@ -203,6 +203,9 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	if v, ok := res["fw_build"].(string); ok {
 		h.FwBuild = v
 	}
+	if v, ok := res["fw_version"].(string); ok { // B10-T8c
+		h.FwVersion = v
+	}
 	if v, ok := res["reset"].(string); ok {
 		h.Reset = v
 	}

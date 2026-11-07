@@ -216,10 +216,13 @@ type daemonBoard struct {
 // bootSight is one hello sighting's boot identity (B10-T8b): the fw's
 // NVS-persisted epoch, the fw build fingerprint, and when the daemon
 // saw it (gap_ms of the reboot event spans last-seen → re-detected).
+// B10-T8c adds fwVersion (semver; empty on older fw) for the
+// fw_version_prev/fw_version event pair.
 type bootSight struct {
-	epoch   uint32
-	fwBuild string
-	at      time.Time
+	epoch     uint32
+	fwBuild   string
+	fwVersion string
+	at        time.Time
 }
 
 // clientConn is one API connection: reader + writer goroutines over the
@@ -1084,11 +1087,13 @@ func boardView(b discover.Board) map[string]any {
 		"port":     b.Port,
 		"usb_path": b.USBPath,
 	}
-	fw := ""
+	fw, fwVer := "", ""
 	if b.Hello != nil {
 		fw = b.Hello.FwBuild
+		fwVer = b.Hello.FwVersion // B10-T8c: semver beside the build id (esp_app_desc face)
 	}
 	v["fw"] = fw
+	v["fw_version"] = fwVer
 	return v
 }
 
@@ -1777,7 +1782,9 @@ func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 //   - epoch 0 (older fw without boot_epoch) is "unknown": 0→0 never
 //     fires; 0→N (fw upgrade flash, which reboots) does — honest, the
 //     fw build pair in the payload says why;
-//   - a changed fw build adds fw_build_prev/fw_build to the payload;
+//   - a changed fw build adds fw_build_prev/fw_build to the payload
+//     (and a changed fw version the fw_version_prev/fw_version pair,
+//     B10-T8c — both follow the same on-change-only pattern);
 //   - baseline is in-memory only (v1): daemon restart = silent
 //     re-baseline (the board registry refresh gives continuity; no new
 //     durable state by ruling).
@@ -1785,7 +1792,7 @@ func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.He
 	now := time.Now()
 	s.mu.Lock()
 	prev := db.bootSeen
-	db.bootSeen = &bootSight{epoch: h.BootEpoch, fwBuild: h.FwBuild, at: now}
+	db.bootSeen = &bootSight{epoch: h.BootEpoch, fwBuild: h.FwBuild, fwVersion: h.FwVersion, at: now}
 	s.mu.Unlock()
 	if prev == nil || prev.epoch == h.BootEpoch {
 		return
@@ -1801,6 +1808,10 @@ func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.He
 	if h.FwBuild != prev.fwBuild {
 		data["fw_build_prev"] = prev.fwBuild
 		data["fw_build"] = h.FwBuild
+	}
+	if h.FwVersion != prev.fwVersion { // B10-T8c: same pattern — pair only on change (reflash across a wave bump)
+		data["fw_version_prev"] = prev.fwVersion
+		data["fw_version"] = h.FwVersion
 	}
 	s.logf("server: board %s rebooted (boot_epoch %d → %d, reset=%s, gap=%dms) — board.reboot event",
 		mac6, prev.epoch, h.BootEpoch, h.ResetReason, now.Sub(prev.at).Milliseconds())

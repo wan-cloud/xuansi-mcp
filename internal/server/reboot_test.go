@@ -32,11 +32,11 @@ func rebootBoard() discover.Board {
 
 // scriptHello pins one fake's hello reply (the epoch/fw/reset identity
 // a sighting will observe).
-func scriptHello(f *fakeCtl, epoch int64, fwBuild, reset string) {
+func scriptHello(f *fakeCtl, epoch int64, fwBuild, fwVersion, reset string) {
 	f.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		return map[string]any{
 			"protocol_ver": int64(5), "role": "controller", "fw": "xuansi-fw v0.1.0",
-			"fw_build": fwBuild, "fs": true,
+			"fw_build": fwBuild, "fw_version": fwVersion, "fs": true,
 			"boot_epoch": epoch, "reset": reset, "reset_reason": reset,
 		}, nil
 	})
@@ -65,7 +65,7 @@ func rebootEventData(t *testing.T, ev map[string]any) map[string]any {
 // full payload; same-build redial carries no fw keys.
 func TestBoardRebootEventOnEpochChange(t *testing.T) {
 	e := newEnv(t, nil, rebootBoard())
-	scriptHello(e.fakes["d75884"], 7, "aaabbb", "usb")
+	scriptHello(e.fakes["d75884"], 7, "aaabbb", "0.2.0", "usb")
 	c := dialSock(t, e.sock)
 
 	// warm touch: the tap's hello is the FIRST sighting (baseline).
@@ -92,7 +92,7 @@ func TestBoardRebootEventOnEpochChange(t *testing.T) {
 	// the board reboots (epoch 7 → 8, cause "panic"): the redial's
 	// hello detects it and the watcher hears board.reboot.
 	fresh := newFakeCtl()
-	scriptHello(fresh, 8, "aaabbb", "panic")
+	scriptHello(fresh, 8, "aaabbb", "0.2.0", "panic")
 	e.fakes["d75884"].markDead()
 	e.dmu.Lock()
 	e.fakes["d75884"] = fresh
@@ -115,18 +115,21 @@ func TestBoardRebootEventOnEpochChange(t *testing.T) {
 	if _, has := d["fw_build_prev"]; has {
 		t.Fatalf("same-build reboot carries fw keys: %#v", d)
 	}
+	if _, has := d["fw_version_prev"]; has {
+		t.Fatalf("same-version reboot carries fw_version keys: %#v", d)
+	}
 	if asStr(d["board"]) != "d75884" {
 		t.Fatalf("board = %#v", d["board"])
 	}
 	w.recvNone() // exactly one event
 }
 
-// TestBoardRebootEventFwChangeIncluded: a changed fw build between
-// sightings adds the fw pair to the payload (an epoch change that is
-// also a reflash says so).
+// TestBoardRebootEventFwChangeIncluded: a changed fw build (and, on a
+// version change, the fw_version pair) between sightings adds the pairs
+// to the payload (an epoch change that is also a reflash says so).
 func TestBoardRebootEventFwChangeIncluded(t *testing.T) {
 	e := newEnv(t, nil, rebootBoard())
-	scriptHello(e.fakes["d75884"], 3, "aaaaaaa", "power-on")
+	scriptHello(e.fakes["d75884"], 3, "aaaaaaa", "0.1.0", "power-on")
 	c := dialSock(t, e.sock)
 	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "rebootfw"})
 	if asMap(rep["error"]) != nil {
@@ -143,7 +146,7 @@ func TestBoardRebootEventFwChangeIncluded(t *testing.T) {
 	}
 
 	fresh := newFakeCtl()
-	scriptHello(fresh, 4, "ccccccc", "usb") // reflash + reboot: build AND epoch changed
+	scriptHello(fresh, 4, "ccccccc", "0.2.0", "usb") // reflash + reboot: build, version AND epoch changed
 	e.fakes["d75884"].markDead()
 	e.dmu.Lock()
 	e.fakes["d75884"] = fresh
@@ -157,6 +160,9 @@ func TestBoardRebootEventFwChangeIncluded(t *testing.T) {
 	if asStr(d["fw_build_prev"]) != "aaaaaaa" || asStr(d["fw_build"]) != "ccccccc" {
 		t.Fatalf("fw pair = %#v, want aaaaaaa → ccccccc", d)
 	}
+	if asStr(d["fw_version_prev"]) != "0.1.0" || asStr(d["fw_version"]) != "0.2.0" {
+		t.Fatalf("fw_version pair = %#v, want 0.1.0 → 0.2.0", d)
+	}
 }
 
 // TestBoardRedialSameEpochSilent: a redial whose hello reports the
@@ -164,7 +170,7 @@ func TestBoardRebootEventFwChangeIncluded(t *testing.T) {
 // epoch 0 (older fw without the key: unknown ≠ changed).
 func TestBoardRedialSameEpochSilent(t *testing.T) {
 	e := newEnv(t, nil, rebootBoard())
-	scriptHello(e.fakes["d75884"], 0, "oldfw00", "usb") // fw without boot_epoch
+	scriptHello(e.fakes["d75884"], 0, "oldfw00", "", "usb") // fw without boot_epoch/fw_version
 	c := dialSock(t, e.sock)
 	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "redial"})
 	if asMap(rep["error"]) != nil {
@@ -181,7 +187,7 @@ func TestBoardRedialSameEpochSilent(t *testing.T) {
 	}
 
 	fresh := newFakeCtl()
-	scriptHello(fresh, 0, "oldfw00", "usb") // same epoch 0 on the redial
+	scriptHello(fresh, 0, "oldfw00", "", "usb") // same epoch 0 on the redial
 	e.fakes["d75884"].markDead()
 	e.dmu.Lock()
 	e.fakes["d75884"] = fresh

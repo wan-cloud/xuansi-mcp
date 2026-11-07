@@ -65,12 +65,16 @@ func runStatus(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	port, _ := bm["port"].(float64)
 	usb, _ := bm["usb_path"].(string)
 	fw, _ := bm["fw"].(string)
+	fwVer, _ := bm["fw_version"].(string)
 	connected := "no"
 	if res["connected"] == true {
 		connected = "yes"
 	}
 	if fw == "" {
 		fw = "-"
+	}
+	if fwVer != "" { // B10-T8c: semver beside the build id
+		fw = fwVer + " @ " + fw
 	}
 
 	fmt.Fprintf(stdout, "board:     %s\n", name)
