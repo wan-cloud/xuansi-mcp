@@ -203,6 +203,23 @@ type daemonBoard struct {
 	// two concurrent captures would interleave their ch=1 stream
 	// chunks into each other's collectors on the shared warm link.
 	cameraMu sync.Mutex
+	// bootSeen is the last hello sighting's boot identity (B10-T8b):
+	// a CHANGED boot_epoch on the next sighting means the board
+	// rebooted while we were not connected (panic auto-reboot included
+	// — epoch change is epoch change regardless of cause) → the
+	// board.reboot event. Guarded by the Server mu (like tapped).
+	// In-memory only (v1 ruling): a daemon restart re-baselines
+	// silently — first sighting after restart never fires.
+	bootSeen *bootSight
+}
+
+// bootSight is one hello sighting's boot identity (B10-T8b): the fw's
+// NVS-persisted epoch, the fw build fingerprint, and when the daemon
+// saw it (gap_ms of the reboot event spans last-seen → re-detected).
+type bootSight struct {
+	epoch   uint32
+	fwBuild string
+	at      time.Time
 }
 
 // clientConn is one API connection: reader + writer goroutines over the
@@ -1743,7 +1760,51 @@ func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 	})
 	if h, err := ctl.Hello(false, "xuansi-daemon"); err == nil {
 		s.reg.Enrich(mac6, h)
+		s.noteBootSighting(mac6, db, h)
 	}
+}
+
+// noteBootSighting (B10-T8b): every tapped hello is a boot sighting.
+// A previously-seen board whose boot_epoch CHANGED rebooted while we
+// were away — panic auto-reboot included, cause-agnostic by design
+// (the fw's epoch is the arbiter) — so one synthetic "board" event
+// (kind board.reboot) rides the same broadcast the board's own events
+// take, reaching every watcher (MCP events ring included). Rules:
+//   - first-ever sighting = baseline only, never an event (no past to
+//     compare against);
+//   - same epoch on a redial = a mere reconnect (redial ≠ reboot §13)
+//     — no event, but the sighting time refreshes (last-seen moves);
+//   - epoch 0 (older fw without boot_epoch) is "unknown": 0→0 never
+//     fires; 0→N (fw upgrade flash, which reboots) does — honest, the
+//     fw build pair in the payload says why;
+//   - a changed fw build adds fw_build_prev/fw_build to the payload;
+//   - baseline is in-memory only (v1): daemon restart = silent
+//     re-baseline (the board registry refresh gives continuity; no new
+//     durable state by ruling).
+func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.HelloInfo) {
+	now := time.Now()
+	s.mu.Lock()
+	prev := db.bootSeen
+	db.bootSeen = &bootSight{epoch: h.BootEpoch, fwBuild: h.FwBuild, at: now}
+	s.mu.Unlock()
+	if prev == nil || prev.epoch == h.BootEpoch {
+		return
+	}
+	data := map[string]any{
+		"kind":         "board.reboot",
+		"board":        mac6,
+		"prev_epoch":   int64(prev.epoch),
+		"new_epoch":    int64(h.BootEpoch),
+		"reset_reason": h.ResetReason,
+		"gap_ms":       now.Sub(prev.at).Milliseconds(),
+	}
+	if h.FwBuild != prev.fwBuild {
+		data["fw_build_prev"] = prev.fwBuild
+		data["fw_build"] = h.FwBuild
+	}
+	s.logf("server: board %s rebooted (boot_epoch %d → %d, reset=%s, gap=%dms) — board.reboot event",
+		mac6, prev.epoch, h.BootEpoch, h.ResetReason, now.Sub(prev.at).Milliseconds())
+	s.broadcast(mac6, replclient.Event{Source: "board", Data: data})
 }
 
 // broadcast fans one board event out to the board's watchers.

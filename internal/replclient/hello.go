@@ -2,10 +2,12 @@ package replclient
 
 import (
 	"context"
+	"math"
 )
 
 // HelloInfo is the parsed hello result — the §2 full picture at
-// protocol_ver 5 (ver 4 + the B10-T1 fs chunked-transport trio).
+// protocol_ver 5 (ver 4 + the B10-T1 fs chunked-transport trio, plus
+// the B10-T8b boot-identity pair boot_epoch/reset_reason).
 // Daemon-relevant fields are surfaced as Go
 // values; the nested snapshots (net/heap/gc/caps) stay maps, faithful
 // to the wire shape.
@@ -24,6 +26,16 @@ type HelloInfo struct {
 	Heap        map[string]any
 	Gc          map[string]any
 	Caps        map[string]any // capability map — same dict as the caps op
+
+	// B10-T8b boot identity: BootEpoch is the fw's NVS-persisted
+	// per-boot counter (0 = older fw without the key — the reboot
+	// detector treats 0 as "unknown", never as a reboot signal on its
+	// own). ResetReason is the canonical esp_reset_reason mapping name;
+	// on fw that predates the reset_reason key it falls back to the
+	// legacy reset key's value (same single mapping table on the fw
+	// side, so they are equal whenever both exist).
+	BootEpoch   uint32
+	ResetReason string
 }
 
 // parseHello tolerates missing keys (older protocol faces): absent
@@ -43,6 +55,13 @@ func parseHello(res map[string]any) *HelloInfo {
 	h.Net, _ = res["net"].(map[string]any)
 	h.Heap, _ = res["heap"].(map[string]any)
 	h.Gc, _ = res["gc"].(map[string]any)
+	if be, ok := res["boot_epoch"].(int64); ok && be >= 0 && be <= math.MaxUint32 {
+		h.BootEpoch = uint32(be)
+	}
+	h.ResetReason, _ = res["reset_reason"].(string)
+	if h.ResetReason == "" {
+		h.ResetReason = h.Reset // legacy key, same fw-side mapping table
+	}
 	if c, ok := res["caps"].(map[string]any); ok {
 		h.Caps = c
 	}

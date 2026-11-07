@@ -37,7 +37,7 @@ import (
 
 const (
 	expectProtocolVer = int64(5)  // B10-T1: fs chunked-transport overlay era
-	expectFwBuild     = "db1fd12" // T8 fix round canonical (camera switch self-deadlock fix + settle + silent-panic + RTC WDT backstop)
+	expectFwBuild     = "fbfef59" // B10-T8b canonical (hello boot identity + settle + silent-panic + RTC WDT backstop; supersedes the T8 fix round)
 
 	// HOUSE RULE (B10-T1 fix rounds 1-2): a fw canonical bump rebinds EVERY
 	// *FwBuild constant in hil/ IN THE SAME COMMIT — expectFwBuild/b6FwBuild/
@@ -87,6 +87,8 @@ func main() {
 		os.Exit(runB9Camera(*attempt, *daemonBin, *runDir))
 	case "b10t5":
 		os.Exit(runB10T5(*attempt, *daemonBin, *runDir))
+	case "b10t8b":
+		os.Exit(runB10T8B(*attempt, *daemonBin, *runDir))
 	case "b10t7aim":
 		os.Exit(runB10T7Aim(*round, *daemonBin, *runDir, *outDir))
 	case "b10t7":
@@ -94,7 +96,7 @@ func main() {
 	case "spawnidle":
 		os.Exit(runSpawnIdle(*attempt, *daemonBin, *runDir))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|b10t7aim|b10t7|spawnidle [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR] [-round N] [-outdir DIR] [-ref x,y,w,h] [-tol PX]")
+		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|b10t7aim|b10t7|b10t8b|spawnidle [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR] [-round N] [-outdir DIR] [-ref x,y,w,h] [-tol PX]")
 		os.Exit(2)
 	}
 }
