@@ -37,7 +37,7 @@ import (
 
 const (
 	expectProtocolVer = int64(5)  // B10-T1: fs chunked-transport overlay era
-	expectFwBuild     = "0c7440b" // fw repo main HEAD at the B10-T1 fix-round-1 canonical re-flash
+	expectFwBuild     = "36df04a" // B10-T2 canonical (interp delivery; wasm track)
 
 	// HOUSE RULE (B10-T1 fix rounds 1-2): a fw canonical bump rebinds EVERY
 	// *FwBuild constant in hil/ IN THE SAME COMMIT — expectFwBuild/b6FwBuild/

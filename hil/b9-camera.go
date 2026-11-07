@@ -85,7 +85,7 @@ import (
 
 const (
 	b9Board   = "d75884"  // the bench board (GC2145 camera on the 14-pin gate)
-	b9FwBuild = "0c7440b" // B10-T1 fix-round-1 canonical re-flash: fw repo main HEAD, protocol_ver 5
+	b9FwBuild = "36df04a" // B10-T2 canonical (interp delivery; wasm track)
 	b9Holder  = "b9-t5"   // custom lease holder for this run
 	b9TCPEndp = "xuansi-d75884.local:7777"
 )
