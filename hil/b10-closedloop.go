@@ -509,6 +509,26 @@ func maxF(a, b float64) float64 {
 	return b
 }
 
+func minF(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// b10t7RefBox parses the -ref geometry "x,y,w,h" (zeros when absent).
+func b10t7RefBox(refGeom string) (float64, float64, float64, float64) {
+	parts := strings.Split(refGeom, ",")
+	if len(parts) != 4 {
+		return 0, 0, 0, 0
+	}
+	v := make([]float64, 4)
+	for i, p := range parts {
+		v[i], _ = strconv.ParseFloat(strings.TrimSpace(p), 64)
+	}
+	return v[0], v[1], v[2], v[3]
+}
+
 // runB10T7Aim is one interactive aim round (task steps 1-2).
 func runB10T7Aim(round int, daemonBin, runDir, outDir string) int {
 	h := &harness{}
@@ -657,6 +677,14 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 		stalled = true
 	}
 	regs, text, okA := b10t7Analyze(b, ctx, "min_area=800")
+	if okA && len(regs) > 0 {
+		// AWB settler: the second analyze is the measurement (attempt 7's
+		// finding - a fresh monochrome field reads crushed on the first)
+		if rs2, _, ok2 := b10t7Analyze(b, ctx, "min_area=800"); ok2 && len(rs2) > 0 {
+			regs = rs2
+			h.note("S3: AWB settler pass -> settled regions used")
+		}
+	}
 	if !okA {
 		h.check(false, fmt.Sprintf("S3 analyze on the red screen (text=%.120s)", text))
 		if strings.Contains(text, "context deadline exceeded") || strings.Contains(text, "timeout") {
@@ -706,10 +734,16 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	// off->draw->on wedged the conn task for minutes in loop attempt 1),
 	// draw the pattern (SPI unconstrained), power shot (JPEG evidence +
 	// sensor warm), then analyze down a threshold ladder (the pattern
-	// persists on the panel - no redraw between rungs). A stall anywhere
+	// persists on the panel - no redraw between rungs). On the first
+	// resolving rung ONE more analyze runs and ITS region is the
+	// measurement: the GC2145's AWB converges over seconds and a fresh
+	// monochrome field reads crushed on the first analyze (attempt 7:
+	// a full RED screen read r/g/b=(255,234,237)) - the settled pass
+	// measures, the first settles. Region selection matches the
+	// REFERENCE SCREEN BBOX (the area-dominant region can be an
+	// AWB-wrecked background blob - attempt 7's S4b). A stall anywhere
 	// awaits the conn-task unwind and reports the phase failed WITHOUT
-	// poisoning the phases after it. Returns the dominant region of the
-	// first rung that resolves.
+	// poisoning the phases after it. Returns the screen region.
 	phase := func(label, drawCode string, shotName string, thrs []int, baseCfg string) (b10t7Reg, int, bool) {
 		if _, text, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_board_op",
 			map[string]any{"board": b10t7Board, "op": "camera.off"}); isErr {
@@ -723,8 +757,33 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 			return b10t7Reg{}, 0, false
 		}
 		if !b10t7Shot(h, b, ctx, filepath.Join(outDir, shotName)) {
+			// the documented transient class: esp_camera_init rc=-1 at
+			// boot-churn margins retries clean (diag round: B9+B10 both,
+			// ~1-2 per 15 cold inits) - one retry, honestly noted
 			b10t7AwaitBoard(h, b, ctx, "after "+label+" stalled capture")
-			return b10t7Reg{}, 0, false
+			h.note("%s: transient init-fail retry (documented class)", label)
+			b.call(ctx, 30*time.Second, "xuansi_board_op", map[string]any{"board": b10t7Board, "op": "camera.off"})
+			time.Sleep(2 * time.Second)
+			if !b10t7Shot(h, b, ctx, filepath.Join(outDir, shotName)) {
+				b10t7AwaitBoard(h, b, ctx, "after "+label+" retry also stalled")
+				return b10t7Reg{}, 0, false
+			}
+		}
+		pickScr := func(rs []b10t7Reg) b10t7Reg { // best overlap with the ref screen bbox
+			if len(rs) == 0 {
+				return b10t7Reg{}
+			}
+			rx, ry, rw, rh := b10t7RefBox(refGeom)
+			best, bestOv := rs[0], -1.0
+			for _, r := range rs {
+				ox := maxF(0, minF(r.x+r.w, rx+rw)-maxF(r.x, rx))
+				oy := maxF(0, minF(r.y+r.h, ry+rh)-maxF(r.y, ry))
+				ov := (ox * oy) / maxF(1, r.w*r.h)
+				if ov > bestOv {
+					best, bestOv = r, ov
+				}
+			}
+			return best
 		}
 		for _, thr := range thrs {
 			rs, t, okA := b10t7Analyze(b, ctx, fmt.Sprintf("%s,threshold=%d", baseCfg, thr))
@@ -741,10 +800,18 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 				h.note("%s thr=%d: 0 regions (ladder continues)", label, thr)
 				continue
 			}
-			for i, r := range rs {
-				h.note("  %s thr=%d region[%d] %s", label, thr, i, r.String())
+			settled := pickScr(rs)
+			rs2, _, ok2 := b10t7Analyze(b, ctx, fmt.Sprintf("%s,threshold=%d", baseCfg, thr)) // AWB settler
+			if ok2 && len(rs2) > 0 {
+				settled = pickScr(rs2)
 			}
-			return rs[0], thr, true
+			for i, r := range rs {
+				h.note("  %s thr=%d region[%d] %s%s", label, thr, i, r.String(),
+					map[bool]string{true: " <= screen", false: ""}[r == settled])
+			}
+			h.note("  %s settled measurement %s (settler pass %s)", label, settled.String(),
+				map[bool]string{true: "used", false: "unavailable"}[ok2 && len(rs2) > 0])
+			return settled, thr, true
 		}
 		h.check(false, fmt.Sprintf("%s: no rung of the threshold ladder %v resolved a region", label, thrs))
 		return b10t7Reg{}, 0, false
@@ -754,7 +821,7 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	rbVerdict, rbDetail := "AMBIGUOUS", ""
 	rbRatio, evBlue := 0.0, 0.0
 	evRed := 0.0
-	var sigs []bool // collected R/B signals (true = red-drawn measured red-dominant)
+	var sigs []bool // DECISIVE signals (>=2x): true = faithful color mapping (drawn color measured as drawn)
 	if sigRed >= 0 {
 		sigs = append(sigs, sigRed == 1)
 		evRed = screen.r / maxF(screen.b, 1)
@@ -763,7 +830,11 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	// S4a: red_rect — the brief's primary: the lit region IS the drawn red
 	// (black surround; a dark-room AE can wash the panel's black above the
 	// threshold and dilute the ratio - that is why S3's full-red carries
-	// signal #1)
+	// signal #1). AWB whitens a SMALL field harder (attempt 8/9: the rect
+	// reads ~(255,247,243), directional but not 2x-decisive) - only
+	// DECISIVE orientations append a signal; directional-but-crushed is
+	// noted, never counted (attempt 9's SWAPPED was this bug plus the
+	// blue-mirror polarity inversion - both fixed, honest history kept).
 	if !stalled {
 		if r, thr, okP := phase("S4a red_rect", "return bench.wasm.call('st7789','pattern','red_rect')",
 			fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-redrect.jpg", attempt),
@@ -771,12 +842,17 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 			if r.r > 0 || r.b > 0 {
 				rbRatio = r.r / maxF(r.b, 1)
 				rbDetail += fmt.Sprintf(" red_rect@%d r=%d b=%d", thr, int(r.r), int(r.b))
-				redDom := r.r >= 2*r.b && r.r > 60
-				sigs = append(sigs, redDom)
-				if r.b >= 2*r.r && r.b > 60 {
+				switch {
+				case r.r >= 2*r.b && r.r > 60:
+					sigs = append(sigs, true)
+					h.note("S4a signal: DECISIVE red-dominant")
+				case r.b >= 2*r.r && r.b > 60:
+					sigs = append(sigs, false)
 					rbDetail += " RED-DRAWN MEASURES BLUE-DOMINANT"
+					h.note("S4a signal: DECISIVE blue-dominant (red-drawn!)")
+				default:
+					h.note("S4a signal: directional r/b=%.2f but AWB-crushed (<2x) - noted, NOT counted", rbRatio)
 				}
-				h.note("S4a signal: red-dominant=%v", redDom)
 			}
 		} else {
 			stalled = true
@@ -784,16 +860,24 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	} else {
 		h.note("S4a red_rect skipped: the camera stalled earlier this run (cycle budget spent)")
 	}
-	// S4b: full-screen clear BLUE - the mirror signal (blue-drawn
-	// measuring red-dominant would confirm a swap from the other side)
+	// S4b: full-screen clear BLUE - the mirror signal: under NORMAL the
+	// blue-drawn screen measures blue-dominant (attempt 9 settled:
+	// (12,248,255), 21x separation); under SWAP it would measure
+	// RED-dominant. blueDom IS the faithful-mapping signal (attempt 9's
+	// machine-SWAPPED was the !blueDom polarity inversion - fixed).
 	if !stalled {
 		if r, thr, okP := phase("S4b clear-BLUE", "return bench.wasm.call('st7789','clear',0x001F)",
 			fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-clear-blue.jpg", attempt),
 			[]int{60, 25, 15, 10}, "min_area=2000"); okP {
 			evBlue = r.r / maxF(r.b, 1)
 			blueDom := r.b >= 2*r.r
-			sigs = append(sigs, !blueDom) // stored in red-drawn-measures-red polarity
-			h.note("S4b clear-BLUE@%d: %s ratio r/b=%.2f blue-dominant=%v (signal polarity: red-drawn-measures-red=%v)", thr, r.String(), evBlue, blueDom, !blueDom)
+			if blueDom {
+				sigs = append(sigs, true) // faithful: drawn blue measured blue
+			} else if r.r >= 2*r.b {
+				sigs = append(sigs, false) // drawn blue measured RED = swap
+			}
+			h.note("S4b clear-BLUE@%d: %s ratio r/b=%.2f blue-dominant=%v (faithful-mapping signal=%v)",
+				thr, r.String(), evBlue, blueDom, blueDom)
 		} else {
 			stalled = true
 		}
@@ -811,23 +895,54 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	} else {
 		h.note("S4c quad skipped: the camera stalled earlier this run (cycle budget spent)")
 	}
-	// N-signal verdict: every collected signal agreeing red-drawn->red
-	// = NORMAL (>=2 required); every one flipped = SWAPPED; anything
-	// mixed (or <2 collected) = AMBIGUOUS with all numbers recorded.
+	// N-signal verdict. DECISIVE signals (>=2x either way) decide alone
+	// when >=2 agree; a single decisive decides only with UNANIMOUS
+	// directional corroboration (the GC2145's AWB clamps full-field red
+	// to ~1.8x - measured twice - so the red mirror is often directional-
+	// only; the blue mirror measured 21x. No inverted measurement may
+	// stand: any conflict = AMBIGUOUS with all numbers recorded).
 	allTrue, allFalse := len(sigs) >= 2, len(sigs) >= 2
 	for _, s := range sigs {
 		allTrue = allTrue && s
 		allFalse = allFalse && !s
+	}
+	dirs := []bool{} // directional orientations: true = faithful (drawn color measured stronger)
+	if evRed > 1 {
+		dirs = append(dirs, true)
+	} else if evRed > 0 && evRed < 1 {
+		dirs = append(dirs, false)
+	}
+	if rbRatio > 1 {
+		dirs = append(dirs, true)
+	} else if rbRatio > 0 && rbRatio < 1 {
+		dirs = append(dirs, false)
+	}
+	if evBlue > 0 {
+		dirs = append(dirs, evBlue < 1) // blue mirror: faithful = r/b < 1
+	}
+	dirsAgree := len(dirs) > 0
+	for _, d := range dirs {
+		dirsAgree = dirsAgree && d
+	}
+	dirsConflict := false
+	for _, d := range dirs {
+		if !d {
+			dirsConflict = true
+		}
 	}
 	switch {
 	case allTrue:
 		rbVerdict = "NORMAL"
 	case allFalse:
 		rbVerdict = "SWAPPED"
+	case len(sigs) == 1 && sigs[0] && dirsAgree && !dirsConflict:
+		rbVerdict = "NORMAL"
+	case len(sigs) == 1 && !sigs[0] && dirsConflict && !dirsAgree:
+		rbVerdict = "SWAPPED"
 	}
 	h.check(rbVerdict != "AMBIGUOUS",
-		fmt.Sprintf("S4 R/B VERDICT from %d collected signal(s) %v (red_rect=%.0f clear-RED=%.0f clear-BLUE=%.0f): %s",
-			len(sigs), sigs, rbRatio, evRed, evBlue, rbVerdict))
+		fmt.Sprintf("S4 R/B VERDICT from %d decisive signal(s) %v + %d directional corroboration(s) (clearRED=%.2f red_rect=%.2f clearBLUE=%.2f): %s",
+			len(sigs), sigs, len(dirs), evRed, rbRatio, evBlue, rbVerdict))
 	fmt.Printf("RB_VERDICT: %s %s | red_rect r/b=%.2f | clear-RED r/b=%.2f | clear-BLUE r/b=%.2f\n",
 		rbVerdict, rbDetail, rbRatio, evRed, evBlue)
 
