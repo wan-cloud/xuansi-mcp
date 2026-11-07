@@ -68,7 +68,7 @@ import (
 
 const (
 	b8t2Board   = "d75884"  // the bench board
-	b8t2FwBuild = "36df04a" // B10-T2 canonical (interp delivery; wasm track)
+	b8t2FwBuild = "c38b08c" // B10-T2 fix-round-1 canonical (interp delivery; VM-before-wifi boot fix)
 	b8t2Holder  = "b8-t2"   // custom lease holder for this run
 	b8t2TCPEndp = "xuansi-d75884.local:7777"
 	b8t2Script  = "b8t2res" // the S3 resident script's name

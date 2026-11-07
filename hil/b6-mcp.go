@@ -99,7 +99,7 @@ import (
 
 const (
 	b6Board    = "d75884"  // the bench board (pin map v1: GPIO1<->GPIO2 wired)
-	b6FwBuild  = "36df04a" // B10-T2 canonical (interp delivery; wasm track)
+	b6FwBuild  = "c38b08c" // B10-T2 fix-round-1 canonical (interp delivery; VM-before-wifi boot fix)
 	b6Holder   = "b6-hil"  // custom lease holder for this run
 	b6TCPEndp  = "xuansi-d75884.local:7777"
 	b6Resource = "xuansi://boards/" + b6Board + "/events"
