@@ -16,9 +16,19 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -269,7 +279,8 @@ type opResultOut = map[string]any
 // face seeds its name-claiming with it so no per-board tool can ever
 // displace a static one (server_test.go pins the served list to the
 // same names). B8 appends fs_rm + driver_pull after capture, then
-// session_reset after those: the existing 17 keep their positions
+// session_reset after those; B9 appended camera_shot; B10 task 5
+// appends driver_fetch: the existing tools keep their positions
 // (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
@@ -293,6 +304,7 @@ var staticToolNames = []string{
 	"xuansi_driver_pull",
 	"xuansi_session_reset",
 	"xuansi_camera_shot",
+	"xuansi_driver_fetch",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -407,6 +419,11 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 			"camera.status and camera.off are also reachable through xuansi_board_op; camera.capture via xuansi_board_op returns the board's metadata reply but its stream frames are dropped daemon-side — THIS tool is the consuming face. " +
 			"Holder semantics: " + holderDesc + ".",
 	}, ts.cameraShot)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "xuansi_driver_fetch",
+		Description: "Fetch one driver-module version from a public module index (task 3's layout: index.json + modules/<name>/<ver>/ artifacts; default " + defaultIndexURL + ") into the daemon-side driver workspace — the fetch half of the module pipeline, xuansi_driver_push deploys what this stores. Every file is downloaded and verified (sha256 + byte count against the index) BEFORE anything is written: a mid-download failure leaves the workspace untouched. Stores drivers/<name>@<version>.<ext> plus one manifest entry (kind from the index; NOT activating — a fresh fetch has no active version, so state version explicitly on its first push). Binary-safe — this is the storing path for .wasm/.aot artifacts (xuansi_ws_put's content field is a JSON string, fit for Lua text only). version omitted = the index's highest for the name.",
+	}, ts.driverFetch)
 
 	ts.registerCapture(srv)
 }
@@ -663,4 +680,314 @@ func obj(v any) map[string]any {
 func arr(v any) []any {
 	a, _ := v.([]any)
 	return a
+}
+
+// ---------------------------------------------------------------------------
+// xuansi_driver_fetch (B10 task 5: the fetch leg — module index → the
+// daemon-side driver workspace)
+
+// defaultIndexURL is the public driver-module index (task 3's repo,
+// wan-cloud/xuansi-drivers, live): index.json at the root,
+// modules/<name>/<ver>/ artifacts at repo-relative paths.
+const defaultIndexURL = "https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/index.json"
+
+// fetch bounds: the index itself is capped (a runaway URL must not
+// buffer unbounded), each artifact is capped at 4 MiB (well past any
+// plausible module — and anything above the daemon's 1 MiB wire-frame
+// cap could not cross to a board anyway), and the whole fetch at
+// 8 MiB so a many-file index cannot balloon the staging buffer.
+const (
+	fetchIndexMax = 1 << 20 // 1 MiB
+	fetchFileMax  = 4 << 20 // per artifact
+	fetchTotalMax = 8 << 20 // whole fetch
+)
+
+// fetchHTTP is the fetch leg's shared client — stdlib net/http only
+// (the repo's five-dependency whitelist stays five).
+var fetchHTTP = &http.Client{Timeout: 60 * time.Second}
+
+type driverFetchIn struct {
+	Name     string `json:"name" jsonschema:"module name from the index, lowercase [a-z0-9_-]+ (e.g. \"hello\", \"ledwatch\")"`
+	Version  string `json:"version,omitempty" jsonschema:"omit to fetch the index's HIGHEST version of the name; an explicit value picks exactly it"`
+	IndexURL string `json:"index_url,omitempty" jsonschema:"the index.json URL; omit for the default https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/index.json"`
+}
+
+// fetchFileOut is one landed artifact's record.
+type fetchFileOut struct {
+	Path   string `json:"path" jsonschema:"workspace-relative path of the stored artifact (drivers/<name>@<version>.<ext>)"`
+	Sha256 string `json:"sha256" jsonschema:"sha256, verified against the index before anything was written"`
+	Bytes  int    `json:"bytes" jsonschema:"byte count, verified against the index before anything was written"`
+}
+
+type driverFetchOut struct {
+	Name    string         `json:"name"`
+	Version string         `json:"version"`
+	Kind    string         `json:"kind" jsonschema:"the index's module kind (e.g. driver, algorithm) — persisted to the workspace manifest's Kind"`
+	Files   []fetchFileOut `json:"files" jsonschema:"one entry per landed artifact, in index order"`
+	Bytes   int            `json:"bytes" jsonschema:"total stored bytes across files"`
+}
+
+// fetchIndex / fetchModule / fetchFileRef mirror task 3's index schema
+// (index_ver 1): one entry per module version; files are repo-relative
+// references with sha256 + byte count.
+type fetchIndex struct {
+	IndexVer int           `json:"index_ver"`
+	Modules  []fetchModule `json:"modules"`
+}
+
+type fetchModule struct {
+	Name    string         `json:"name"`
+	Kind    string         `json:"kind"`
+	Version string         `json:"version"`
+	Files   []fetchFileRef `json:"files"`
+}
+
+type fetchFileRef struct {
+	Path   string `json:"path"`
+	Sha256 string `json:"sha256"`
+	Bytes  int64  `json:"bytes"`
+}
+
+// stagedFile is one fully-verified artifact awaiting the commit phase.
+type stagedFile struct {
+	ext  string
+	body []byte
+	sha  string
+}
+
+// fetchGet GETs url with the fetch client, refusing bodies above max
+// (the index cap; for artifacts, declared bytes + 1 — a longer body is
+// a size mismatch, not a buffer).
+func fetchGet(ctx context.Context, url string, max int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := fetchHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", res.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(res.Body, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("body exceeds %d bytes", max)
+	}
+	return b, nil
+}
+
+// fetchRefPathOK gates one index file reference: repo-relative, no
+// traversal, no backslash, no NUL — a hostile index must not steer the
+// fetch outside its own origin.
+func fetchRefPathOK(p string) bool {
+	return p != "" && !strings.HasPrefix(p, "/") && !strings.Contains(p, "..") &&
+		!strings.Contains(p, "\\") && !strings.Contains(p, "\x00")
+}
+
+// cmpVer orders dotted version strings: segments compare numerically
+// when both parse ("1.10.0" > "1.2.0"), lexically otherwise
+// ("1.0.0-rc" style); a missing segment reads as 0 ("1.0" == "1.0.0").
+func cmpVer(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		av, bv := "0", "0"
+		if i < len(as) {
+			av = as[i]
+		}
+		if i < len(bs) {
+			bv = bs[i]
+		}
+		an, aerr := strconv.Atoi(av)
+		bn, berr := strconv.Atoi(bv)
+		switch {
+		case aerr == nil && berr == nil:
+			if an != bn {
+				if an < bn {
+					return -1
+				}
+				return 1
+			}
+		default:
+			if av != bv {
+				if av < bv {
+					return -1
+				}
+				return 1
+			}
+		}
+	}
+	return 0
+}
+
+// driverFetch pulls one module version from a public index into the
+// workspace (the fetch half of the B10 module pipeline: fetch stores,
+// the EXISTING xuansi_driver_push deploys). Download-atomicity (Review
+// Focus #5): EVERY file is downloaded and verified (sha256 + byte
+// count against the index) in memory BEFORE the first durable write —
+// a mid-download failure leaves zero manifest entries and no half
+// state in the workspace. The commit then writes each artifact
+// atomically (writeDurableFile) and records ONE manifest entry (Kind
+// from the index; storing is NOT activating, like ws_put — a push
+// activates). Binary-safe by construction: this is the storing path
+// for .wasm/.aot artifacts (ws_put's content is a JSON string, fit
+// for Lua text only). Never crosses to the daemon.
+func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, in driverFetchIn) (*mcpsdk.CallToolResult, driverFetchOut, error) {
+	if !wsNameRe.MatchString(in.Name) {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: name must match [a-z0-9_-]+, got %q", in.Name)
+	}
+	if in.Version != "" && !wsVerRe.MatchString(in.Version) {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: version must match [a-z0-9.]+, got %q", in.Version)
+	}
+	raw := in.IndexURL
+	if raw == "" {
+		raw = defaultIndexURL
+	}
+	iu, uerr := url.Parse(raw)
+	if uerr != nil || (iu.Scheme != "http" && iu.Scheme != "https") || iu.Host == "" {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: index_url must be an http(s) URL, got %q", raw)
+	}
+
+	// 1) the index
+	body, gerr := fetchGet(ctx, iu.String(), fetchIndexMax)
+	if gerr != nil {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: index %s: %v", raw, gerr)
+	}
+	var idx fetchIndex
+	if err := json.Unmarshal(body, &idx); err != nil {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: index %s: not valid JSON: %v", raw, err)
+	}
+	if idx.IndexVer != 1 {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: index %s: unsupported index_ver %d (want 1)", raw, idx.IndexVer)
+	}
+
+	// 2) module + version selection (omitted version = the index's
+	// HIGHEST for the name)
+	var vers []string
+	var chosen *fetchModule
+	for i := range idx.Modules {
+		m := &idx.Modules[i]
+		if m.Name != in.Name {
+			continue
+		}
+		vers = append(vers, m.Version)
+		switch {
+		case in.Version != "":
+			if m.Version == in.Version {
+				chosen = m
+			}
+		case chosen == nil || cmpVer(m.Version, chosen.Version) > 0:
+			chosen = m
+		}
+	}
+	if chosen == nil {
+		if len(vers) == 0 {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: module %q not in index %s (%d modules)", in.Name, raw, len(idx.Modules))
+		}
+		sort.Strings(vers)
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s: version %q not in index (have %s)", in.Name, in.Version, strings.Join(vers, ", "))
+	}
+	if len(chosen.Files) == 0 {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: index entry lists no files", in.Name, chosen.Version)
+	}
+
+	// 3) stage + verify EVERYTHING (memory only — nothing touches the
+	// workspace until all of it verified)
+	var total int64
+	staged := make([]stagedFile, 0, len(chosen.Files))
+	seen := map[string]string{} // ext → declared path (one artifact per extension slot)
+	for _, f := range chosen.Files {
+		if !fetchRefPathOK(f.Path) {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file path %q must be repo-relative, without \"..\"", in.Name, chosen.Version, f.Path)
+		}
+		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(f.Path), "."))
+		if ext != "lua" && ext != "wasm" && ext != "aot" {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %q has unsupported extension %q (want .lua/.wasm/.aot)", in.Name, chosen.Version, f.Path, ext)
+		}
+		if prev, dup := seen[ext]; dup {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: files %q and %q share the .%s slot — the workspace stores one artifact per extension", in.Name, chosen.Version, prev, f.Path, ext)
+		}
+		seen[ext] = f.Path
+		if f.Bytes <= 0 || f.Bytes > fetchFileMax {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares %d bytes (outside 1..%d)", in.Name, chosen.Version, f.Path, f.Bytes, fetchFileMax)
+		}
+		if total+f.Bytes > fetchTotalMax {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: total %d bytes exceeds the %d-byte fetch cap", in.Name, chosen.Version, total+f.Bytes, fetchTotalMax)
+		}
+		fu, ferr := iu.Parse(f.Path) // relative reference → resolved against the index's own directory
+		if ferr != nil || fu.Scheme != iu.Scheme || fu.Host != iu.Host {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file path %q does not resolve inside the index origin", in.Name, chosen.Version, f.Path)
+		}
+		fbody, derr := fetchGet(ctx, fu.String(), f.Bytes+1)
+		if derr != nil {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: %v", in.Name, chosen.Version, f.Path, derr)
+		}
+		if int64(len(fbody)) != f.Bytes {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: got %d bytes, index says %d", in.Name, chosen.Version, f.Path, len(fbody), f.Bytes)
+		}
+		sha := sha256hex(fbody)
+		if sha != strings.ToLower(f.Sha256) {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: sha256 %s != index %s", in.Name, chosen.Version, f.Path, sha, f.Sha256)
+		}
+		total += f.Bytes
+		staged = append(staged, stagedFile{ext: ext, body: fbody, sha: sha})
+	}
+
+	// 4) commit — everything verified; now the durable writes and ONE
+	// manifest cycle, the whole phase under wsMu like every other
+	// workspace mutation
+	wsMu.Lock()
+	defer wsMu.Unlock()
+	if err := os.MkdirAll(filepath.Join(ts.ws.root, "drivers"), 0o755); err != nil {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: %v", err)
+	}
+	for _, s := range staged {
+		p := ts.ws.driverPath(in.Name, chosen.Version, s.ext)
+		if err := writeDurableFile(p, s.body, 0o644); err != nil {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: %v", err)
+		}
+	}
+	m, err := loadManifest(ts.ws.manifestPath())
+	if err != nil {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: %v", err)
+	}
+	e := m.entry(in.Name)
+	e.Kind = chosen.Kind
+	fm := e.Files[chosen.Version] // push footprints survive a re-fetch, like a re-put
+	// the Files entry records the artifact a bare push deploys — the
+	// same .lua > .wasm > .aot priority driverPush resolves with
+priority:
+	for _, pri := range pushExts {
+		for _, s := range staged {
+			if s.ext == pri {
+				fm.Sha256, fm.Size = s.sha, len(s.body)
+				break priority
+			}
+		}
+	}
+	e.Files[chosen.Version] = fm // Active deliberately untouched
+	m.Drivers[in.Name] = e
+	if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: %v", err)
+	}
+
+	out := driverFetchOut{
+		Name: in.Name, Version: chosen.Version, Kind: chosen.Kind,
+		Files: make([]fetchFileOut, 0, len(staged)), Bytes: int(total),
+	}
+	for _, s := range staged {
+		out.Files = append(out.Files, fetchFileOut{
+			Path:   "drivers/" + in.Name + "@" + chosen.Version + "." + s.ext,
+			Sha256: s.sha, Bytes: len(s.body),
+		})
+	}
+	return nil, out, nil
 }

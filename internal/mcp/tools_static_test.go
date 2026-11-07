@@ -686,6 +686,7 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_driver_pull":   {"board", "name"},
 	"xuansi_session_reset": {"board"},
 	"xuansi_camera_shot":   {"board"},
+	"xuansi_driver_fetch":  {"name"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static

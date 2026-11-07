@@ -24,9 +24,11 @@ package mcp
 // xuansi_ws_list / xuansi_ws_get read the store back, and
 // xuansi_driver_push runs the gated pipeline
 //
-//	read file → --@api gate → caps → fs_write (B10-T1: >16KB rides the
-//	chunked transport — fat .aot-era drivers push whole) → fs_read back
-//	→ sha256 compare → manifest
+//	read file → load gate (B10 task 5, branched by artifact: .lua →
+//	--@api vs bench.api_version; .wasm/.aot → module magic) →
+//	fs_write (B10-T1: >16KB rides the chunked transport — fat
+//	.aot-era drivers push whole) → fs_read back → sha256 compare →
+//	manifest
 //
 // The manifest records the push ONLY after the read-back verifies
 // byte-exact — a corrupt board write never becomes history. B8 task 1
@@ -34,6 +36,7 @@ package mcp
 // file + Active cleared, footprints kept), after the capture tool.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -90,14 +93,18 @@ func newWSState(root string) *wsState {
 
 func (w *wsState) manifestPath() string { return filepath.Join(w.root, "manifest.json") }
 
-// driverPath is drivers/<name>@<ver>.lua on sanitized parts only.
-func (w *wsState) driverPath(name, ver string) string {
-	return filepath.Join(w.root, "drivers", name+"@"+ver+".lua")
+// driverPath is drivers/<name>@<ver>.<ext> on sanitized parts only —
+// ext is one of the fixed artifact set (lua/wasm/aot, pushExts), never
+// raw input, so "../evil" & friends never reach the filesystem.
+func (w *wsState) driverPath(name, ver, ext string) string {
+	return filepath.Join(w.root, "drivers", name+"@"+ver+"."+ext)
 }
 
 // drvBoardPath is the board's EFFECTIVE driver file the push
-// overwrites — always /drv/<sanitized name>.lua, never raw input.
-func drvBoardPath(name string) string { return "/drv/" + name + ".lua" }
+// overwrites — always /drv/<sanitized name>.<ext>, never raw input.
+// B10 task 5: the extension is the artifact's own (a fetched .wasm
+// deploys to /drv/<name>.wasm — the fw wasm loader's lookup path).
+func drvBoardPath(name, ext string) string { return "/drv/" + name + "." + ext }
 
 // name/version sanitization (the path-traversal guard): name
 // [a-z0-9_-]+, version [a-z0-9.]+; anything else is a local api-class
@@ -155,6 +162,52 @@ func firstWords(line string) string {
 	}
 	return line
 }
+
+// B10 module magics, byte-for-byte the fw wasm loader's own gate
+// (xs_wasm.c k_wasm_magic/k_aot_magic) AND the real artifacts under
+// wan-cloud/xuansi-drivers modules/ (hello.aot/ledwatch.aot open
+// 00 61 6f 74; every .wasm opens 00 61 73 6d): a wasm module starts
+// "\0asm", a WAMR AOT file starts "\0aot".
+var (
+	wasmMagic = [4]byte{0x00, 0x61, 0x73, 0x6d} // \0asm
+	aotMagic  = [4]byte{0x00, 0x61, 0x6f, 0x74} // \0aot (WAMR AOT header)
+)
+
+// gateModuleMagic is the B10 push gate for binary artifacts (task 5:
+// the .aot leg the brief names, plus its .wasm sibling): the fw's
+// wasm loader refuses any /drv/<name>.wasm|.aot whose first four
+// bytes are not the module magic (xs_wasm.c read_one_module_file), so
+// the write is refused daemon-side BEFORE the flash cycle — the same
+// waste-avoidance the --@api gate gives the Lua track. The Lua track
+// itself rides parseAPIDirective unchanged.
+func gateModuleMagic(ext string, content []byte, file string) error {
+	var want *[4]byte
+	switch ext {
+	case "wasm":
+		want = &wasmMagic
+	case "aot":
+		want = &aotMagic
+	default:
+		return nil // .lua rides the --@api directive gate instead
+	}
+	head := content
+	if len(head) > 4 {
+		head = head[:4]
+	}
+	if len(content) < 4 || !bytes.Equal(head, want[:]) {
+		return errWs("xuansi_driver_push: %s: first bytes % x are not the .%s module magic % x — the board's wasm loader refuses to load it", file, ext, head, want[:])
+	}
+	return nil
+}
+
+// pushExts is the fixed artifact-extension probe order a push (and a
+// fetched version's manifest FileMeta) resolves with (B10 task 5):
+// classic .lua first — every pre-B10 workspace and manifest behaves
+// exactly as before — then the delivery tracks: .wasm (INTERP, what
+// the fetch stores; the fw loader's fallback) and .aot
+// (meta-auxiliary; this stack's loader honestly refuses AOT execution
+// but the file still deploys whole and read-back-verified).
+var pushExts = []string{"lua", "wasm", "aot"}
 
 // errWs is the workspace's local api-class refusal (the fs tools'
 // client-side refusal convention, errors.go).
@@ -243,7 +296,7 @@ func (ts *toolset) wsPut(_ context.Context, _ *mcpsdk.CallToolRequest, in wsPutI
 	if !wsVerRe.MatchString(in.Version) {
 		return nil, wsPutOut{}, errWs("xuansi_ws_put: version must match [a-z0-9.]+, got %q", in.Version)
 	}
-	path := ts.ws.driverPath(in.Name, in.Version)
+	path := ts.ws.driverPath(in.Name, in.Version, "lua")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, wsPutOut{}, errWs("xuansi_ws_put: %v", err)
 	}
@@ -312,7 +365,7 @@ func (ts *toolset) wsGet(_ context.Context, _ *mcpsdk.CallToolRequest, in wsGetI
 	if !wsVerRe.MatchString(in.Version) {
 		return nil, wsGetOut{}, errWs("xuansi_ws_get: version must match [a-z0-9.]+, got %q", in.Version)
 	}
-	b, err := readFileShared(ts.ws.driverPath(in.Name, in.Version)) // share-delete read (windows replace contract)
+	b, err := readFileShared(ts.ws.driverPath(in.Name, in.Version, "lua")) // share-delete read (windows replace contract)
 	if os.IsNotExist(err) {
 		return nil, wsGetOut{}, errWs("xuansi_ws_get: %s@%s.lua is not in the workspace — xuansi_ws_put it first", in.Name, in.Version)
 	}
@@ -366,31 +419,56 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: version must match [a-z0-9.]+, got %q", ver)
 	}
 
-	file := in.Name + "@" + ver + ".lua"
-	content, err := readFileShared(ts.ws.driverPath(in.Name, ver)) // share-delete read (windows replace contract)
-	if os.IsNotExist(err) {
-		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s is not in the workspace — xuansi_ws_put it first", file)
+	// artifact resolution (B10 task 5): the first extension with a
+	// stored file wins (.lua → .wasm → .aot, pushExts) — a fetched
+	// binary module pushes exactly like a stored Lua one, to the
+	// extension-matching board path.
+	var ext string
+	var content []byte
+	for _, cand := range pushExts {
+		b, rerr := readFileShared(ts.ws.driverPath(in.Name, ver, cand)) // share-delete read (windows replace contract)
+		if rerr == nil {
+			ext, content = cand, b
+			break
+		}
+		if !os.IsNotExist(rerr) {
+			return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", rerr)
+		}
 	}
-	if err != nil {
-		return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", err)
+	file := in.Name + "@" + ver
+	if ext == "" {
+		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s.lua is not in the workspace — xuansi_ws_put it first (no .wasm/.aot artifact either; xuansi_driver_fetch stores those)", file)
 	}
+	file += "." + ext
 
-	// the fw's load gate, enforced BEFORE the flash write (§7): first
-	// line --@api N with N EXACTLY the board's bench.api_version — the
-	// board would refuse to load anything else, so we refuse to write
-	// it and the flash cycle is not wasted.
-	api, perr := parseAPIDirective(string(content))
-	if perr != nil {
-		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s: %v — the board only loads a driver whose first line is \"--@api N\" matching its bench.api_version", file, perr)
+	// the load gate, enforced BEFORE the flash write, branched by
+	// artifact (task 5): the Lua track keeps its §7 gate — first line
+	// --@api N with N EXACTLY the board's bench.api_version — while a
+	// binary module (.wasm/.aot) gates on the module magic the fw's
+	// wasm loader itself checks (its compatibility axis is the module
+	// ABI the loader validates, NOT bench.api_version, so no caps
+	// crossing happens on this leg).
+	var path string
+	switch ext {
+	case "lua":
+		api, perr := parseAPIDirective(string(content))
+		if perr != nil {
+			return nil, driverPushOut{}, errWs("xuansi_driver_push: %s: %v — the board only loads a driver whose first line is \"--@api N\" matching its bench.api_version", file, perr)
+		}
+		want, cerr := ts.boardAPIVersion(ctx, board, resolved)
+		if cerr != nil {
+			return nil, driverPushOut{}, cerr
+		}
+		if api != want {
+			return nil, driverPushOut{}, errWs("xuansi_driver_push: %s declares --@api %d but board %s reports bench.api_version %d — the board refuses to load it (exact match, no semver)", file, api, board, want)
+		}
+		path = drvBoardPath(in.Name, "lua")
+	default:
+		if gerr := gateModuleMagic(ext, content, file); gerr != nil {
+			return nil, driverPushOut{}, gerr
+		}
+		path = drvBoardPath(in.Name, ext)
 	}
-	want, cerr := ts.boardAPIVersion(ctx, board, resolved)
-	if cerr != nil {
-		return nil, driverPushOut{}, cerr
-	}
-	if api != want {
-		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s declares --@api %d but board %s reports bench.api_version %d — the board refuses to load it (exact match, no semver)", file, api, board, want)
-	}
-	path := drvBoardPath(in.Name)
 
 	// write, read back, verify — then (and only then) the manifest.
 	// The WHOLE cycle rides wsMu (not just the manifest half): a
@@ -481,7 +559,7 @@ func (ts *toolset) driverPull(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	if !wsNameRe.MatchString(in.Name) {
 		return nil, driverPullOut{}, errWs("xuansi_driver_pull: name must match [a-z0-9_-]+, got %q", in.Name)
 	}
-	path := drvBoardPath(in.Name)
+	path := drvBoardPath(in.Name, "lua")
 
 	// the removal first: only a file the board actually removed clears
 	// Active (its error — the api not-found on an absent file — crosses

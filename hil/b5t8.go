@@ -79,10 +79,12 @@ func main() {
 		os.Exit(runB8T2(*attempt, *daemonBin, *runDir))
 	case "b9camera":
 		os.Exit(runB9Camera(*attempt, *daemonBin, *runDir))
+	case "b10t5":
+		os.Exit(runB10T5(*attempt, *daemonBin, *runDir))
 	case "spawnidle":
 		os.Exit(runSpawnIdle(*attempt, *daemonBin, *runDir))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|spawnidle [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR]")
+		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|spawnidle [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR]")
 		os.Exit(2)
 	}
 }
