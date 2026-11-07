@@ -81,7 +81,7 @@ import (
 
 const (
 	b10t7Board   = "d75884"
-	b10t7FwBuild = "f33577f" // B10-T7 fix canonical (HOUSE RULE: same commit as the other hil constants)
+	b10t7FwBuild = "29378a6" // B10-T7 final canonical (HOUSE RULE: same commit as the other hil constants)
 	b10t7Holder  = "b10t7-hil"
 	b10t7TCPEndp = "xuansi-d75884.local:7777"
 

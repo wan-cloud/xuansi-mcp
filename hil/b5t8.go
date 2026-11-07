@@ -37,7 +37,7 @@ import (
 
 const (
 	expectProtocolVer = int64(5)  // B10-T1: fs chunked-transport overlay era
-	expectFwBuild     = "f33577f" // B10-T7 fix canonical (internal-RAM right-sizing: wasm staging buffers to PSRAM)
+	expectFwBuild     = "29378a6" // B10-T7 final canonical (connection guarantee: conn floor + one-shot reserve valve)
 
 	// HOUSE RULE (B10-T1 fix rounds 1-2): a fw canonical bump rebinds EVERY
 	// *FwBuild constant in hil/ IN THE SAME COMMIT — expectFwBuild/b6FwBuild/
