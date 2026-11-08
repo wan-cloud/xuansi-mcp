@@ -281,8 +281,9 @@ type opResultOut = map[string]any
 // displace a static one (server_test.go pins the served list to the
 // same names). B8 appends fs_rm + driver_pull after capture, then
 // session_reset after those; B9 appended camera_shot; B10 task 5
-// appends driver_fetch: the existing tools keep their positions
-// (nothing renumbers).
+// appended driver_fetch; B11 task 2 appended toolchain_status, task 3
+// toolchain_fetch, task 5 wasm_build: the existing tools keep their
+// positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -306,6 +307,9 @@ var staticToolNames = []string{
 	"xuansi_session_reset",
 	"xuansi_camera_shot",
 	"xuansi_driver_fetch",
+	"xuansi_toolchain_status",
+	"xuansi_toolchain_fetch",
+	"xuansi_wasm_build",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -425,6 +429,32 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_driver_fetch",
 		Description: "Fetch one driver-module version from a public module index (task 3's layout: index.json + modules/<name>/<ver>/ artifacts; default " + defaultIndexURL + ") into the daemon-side driver workspace — the fetch half of the module pipeline, xuansi_driver_push deploys what this stores. Every file is downloaded and verified (sha256 + byte count against the index) BEFORE anything is written: a mid-download failure leaves the workspace untouched. Stores drivers/<name>@<version>.<ext> plus one manifest entry (kind from the index; NOT activating — a fresh fetch has no active version, so state version explicitly on its first push). Binary-safe — this is the storing path for .wasm/.aot artifacts (xuansi_ws_put's content field is a JSON string, fit for Lua text only). version omitted = the index's highest for the name.",
 	}, ts.driverFetch)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_toolchain_status",
+		Description: "One read-only view of the local wasm toolchain cache x the toolchain index: per piece (wasi_sdk, wamrc) whether toolchain-state.json records it AND its files still exist under cache_root, the installed generation vs the index's latest, and the board-fw pairing matrix — wasm >=0.2.0 (wide domain: bytecode is version-less), aot = null (empty domain: P1 refuses .aot on every fw — the aot runtime lands with A1). The index is read from " + defaultToolchainIndexURL + " (index_url overrides; http(s) only, file:// refused); an unreachable index degrades to the daemon's embedded known-good snapshot with a note — a status answer never dies on the network, but an index that arrives and fails the version gate is a hard refusal (a newer index needs a newer daemon). Missing pieces carry their next step automatically: install with xuansi_toolchain_fetch (opt-in, sha-pinned, atomic). No lease, no daemon call.",
+	}, ts.toolchainStatus)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "xuansi_toolchain_fetch",
+		Description: "Install this host's wasm toolchain pieces (wasi_sdk, wamrc) from the toolchain index (" + defaultToolchainIndexURL + "; index_url overrides, http(s) only) into the local cache — the write half of the toolchain face, xuansi_toolchain_status's install step. " +
+			"PLATFORM is chosen automatically from the host (linux-x64, macos-arm64, ...) — there is no platform input. " +
+			"IDEMPOTENT: a piece whose state record already pins the index's sha AND whose files still exist is skipped untouched, so re-calling is the safe sync verb. " +
+			"ATOMIC: every piece downloads into a random staging dir, its sha256 + byte count verified against the index pin as it streams, re-verified staged, then renamed into place and recorded in toolchain-state.json — any failure at any step (bad sha, HTTP error, mid-download cut) leaves the cache byte-for-byte untouched. " +
+			"FIRST PULL IS BIG: wasi-sdk is ~120MB (linux) / ~495MB (win) compressed; timeout_sec bounds the whole fetch (default 600s, max 3600). " +
+			"PAIRING: installing a generation is what makes xuansi_toolchain_status's fw-compat answer current (P1: wasm >=0.2.0 wide domain, aot empty — refused until A1); a generation this platform has no wamrc asset for installs wasi_sdk alone and says so in the note. " +
+			"No lease, no daemon call.",
+	}, ts.toolchainFetch)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "xuansi_wasm_build",
+		Description: "Compile one C source to a .wasm module ON THIS HOST and store it into the daemon-side driver workspace (drivers/<name>@<version>.wasm + its manifest entry) — the build half of the wasm lane, push-ready: a bare xuansi_driver_push deploys what this stores (version omitted re-deploys the manifest's ACTIVE). No board, no lease. " +
+			"INPUT: name [a-z0-9_-]+; source = the module's full C source (at most 1 MiB — over is a refusal naming the cap; #include \"xuansi_host.h\" resolves, the frozen host table every drivers-repo module compiles against); version [a-z0-9.]+, omitted = 0.0.1 (the first-build convention — the build face has no index whose highest to take, driver_fetch's omitted-version rule); initial_memory in bytes, omitted = the ABI freeze default 262144 (4 x 64 KiB pages), an explicit value must be a whole 65536-byte page multiple at most the frozen 1048576 (1 MiB) ceiling. " +
+			"FW IS AN EXPLICIT PRE-CHECK, NOT A GATE THE INTERP TRACK NEEDS: the board's interp track loads .wasm without an fw gate — the bytecode is version-less — so an omitted fw builds with no check; supply the target board's fw version only to refuse EARLY below the 0.2.0 floor (the first fw with a wasm loader). " +
+			"TOOLCHAIN: the wasi-sdk comes from the cache xuansi_toolchain_fetch lands (a missing or broken toolchain refuses with the fetch guidance in the error itself); the frozen module-ABI flag block rides every build, so a built module is byte-comparable with the drivers repo's own; one compile is internally capped (120s — a wedged compiler cannot hold the tool hostage; the timeout refusal says so). " +
+			"DEVELOPER OVERRIDES (spec §6.4 — explicit, they bypass the cache-state pairing evidence): wasi_sdk_path compiles with a local wasi-sdk tree (its bin/clang, never a PATH lookup); wamrc_path is the aot lane's knob (the .aot compile itself arrives with the A1 runtime). EITHER override marks the manifest entry kind \"wasm-dev\" instead of \"wasm\" — visibly a dev artifact, not an index-paired build. " +
+			"Storing is NOT activating — the manifest's Active only moves on a verified push. clang's stdout/stderr ride the reply's warnings verbatim; a failed compile refuses carrying the stderr tail and nothing lands. When this host cannot provision the toolchain through the face at all, the module can still be built by hand — see the xuansi-drivers README's \"User-compiled modules (agent path)\" section (the refusals point there too).",
+	}, ts.wasmBuild)
 
 	ts.registerCapture(srv)
 }

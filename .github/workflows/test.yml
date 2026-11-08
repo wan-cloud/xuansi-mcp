@@ -60,3 +60,53 @@ jobs:
         run: make matrix
       - name: go test -race (race pass, explicit — never `make test -race`)
         run: go test -race ./...
+
+  # drivers parity leg — the frozen-flag single-source lock. Rebuilds
+  # every module of the public wan-cloud/xuansi-drivers checkout
+  # through the daemon's own wasmBuildInner (frozen tcBuildFlags +
+  # the embedded wasmhdr/xuansi_host.h twin) and byte-compares the
+  # sha256 against the repo's committed modules/<n>/<v>/<n>.wasm and
+  # index.json pins. Any drift in EITHER direction — daemon flags,
+  # build.sh flags, or the host-header twins — is a red build. The
+  # toolchain pins below are toolchain-index.json's linux-x64 values,
+  # written dead on purpose: a moving index must not silently move a
+  # CI pin; bump these by hand in lockstep when a new toolchain
+  # generation lands.
+  drivers-parity:
+    runs-on: ubuntu-latest
+    env:
+      WASI_SDK_URL: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz
+      WASI_SDK_SHA256: c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5
+      WASI_SDK_BYTES: "118879731"
+      WASI_SDK_DIR: wasi-sdk-24.0-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      # public repo — no token needed
+      - uses: actions/checkout@v4
+        with:
+          repository: wan-cloud/xuansi-drivers
+          path: drivers
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+      - name: lay the toolchain cache (toolchainFetch's commit shape, by hand)
+        run: |
+          cache="$RUNNER_TEMP/wasm-cache"
+          mkdir -p "$cache"
+          curl -fsSL "$WASI_SDK_URL" -o sdk.tar.gz
+          echo "$WASI_SDK_SHA256  sdk.tar.gz" | sha256sum -c -
+          size=$(wc -c < sdk.tar.gz)
+          [ "$size" = "$WASI_SDK_BYTES" ] || { echo "sdk tarball is $size bytes, pin says $WASI_SDK_BYTES"; exit 1; }
+          mkdir sdk-x && tar -xzf sdk.tar.gz -C sdk-x
+          # fetch renames the archive's single top-level dir to the
+          # state-recorded name; same commit shape by hand:
+          mv sdk-x/wasi-sdk-24.0-x86_64-linux "$cache/$WASI_SDK_DIR"
+          printf '{"generation":"toolchain-v2","installed":{"wasi_sdk":{"sha256":"%s","bytes":%s,"dir":"%s"}}}\n' \
+            "$WASI_SDK_SHA256" "$WASI_SDK_BYTES" "$WASI_SDK_DIR" > "$cache/toolchain-state.json"
+          "$cache/$WASI_SDK_DIR/bin/clang" --version | head -1
+          echo "XUANSI_WASM_CACHE=$cache" >> "$GITHUB_ENV"
+      - name: go test (real wasm build + drivers parity)
+        run: |
+          XUANSI_DRIVERS_DIR="$PWD/drivers" \
+            go test ./internal/mcp/ -run 'TestWasmBuildReal|TestDriversParity' -v
