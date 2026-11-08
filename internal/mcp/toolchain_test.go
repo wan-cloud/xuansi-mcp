@@ -501,11 +501,16 @@ type tcEnt struct {
 	body string
 	mode int64
 	dir  bool
+	// link members (the official wasi-sdk's own shape): TypeSymlink /
+	// TypeLink with the target in linkname. 0 = regular/dir by dir.
+	link     byte
+	linkname string
 }
 
 // tcTarGz builds a REAL (small) tar.gz in-process — stdlib archive/tar
 // + compress/gzip, no disk fixtures, exactly the shapes the extract
-// path must handle (dir members, exec-bit files, nested paths).
+// path must handle (dir members, exec-bit files, nested paths, and
+// the wasi-sdk tarball's relative symlink/hardlink members).
 func tcTarGz(t *testing.T, ents ...tcEnt) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -513,16 +518,20 @@ func tcTarGz(t *testing.T, ents ...tcEnt) []byte {
 	tw := tar.NewWriter(gz)
 	for _, e := range ents {
 		hdr := &tar.Header{Name: e.name, Mode: e.mode}
-		if e.dir {
+		switch {
+		case e.link != 0:
+			hdr.Typeflag = e.link
+			hdr.Linkname = e.linkname
+		case e.dir:
 			hdr.Typeflag = tar.TypeDir
-		} else {
+		default:
 			hdr.Typeflag = tar.TypeReg
 			hdr.Size = int64(len(e.body))
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatalf("fixture tar header %q: %v", e.name, err)
 		}
-		if !e.dir {
+		if e.link == 0 && !e.dir {
 			if _, err := tw.Write([]byte(e.body)); err != nil {
 				t.Fatalf("fixture tar body %q: %v", e.name, err)
 			}
@@ -804,6 +813,78 @@ func TestExtractTarGzSlip(t *testing.T) {
 	for _, p := range []string{"evil", "evil2", "tc-evil-abs"} {
 		if _, err := os.Stat(filepath.Join(base, p)); !os.IsNotExist(err) {
 			t.Errorf("member %q escaped the extraction root", p)
+		}
+	}
+}
+
+// TestExtractTarGzLinks: the OFFICIAL wasi-sdk tarball's own shape —
+// relative symlink members (bin/llvm-strip -> llvm-objcopy,
+// bin/clang++ -> clang &c) and hardlink members — LAND, resolve
+// inside the extraction root, and run; hostile link targets (absolute,
+// ".."-escaping, backslash) stay refused. Found by the B11 task-11
+// HIL: the real wasi-sdk-24.0-x86_64-linux.tar.gz carries ~20 relative
+// symlinks, and the blanket link refusal made the fetch of the REAL
+// artifact impossible — the "wasi-sdk tarballs carry none" assumption
+// was wrong.
+func TestExtractTarGzLinks(t *testing.T) {
+	base := t.TempDir()
+	dst := filepath.Join(base, "out")
+
+	// the wasi-sdk shape: one top dir, a real binary, a same-dir
+	// relative symlink onto it, another, and a hardlink onto an
+	// earlier member.
+	good := tcTarGz(t,
+		tcEnt{name: "wasi-sdk-x", dir: true, mode: 0o755},
+		tcEnt{name: "wasi-sdk-x/bin", dir: true, mode: 0o755},
+		tcEnt{name: "wasi-sdk-x/bin/llvm-objcopy", body: "objcopy-bytes\n", mode: 0o755},
+		tcEnt{name: "wasi-sdk-x/bin/llvm-strip", mode: 0o755, link: tar.TypeSymlink, linkname: "llvm-objcopy"},
+		tcEnt{name: "wasi-sdk-x/bin/clang", body: "clang-bytes\n", mode: 0o755},
+		tcEnt{name: "wasi-sdk-x/bin/clang++", mode: 0o755, link: tar.TypeSymlink, linkname: "clang"},
+		tcEnt{name: "wasi-sdk-x/bin/clang-hardlink", mode: 0o755, link: tar.TypeLink, linkname: "wasi-sdk-x/bin/clang"},
+	)
+	if err := extractTarGz(bytes.NewReader(good), dst); err != nil {
+		t.Fatalf("wasi-sdk-shaped archive (relative links): %v", err)
+	}
+	// the symlinks exist as symlinks and resolve to the real bytes
+	for ln, want := range map[string]string{
+		"wasi-sdk-x/bin/llvm-strip": "objcopy-bytes\n",
+		"wasi-sdk-x/bin/clang++":    "clang-bytes\n",
+	} {
+		p := filepath.Join(dst, filepath.FromSlash(ln))
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("link member %s did not land: %v", ln, err)
+		}
+		fi, err := os.Stat(p) // follows the link: the target's bytes
+		if err != nil || fi.IsDir() {
+			t.Fatalf("link %s must resolve to a file (fi=%v err=%v)", ln, fi, err)
+		}
+		if b, rerr := os.ReadFile(p); rerr != nil || string(b) != want {
+			t.Fatalf("link %s resolved bytes = %q (want %q), err=%v", ln, b, want, rerr)
+		}
+	}
+	// the hardlink shares the target's bytes
+	if b, err := os.ReadFile(filepath.Join(dst, "wasi-sdk-x", "bin", "clang-hardlink")); err != nil || string(b) != "clang-bytes\n" {
+		t.Fatalf("hardlink bytes = %q err=%v", b, err)
+	}
+
+	// hostile link TARGETS stay refused (the target, not the member
+	// type, is the vector): absolute, ..-escaping, backslash.
+	for _, evil := range []tcEnt{
+		{name: "lnk-abs", link: tar.TypeSymlink, linkname: "/etc/passwd"},
+		{name: "lnk-up", link: tar.TypeSymlink, linkname: "../../escape"},
+		{name: "lnk-empty", link: tar.TypeSymlink, linkname: ""},
+		{name: `lnk\bs`, link: tar.TypeSymlink, linkname: `win\path`},
+		{name: "hl-abs", link: tar.TypeLink, linkname: "/etc/passwd"},
+		{name: "hl-up", link: tar.TypeLink, linkname: "../escape"},
+	} {
+		if err := extractTarGz(bytes.NewReader(tcTarGz(t, evil)), filepath.Join(base, "slip")); err == nil {
+			t.Errorf("link member %q (target %q): want refusal, got nil", evil.name, evil.linkname)
+		}
+	}
+	// and nothing escaped
+	for _, p := range []string{"escape"} {
+		if _, err := os.Stat(filepath.Join(base, p)); !os.IsNotExist(err) {
+			t.Errorf("link target %q escaped the extraction root", p)
 		}
 	}
 }

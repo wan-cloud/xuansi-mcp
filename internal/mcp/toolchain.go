@@ -32,6 +32,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,6 +43,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -553,13 +555,24 @@ func tcFilePerm(mode int64) os.FileMode {
 // shrug at), NUL bytes, and everything that resolves outside dst
 // after cleaning (belt and braces: the resolved path is re-checked
 // relative to dst). Directories land 0755, files 0644 + header exec
-// bits. Symlink/hardlink/special members are REJECTED, not skipped:
-// a link member is an escape vector even when the link itself sits
-// inside dst (later members and the toolchain at RUN time would
-// follow it), a skipped link would leave a silently-broken toolchain
-// the sha pin cannot see, and wasi-sdk/wamrc tarballs carry none —
-// so refusal is both the safe and the honest answer if that
-// assumption ever breaks.
+// bits.
+//
+// Link members (tar.TypeSymlink / tar.TypeLink) LAND when their
+// target is a contained RELATIVE path — the official wasi-sdk
+// tarball's own shape: it ships ~20 same-dir relative symlinks
+// (bin/llvm-strip -> llvm-objcopy, bin/clang++ -> clang &c; found by
+// the B11 task-11 HIL — the earlier blanket refusal assumed "real
+// toolchain tarballs carry none", which the real artifact disproved,
+// so the fetch of the actual wasi-sdk could never complete). The
+// target gate is the member-name gate verbatim plus containment of
+// the LEXICALLY resolved target: an absolute, ".."-escaping,
+// backslash, or NUL-bearing target is refused — a link member is an
+// escape vector exactly when its target escapes. Links land in a
+// DEFERRED pass after every regular member, so the windows-friendly
+// copy fallback (os.Symlink denied without developer mode) always
+// finds its target on disk; unix keeps true symlinks because the
+// toolchain's binaries exec through them. Special members (devices,
+// fifos &c) stay refused.
 func extractTarGz(src io.Reader, dst string) error {
 	gz, err := gzip.NewReader(src)
 	if err != nil {
@@ -568,6 +581,28 @@ func extractTarGz(src io.Reader, dst string) error {
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 	var total int64
+	type tcLink struct {
+		name, target string // member path; VERBATIM link target
+		hard         bool   // hardlink (else symlink)
+	}
+	var links []tcLink
+	// linkTargetOK gates one link target: a non-empty RELATIVE path
+	// with no "..", no backslash, no NUL, whose resolution (relative
+	// to the link's own directory for symlinks, to the archive root
+	// for hardlinks) stays lexically inside dst.
+	linkTargetOK := func(name, target string, hard bool) bool {
+		if target == "" || strings.ContainsAny(target, "\x00\\") ||
+			filepath.IsAbs(target) || strings.Contains(target, "..") {
+			return false
+		}
+		resolved := target
+		if !hard { // a symlink's target resolves from the link's dir
+			resolved = filepath.Join(filepath.Dir(name), target)
+		}
+		rel, rerr := filepath.Rel(dst, filepath.Join(dst, resolved))
+		return rerr == nil && rel != ".." && !filepath.IsAbs(rel) &&
+			!strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -616,11 +651,57 @@ func extractTarGz(src io.Reader, dst string) error {
 			if cerr = f.Close(); cerr != nil {
 				return cerr
 			}
+		case tar.TypeSymlink, tar.TypeLink:
+			if !linkTargetOK(name, hdr.Linkname, hdr.Typeflag == tar.TypeLink) {
+				return fmt.Errorf("member %q links to %q — an absolute, \"..\", backslash, or escaping link target is refused", name, hdr.Linkname)
+			}
+			links = append(links, tcLink{name: name, target: hdr.Linkname, hard: hdr.Typeflag == tar.TypeLink})
 		case tar.TypeXGlobalHeader:
 			continue // pax global metadata — no filesystem member
 		default:
-			return fmt.Errorf("member %q has unsupported type (symlink/hardlink/special members are refused — wasi-sdk and wamrc tarballs carry none)", name)
+			return fmt.Errorf("member %q has unsupported type (special members — devices, fifos &c — are refused; link members land when their target is a contained relative path)", name)
 		}
+	}
+	// the deferred link pass: every regular member is on disk, so a
+	// link's target (an earlier member per tar semantics) exists.
+	for _, l := range links {
+		p := filepath.Join(dst, l.name)
+		resolved := l.target
+		if !l.hard {
+			resolved = filepath.Join(filepath.Dir(p), l.target)
+		}
+		resolved = filepath.Join(dst, resolved)
+		var lerr error
+		if l.hard {
+			lerr = os.Link(resolved, p)
+		} else {
+			lerr = os.Symlink(l.target, p)
+		}
+		if lerr == nil {
+			continue
+		}
+		// the windows-friendly fallback (and the cross-device guard
+		// for hardlinks): a symlink denied (no developer mode) or a
+		// cross-device os.Link becomes a BYTE COPY of the target —
+		// the toolchain runs the same either way; any other failure
+		// (a genuinely dangling link — the real tarballs carry none)
+		// stays an error rather than a silent gap.
+		if os.IsPermission(lerr) || errors.Is(lerr, syscall.EXDEV) || errors.Is(lerr, syscall.EPERM) || errors.Is(lerr, syscall.EACCES) {
+			if b, rerr := os.ReadFile(resolved); rerr == nil {
+				if int64(len(b))+total > tcExtractMax {
+					return fmt.Errorf("member %q: copy fallback expands beyond the %d-byte extraction cap", l.name, tcExtractMax)
+				}
+				mode := os.FileMode(0o644)
+				if fi, serr := os.Stat(resolved); serr == nil && fi.Mode()&0o111 != 0 {
+					mode = 0o755
+				}
+				if werr := os.WriteFile(p, b, mode); werr == nil {
+					total += int64(len(b))
+					continue
+				}
+			}
+		}
+		return fmt.Errorf("member %q: link to %q: %w", l.name, l.target, lerr)
 	}
 	return nil
 }
