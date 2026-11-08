@@ -1,0 +1,65 @@
+{
+  "index_ver": 1,
+  "latest": "toolchain-v2",
+  "generations": {
+    "toolchain-v2": {
+      "kind": "stock-wamrc",
+      "fw_compat": { "wasm": ">=0.2.0", "aot": "" },
+      "wasi_sdk": "24.0",
+      "platforms": {
+        "linux-x64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz",
+            "sha256": "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5",
+            "bytes": 118879731
+          },
+          "wamrc": {
+            "url": "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/wamrc-2.4.0-xtensa-18.1.2-linux-x64.tar.gz",
+            "sha256": "209a6a51b6066f05e91060d95c2506ec0bad97cb898fec1fe634cd68865b9c42",
+            "bytes": 33053698
+          }
+        },
+        "linux-arm64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-linux.tar.gz",
+            "sha256": "ae6c1417ea161e54bc54c0a168976af57a0c6e53078857886057a71a0d928646",
+            "bytes": 119660865
+          },
+          "wamrc": null
+        },
+        "macos-x64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-macos.tar.gz",
+            "sha256": "4bfc274ae8b68c771dd93e32ad4bd695336ca46b585beb3b1260e5602dbc11a2",
+            "bytes": 109975956
+          },
+          "wamrc": {
+            "url": "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/wamrc-2.4.0-xtensa-18.1.2-macos-x64.tar.gz",
+            "sha256": "b87c91e5b6bd907937f8b5f79053212abfc297ee810d2dc348488d8c0089bdc1",
+            "bytes": 23784250
+          }
+        },
+        "macos-arm64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-macos.tar.gz",
+            "sha256": "aeae999396d5f5caa5ce419f52e83c35869d5fd21d40af80acba2c80f51b0b3a",
+            "bytes": 108199177
+          },
+          "wamrc": {
+            "url": "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/wamrc-2.4.0-xtensa-18.1.2-macos-arm64.tar.gz",
+            "sha256": "e73c84a24abbc50e5122a5dc8221aa2c579594ea1559224d156f8bb1778fca30",
+            "bytes": 22421504
+          }
+        },
+        "win-x64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-windows.tar.gz",
+            "sha256": "0f934c6e7e171b5627c81b697a9e57e96d65cd889f56ce6077350de48978afd3",
+            "bytes": 495098073
+          },
+          "wamrc": null
+        }
+      }
+    }
+  }
+}

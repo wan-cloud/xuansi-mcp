@@ -54,9 +54,10 @@ type DriverEntry struct {
 }
 
 // FileMeta describes one stored version: content checksum and size,
-// when it was last pushed to ANY board, and per board (mac6 when the
-// local board list resolved it, else the raw selector) when it was
-// last pushed THERE — the fleet audit trail behind the design's
+// when it was last pushed to ANY board (the build face records its
+// built-at there), and per board (mac6 when the local board list
+// resolved it, else the raw selector) when it was last pushed THERE
+// — the fleet audit trail behind the design's
 // "艦隊 = 推 N 片 + 對 checksum" loop.
 type FileMeta struct {
 	Sha256   string               `json:"sha256"`
