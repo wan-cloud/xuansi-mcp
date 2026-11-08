@@ -200,6 +200,21 @@ func b11ClangName() string {
 	return "clang"
 }
 
+// b11ExecOK is the W21/W22 disk probe's platform-honest exec assertion
+// — the daemon-side tcExecOK's twin (internal/mcp toolchain_test.go;
+// hil is a standalone package main and does not import internal/).
+// Off-windows the exec bit must survive extraction (perm&0o111 — the
+// toolchain runs these); on windows NTFS a Go file mode carries only
+// the read-only bit (0666 writable / 0444 read-only, exec is
+// unrepresentable), so the honest pin there is a landed, writable
+// file — existence plus non-read-only semantics, no skip.
+func b11ExecOK(fi os.FileInfo) bool {
+	if runtime.GOOS == "windows" {
+		return fi.Mode().Perm()&0o222 != 0
+	}
+	return fi.Mode().Perm()&0o111 != 0
+}
+
 // b11SandboxEnv is the platform-trio sandbox env the daemon + mcp
 // children run under: the daemon's DataDir (internal/paths
 // dataDirFor) is $XDG_DATA_HOME/xuansi on linux, $HOME/Library/
@@ -658,7 +673,7 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	sdkClang := filepath.Join(wasmCache, sdkDir, "bin", b11ClangName())
 	wamrcBin := filepath.Join(wasmCache, "wamrc", "wamrc")
 	if fi, err := os.Stat(sdkClang); err == nil {
-		h.check(fi.Mode()&0o111 != 0, fmt.Sprintf("W21 wasi-sdk landed: %s (executable, %dB tree root %s; compiler name %s per this host)", sdkClang, fi.Size(), sdkDir, b11ClangName()))
+		h.check(b11ExecOK(fi), fmt.Sprintf("W21 wasi-sdk landed: %s (executable, %dB tree root %s; compiler name %s per this host)", sdkClang, fi.Size(), sdkDir, b11ClangName()))
 	} else {
 		h.check(false, "W21 wasi-sdk landed: "+err.Error())
 	}
@@ -668,7 +683,7 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		// the INDEX pin is on the ARCHIVE - that pin is
 		// reconciled via S3's status rows (W33); here the probe is the
 		// EXTRACTED binary itself: present and executable
-		h.check(fi.Size() > 0 && fi.Mode()&0o111 != 0,
+		h.check(fi.Size() > 0 && b11ExecOK(fi),
 			fmt.Sprintf("W22 wamrc binary landed: %s (executable, %dB; the archive-level sha/bytes pin is W33's reconciliation)", wamrcBin, fi.Size()))
 	} else {
 		h.check(false, "W22 wamrc binary landed: "+err.Error())
