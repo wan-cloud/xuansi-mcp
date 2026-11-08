@@ -77,6 +77,14 @@ const (
 	b11Holder  = "b11tc-hil"
 	b11TCPEndp = "xuansi-d75884.local:7777"
 
+	// b11USBRebootWarning mirrors internal/server.USBRebootWarning
+	// byte-for-byte (hil is a standalone package main and does not
+	// import internal/ - the same local-map policy as b11Pins
+	// mirroring the index): the usb-route W00 asserts the lease reply
+	// carries THIS string verbatim, and the S0 note passes it through
+	// unchanged.
+	b11USBRebootWarning = "USB transport: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)"
+
 	// the module this run builds + deploys + calls
 	b11ModName = "hilhello"
 	b11ModVer  = "1.0.0" // EXPLICIT first version (T10 concern-2: the build/push pair names it)
@@ -332,7 +340,24 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		endp = v
 		fmt.Printf("endpoint override: B11_TCP_ENDP=%s (the mac leg's .local dial workaround)\n", endp)
 	}
-	fmt.Printf("board: %s over TCP %s (daemon never opens CDC - that reboots); fw expect %s (protocol_ver 5)\n", b11Board, endp, b11FwBuild)
+	// B11_TRANSPORT selects this run's lease route: "" (default) = the
+	// TCP path every prior attempt ran, byte-identical; "usb" = the
+	// deliberate USB fallback for the win leg (the board's USB is
+	// physically attached to the win host, whose real-host mDNS
+	// browse is a known limit - the B11 win-leg unblock): the lease
+	// call carries transport:"usb", the daemon opens the CDC
+	// controller itself (opening the port REBOOTS the board -
+	// b10-series precedent, deliberate), driver_push/eval ride that
+	// controller unchanged, and the S0 TCP preflight dial is skipped
+	// in favor of the daemon's USB discovery. Any value other than
+	// "usb" is the default route.
+	usbTransport := os.Getenv("B11_TRANSPORT") == "usb"
+	if usbTransport {
+		fmt.Printf("board: %s over USB (B11_TRANSPORT=usb - the deliberate fallback: the lease opens CDC and that REBOOTS the board); fw expect %s (protocol_ver 5)\n", b11Board, b11FwBuild)
+		fmt.Printf("transport route: usb - lease carries transport:\"usb\" (the daemon opens the CDC controller; driver_push/eval unchanged), S0 TCP preflight dial skipped (the daemon's USB discovery asserts presence)\n")
+	} else {
+		fmt.Printf("board: %s over TCP %s (daemon never opens CDC - that reboots); fw expect %s (protocol_ver 5)\n", b11Board, endp, b11FwBuild)
+	}
 	fmt.Printf("index: the live public one, default URL (raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json); platform key %s (wamrc leg: %v)\n", platKey, hasWamrc)
 	fmt.Printf("chain: status(missing) -> fetch(real %s download) -> fetch#2(all Skipped) -> status(present) ->\n", fetchSizes())
 	fmt.Printf("  wasm_build(hilhello@1.0.0 from C source) -> driver_push -> bench.wasm load/call echo -> ws_list reconcile\n")
@@ -362,7 +387,14 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	if scanned, stale := benchStaleServers(h); scanned {
 		h.check(stale == 0, fmt.Sprintf("no stale xuansi serve daemon on the bench (found %d - the resident npm daemon must be stopped first: it holds the controller slot)", stale))
 	}
-	if conn, err := net.DialTimeout("tcp", endp, 3*time.Second); err != nil {
+	if usbTransport {
+		// the USB route cannot dial the board's TCP face from this
+		// host (that is the whole point of the fallback): presence is
+		// probed by the daemon's own USB discovery below - the sweep
+		// check plus the list_boards usb-source pin. A note, not a
+		// pass/fail: the W count stays comparable across routes.
+		h.note("TCP probe skipped: USB transport route")
+	} else if conn, err := net.DialTimeout("tcp", endp, 3*time.Second); err != nil {
 		h.check(false, fmt.Sprintf("board TCP face reachable at %s: %v (dial only - no reboot, no USB open)", endp, err))
 		fmt.Println("  BLOCKED: the bench board is not reachable - report and stop (no spin)")
 		return finish()
@@ -456,41 +488,139 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	h.check(terr == nil && allServed,
 		fmt.Sprintf("static face serves the toolchain trio (24->25; served=%v of %d tools incl. dynamic)", want, len(names)))
 
-	// the board must be LISTED with fw populated (hello-enriched) - an
-	// absent board is BLOCKED per the brief, never a spin
+	// the board must be LISTED - an absent board is BLOCKED per the
+	// brief, never a spin. Route split: the default path demands fw
+	// populated up front (the startup audit's TCP resync enriched
+	// it); the usb route cannot - discovery never dials (registry.go:
+	// a USB dial reboots the board, §2, nobody wants that as a
+	// discovery side effect), so on a usb-only leg the row's
+	// hello-enrichment rides the LEASE's own USB dial (tap ->
+	// reg.Enrich). There the order flexes - row + usb-source presence
+	// first, the lease (which reboots, hellos, enriches), THEN the fw
+	// binding - while the binding assertion itself stays identical.
 	var boardRow map[string]any
-	ok, last = pollUntil(time.Second, 45*time.Second, func() (bool, string) {
-		m, _, isErr, cok := b.call(ctx, 15*time.Second, "xuansi_list_boards", map[string]any{})
-		if !cok || isErr {
-			return false, "list_boards trouble"
-		}
-		if boards, yes := m["boards"].([]any); yes {
-			for _, e := range boards {
-				if bm, y2 := e.(map[string]any); y2 && bm["mac6"] == b11Board {
-					if fw, _ := bm["fw"].(string); fw != "" {
+	var m map[string]any
+	var text string
+	var isErr bool
+	if usbTransport {
+		ok, last = pollUntil(time.Second, 45*time.Second, func() (bool, string) {
+			m, _, isErr, cok := b.call(ctx, 15*time.Second, "xuansi_list_boards", map[string]any{})
+			if !cok || isErr {
+				return false, "list_boards trouble"
+			}
+			if boards, yes := m["boards"].([]any); yes {
+				for _, e := range boards {
+					if bm, y2 := e.(map[string]any); y2 && bm["mac6"] == b11Board {
 						boardRow = bm
-						return true, "fw populated (hello-enriched)"
+						if fw, _ := bm["fw"].(string); fw != "" {
+							return true, "fw already populated (a live TCP face enriched it)"
+						}
+						return true, "row present, fw empty pre-lease (expected: enrichment rides the lease's USB hello)"
 					}
-					return false, "board listed, fw not yet enriched"
+				}
+			}
+			return false, "board not in list yet"
+		})
+		if !ok || boardRow == nil {
+			h.check(false, fmt.Sprintf("list_boards shows %s (%s)", b11Board, last))
+			fmt.Println("  BLOCKED: the bench board is not listed - report and stop (no spin)")
+			return finish()
+		}
+		h.check(true, fmt.Sprintf("list_boards shows %s (usb route: %s)", b11Board, last))
+		// the USB-presence probe this route rides instead of the
+		// preflight dial: the daemon's board row must carry the usb
+		// source (the sweep check above already asserted 1 board
+		// found; this pins WHICH discovery face saw it).
+		usbPath := b6Str(boardRow, "usb_path")
+		usbSeen := false
+		if srcs, ok2 := boardRow["sources"].([]any); ok2 {
+			for _, s := range srcs {
+				if s == "usb" {
+					usbSeen = true
 				}
 			}
 		}
-		return false, "board not in list yet"
-	})
-	if !ok || boardRow == nil {
-		h.check(false, fmt.Sprintf("list_boards shows %s with fw populated (%s)", b11Board, last))
-		fmt.Println("  BLOCKED: the bench board is not listed - report and stop (no spin)")
-		return finish()
+		h.check(usbSeen, fmt.Sprintf("USB device present: list_boards carries %s on its usb source (sources=%v, usb_path=%q)", b11Board, boardRow["sources"], usbPath))
+	} else {
+		ok, last = pollUntil(time.Second, 45*time.Second, func() (bool, string) {
+			m, _, isErr, cok := b.call(ctx, 15*time.Second, "xuansi_list_boards", map[string]any{})
+			if !cok || isErr {
+				return false, "list_boards trouble"
+			}
+			if boards, yes := m["boards"].([]any); yes {
+				for _, e := range boards {
+					if bm, y2 := e.(map[string]any); y2 && bm["mac6"] == b11Board {
+						if fw, _ := bm["fw"].(string); fw != "" {
+							boardRow = bm
+							return true, "fw populated (hello-enriched)"
+						}
+						return false, "board listed, fw not yet enriched"
+					}
+				}
+			}
+			return false, "board not in list yet"
+		})
+		if !ok || boardRow == nil {
+			h.check(false, fmt.Sprintf("list_boards shows %s with fw populated (%s)", b11Board, last))
+			fmt.Println("  BLOCKED: the bench board is not listed - report and stop (no spin)")
+			return finish()
+		}
+		h.check(true, fmt.Sprintf("list_boards shows %s with fw populated (%s)", b11Board, last))
 	}
-	h.check(true, fmt.Sprintf("list_boards shows %s with fw populated (%s)", b11Board, last))
-	fw, _ := boardRow["fw"].(string)
-	h.check(fw == b11FwBuild, fmt.Sprintf("fw BUILD BINDING: %q == expected %q", fw, b11FwBuild))
 
-	// the lease everything below rides
-	m, text, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_lease", map[string]any{"board": b11Board, "holder": b11Holder})
+	// the lease everything below rides. B11_TRANSPORT=usb swaps in
+	// the deliberate fallback: the call carries transport:"usb", the
+	// daemon opens the CDC controller itself (opening the port
+	// REBOOTS the board - the warning rides the reply verbatim), and
+	// everything after (driver_push, eval, fs) rides that controller
+	// unchanged - the tool chain never learns which route holds it.
+	leaseArgs := map[string]any{"board": b11Board, "holder": b11Holder}
+	if usbTransport {
+		leaseArgs["transport"] = "usb"
+	}
+	m, text, isErr, _ = b.call(ctx, 30*time.Second, "xuansi_lease", leaseArgs)
 	leaseSess, _ := b6Num(m, "session")
-	h.check(!isErr && b6Str(m, "board") == b11Board && b6Str(m, "holder") == b11Holder && leaseSess > 0,
-		fmt.Sprintf("W00 lease holder=%s session=%.0f (default TCP route, no reboot)", b11Holder, leaseSess))
+	if usbTransport {
+		h.check(!isErr && b6Str(m, "board") == b11Board && b6Str(m, "holder") == b11Holder && leaseSess > 0 &&
+			b6Str(m, "transport") == "usb" && b6Str(m, "warning") == b11USBRebootWarning,
+			fmt.Sprintf("W00 lease holder=%s session=%.0f transport=usb (the deliberate reboot route - the daemon's warning rode the reply verbatim)", b11Holder, leaseSess))
+		h.note("USB route: lease reboots the board (deliberate fallback, b10-series precedent) - the win leg rides the board's physically-attached USB to bypass the mDNS known limitation")
+		h.note("port-open reboot warning, verbatim: %s", b6Str(m, "warning"))
+		// the lease's USB hello is what enriches a usb-only leg's fw
+		// row - the BUILD BINDING runs here, after it
+		boardRow = nil
+		ok, last = pollUntil(time.Second, 30*time.Second, func() (bool, string) {
+			m, _, isErr, cok := b.call(ctx, 15*time.Second, "xuansi_list_boards", map[string]any{})
+			if !cok || isErr {
+				return false, "list_boards trouble"
+			}
+			if boards, yes := m["boards"].([]any); yes {
+				for _, e := range boards {
+					if bm, y2 := e.(map[string]any); y2 && bm["mac6"] == b11Board {
+						if fw, _ := bm["fw"].(string); fw != "" {
+							boardRow = bm
+							return true, "fw populated (the lease's USB hello enriched it)"
+						}
+						return false, "board listed, fw not yet enriched"
+					}
+				}
+			}
+			return false, "board not in list yet"
+		})
+		if !ok || boardRow == nil {
+			h.check(false, fmt.Sprintf("list_boards shows %s with fw populated (%s)", b11Board, last))
+			fmt.Println("  BLOCKED: the usb route's post-lease enrichment never landed - report and stop (no spin)")
+			return finish()
+		}
+		h.check(true, fmt.Sprintf("list_boards shows %s with fw populated (%s)", b11Board, last))
+		fw, _ := boardRow["fw"].(string)
+		h.check(fw == b11FwBuild, fmt.Sprintf("fw BUILD BINDING: %q == expected %q", fw, b11FwBuild))
+	} else {
+		fw, _ := boardRow["fw"].(string)
+		h.check(fw == b11FwBuild, fmt.Sprintf("fw BUILD BINDING: %q == expected %q", fw, b11FwBuild))
+		h.check(!isErr && b6Str(m, "board") == b11Board && b6Str(m, "holder") == b11Holder && leaseSess > 0,
+			fmt.Sprintf("W00 lease holder=%s session=%.0f (default TCP route, no reboot)", b11Holder, leaseSess))
+	}
 
 	// ---------- S1: missing-cache status ----------
 	fmt.Println("\n- S1: xuansi_toolchain_status on the fresh cache - both pieces missing, self-guiding -")
