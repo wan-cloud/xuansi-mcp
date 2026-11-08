@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -836,19 +837,28 @@ func TestExtractTarGzLinks(t *testing.T) {
 	good := tcTarGz(t,
 		tcEnt{name: "wasi-sdk-x", dir: true, mode: 0o755},
 		tcEnt{name: "wasi-sdk-x/bin", dir: true, mode: 0o755},
+		// FORWARD REFERENCE (L1): this link member precedes its
+		// target in the member stream — legal tar, and exactly why
+		// links land in a DEFERRED pass rather than in-loop (a
+		// refactor back to in-loop linking breaks this pin).
+		tcEnt{name: "wasi-sdk-x/bin/wasm-ld", mode: 0o755, link: tar.TypeSymlink, linkname: "lld"},
 		tcEnt{name: "wasi-sdk-x/bin/llvm-objcopy", body: "objcopy-bytes\n", mode: 0o755},
 		tcEnt{name: "wasi-sdk-x/bin/llvm-strip", mode: 0o755, link: tar.TypeSymlink, linkname: "llvm-objcopy"},
 		tcEnt{name: "wasi-sdk-x/bin/clang", body: "clang-bytes\n", mode: 0o755},
 		tcEnt{name: "wasi-sdk-x/bin/clang++", mode: 0o755, link: tar.TypeSymlink, linkname: "clang"},
+		// the forward-referenced target, listed AFTER its link
+		tcEnt{name: "wasi-sdk-x/bin/lld", body: "lld-bytes\n", mode: 0o755},
 		tcEnt{name: "wasi-sdk-x/bin/clang-hardlink", mode: 0o755, link: tar.TypeLink, linkname: "wasi-sdk-x/bin/clang"},
 	)
 	if err := extractTarGz(bytes.NewReader(good), dst); err != nil {
 		t.Fatalf("wasi-sdk-shaped archive (relative links): %v", err)
 	}
-	// the symlinks exist as symlinks and resolve to the real bytes
+	// the symlinks exist as symlinks and resolve to the real bytes —
+	// including the FORWARD-REFERENCED one
 	for ln, want := range map[string]string{
 		"wasi-sdk-x/bin/llvm-strip": "objcopy-bytes\n",
 		"wasi-sdk-x/bin/clang++":    "clang-bytes\n",
+		"wasi-sdk-x/bin/wasm-ld":    "lld-bytes\n",
 	} {
 		p := filepath.Join(dst, filepath.FromSlash(ln))
 		if _, err := os.Lstat(p); err != nil {
@@ -886,6 +896,91 @@ func TestExtractTarGzLinks(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(base, p)); !os.IsNotExist(err) {
 			t.Errorf("link target %q escaped the extraction root", p)
 		}
+	}
+}
+
+// TestExtractTarGzFallbackPath (T11a M1): the symlink COPY FALLBACK
+// reads the correctly-resolved target path — pinned by driving
+// tcLandLink directly with an injected link primitive that fails the
+// way windows denies symlinks (EACCES without developer mode). On
+// unix os.Symlink just succeeds, so the copy leg is unreachable in
+// production there — which is exactly how the original bug survived a
+// green linux HIL: absTarget used to prefix dst a SECOND time for
+// symlinks (dst/dst/...), the fallback's ReadFile ENOENT'd, and every
+// windows fetch — where the fallback fires for EVERY symlink member
+// of the real wasi-sdk tarball — would have died at extraction.
+func TestExtractTarGzFallbackPath(t *testing.T) {
+	base := t.TempDir()
+	dst := filepath.Join(base, "out")
+	if err := os.MkdirAll(filepath.Join(dst, "bin"), 0o755); err != nil {
+		t.Fatalf("fixture bin dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "bin", "clang"), []byte("clang-bytes\n"), 0o755); err != nil {
+		t.Fatalf("fixture target: %v", err)
+	}
+
+	// the symlink leg: EACCES from the primitive (the windows shape)
+	// forces the copy fallback, which must read EXACTLY dst/bin/clang
+	// — the seam observes the resolved path it was handed, so a
+	// doubled dst prefix fails loudly right here.
+	want := filepath.Join(dst, "bin", "clang")
+	sl := tcLink{name: "bin/clang++", target: "clang"}
+	saw := ""
+	n, err := tcLandLink(dst, sl, func(resolved, linkPath string) error {
+		saw = resolved
+		return syscall.EACCES
+	}, tcExtractMax)
+	if err != nil {
+		t.Fatalf("symlink copy fallback: %v (resolved %q; this is the M1 shape when the path is wrong)", err, saw)
+	}
+	if saw != want {
+		t.Errorf("symlink fallback reads %q, want %q (the M1 bug doubled the dst prefix)", saw, want)
+	}
+	if n != int64(len("clang-bytes\n")) {
+		t.Errorf("fallback byte count = %d, want %d", n, len("clang-bytes\n"))
+	}
+	// the fallback's artifact: a REAL FILE (not a link) with the
+	// target's bytes and its exec bit kept
+	fb, rerr := os.ReadFile(filepath.Join(dst, "bin", "clang++"))
+	if rerr != nil || string(fb) != "clang-bytes\n" {
+		t.Fatalf("fallback artifact bytes = %q err=%v", fb, rerr)
+	}
+	if fi, ferr := os.Lstat(filepath.Join(dst, "bin", "clang++")); ferr != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("fallback artifact must be a regular file (fi=%v err=%v)", fi, ferr)
+	} else if !tcExecOK(fi) {
+		t.Fatalf("fallback artifact must keep the target's exec bit (mode=%v)", fi.Mode())
+	}
+
+	// the hardlink leg: the target is ARCHIVE-ROOT-relative and must
+	// anchor at dst (never double-prefixed); EXDEV (cross-device
+	// os.Link) forces the copy fallback there too
+	hl := tcLink{name: "bin/cc", target: "bin/clang", hard: true}
+	saw = ""
+	if _, err := tcLandLink(dst, hl, func(resolved, linkPath string) error {
+		saw = resolved
+		return syscall.EXDEV
+	}, tcExtractMax); err != nil {
+		t.Fatalf("hardlink copy fallback: %v (resolved %q)", err, saw)
+	}
+	if saw != want {
+		t.Errorf("hardlink fallback reads %q, want %q", saw, want)
+	}
+	if hb, herr := os.ReadFile(filepath.Join(dst, "bin", "cc")); herr != nil || string(hb) != "clang-bytes\n" {
+		t.Fatalf("hardlink fallback bytes = %q err=%v", hb, herr)
+	}
+
+	// a NON-fallback-worthy failure (ENOENT — a dangling link) stays
+	// an error rather than silently vanishing
+	if _, err := tcLandLink(dst, tcLink{name: "bin/dangling", target: "nope"}, func(string, string) error {
+		return syscall.ENOENT
+	}, tcExtractMax); err == nil {
+		t.Error("dangling link: want an error, got nil")
+	}
+
+	// the copy fallback respects the remaining extraction budget
+	if _, err := tcLandLink(dst, sl, func(string, string) error { return syscall.EACCES },
+		int64(len("clang-bytes\n")-1)); err == nil {
+		t.Error("budget-exceeded copy: want an error, got nil")
 	}
 }
 
