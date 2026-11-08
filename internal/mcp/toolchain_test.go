@@ -796,9 +796,39 @@ func TestFetchTCArchiveShaMismatch(t *testing.T) {
 	tcNoResidue(t, cache)
 }
 
+// TestTCPathHostile: the shared tar-slip shape gate, pinned
+// LEXICALLY — the same refusal set on every host (final-review C1:
+// the old IsAbs-only checks had per-platform blind spots — "/tmp/x"
+// passes IsAbs on neither... on windows IsAbs("/tmp/x")=false, and
+// on unix IsAbs("C:/x")=false with an empty VolumeName). This pin
+// runs on BOTH CI legs, so each platform proves the forms the OTHER
+// platform's natives would miss.
+func TestTCPathHostile(t *testing.T) {
+	hostile := []string{
+		"", "/tmp/tc-evil-abs", "C:/evil", "c:/evil", `C:\evil`,
+		"../evil", "a/../../evil2", `back\slash`, "nul\x00byte",
+		"C:", // a bare drive letter colon is never a member shape
+	}
+	for _, p := range hostile {
+		if !tcPathHostile(p) {
+			t.Errorf("tcPathHostile(%q) = false, want true (the refusal set must be platform-blind)", p)
+		}
+	}
+	safe := []string{"top", "top/bin/tool", "wasi-sdk-24.0-x86_64-linux/bin/clang", "clang", "llvm-objcopy", "share/wasi-sysroot/include/stdio.h"}
+	for _, p := range safe {
+		if tcPathHostile(p) {
+			t.Errorf("tcPathHostile(%q) = true, want false (a real toolchain member shape)", p)
+		}
+	}
+}
+
 // TestExtractTarGzSlip: hostile tar members — ../ traversal, absolute
-// paths, backslash names, symlinks — are all refused, and nothing
-// escapes the extraction root. A safe member (control) extracts fine.
+// paths, backslash names, WINDOWS-SHAPED absolutes (leading "/", volume
+// names "C:/evil" and "C:\evil" — filepath.IsAbs is false for these on
+// windows, and VolumeName is empty on unix, so BOTH platforms need the
+// explicit forms), and hostile link targets — are all refused, and
+// nothing escapes the extraction root. A safe member (control)
+// extracts fine.
 func TestExtractTarGzSlip(t *testing.T) {
 	base := t.TempDir()
 	dst := filepath.Join(base, "out")
@@ -820,28 +850,49 @@ func TestExtractTarGzSlip(t *testing.T) {
 		{name: "/tmp/tc-evil-abs", body: "x", mode: 0o644},
 		{name: "a/../../evil2", body: "x", mode: 0o644},
 		{name: `back\slash`, body: "x", mode: 0o644},
+		// windows-shaped absolutes: on windows filepath.IsAbs("/tmp/…")
+		// is FALSE (no volume) and IsAbs("C:/evil") is true; on unix
+		// VolumeName("C:/evil") is EMPTY — so on BOTH platforms at
+		// least one of these two used to slip past a plain IsAbs gate
+		// (final-review C1: the leading-"/" form on windows, the
+		// volume form on linux — landing a garbage "C:" tree inside
+		// the cache even when contained)
+		{name: "C:/evil-vol", body: "x", mode: 0o644},
+		{name: `C:\evil-vol-bs`, body: "x", mode: 0o644},
 	} {
 		if err := extractTarGz(bytes.NewReader(tcTarGz(t, evil)), filepath.Join(base, "slip")); err == nil {
 			t.Errorf("member %q: want refusal, got nil", evil.name)
 		}
 	}
 
-	// symlink member: refused (TypeSymlink is not a landable type)
-	var sbuf bytes.Buffer
-	sgz := gzip.NewWriter(&sbuf)
-	stw := tar.NewWriter(sgz)
-	if err := stw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: "lnk", Linkname: "/etc/passwd"}); err != nil {
-		t.Fatalf("fixture symlink header: %v", err)
-	}
-	stw.Close()
-	sgz.Close()
-	if err := extractTarGz(bytes.NewReader(sbuf.Bytes()), filepath.Join(base, "slip")); err == nil {
-		t.Error("symlink member: want refusal, got nil")
+	// hostile link TARGETS, both plain-absolute and windows-shaped:
+	// since the controlled-landing fix (B11 task-11 fix round) link
+	// members with contained RELATIVE targets land — these fixtures
+	// are refused for their TARGETS ("/etc/passwd" is a path-shape
+	// escape on every platform: an absolute on unix, and on windows a
+	// root-relative pointer the OS resolves against the current
+	// drive's root — OUTSIDE the cache; "C:/Windows/evil" likewise).
+	for _, evil := range []struct{ name, target string }{
+		{"lnk", "/etc/passwd"},          // absolute (unix) / drive-root-relative (windows)
+		{"lnk-c", "C:/Windows/evil"},    // windows volume-absolute — IsAbs=false on unix
+		{"lnk-c-bs", `C:\Windows\evil`}, // backslash + volume
+	} {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: evil.name, Linkname: evil.target}); err != nil {
+			t.Fatalf("fixture link header %q: %v", evil.name, err)
+		}
+		tw.Close()
+		gz.Close()
+		if err := extractTarGz(bytes.NewReader(buf.Bytes()), filepath.Join(base, "slip")); err == nil {
+			t.Errorf("symlink member %q -> %q: want refusal, got nil", evil.name, evil.target)
+		}
 	}
 
 	// and nothing escaped the roots
 	for _, p := range []string{"evil", "evil2", "tc-evil-abs"} {
-		if _, err := os.Stat(filepath.Join(base, p)); !os.IsNotExist(err) {
+		if _, err := os.Lstat(filepath.Join(base, p)); !os.IsNotExist(err) {
 			t.Errorf("member %q escaped the extraction root", p)
 		}
 	}
