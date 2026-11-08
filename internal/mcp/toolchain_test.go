@@ -1079,3 +1079,78 @@ func TestTCFetchTimeoutClamp(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractTarGzBoundedWrite (T3 review M1): the extract cap bounds
+// the WRITE, not just the after-the-fact total — a member past the
+// remaining budget is cut AT the budget on disk (never fully landed)
+// and the extraction refuses immediately; later members never
+// extract. Exactly-at-cap still passes (a ceiling, not an off-by-one).
+func TestExtractTarGzBoundedWrite(t *testing.T) {
+	old := tcExtractMax // test seam: the var exists so this can lower it
+	tcExtractMax = 1024
+	t.Cleanup(func() { tcExtractMax = old })
+	base := t.TempDir()
+
+	// 600 + 600 bytes of members against a 1024-byte cap: member b
+	// must be cut at the remaining budget (425 = 1024-600+1) and the
+	// whole extraction refused.
+	past := tcTarGz(t,
+		tcEnt{name: "top", dir: true, mode: 0o755},
+		tcEnt{name: "top/a", body: strings.Repeat("a", 600), mode: 0o644},
+		tcEnt{name: "top/b", body: strings.Repeat("b", 600), mode: 0o644},
+	)
+	if err := extractTarGz(bytes.NewReader(past), filepath.Join(base, "x")); err == nil || !strings.Contains(err.Error(), "extraction cap") {
+		t.Fatalf("past-cap archive: want the extraction-cap refusal, got %v", err)
+	}
+	b, berr := os.ReadFile(filepath.Join(base, "x", "top", "b"))
+	if berr != nil {
+		t.Fatalf("cut member b: %v", berr)
+	}
+	if int64(len(b)) > tcExtractMax-600+1 {
+		t.Fatalf("member b landed %d bytes; the bounded write must cut at the remaining budget %d", len(b), tcExtractMax-600+1)
+	}
+
+	// exactly at cap: one member of exactly cap bytes passes...
+	at := tcTarGz(t, tcEnt{name: "c", body: strings.Repeat("c", 1024), mode: 0o644})
+	if err := extractTarGz(bytes.NewReader(at), filepath.Join(base, "y")); err != nil {
+		t.Fatalf("at-cap archive: want pass, got %v", err)
+	}
+	// ...one byte over is refused.
+	over := tcTarGz(t, tcEnt{name: "d", body: strings.Repeat("d", 1025), mode: 0o644})
+	if err := extractTarGz(bytes.NewReader(over), filepath.Join(base, "z")); err == nil || !strings.Contains(err.Error(), "extraction cap") {
+		t.Fatalf("one-byte-over archive: want the extraction-cap refusal, got %v", err)
+	}
+}
+
+// tcSDKTarNoBin is the wasi-sdk shape WITHOUT bin/ — the M3 fixture:
+// a "sdk" tarball whose top dir holds only share/ data, no compiler.
+func tcSDKTarNoBin(t *testing.T) []byte {
+	return tcTarGz(t,
+		tcEnt{name: "wasi-sdk-24.0-x86_64-linux", dir: true, mode: 0o755},
+		tcEnt{name: "wasi-sdk-24.0-x86_64-linux/share/misc.txt", body: "share\n", mode: 0o644},
+	)
+}
+
+// TestToolchainFetchSDKLayoutGate (T3 review M3): a wasi-sdk tarball
+// that lands without bin/ under its root is refused at the staging
+// door — "unexpected wasi-sdk layout" — with zero cache residue (the
+// sha pin cannot see SHAPE; wamrc's no-binary check, sdk twin).
+func TestToolchainFetchSDKLayoutGate(t *testing.T) {
+	plat := tcHostPlat(t)
+	sdk := tcSDKTarNoBin(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index", func(w http.ResponseWriter, r *http.Request) {
+		body := bytes.ReplaceAll(tcTestIndex(t, plat,
+			&tcAsset{URL: "__SDK__", SHA256: sha256hex(sdk), Bytes: int64(len(sdk))},
+			nil), []byte("__SDK__"), []byte("http://"+r.Host+"/sdk"))
+		_, _ = w.Write(body)
+	})
+	mux.HandleFunc("/sdk", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(sdk) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	cache := tcCacheEnv(t)
+
+	_, err := tcFetchRun(tcFetchIn{IndexURL: srv.URL + "/index"})
+	tcAPIErr(t, err, "unexpected wasi-sdk layout")
+	tcNoResidue(t, cache)
+}

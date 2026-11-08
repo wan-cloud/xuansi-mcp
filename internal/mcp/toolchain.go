@@ -434,10 +434,15 @@ func (ts *toolset) toolchainStatus(ctx context.Context, _ *mcpsdk.CallToolReques
 const (
 	tcArchiveMax      int64 = 700 << 20 // 700 MiB per archive
 	tcFetchTotalMax   int64 = 3 << 29   // 1.5 GiB across one fetch's declared assets
-	tcExtractMax      int64 = 4 << 30   // 4 GiB uncompressed per tarball
 	tcTimeoutDefaultS int   = 600       // timeout_sec default
 	tcTimeoutMaxS     int   = 3600      // timeout_sec clamp ceiling
 )
+
+// tcExtractMax is the 4 GiB uncompressed-per-tarball ceiling — a var
+// (its const block siblings stay const) only as the bounded-write
+// test's seam, so it can lower the cap to a fixture-sized budget; no
+// production path ever assigns it (T3 review M1).
+var tcExtractMax int64 = 4 << 30
 
 // tcHTTP is the toolchain assets' client — deliberately NOT
 // fetchHTTP (the 60s index/artifact client): a wasi-sdk archive is
@@ -592,11 +597,16 @@ func extractTarGz(src io.Reader, dst string) error {
 			if ferr != nil {
 				return ferr
 			}
-			n, cerr := io.Copy(f, tr)
+			// T3 review M1: the cap bounds the WRITE itself — the copy
+			// stops at the remaining budget (+1 to detect the byte that
+			// crosses it), so a bomb member is cut on disk at the budget
+			// and the refusal fires immediately, mid-member; members
+			// past it never extract at all.
+			n, cerr := io.Copy(f, io.LimitReader(tr, tcExtractMax-total+1))
 			if cerr == nil {
 				total += n
 				if total > tcExtractMax {
-					cerr = fmt.Errorf("expands beyond the %d-byte extraction cap", int64(tcExtractMax))
+					cerr = fmt.Errorf("expands beyond the %d-byte extraction cap", tcExtractMax)
 				}
 			}
 			if cerr != nil {
@@ -879,6 +889,15 @@ func (ts *toolset) toolchainFetch(ctx context.Context, _ *mcpsdk.CallToolRequest
 				return nil, tcFetchOut{}, errWs("xuansi_toolchain_fetch wamrc: the tarball carries no wamrc binary at its root — refusing a toolchain with no compiler (the index pin and the tarball's shape disagree)")
 			}
 		}
+		// T3 review M3: the flattened sdk tree must carry bin/ — a
+		// wasi-sdk without bin/ holds no compiler, and the sha pin
+		// cannot see SHAPE (it hashed the tarball, not the layout);
+		// wamrc's no-binary check, sdk twin.
+		if piece.kind == "wasi_sdk" {
+			if _, serr := os.Stat(filepath.Join(tree, "bin")); serr != nil {
+				return nil, tcFetchOut{}, errWs("xuansi_toolchain_fetch wasi_sdk: unexpected wasi-sdk layout (no bin/ under the archive's root) — refusing a toolchain with no compiler; the index pin and the tarball's shape disagree")
+			}
+		}
 		stagedList = append(stagedList, tcStaged{piece: piece, tree: tree})
 	}
 
@@ -922,6 +941,11 @@ func (ts *toolset) toolchainFetch(ctx context.Context, _ *mcpsdk.CallToolRequest
 			}
 		}
 		if rerr := os.Rename(s.tree, target); rerr != nil {
+			// T3 review M2: same narrow window as a crash between the
+			// remove and the rename — the target is already gone and
+			// the state not yet saved, so status honestly reads
+			// not-present and a re-fetch heals; this fetch dies whole,
+			// never half-committed.
 			return nil, tcFetchOut{}, errWs("xuansi_toolchain_fetch %s: %v", s.piece.kind, rerr)
 		}
 		fresh.Installed[s.piece.kind] = tcInstalled{SHA256: strings.ToLower(s.piece.asset.SHA256), Bytes: s.piece.asset.Bytes, Dir: s.piece.record}
