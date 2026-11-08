@@ -1,8 +1,10 @@
 package mcp
 
-// wasmbuild.go — the wasm build face's INTERNAL core (B11 task 4,
-// design §6.2/§6.3/§6.4). Task 5's xuansi_wasm_build handler wraps
-// exactly these pieces; nothing here registers a tool.
+// wasmbuild.go — the wasm build face (B11 tasks 4+5, design
+// §6.2/§6.3/§6.4): the internal core below, plus the xuansi_wasm_build
+// handler that gates tool input, calls the core, and lands the
+// artifact in the driver workspace — registration lives in
+// tools_static.go with every static tool.
 //
 //   - tcBuildFlags: the FROZEN module-ABI §8 clang flag block,
 //     single-sourced here (drivers build.sh's twin — T9's CI
@@ -21,6 +23,9 @@ package mcp
 //     clang's stdout/stderr verbatim as warnings.
 //   - wamrcExec: a stub — wamrc execution lands with A1/A3 runtime
 //     work; the aot lane's override half dies there, explicitly.
+//   - wasmBuild (T5): the tool face — input gates, the gates above,
+//     the compile, then drivers/<name>@<ver>.wasm + one manifest
+//     cycle (kind "wasm", or "wasm-dev" on the wamrc_path override).
 
 import (
 	"bytes"
@@ -31,6 +36,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // wasmHdrXuansiHost is the drivers repo's src/xuansi_host.h, embedded
@@ -182,7 +190,8 @@ func tcWarnTail(s string) string {
 // workspace landing). Resolution order (§6.4): WasiSDKPath override
 // first — the developer's explicit "compile with my local tree",
 // which deliberately bypasses the cache-state pairing evidence
-// (T5's manifest note marks the artifact dev) and derives the
+// (T5's manifest marks the override lane by Kind: wamrc_path lands
+// "wasm-dev") and derives the
 // sysroot from ITS root — then the cache state's landed wasi_sdk
 // record (the T3 path contract: tcCacheRoot() + the record's Dir),
 // then the self-guiding fetch refusal (§6.3 UX: the error carries
@@ -268,4 +277,170 @@ func (ts *toolset) wasmBuildInner(ctx context.Context, r buildReq) (wasmBytes []
 		return nil, warnings, errWs("xuansi_wasm_build: clang reported success but no .wasm landed: %v (transcript: %s)", rerr, tcWarnTail(warnings))
 	}
 	return wasm, warnings, nil
+}
+
+// ---------------------------------------------------------------------------
+// the tool face (B11 task 5)
+
+// wasmBuildSourceMax caps the C source one tool call may carry: 1 MiB,
+// the internal wire's own frame ceiling — a module whose source runs
+// past it belongs in the drivers repo (fetch its prebuilt artifact
+// with xuansi_driver_fetch), and the refusal says so.
+const wasmBuildSourceMax = 1 << 20
+
+// wasmBuildFirstVersion is the omitted version's default: the
+// first-build convention "0.0.1". driver_fetch's omitted version
+// takes the index's highest for the name — build has no index to ask,
+// so the default says "this is the module's first build"; a rebuilt
+// module versions explicitly.
+const wasmBuildFirstVersion = "0.0.1"
+
+// wasmBuildNext is the out's fixed next-step sentence — the build
+// verb's whole point is to hand the artifact to the deploy verb.
+const wasmBuildNext = "push with xuansi_driver_push {board, name} then bench.wasm.load/call"
+
+// wasmBuildIn is xuansi_wasm_build's input. No index_url: the build
+// face never reads an index — the toolchain cache's state IS the
+// pairing evidence (the plan's IndexURL row was driver_fetch's, not
+// this tool's).
+type wasmBuildIn struct {
+	Name   string `json:"name" jsonschema:"module name, lowercase [a-z0-9_-]+ (e.g. \"hello\", \"ledwatch\") — the workspace file is drivers/<name>@<version>.wasm"`
+	Source string `json:"source" jsonschema:"the module's full C source, at most 1 MiB (over is an api refusal naming the cap). #include \"xuansi_host.h\" resolves — the frozen host table every drivers-repo module compiles against"`
+	// Version omitted = wasmBuildFirstVersion (the first-build
+	// convention — there is no index whose highest to take).
+	Version string `json:"version,omitempty" jsonschema:"version string, [a-z0-9.]+ (e.g. \"1.0.0\"); omit for \"0.0.1\", the first-build default"`
+	// InitialMemory is the one ABI knob an explicit request may turn
+	// (see tcInitialMemory): omitted = the frozen 262144 default.
+	InitialMemory int64 `json:"initial_memory,omitempty" jsonschema:"the wasm linear memory's initial size in BYTES: omit for the ABI freeze default 262144 (4 x 64 KiB pages); an explicit value must be a whole multiple of the 65536-byte wasm page and at most the frozen 1048576 (1 MiB) ceiling"`
+	// FW is an EXPLICIT pre-check, not a gate the interp track needs:
+	// wasm bytecode is version-less and loads on any fw with a wasm
+	// loader, so omitted builds with no check; fwGateWasm judges what
+	// is given (floor 0.2.0).
+	FW string `json:"fw,omitempty" jsonschema:"an EXPLICIT fw-compat pre-check, not a gate the interp track needs (wasm bytecode is version-less): supply the target board's fw version to refuse early below the 0.2.0 floor — the first fw with a wasm loader; omit to build with no check"`
+	// WamrcPath / WasiSDKPath are the §6.4 developer overrides:
+	// explicit, deliberately outside the toolchain cache's pairing
+	// evidence. WamrcPath marks the manifest entry kind "wasm-dev"
+	// (the .aot compile itself arrives with the A1 runtime);
+	// WasiSDKPath compiles with a local wasi-sdk tree (bin/clang
+	// inside it) instead of the cache's landed record.
+	WamrcPath   string `json:"wamrc_path,omitempty" jsonschema:"the §6.4 developer override: an explicit wamrc marks this a dev build — the manifest entry records kind \"wasm-dev\" instead of \"wasm\" (the .aot lane itself arrives with the A1 runtime)"`
+	WasiSDKPath string `json:"wasi_sdk_path,omitempty" jsonschema:"the §6.4 developer override: compile with this local wasi-sdk tree (its bin/clang, never a PATH lookup) instead of the toolchain cache's landed record — explicitly bypassing the index pairing evidence"`
+}
+
+// wasmBuildOut is the build's answer: what landed, where, and the one
+// next step.
+type wasmBuildOut struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	File    string `json:"file" jsonschema:"the landed artifact's workspace-relative path (drivers/<name>@<version>.wasm) — same presentation xuansi_ws_list/xuansi_driver_fetch use"`
+	Sha256  string `json:"sha256" jsonschema:"sha256 of the compiled .wasm — the value the manifest's Files entry records"`
+	Bytes   int    `json:"bytes" jsonschema:"compiled .wasm bytes"`
+	// Warnings is clang's stdout+stderr verbatim (empty transcript =
+	// absent). On a failed compile it is LOST — the refusal carries
+	// the stderr tail instead, and nothing lands.
+	Warnings string `json:"warnings,omitempty" jsonschema:"clang's stdout+stderr verbatim; absent when the compile was silent"`
+	Next     string `json:"next" jsonschema:"the fixed next step: deploy the artifact, then exercise it"`
+}
+
+// wasmBuild is the xuansi_wasm_build handler — the toolchain face's
+// build verb and the workspace's third storing path (ws_put stores
+// Lua text, driver_fetch a prebuilt index artifact, this compiles C
+// source into a fresh .wasm on this host). Pipeline: input gates
+// (name/version/source size/the one ABI knob, both its rules) → the
+// split-track gates (§6.2) → wasmBuildInner (sdk resolution + the
+// compile) → the landing (writeDurableFile + one manifest cycle,
+// driverFetch's commit pattern under wsMu). No board, no lease — the
+// compile is host-side, storing is not activating.
+func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in wasmBuildIn) (*mcpsdk.CallToolResult, wasmBuildOut, error) {
+	// input shape: the same name/version whitelist every workspace
+	// path rides (ws_put's gates verbatim), the version default first
+	// so the default lands in the manifest, never the raw "".
+	if !wsNameRe.MatchString(in.Name) {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: name must match [a-z0-9_-]+, got %q", in.Name)
+	}
+	ver := in.Version
+	if ver == "" {
+		ver = wasmBuildFirstVersion
+	}
+	if !wsVerRe.MatchString(ver) {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: version must match [a-z0-9.]+, got %q", in.Version)
+	}
+	if len(in.Source) > wasmBuildSourceMax {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: source is %d bytes, over the %d-byte (1 MiB) cap — split the module, or fetch a prebuilt artifact with xuansi_driver_fetch", len(in.Source), wasmBuildSourceMax)
+	}
+	// the one ABI knob gates at the TOOL edge with both rules clean
+	// (T4 review note): a whole 64 KiB page multiple within the frozen
+	// 1 MiB ceiling. The inner re-gates the multiple — harmless
+	// repetition; this side's refusals name the contract before any
+	// filesystem or exec work (wasm-ld would refuse the lawless
+	// shapes later, less clearly).
+	if _, err := tcInitialMemory(in.InitialMemory); err != nil {
+		return nil, wasmBuildOut{}, err
+	}
+	if in.InitialMemory > tcWasmMaxMemory {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: initial_memory %d is over the frozen 1 MiB ceiling (the module-ABI freeze caps it at 1048576, the -Wl,--max-memory every build rides) — ask for at most 1048576", in.InitialMemory)
+	}
+
+	// the split-track gates (§6.2): the aot half can only fire the
+	// day this face grows an aot knob (WantAOT is never set from tool
+	// input today — the call keeps the pipeline whole for that day);
+	// the wasm half judges an EXPLICIT fw only.
+	r := buildReq{Name: in.Name, Source: in.Source, Version: ver, InitialMemory: in.InitialMemory, FW: in.FW, WamrcPath: in.WamrcPath, WasiSDKPath: in.WasiSDKPath}
+	if err := aotGate(r); err != nil {
+		return nil, wasmBuildOut{}, err
+	}
+	if err := fwGateWasm(in.FW); err != nil {
+		return nil, wasmBuildOut{}, err
+	}
+	wasm, warnings, err := ts.wasmBuildInner(ctx, r)
+	if err != nil {
+		return nil, wasmBuildOut{}, err
+	}
+
+	// the landing: drivers/<name>@<ver>.wasm + one manifest cycle, the
+	// whole commit phase under wsMu like driverFetch's (file and
+	// manifest land as one unit against concurrent push/pull cycles;
+	// the compile itself stayed outside the lock — it is the slow
+	// half and touches only its temp dir).
+	kind := "wasm"
+	if in.WamrcPath != "" {
+		kind = "wasm-dev" // the §6.4 override lane: visibly not an index-paired build
+	}
+	sha := sha256hex(wasm)
+	wsMu.Lock()
+	defer wsMu.Unlock()
+	path := ts.ws.driverPath(in.Name, ver, "wasm")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: %v", err)
+	}
+	if err := writeDurableFile(path, wasm, 0o644); err != nil {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: %v", err)
+	}
+	m, err := loadManifest(ts.ws.manifestPath())
+	if err != nil {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: %v", err)
+	}
+	e := m.entry(in.Name)
+	e.Kind = kind
+	fm := e.Files[ver] // push footprints (Boards) survive a re-build, like a re-put/re-fetch
+	fm.Sha256, fm.Size = sha, len(wasm)
+	// built-at: for put/fetch storing is NOT pushing and the field
+	// stays zero; a build is the artifact's birth, and this face owns
+	// that timestamp — the disk values win on a re-build, the same
+	// single-source discipline driverPush applies to sha/size.
+	fm.PushedAt = time.Now().UTC()
+	e.Files[ver] = fm // Active deliberately untouched
+	m.Drivers[in.Name] = e
+	if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: %v", err)
+	}
+	return nil, wasmBuildOut{
+		Name:     in.Name,
+		Version:  ver,
+		File:     "drivers/" + in.Name + "@" + ver + ".wasm",
+		Sha256:   sha,
+		Bytes:    len(wasm),
+		Warnings: warnings,
+		Next:     wasmBuildNext,
+	}, nil
 }

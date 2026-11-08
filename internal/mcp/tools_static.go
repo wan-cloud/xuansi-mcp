@@ -281,8 +281,8 @@ type opResultOut = map[string]any
 // displace a static one (server_test.go pins the served list to the
 // same names). B8 appends fs_rm + driver_pull after capture, then
 // session_reset after those; B9 appended camera_shot; B10 task 5
-// appended driver_fetch; B11 task 2 appended toolchain_status; B11
-// task 3 appends toolchain_fetch: the existing tools keep their
+// appended driver_fetch; B11 task 2 appended toolchain_status, task 3
+// toolchain_fetch, task 5 wasm_build: the existing tools keep their
 // positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
@@ -309,6 +309,7 @@ var staticToolNames = []string{
 	"xuansi_driver_fetch",
 	"xuansi_toolchain_status",
 	"xuansi_toolchain_fetch",
+	"xuansi_wasm_build",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -444,6 +445,16 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 			"PAIRING: installing a generation is what makes xuansi_toolchain_status's fw-compat answer current (P1: wasm >=0.2.0 wide domain, aot empty — refused until A1); a generation this platform has no wamrc asset for installs wasi_sdk alone and says so in the note. " +
 			"No lease, no daemon call.",
 	}, ts.toolchainFetch)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "xuansi_wasm_build",
+		Description: "Compile one C source to a .wasm module ON THIS HOST and store it into the daemon-side driver workspace (drivers/<name>@<version>.wasm + its manifest entry) — the build half of the wasm lane, push-ready: a bare xuansi_driver_push deploys what this stores (version omitted re-deploys the manifest's ACTIVE). No board, no lease. " +
+			"INPUT: name [a-z0-9_-]+; source = the module's full C source (at most 1 MiB — over is a refusal naming the cap; #include \"xuansi_host.h\" resolves, the frozen host table every drivers-repo module compiles against); version [a-z0-9.]+, omitted = 0.0.1 (the first-build convention — the build face has no index whose highest to take, driver_fetch's omitted-version rule); initial_memory in bytes, omitted = the ABI freeze default 262144 (4 x 64 KiB pages), an explicit value must be a whole 65536-byte page multiple at most the frozen 1048576 (1 MiB) ceiling. " +
+			"FW IS AN EXPLICIT PRE-CHECK, NOT A GATE THE INTERP TRACK NEEDS: the board's interp track loads .wasm without an fw gate — the bytecode is version-less — so an omitted fw builds with no check; supply the target board's fw version only to refuse EARLY below the 0.2.0 floor (the first fw with a wasm loader). " +
+			"TOOLCHAIN: the wasi-sdk comes from the cache xuansi_toolchain_fetch lands (a missing or broken toolchain refuses with the fetch guidance in the error itself); the frozen module-ABI flag block rides every build, so a built module is byte-comparable with the drivers repo's own. " +
+			"DEVELOPER OVERRIDES (spec §6.4 — explicit, they bypass the cache-state pairing evidence): wasi_sdk_path compiles with a local wasi-sdk tree (its bin/clang, never a PATH lookup); wamrc_path marks the manifest entry kind \"wasm-dev\" instead of \"wasm\" — visibly a dev artifact, not an index-paired build (the .aot compile itself arrives with the A1 runtime). " +
+			"Storing is NOT activating — the manifest's Active only moves on a verified push. clang's stdout/stderr ride the reply's warnings verbatim; a failed compile refuses carrying the stderr tail and nothing lands.",
+	}, ts.wasmBuild)
 
 	ts.registerCapture(srv)
 }

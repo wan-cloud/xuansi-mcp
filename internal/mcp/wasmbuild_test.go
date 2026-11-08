@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestTCBuildFlagsFrozen pins the module-ABI §8 flag block exactly:
@@ -238,6 +239,239 @@ echo "fake clang: 1 warning generated" >&2
 	}
 	_, _, err = ts.wasmBuildInner(context.Background(), buildReq{Source: "int x;\n", WasiSDKPath: sdk, InitialMemory: 65537})
 	tcAPIErr(t, err, "65536")
+}
+
+// ---------------------------------------------------------------------------
+// xuansi_wasm_build (B11 task 5) — the tool handler, handler-direct
+// (the toolchain-test pattern: the build face crosses no daemon wire,
+// so there is nothing to script — the workspace root is injected and
+// the sdk resolution rides a fake clang fixture or a fresh cache).
+
+// fakeWasmSDK plants a fixture wasi-sdk tree whose bin/clang is a
+// shell script that writes fixed .wasm-magic bytes to the -o target
+// and one line on stderr — the tool tests' compile stand-in (the
+// argv-shape pins live in TestWasmBuildInnerFakeClang; here only the
+// landing is under test). Returns the sdk root to pass as
+// wasi_sdk_path (the §6.4 override: the inner execs <root>/bin/clang
+// directly, no state/bin gate on this path).
+func fakeWasmSDK(t *testing.T) string {
+	t.Helper()
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh absent: the fake clang is a shell script")
+	}
+	sdk := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(sdk, "bin"), 0o755); err != nil {
+		t.Fatalf("fake sdk bin: %v", err)
+	}
+	script := `#!/bin/sh
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+printf '\000\141\163\155\000\000fake-module-body' > "$out"
+echo "fake clang: ok" >&2
+`
+	if err := os.WriteFile(filepath.Join(sdk, "bin", "clang"), []byte(script), 0o755); err != nil {
+		t.Fatalf("plant fake clang: %v", err)
+	}
+	return sdk
+}
+
+// fakeWasmBody is the fake clang's exact output: the \0asm magic, two
+// zero bytes, then the marker body — the bytes the landing must store
+// byte-for-byte and the manifest's FileMeta must describe.
+func fakeWasmBody() []byte {
+	b := append([]byte{}, wasmMagic[:]...)
+	b = append(b, 0x00, 0x00)
+	return append(b, []byte("fake-module-body")...)
+}
+
+// wasmBuildRun runs the handler once under a test timeout, with the
+// workspace root injected (ts.ws) — the landing target the test then
+// inspects through the same wsState paths.
+func wasmBuildRun(t *testing.T, ts *toolset, in wasmBuildIn) (wasmBuildOut, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, out, err := ts.wasmBuild(ctx, nil, in)
+	return out, err
+}
+
+// TestWasmBuildToolLargeSource (brief-named): a source over the 1 MiB
+// cap is an api refusal naming the cap, fired at the TOOL edge before
+// any sdk resolution or landing — the workspace stays empty (the
+// zero-write proof).
+func TestWasmBuildToolLargeSource(t *testing.T) {
+	ts := &toolset{ws: newWSState(t.TempDir())}
+	tcCacheEnv(t) // fresh cache: the size gate must fire, never the tc guidance
+	big := strings.Repeat("// padding padding\n", (1<<20)/18+2)
+	if len(big) <= 1<<20 {
+		t.Fatalf("fixture source is %d bytes, want over 1048576", len(big))
+	}
+	_, err := wasmBuildRun(t, ts, wasmBuildIn{Name: "hello", Source: big})
+	tcAPIErr(t, err, "1048576") // the cap named in the refusal
+	if !strings.Contains(err.Error(), "1 MiB") {
+		t.Errorf("refusal %v: want the 1 MiB cap named in human units too", err)
+	}
+	if _, serr := os.Stat(ts.ws.manifestPath()); !os.IsNotExist(serr) {
+		t.Errorf("over-cap source: manifest exists — nothing should have landed")
+	}
+}
+
+// TestWasmBuildToolMissingTCGuidance (brief-named): no override, no
+// cache → the self-guiding refusal names the fetch tool (§6.3 UX),
+// through the tool handler this time (the inner's guidance, verbatim).
+func TestWasmBuildToolMissingTCGuidance(t *testing.T) {
+	tcCacheEnv(t)
+	ts := &toolset{ws: newWSState(t.TempDir())}
+	_, err := wasmBuildRun(t, ts, wasmBuildIn{Name: "hello", Source: "int x;\n"})
+	tcAPIErr(t, err, "xuansi_toolchain_fetch")
+}
+
+// TestWasmBuildToolLandsWorkspace (brief-named): the whole tool path
+// against the fake sdk — the artifact lands at drivers/<name>@<ver>.wasm
+// with the fake's exact bytes, the manifest entry records kind "wasm"
+// plus the FileMeta (sha/size of the built bytes, built-at time,
+// Active untouched), and every out field answers (File the
+// workspace-relative path, Next the fixed push sentence, Warnings the
+// transcript verbatim).
+func TestWasmBuildToolLandsWorkspace(t *testing.T) {
+	sdk := fakeWasmSDK(t)
+	root := t.TempDir()
+	ts := &toolset{ws: newWSState(root)}
+	out, err := wasmBuildRun(t, ts, wasmBuildIn{
+		Name: "hello", Version: "1.2.0", Source: "int x;\n",
+		InitialMemory: 131072, // an explicit 2-page value rides through the gates
+		WasiSDKPath:   sdk,
+	})
+	if err != nil {
+		t.Fatalf("wasmBuild: %v", err)
+	}
+	body := fakeWasmBody()
+	if out.Name != "hello" || out.Version != "1.2.0" {
+		t.Fatalf("out identity = %+v: want hello@1.2.0", out)
+	}
+	if out.File != "drivers/hello@1.2.0.wasm" {
+		t.Errorf("out.File = %q: want the workspace-relative landed path", out.File)
+	}
+	if out.Sha256 != sha256hex(body) || out.Bytes != len(body) {
+		t.Errorf("out sha/bytes = %s/%d: want %s/%d (the compiled artifact's own)", out.Sha256, out.Bytes, sha256hex(body), len(body))
+	}
+	if out.Warnings != "fake clang: ok\n" {
+		t.Errorf("out.Warnings = %q: want the transcript verbatim", out.Warnings)
+	}
+	if out.Next != wasmBuildNext {
+		t.Errorf("out.Next = %q: want the fixed push sentence %q", out.Next, wasmBuildNext)
+	}
+
+	// the landed file: exact bytes at the driverPath the manifest names
+	got, rerr := readFileShared(filepath.Join(root, "drivers", "hello@1.2.0.wasm"))
+	if rerr != nil {
+		t.Fatalf("landed artifact: %v", rerr)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("landed bytes % x: want the fake clang's output % x", got, body)
+	}
+
+	// the manifest entry: kind wasm, FileMeta of the built bytes,
+	// built-at recorded, no activation, no push footprints
+	m, merr := loadManifest(filepath.Join(root, "manifest.json"))
+	if merr != nil {
+		t.Fatalf("loadManifest: %v", merr)
+	}
+	e, ok := m.Drivers["hello"]
+	if !ok {
+		t.Fatal("manifest: no hello entry after the build")
+	}
+	if e.Kind != "wasm" {
+		t.Errorf("kind = %q: want wasm (no dev override in play)", e.Kind)
+	}
+	if e.Active != "" {
+		t.Errorf("active = %q: storing is NOT activating (a push moves it)", e.Active)
+	}
+	fm, ok := e.Files["1.2.0"]
+	if !ok {
+		t.Fatal("manifest: no files[1.2.0] entry after the build")
+	}
+	if fm.Sha256 != sha256hex(body) || fm.Size != len(body) {
+		t.Errorf("files[1.2.0] = %+v: want sha %s size %d", fm, sha256hex(body), len(body))
+	}
+	if fm.PushedAt.IsZero() {
+		t.Error("files[1.2.0].pushed_at: want the built-at timestamp recorded")
+	}
+	if len(fm.Boards) != 0 {
+		t.Errorf("files[1.2.0].boards = %v: want none (a build pushes nowhere)", fm.Boards)
+	}
+}
+
+// TestWasmBuildToolVersionGate (brief-named): the tool-edge input
+// gates — name/version regex refusals (the omitted version's 0.0.1
+// default lands in the dev test below) and the one ABI knob's frozen
+// ceiling — all api-class, all BEFORE sdk resolution (a fresh cache
+// never reaches the toolchain guidance on these shapes).
+func TestWasmBuildToolVersionGate(t *testing.T) {
+	tcCacheEnv(t)
+	ts := &toolset{ws: newWSState(t.TempDir())}
+	for _, c := range []struct {
+		name, ver, want string
+	}{
+		{"Hello", "", "name must match"},   // uppercase outside [a-z0-9_-]+
+		{"../evil", "", "name must match"}, // a path-shaped name never reaches one
+		{"hello", "1.0-beta", "version must match"},
+		{"hello", "V2", "version must match"},
+		{"hello", "1.0/x", "version must match"},
+	} {
+		_, err := wasmBuildRun(t, ts, wasmBuildIn{Name: c.name, Version: c.ver, Source: "int x;\n"})
+		tcAPIErr(t, err, c.want)
+	}
+
+	// the frozen 1 MiB memory ceiling (T4 review note): a page
+	// MULTIPLE over the cap is the tool edge's own refusal naming the
+	// legal max — wasm-ld would refuse it later; this says it before
+	// any exec.
+	_, err := wasmBuildRun(t, ts, wasmBuildIn{Name: "hello", Source: "int x;\n", InitialMemory: 1114112})
+	tcAPIErr(t, err, "1048576")
+
+	// and the non-multiple still refuses at the edge (the inner's
+	// gate re-fired from the tool, message naming the page size)
+	_, err = wasmBuildRun(t, ts, wasmBuildIn{Name: "hello", Source: "int x;\n", InitialMemory: 65537})
+	tcAPIErr(t, err, "65536")
+}
+
+// TestWasmBuildToolDevOverrideKind (the added cases): wamrc_path
+// marks the manifest entry kind "wasm-dev" (the §6.4 override lane —
+// visibly not an index-paired build), and an omitted version lands
+// the first-build default 0.0.1.
+func TestWasmBuildToolDevOverrideKind(t *testing.T) {
+	sdk := fakeWasmSDK(t)
+	ts := &toolset{ws: newWSState(t.TempDir())}
+	out, err := wasmBuildRun(t, ts, wasmBuildIn{
+		Name: "hello", Source: "int x;\n",
+		WamrcPath: "/opt/wamrc", WasiSDKPath: sdk, // no Version: the 0.0.1 default
+	})
+	if err != nil {
+		t.Fatalf("wasmBuild (dev): %v", err)
+	}
+	if out.Version != wasmBuildFirstVersion {
+		t.Fatalf("out.Version = %q: want the %s first-build default", out.Version, wasmBuildFirstVersion)
+	}
+	if out.File != "drivers/hello@"+wasmBuildFirstVersion+".wasm" {
+		t.Errorf("out.File = %q: want the default version's path", out.File)
+	}
+	m, merr := loadManifest(ts.ws.manifestPath())
+	if merr != nil {
+		t.Fatalf("loadManifest: %v", merr)
+	}
+	e := m.Drivers["hello"]
+	if e.Kind != "wasm-dev" {
+		t.Fatalf("kind = %q: want wasm-dev (wamrc_path marks the override lane)", e.Kind)
+	}
+	fm, ok := e.Files[wasmBuildFirstVersion]
+	if !ok || fm.Sha256 != out.Sha256 || fm.Size != out.Bytes {
+		t.Fatalf("files[%s] = %+v (ok=%v): want the built artifact's meta matching out", wasmBuildFirstVersion, fm, ok)
+	}
 }
 
 // wasmRealSDKRoot finds a REAL wasi-sdk for the compile smoke: the
