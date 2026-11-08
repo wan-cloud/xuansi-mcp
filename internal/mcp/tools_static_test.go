@@ -695,6 +695,10 @@ var staticToolsRequiredAudit = map[string][]string{
 	// latest, index_url = default, timeout_sec = 600) — a bare call
 	// installs the latest generation for this host.
 	"xuansi_toolchain_fetch": {},
+	// B11 task 5: build needs the module's identity and its source;
+	// everything else defaults (version = 0.0.1, initial_memory =
+	// 262144, fw/wamrc_path/wasi_sdk_path = unset lanes).
+	"xuansi_wasm_build": {"name", "source"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
