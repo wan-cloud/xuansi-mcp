@@ -63,7 +63,6 @@ import (
 	"math"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -356,21 +355,12 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 
 	// ---------- S0: prelude ----------
 	fmt.Println("\n- S0: prelude - clean bench, board reachable + listed, sandbox, HEAD serve+mcp up, tools served, lease -")
-	if out, err := exec.Command("pgrep", "-af", "xuansi").CombinedOutput(); err == nil {
-		stale := 0
-		for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			f := strings.Fields(ln)
-			// pgrep -af lines LEAD WITH THE PID; only `serve` counts as
-			// stale (the controller-slot owner). An idle `mcp` face owns
-			// nothing without its daemon.
-			if len(f) >= 3 && strings.Contains(filepath.Base(f[1]), "xuansi") && f[2] == "serve" {
-				stale++
-				fmt.Printf("  [note] stale xuansi serve process: %s\n", asciiLine(ln))
-			}
-		}
+	// stale-bench scan, platform helper (b6proc_*.go): pgrep argv
+	// parsing on unix, tasklist image counting on windows. Only a scan
+	// that RAN gets the verdict line — a pgrep exit-1 bench is the
+	// cleanest (note only), exactly the original control flow.
+	if scanned, stale := benchStaleServers(h); scanned {
 		h.check(stale == 0, fmt.Sprintf("no stale xuansi serve daemon on the bench (found %d - the resident npm daemon must be stopped first: it holds the controller slot)", stale))
-	} else {
-		h.note("pgrep: no xuansi processes found (clean bench)")
 	}
 	if conn, err := net.DialTimeout("tcp", endp, 3*time.Second); err != nil {
 		h.check(false, fmt.Sprintf("board TCP face reachable at %s: %v (dial only - no reboot, no USB open)", endp, err))
@@ -698,16 +688,35 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	m, text, isErr, _ = b.call(ctx, 30*time.Second, "xuansi_release", map[string]any{"board": b11Board, "holder": b11Holder})
 	h.check(!isErr, "W84 lease released")
 
+	// stop the children: unix delivers a real SIGINT and asserts the
+	// daemon's own graceful exit ("shutdown complete" + sock file
+	// removed). The windows leg cannot deliver one (taskkill hard-kill
+	// — no console carries a ctrl event under ssh; the b6proc_windows.go
+	// ruling), so its assertions degrade to the honest pair: process
+	// EXITED and the sock no longer OCCUPIED (a hard-killed daemon can
+	// print no shutdown line and unlink no sock FILE; the lingered file
+	// is cosmetic — a still-dialable sock would be a real leak).
 	if mcp.sigintAndWait(h, 10*time.Second) {
 		h.check(mcp.has("shutdown complete") || true, "mcp child exited cleanly on SIGINT")
 	}
 	if serve.sigintAndWait(h, 15*time.Second) {
-		h.check(serve.has("shutdown complete"), "daemon exited cleanly on SIGINT (shutdown complete)")
+		if gracefulStopSupported {
+			h.check(serve.has("shutdown complete"), "daemon exited cleanly on SIGINT (shutdown complete)")
+		} else {
+			h.check(true, "daemon process exited on the windows stop leg (hard kill - graceful \"shutdown complete\" needs a console-delivered ctrl event, unavailable over ssh; the unix legs own that contract)")
+		}
 	}
-	if _, err := os.Stat(sock); os.IsNotExist(err) {
-		h.check(true, "daemon sock removed on exit")
+	if gracefulStopSupported {
+		if _, err := os.Stat(sock); os.IsNotExist(err) {
+			h.check(true, "daemon sock removed on exit")
+		} else {
+			h.check(false, "daemon sock left behind: "+sock)
+		}
+	} else if conn, err := net.DialTimeout("unix", sock, time.Second); err != nil {
+		h.check(true, "daemon sock no longer occupied after the hard kill (dial refused - the lingering sock file is cosmetic on windows)")
 	} else {
-		h.check(false, "daemon sock left behind: "+sock)
+		conn.Close()
+		h.check(false, "daemon sock still occupied after exit: "+sock)
 	}
 	h.note("board as found: no /drv files, no loaded modules, no lease")
 	h.note("sandbox kept for inspection: workspace under %s, toolchain cache under %s (the wrapper wipes the run dir on the next attempt)", sb.dataDir(), wasmCache)

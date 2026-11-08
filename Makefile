@@ -17,7 +17,7 @@ VERSION := $(VERSION:v%=%)
 # never cross-compiled from Linux.
 MATRIX := linux/amd64 linux/arm64 windows/amd64 windows/arm64
 
-.PHONY: vet test build matrix clean
+.PHONY: vet test build matrix hil-win clean
 
 vet:
 	$(GO) vet ./...
@@ -44,6 +44,15 @@ matrix:
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) vet ./...; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build ./...; \
 	done
+
+# The windows HIL leg's driver (b11toolchain et al.): cross-compiled
+# from linux, pure Go — hil's windows process primitives ride exec'd
+# taskkill/tasklist, no console APIs, no cgo. Deliberately OUTSIDE the
+# matrix: the matrix gates the SHIPPED daemon; this is the bench
+# driver artifact the win HIL leg scp's over.
+hil-win:
+	mkdir -p bin
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -trimpath -o bin/hil-windows-amd64.exe ./hil
 
 clean:
 	rm -rf bin

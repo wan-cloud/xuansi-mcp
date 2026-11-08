@@ -91,7 +91,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -255,23 +254,25 @@ func (p *b6Proc) kill(label string) {
 		return
 	default:
 	}
-	fmt.Printf("  [note] driver exit: SIGKILLing the still-running %s (%s)\n", p.prefix, label)
-	_ = p.cmd.Process.Signal(syscall.SIGKILL)
+	fmt.Printf("  [note] driver exit: %s the still-running %s (%s)\n", killGerund, p.prefix, label)
+	_ = killProc(p.cmd.Process)
 	<-p.exited
 }
 
-// sigintAndWait delivers SIGINT and waits for a clean exit within bound.
+// sigintAndWait delivers the platform stop (SIGINT on unix; the
+// windows leg's taskkill hard-kill — the b6proc_*.go ruling) and
+// waits for a clean exit within bound.
 func (p *b6Proc) sigintAndWait(h *harness, bound time.Duration) bool {
-	if err := p.cmd.Process.Signal(syscall.SIGINT); err != nil {
-		h.check(false, "SIGINT the daemon: "+err.Error())
+	if err := stopProc(p.cmd.Process); err != nil {
+		h.check(false, stopLabel+" the daemon: "+err.Error())
 		return false
 	}
 	select {
 	case <-p.exited:
 		return true
 	case <-time.After(bound):
-		h.check(false, fmt.Sprintf("daemon did not exit within %v of SIGINT (SIGKILLed)", bound))
-		_ = p.cmd.Process.Signal(syscall.SIGKILL)
+		h.check(false, fmt.Sprintf("daemon did not exit within %v of %s (%s)", bound, stopLabel, killPast))
+		_ = killProc(p.cmd.Process)
 		<-p.exited
 		return false
 	}
