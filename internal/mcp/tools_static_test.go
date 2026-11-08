@@ -691,6 +691,10 @@ var staticToolsRequiredAudit = map[string][]string{
 	// B11 task 2: status's only input is the omitempty index_url —
 	// nothing required (the whole point: a bare call just answers).
 	"xuansi_toolchain_status": {},
+	// B11 task 3: fetch's inputs are all omitempty (generation =
+	// latest, index_url = default, timeout_sec = 600) — a bare call
+	// installs the latest generation for this host.
+	"xuansi_toolchain_fetch": {},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
