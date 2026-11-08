@@ -238,8 +238,23 @@ func (ts *toolset) wasmBuildInner(ctx context.Context, r buildReq) (wasmBytes []
 	}
 
 	// staging: one temp dir holding the expanded host header, the
-	// source, and the output. Fixed names — r.Name is T5's to gate,
-	// and an unvalidated name never reaches a path here.
+	// source, and the output. The source keeps its fixed name
+	// (module.c — the compile is source-name-blind); the OUTPUT rides
+	// the request's name when it carries one: wasm-ld embeds the -o
+	// basename as the wasm module's name (the "name" custom section's
+	// module-name subsection), so a daemon-built artifact must stage
+	// its output as <name>.wasm to be byte-identical with the drivers
+	// repo's own builds — T9's parity leg locks exactly this. The name
+	// now reaches a path, so an EXPLICIT name is gated here too (the
+	// tool layer's gate rides again as defense in depth); empty keeps
+	// the legacy module.wasm staging (the inner stays name-optional).
+	base := "module"
+	if r.Name != "" {
+		if !wsNameRe.MatchString(r.Name) {
+			return nil, "", errWs("xuansi_wasm_build: name must match [a-z0-9_-]+, got %q", r.Name)
+		}
+		base = r.Name
+	}
 	tmp, terr := os.MkdirTemp("", "xuansi-wasm-build-*")
 	if terr != nil {
 		return nil, "", errWs("xuansi_wasm_build: staging dir: %v", terr)
@@ -256,7 +271,7 @@ func (ts *toolset) wasmBuildInner(ctx context.Context, r buildReq) (wasmBytes []
 	if err := os.WriteFile(srcPath, []byte(r.Source), 0o644); err != nil {
 		return nil, "", errWs("xuansi_wasm_build: stage source: %v", err)
 	}
-	outPath := filepath.Join(tmp, "module.wasm")
+	outPath := filepath.Join(tmp, base+".wasm")
 
 	// compile. stdout and stderr are captured separately (exec copies
 	// them from two goroutines — one shared buffer would race) and
