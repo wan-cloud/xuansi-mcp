@@ -1,21 +1,27 @@
 package mcp
 
-// toolchain_test.go — B11 task 1's toolchain-face foundations: the
-// index ver gate (index_ver!=1 refuses — a newer index needs a newer
-// daemon, the driver fetch's fetchIndex gate discipline, toolchain
-// twin), the embedded known-good snapshot (parses past the gate and
-// mirrors the drivers repo's index first version: the toolchain-v2
-// generation, five-platform wasi-sdk matrix, wamrc on linux-x64 only),
-// and the local state round trip (save→load equal over the atomic
-// writeDurableFile, a bad path's error crossing untouched, missing
-// file = fresh cache, corrupt file = refusal).
+// toolchain_test.go — B11 task 1's toolchain-face foundations (the
+// index ver gate, the embedded snapshot, the state round trip) plus
+// task 2's xuansi_toolchain_status: local installed state x index
+// latest (present = state record AND files on disk, the §6.1 layout),
+// a remote-unreachable index degrading to the embedded snapshot
+// without error, a REACHABLE index failing the ver gate refused (not
+// degraded), file:// index URLs refused client-side, and missing
+// pieces self-guiding to xuansi_toolchain_fetch (spec §6.3 UX).
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"xuansi/internal/server"
 )
@@ -33,6 +39,13 @@ func TestParseToolchainIndexVerGate(t *testing.T) {
 		if !errors.As(err, &rerr) || rerr.Class != "api" {
 			t.Fatalf("index_ver 2: want api-class refusal, got %v", err)
 		}
+	}
+
+	// T1 review M3: a body MISSING index_ver unmarshals to 0 — the same
+	// gate must refuse it (an unversioned document is not a version 1;
+	// only the explicit-ver case was pinned before).
+	if _, err := parseToolchainIndex([]byte(`{"latest":"toolchain-v2"}`)); err == nil {
+		t.Fatal("missing index_ver: want refusal (unmarshals to 0), got nil")
 	}
 
 	ix, err := parseToolchainIndex([]byte(`{
@@ -119,6 +132,12 @@ func TestEmbeddedSnapshotParses(t *testing.T) {
 	if gen.Platforms["linux-x64"].Wamrc == nil {
 		t.Fatal("embedded linux-x64 wamrc: want asset, got null")
 	}
+	// T1 review M1: the linux-x64 wamrc URL pinned verbatim — the one
+	// self-built asset the P1 fetch downloads; a guessed URL would
+	// plant a dead release link only task 6's cross-check would catch.
+	if w := gen.Platforms["linux-x64"].Wamrc; w.URL != "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/wamrc-2.4.0-xtensa-18.1.2-linux-x64.tar.gz" {
+		t.Fatalf("embedded linux-x64 wamrc URL = %q, want the toolchain-v2 release URL verbatim", w.URL)
+	}
 	for _, plat := range []string{"linux-arm64", "macos-x64", "macos-arm64", "win-x64"} {
 		if gen.Platforms[plat].Wamrc != nil {
 			t.Fatalf("embedded %s wamrc: want null (P1 matrix), got %+v", plat, gen.Platforms[plat].Wamrc)
@@ -172,5 +191,221 @@ func TestTCStateRoundTripAtomic(t *testing.T) {
 	}
 	if _, err := loadTCState(path); err == nil {
 		t.Fatal("corrupt file: want refusal, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// xuansi_toolchain_status (B11 task 2)
+
+// tcStatusOK runs the status handler directly (no daemon, no
+// workspace — the tool reads only the cache root and the index URL)
+// and fails the test on any error.
+func tcStatusOK(t *testing.T, indexURL string) tcStatusOut {
+	t.Helper()
+	ts := &toolset{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, out, err := ts.toolchainStatus(ctx, nil, tcStatusIn{IndexURL: indexURL})
+	if err != nil {
+		t.Fatalf("toolchainStatus: %v", err)
+	}
+	return out
+}
+
+// tcStatusErr runs the handler expecting a refusal, returning it.
+func tcStatusErr(t *testing.T, indexURL string) error {
+	t.Helper()
+	ts := &toolset{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := ts.toolchainStatus(ctx, nil, tcStatusIn{IndexURL: indexURL})
+	if err == nil {
+		t.Fatalf("toolchainStatus(%q): want refusal, got nil", indexURL)
+	}
+	return err
+}
+
+// TestTCStatusAllPresentRemoteIndex: a FULL cache (state records both
+// pieces, both exist on disk in the §6.1 layout — wasi-sdk-<ver>-<plat>
+// dir, wamrc/wamrc file) against a reachable index → source=remote,
+// both rows present with the state's pins carried, exactly one HTTP
+// hit (the index; status downloads nothing else), and NO guidance
+// (nothing missing). The fake index serves the embedded snapshot's own
+// body — the exact document task 6 lands upstream.
+func TestTCStatusAllPresentRemoteIndex(t *testing.T) {
+	plat := tcPlatKey(runtime.GOOS, runtime.GOARCH)
+	if plat == "" {
+		t.Skipf("host %s/%s has no index platform key — the present-path needs a matrix leg", runtime.GOOS, runtime.GOARCH)
+	}
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write(toolchainSnapshotJSON)
+	}))
+	defer srv.Close()
+
+	cache := t.TempDir()
+	t.Setenv("XUANSI_WASM_CACHE", cache)
+	sdkPin := tcInstalled{SHA256: "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5", Bytes: 118879731}
+	wamrcPin := tcInstalled{SHA256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", Bytes: 4096}
+	if err := saveTCState(filepath.Join(cache, toolchainStateFile), &tcState{
+		Generation: "toolchain-v2",
+		Installed:  map[string]tcInstalled{"wasi_sdk": sdkPin, "wamrc": wamrcPin},
+	}); err != nil {
+		t.Fatalf("plant state: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cache, "wasi-sdk-24.0-"+plat), 0o755); err != nil {
+		t.Fatalf("plant wasi-sdk dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cache, "wamrc"), 0o755); err != nil {
+		t.Fatalf("plant wamrc dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "wamrc", "wamrc"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("plant wamrc binary: %v", err)
+	}
+
+	out := tcStatusOK(t, srv.URL)
+	if out.Index.Source != "remote" || out.Index.Latest != "toolchain-v2" || out.Index.Note != "" {
+		t.Fatalf("index = %+v, want remote / toolchain-v2 / no note", out.Index)
+	}
+	if out.Generation != "toolchain-v2" {
+		t.Fatalf("generation = %q, want the state's toolchain-v2", out.Generation)
+	}
+	if out.CacheRoot != cache {
+		t.Fatalf("cache_root = %q, want the XUANSI_WASM_CACHE override %q", out.CacheRoot, cache)
+	}
+	if len(out.Installed) != 2 {
+		t.Fatalf("installed rows = %d (%+v), want 2", len(out.Installed), out.Installed)
+	}
+	for _, row := range out.Installed {
+		if !row.Present {
+			t.Errorf("row %+v: want present", row)
+		}
+		switch row.Kind {
+		case "wasi_sdk":
+			if row.SHA256 != sdkPin.SHA256 || row.Bytes != sdkPin.Bytes {
+				t.Errorf("wasi_sdk row = %+v, want the state's pins %+v", row, sdkPin)
+			}
+		case "wamrc":
+			if row.SHA256 != wamrcPin.SHA256 || row.Bytes != wamrcPin.Bytes {
+				t.Errorf("wamrc row = %+v, want the state's pins %+v", row, wamrcPin)
+			}
+		default:
+			t.Errorf("unexpected row kind %q", row.Kind)
+		}
+	}
+	if out.Guidance != "" {
+		t.Errorf("guidance = %q, want empty (nothing missing)", out.Guidance)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("HTTP hits = %d, want exactly 1 (the index; status downloads no assets)", n)
+	}
+}
+
+// TestTCStatusRemoteUnreachableDegradesToEmbedded: a dead index URL
+// with a fresh cache is NOT an error — source=embedded, the snapshot's
+// latest, a non-empty note saying why, both rows absent, and guidance
+// naming xuansi_toolchain_fetch (the offline pin's whole point).
+func TestTCStatusRemoteUnreachableDegradesToEmbedded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	srv.Close() // dead port: connection refused
+
+	t.Setenv("XUANSI_WASM_CACHE", t.TempDir())
+	out := tcStatusOK(t, srv.URL)
+	if out.Index.Source != "embedded" || out.Index.Latest != "toolchain-v2" {
+		t.Fatalf("index = %+v, want embedded / toolchain-v2 (the snapshot's values)", out.Index)
+	}
+	if out.Index.Note == "" {
+		t.Fatal("note: want non-empty (why the remote index did not answer)")
+	}
+	if out.Generation != "" {
+		t.Fatalf("generation = %q, want empty (fresh cache)", out.Generation)
+	}
+	for _, row := range out.Installed {
+		if row.Present {
+			t.Errorf("row %+v: want present=false on a fresh cache", row)
+		}
+		if row.SHA256 != "" || row.Bytes != 0 {
+			t.Errorf("row %+v: want no pins without a state record", row)
+		}
+	}
+	if !strings.Contains(out.Guidance, "xuansi_toolchain_fetch") {
+		t.Errorf("guidance = %q, want it to name xuansi_toolchain_fetch", out.Guidance)
+	}
+}
+
+// TestTCStatusRemoteVerGateRefused: a REACHABLE index whose body fails
+// the ver gate is a hard api-class refusal, NOT a silent degrade — the
+// degrade path is for UNAVAILABILITY only; "a newer index needs a
+// newer daemon" is a compatibility signal status must not paper over
+// with the older snapshot's latest.
+func TestTCStatusRemoteVerGateRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"index_ver":2,"latest":"toolchain-v3"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("XUANSI_WASM_CACHE", t.TempDir())
+	err := tcStatusErr(t, srv.URL)
+	var rerr *server.RPCError
+	if !errors.As(err, &rerr) || rerr.Class != "api" {
+		t.Fatalf("index_ver 2 index: want api-class refusal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "index_ver 2") {
+		t.Errorf("refusal %v: want the gate's newer-daemon message verbatim", err)
+	}
+}
+
+// TestTCStatusFileURLRefused: an explicit non-http(s) index URL is
+// refused client-side before any request — driverFetch's gate shape
+// (file:// must not read local paths).
+func TestTCStatusFileURLRefused(t *testing.T) {
+	t.Setenv("XUANSI_WASM_CACHE", t.TempDir())
+	err := tcStatusErr(t, "file:///etc/passwd")
+	var rerr *server.RPCError
+	if !errors.As(err, &rerr) || rerr.Class != "api" {
+		t.Fatalf("file:// index_url: want api-class refusal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "http(s)") {
+		t.Errorf("refusal %v: want it to demand an http(s) URL", err)
+	}
+}
+
+// TestTCStatusGuidanceOnMissing (brief-named): an empty cache with a
+// dead index → guidance non-empty and pointing at fetch — the status
+// answer always carries the next step (spec §6.3 UX).
+func TestTCStatusGuidanceOnMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	srv.Close()
+
+	t.Setenv("XUANSI_WASM_CACHE", t.TempDir())
+	out := tcStatusOK(t, srv.URL)
+	if out.Guidance == "" {
+		t.Fatal("guidance: want non-empty on an empty cache")
+	}
+	if !strings.Contains(out.Guidance, "xuansi_toolchain_fetch") {
+		t.Errorf("guidance = %q, want the fetch pointer", out.Guidance)
+	}
+}
+
+// TestTCStatusPlatKeyMapping: Go's runtime names → the index's
+// platform-key vocabulary ("macos" not "darwin", "x64" not "amd64"),
+// compositional over the two tables; anything off the matrix maps to
+// "" (win-arm64 composes — no index carries the key, and the
+// Platforms lookup is the asset-leg gate, not the naming).
+func TestTCStatusPlatKeyMapping(t *testing.T) {
+	for _, c := range []struct{ goos, goarch, want string }{
+		{"linux", "amd64", "linux-x64"},
+		{"linux", "arm64", "linux-arm64"},
+		{"darwin", "amd64", "macos-x64"},
+		{"darwin", "arm64", "macos-arm64"},
+		{"windows", "amd64", "win-x64"},
+		{"windows", "arm64", "win-arm64"},
+		{"freebsd", "amd64", ""},
+		{"linux", "riscv64", ""},
+	} {
+		if got := tcPlatKey(c.goos, c.goarch); got != c.want {
+			t.Errorf("tcPlatKey(%s,%s) = %q, want %q", c.goos, c.goarch, got, c.want)
+		}
 	}
 }
