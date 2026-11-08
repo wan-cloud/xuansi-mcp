@@ -281,8 +281,8 @@ type opResultOut = map[string]any
 // displace a static one (server_test.go pins the served list to the
 // same names). B8 appends fs_rm + driver_pull after capture, then
 // session_reset after those; B9 appended camera_shot; B10 task 5
-// appends driver_fetch: the existing tools keep their positions
-// (nothing renumbers).
+// appended driver_fetch; B11 task 2 appends toolchain_status: the
+// existing tools keep their positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -306,6 +306,7 @@ var staticToolNames = []string{
 	"xuansi_session_reset",
 	"xuansi_camera_shot",
 	"xuansi_driver_fetch",
+	"xuansi_toolchain_status",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -425,6 +426,11 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_driver_fetch",
 		Description: "Fetch one driver-module version from a public module index (task 3's layout: index.json + modules/<name>/<ver>/ artifacts; default " + defaultIndexURL + ") into the daemon-side driver workspace — the fetch half of the module pipeline, xuansi_driver_push deploys what this stores. Every file is downloaded and verified (sha256 + byte count against the index) BEFORE anything is written: a mid-download failure leaves the workspace untouched. Stores drivers/<name>@<version>.<ext> plus one manifest entry (kind from the index; NOT activating — a fresh fetch has no active version, so state version explicitly on its first push). Binary-safe — this is the storing path for .wasm/.aot artifacts (xuansi_ws_put's content field is a JSON string, fit for Lua text only). version omitted = the index's highest for the name.",
 	}, ts.driverFetch)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_toolchain_status",
+		Description: "One read-only view of the local wasm toolchain cache x the toolchain index: per piece (wasi_sdk, wamrc) whether toolchain-state.json records it AND its files still exist under cache_root, the installed generation vs the index's latest, and the board-fw pairing matrix — wasm >=0.2.0 (wide domain: bytecode is version-less), aot = null (empty domain: P1 refuses .aot on every fw — the aot runtime lands with A1). The index is read from " + defaultToolchainIndexURL + " (index_url overrides; http(s) only, file:// refused); an unreachable index degrades to the daemon's embedded known-good snapshot with a note — a status answer never dies on the network, but an index that arrives and fails the version gate is a hard refusal (a newer index needs a newer daemon). Missing pieces carry their next step automatically: install with xuansi_toolchain_fetch (opt-in, sha-pinned, atomic). No lease, no daemon call.",
+	}, ts.toolchainStatus)
 
 	ts.registerCapture(srv)
 }

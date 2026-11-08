@@ -688,6 +688,9 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_session_reset": {"board"},
 	"xuansi_camera_shot":   {"board"},
 	"xuansi_driver_fetch":  {"name"},
+	// B11 task 2: status's only input is the omitempty index_url —
+	// nothing required (the whole point: a bare call just answers).
+	"xuansi_toolchain_status": {},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
