@@ -3,8 +3,10 @@ package discover
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grandcat/zeroconf"
@@ -33,25 +35,38 @@ const (
 
 // DiscoverMDNS browses _xuansi._tcp within the 3s budget (two 1.5s
 // windows, see mdnsTimeout) and returns the answering boards merged
-// field-wise. The budget expiring on the internal deadline is the
-// normal end of a sweep (a clean empty set is real knowledge that no
-// service answered — boards off WiFi, or an AP that drops multicast);
-// a browse failure (no usable multicast interface, send error) or a
-// canceled caller context returns the error instead — Registry.Refresh
-// treats those as environment degradation and freezes the mdns face at
-// last-known rather than trusting a blind empty sweep. ctx-driven only:
-// every goroutine a browse spawns dies with the derived context; the
-// entries channel is closed by the library when the window ends.
+// field-wise. Each window browses on EVERY usable interface
+// concurrently — the multihomed fix: a win real host with 10.1.50.x /
+// 10.1.51.x NICs and the board on the 51 link got zero entries from
+// the default resolver (one 0.0.0.0:5353 socket, default-route sends),
+// while a resolver pinned to the board's link saw it — so each
+// interface gets its own SelectIfaces-pinned resolver sharing the
+// window deadline. Interfaces are enumerated ONCE per sweep: the 3s
+// budget is far shorter than any interface churn (cable pulls, VPN
+// ramps), so per-window re-enumeration buys nothing. The budget
+// expiring on the internal deadline is the normal end of a sweep (a
+// clean empty set is real knowledge that no service answered — boards
+// off WiFi, or an AP that drops multicast); a TOTAL browse failure
+// (every interface's resolver failed to launch, or no usable interface
+// and the default resolver failed) or a canceled caller context
+// returns the error instead — Registry.Refresh treats those as
+// environment degradation and freezes the mdns face at last-known
+// rather than trusting a blind empty sweep. ctx-driven only: every
+// goroutine a browse spawns dies with the derived context; each
+// resolver's entries channel is closed by the library when its window
+// ends.
 func DiscoverMDNS(ctx context.Context) ([]Board, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Interface set is fixed for the whole sweep (see doc comment).
+	ifaces := browseIfaces()
 	accum := mdnsAccum{}
 	for w := 0; w < 2; w++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := browseOnce(ctx, accum); err != nil {
+		if err := browseOnce(ctx, ifaces, accum); err != nil {
 			return nil, err
 		}
 	}
@@ -61,29 +76,152 @@ func DiscoverMDNS(ctx context.Context) ([]Board, error) {
 	return accum.snapshot(), nil
 }
 
-// browseOnce runs one browse window into the shared accumulator. The
-// window deadline expiring is clean; only a launch failure or caller
-// cancellation is an error.
-func browseOnce(ctx context.Context, accum mdnsAccum) error {
-	resolver, err := zeroconf.NewResolver()
+// mdnsBrowser is the resolver seam: *zeroconf.Resolver satisfies it;
+// tests substitute fakes that observe Browse calls.
+type mdnsBrowser interface {
+	Browse(ctx context.Context, service, domain string, entries chan<- *zeroconf.ServiceEntry) error
+}
+
+// newResolverFunc is the constructor seam over zeroconf.NewResolver.
+// Per-interface browses pass exactly one option (SelectIfaces pinning
+// the resolver to that interface); the no-usable-interface fallback
+// passes none (library default).
+var newResolverFunc = func(opts ...zeroconf.ClientOption) (mdnsBrowser, error) {
+	return zeroconf.NewResolver(opts...)
+}
+
+// browseIfaces enumerates the interfaces that each get a dedicated
+// browse (seam: tests inject a fake list). Usable = up,
+// multicast-capable, not loopback, holding an IPv4 address: the
+// pinned resolver joins the v4 multicast group on its one interface,
+// and a v6-only interface would fail resolver construction outright.
+// Virtual switches (vEthernet, docker0, VPN tun...) stay in on
+// purpose — harmless: each gets its own browse and an empty result is
+// honest. Enumeration failure or nothing qualifying returns nil — the
+// caller falls back to the default resolver and lets it surface the
+// environment error itself.
+var browseIfaces = func() []net.Interface {
+	all, err := net.Interfaces()
 	if err != nil {
-		return fmt.Errorf("discover: mdns resolver: %w", err)
+		return nil
 	}
+	var out []net.Interface
+	for _, iface := range all {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		hasV4 := false
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+				hasV4 = true
+				break
+			}
+		}
+		if !hasV4 {
+			continue
+		}
+		out = append(out, iface)
+	}
+	return out
+}
+
+// browseOnce runs one browse window into the shared accumulator: one
+// concurrent Browse per usable interface (each resolver pinned to its
+// interface — the multihomed fix), all sharing this window's deadline;
+// without usable interfaces it falls back to the single default
+// resolver (pre-fix behavior). Results merge in interface order, so
+// accumulation is deterministic. The window deadline expiring is
+// clean; the error returns only when EVERY interface browse failed to
+// launch (first error text) or the caller canceled — one interface
+// failing is that interface's degradation, the rest of the sweep is
+// still real data.
+func browseOnce(ctx context.Context, ifaces []net.Interface, accum mdnsAccum) error {
 	wctx, cancel := context.WithTimeout(ctx, mdnsWindow)
 	defer cancel()
-	entries := make(chan *zeroconf.ServiceEntry, 16)
-	if err := resolver.Browse(wctx, mdnsService, mdnsDomain, entries); err != nil {
+	if len(ifaces) == 0 {
+		r := browseOne(wctx, nil)
+		for _, b := range r.boards {
+			accum.add(b)
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("discover: mdns browse %s: %w", mdnsService, err)
+		return r.err
 	}
-	for e := range entries {
-		if b, ok := boardFromEntry(e); ok {
+	results := make([]browseResult, len(ifaces))
+	var wg sync.WaitGroup
+	for i := range ifaces {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = browseOne(wctx, &ifaces[i])
+		}()
+	}
+	wg.Wait()
+	var firstErr error
+	failed := 0
+	for _, r := range results {
+		for _, b := range r.boards {
 			accum.add(b)
 		}
+		if r.err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = r.err
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if failed == len(ifaces) {
+		return firstErr
 	}
 	return nil
+}
+
+// browseResult is one interface's browse outcome: the boards its
+// window yielded (possibly split-packet partials) and, when it never
+// got off the ground, the launch error.
+type browseResult struct {
+	boards []Board
+	err    error
+}
+
+// browseOne browses on a single interface (iface non-nil: the resolver
+// is pinned to it via SelectIfaces) or on the library default (iface
+// nil). Only construction or the initial query send can fail — the
+// window deadline expiring is the normal nil-error end: the library
+// closes the entries channel when its context ends, which is where
+// the drain loop stops.
+func browseOne(wctx context.Context, iface *net.Interface) browseResult {
+	var (
+		resolver mdnsBrowser
+		err      error
+	)
+	if iface != nil {
+		resolver, err = newResolverFunc(zeroconf.SelectIfaces([]net.Interface{*iface}))
+	} else {
+		resolver, err = newResolverFunc()
+	}
+	if err != nil {
+		return browseResult{err: fmt.Errorf("discover: mdns resolver: %w", err)}
+	}
+	entries := make(chan *zeroconf.ServiceEntry, 16)
+	if err := resolver.Browse(wctx, mdnsService, mdnsDomain, entries); err != nil {
+		return browseResult{err: fmt.Errorf("discover: mdns browse %s: %w", mdnsService, err)}
+	}
+	var boards []Board
+	for e := range entries {
+		if b, ok := boardFromEntry(e); ok {
+			boards = append(boards, b)
+		}
+	}
+	return browseResult{boards: boards}
 }
 
 // mdnsAccum merges browse results as they arrive within one window.
