@@ -581,10 +581,6 @@ func extractTarGz(src io.Reader, dst string) error {
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 	var total int64
-	type tcLink struct {
-		name, target string // member path; VERBATIM link target
-		hard         bool   // hardlink (else symlink)
-	}
 	var links []tcLink
 	// linkTargetOK gates one link target: a non-empty RELATIVE path
 	// with no "..", no backslash, no NUL, whose resolution (relative
@@ -663,47 +659,94 @@ func extractTarGz(src io.Reader, dst string) error {
 		}
 	}
 	// the deferred link pass: every regular member is on disk, so a
-	// link's target (an earlier member per tar semantics) exists.
+	// link's target exists — even when the link member PRECEDES its
+	// target in the stream (legal tar; TestExtractTarGzLinks pins the
+	// forward-reference shape). The landing itself lives in tcLandLink
+	// behind an injectable link primitive — the fallback's own test
+	// seam (T11a M1).
 	for _, l := range links {
-		p := filepath.Join(dst, l.name)
-		resolved := l.target
-		if !l.hard {
-			resolved = filepath.Join(filepath.Dir(p), l.target)
-		}
-		resolved = filepath.Join(dst, resolved)
-		var lerr error
+		mk := func(_, linkPath string) error { return os.Symlink(l.target, linkPath) }
 		if l.hard {
-			lerr = os.Link(resolved, p)
-		} else {
-			lerr = os.Symlink(l.target, p)
+			mk = os.Link
 		}
-		if lerr == nil {
-			continue
+		n, lerr := tcLandLink(dst, l, mk, tcExtractMax-total)
+		if lerr != nil {
+			return lerr
 		}
-		// the windows-friendly fallback (and the cross-device guard
-		// for hardlinks): a symlink denied (no developer mode) or a
-		// cross-device os.Link becomes a BYTE COPY of the target —
-		// the toolchain runs the same either way; any other failure
-		// (a genuinely dangling link — the real tarballs carry none)
-		// stays an error rather than a silent gap.
-		if os.IsPermission(lerr) || errors.Is(lerr, syscall.EXDEV) || errors.Is(lerr, syscall.EPERM) || errors.Is(lerr, syscall.EACCES) {
-			if b, rerr := os.ReadFile(resolved); rerr == nil {
-				if int64(len(b))+total > tcExtractMax {
-					return fmt.Errorf("member %q: copy fallback expands beyond the %d-byte extraction cap", l.name, tcExtractMax)
-				}
-				mode := os.FileMode(0o644)
-				if fi, serr := os.Stat(resolved); serr == nil && fi.Mode()&0o111 != 0 {
-					mode = 0o755
-				}
-				if werr := os.WriteFile(p, b, mode); werr == nil {
-					total += int64(len(b))
-					continue
-				}
-			}
-		}
-		return fmt.Errorf("member %q: link to %q: %w", l.name, l.target, lerr)
+		total += n
 	}
 	return nil
+}
+
+// tcLink is one deferred link member: the member's path relative to
+// the extraction root, its VERBATIM link target, and whether it is a
+// hardlink (else symlink). Package-level so the fallback test can
+// drive tcLandLink directly.
+type tcLink struct {
+	name, target string
+	hard         bool
+}
+
+// absTarget resolves one link's TARGET to its absolute path under
+// dst: a symlink's target resolves from the link's OWN DIRECTORY —
+// Join(dst, name) is already absolute, so that join ends the
+// computation (T11a M1: prefixing dst a SECOND time doubled the path,
+// the copy fallback ENOENT'd, and the windows fetch — where
+// os.Symlink is denied and the fallback fires for every symlink —
+// could never complete); a hardlink's target is archive-root-relative
+// and anchors at dst.
+func (l tcLink) absTarget(dst string) string {
+	if l.hard {
+		return filepath.Join(dst, l.target)
+	}
+	return filepath.Join(filepath.Dir(filepath.Join(dst, l.name)), l.target)
+}
+
+// tcLandLink lands ONE deferred link member: the native link through
+// mk (os.Link for hardlinks, os.Symlink else — the resolved target
+// rides along for the assertion-shaped seams), and — when the OS
+// refuses in the fallback-worthy way — a BYTE COPY of the resolved
+// target, budget-checked against the remaining extraction cap.
+// Returns the fallback's byte count (0 when the native link landed).
+//
+// mk is the injectable seam the fallback test rides: on unix
+// os.Symlink just succeeds, so the copy leg is unreachable in
+// production there — exactly how the T11a-M1 double-dst-join bug
+// survived a green linux HIL and would have killed the windows fetch
+// (where os.Symlink is denied without developer mode and the
+// fallback fires for EVERY symlink member). The test injects the
+// denial and pins the exact path the fallback reads.
+func tcLandLink(dst string, l tcLink, mk func(resolved, linkPath string) error, budget int64) (int64, error) {
+	p := filepath.Join(dst, l.name)
+	resolved := l.absTarget(dst)
+	lerr := mk(resolved, p)
+	if lerr == nil {
+		return 0, nil
+	}
+	// the windows-friendly fallback (and the cross-device guard for
+	// hardlinks): a symlink denied (no developer mode) or a
+	// cross-device os.Link becomes a BYTE COPY of the target — the
+	// toolchain runs the same either way; any other failure (a
+	// genuinely dangling link — the real tarballs carry none) stays
+	// an error rather than a silent gap.
+	if !(os.IsPermission(lerr) || errors.Is(lerr, syscall.EXDEV) || errors.Is(lerr, syscall.EPERM) || errors.Is(lerr, syscall.EACCES)) {
+		return 0, fmt.Errorf("member %q: link to %q: %w", l.name, l.target, lerr)
+	}
+	b, rerr := os.ReadFile(resolved)
+	if rerr != nil {
+		return 0, fmt.Errorf("member %q: link to %q: %w (copy fallback could not read the resolved target %s: %v)", l.name, l.target, lerr, resolved, rerr)
+	}
+	if int64(len(b)) > budget {
+		return 0, fmt.Errorf("member %q: copy fallback expands beyond the %d-byte extraction budget", l.name, budget)
+	}
+	mode := os.FileMode(0o644)
+	if fi, serr := os.Stat(resolved); serr == nil && fi.Mode()&0o111 != 0 {
+		mode = 0o755
+	}
+	if werr := os.WriteFile(p, b, mode); werr != nil {
+		return 0, fmt.Errorf("member %q: link to %q: %w (copy fallback write: %v)", l.name, l.target, lerr, werr)
+	}
+	return int64(len(b)), nil
 }
 
 // tcPiece is one asset this fetch manages: its index pin, its rename
