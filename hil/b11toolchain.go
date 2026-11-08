@@ -64,6 +64,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -83,8 +84,10 @@ const (
 	// pinned against the LIVE public index at writing time
 	// (2026-11-08); a released generation's assets are immutable
 	// upstream, so these pins are stability, not snapshot luck.
+	// NOTE: b11SDKSHA/b11SDKBytes/b11WamrcSHA/b11WamrcBytes are the
+	// LINUX-X64 asset pins (this bench's leg); the mac leg runs with
+	// its own index pins.
 	b11Gen      = "toolchain-v2"
-	b11SDKDir   = "wasi-sdk-24.0-linux-x64" // wasi_sdk 24.0 on this linux-x64 host
 	b11SDKSHA   = "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5"
 	b11SDKBytes = 118879731
 	b11WamrcSHA = "209a6a51b6066f05e91060d95c2506ec0bad97cb898fec1fe634cd68865b9c42"
@@ -92,6 +95,23 @@ const (
 	// the linux-x64 matrix carries BOTH pieces)
 	b11WamrcBytes = 33053698
 )
+
+// b11SDKDirName maps THIS host onto the index's platform key the way
+// the daemon's tcPlatKey does (the index says "macos"/"win" where Go
+// says "darwin"/"windows", "x64" where Go says "amd64"): the SDK tree
+// the fetch lands is named wasi-sdk-24.0-<platkey>, so the W21 disk
+// probe must look in the directory the FETCH ACTUALLY installed — the
+// mac leg (darwin/arm64 -> macos-arm64) would otherwise look for this
+// linux bench's spelling. Local map on purpose: hil is a standalone
+// package main and does not import internal/.
+func b11SDKDirName() string {
+	osName := map[string]string{"linux": "linux", "darwin": "macos", "windows": "win"}[runtime.GOOS]
+	arch := map[string]string{"amd64": "x64", "arm64": "arm64"}[runtime.GOARCH]
+	if osName == "" || arch == "" {
+		return "wasi-sdk-24.0-unknown" // off-matrix host: the W21 probe fails loudly, the name in the log
+	}
+	return "wasi-sdk-24.0-" + osName + "-" + arch
+}
 
 // b11HelloSrc is the hello-scale module the build compiles: the
 // drivers repo's src/hello/hello.c cut to the ABI's mandatory trio
@@ -339,10 +359,11 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		fmt.Sprintf("W20 fetch downloaded BOTH pieces in one call: generation=%s downloaded=%v skipped=%v (%.1fs real network time; text=%.80s)",
 			b6Str(m, "generation"), dl, sk, float64(fetchMS)/1000, text))
 	// disk probes: the landed trees, exactly where §6.1 says
-	sdkClang := filepath.Join(wasmCache, b11SDKDir, "bin", "clang")
+	sdkDir := b11SDKDirName()
+	sdkClang := filepath.Join(wasmCache, sdkDir, "bin", "clang")
 	wamrcBin := filepath.Join(wasmCache, "wamrc", "wamrc")
 	if fi, err := os.Stat(sdkClang); err == nil {
-		h.check(fi.Mode()&0o111 != 0, fmt.Sprintf("W21 wasi-sdk landed: %s (executable, %dB tree root %s)", sdkClang, fi.Size(), b11SDKDir))
+		h.check(fi.Mode()&0o111 != 0, fmt.Sprintf("W21 wasi-sdk landed: %s (executable, %dB tree root %s)", sdkClang, fi.Size(), sdkDir))
 	} else {
 		h.check(false, "W21 wasi-sdk landed: "+err.Error())
 	}
