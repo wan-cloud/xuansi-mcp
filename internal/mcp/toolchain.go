@@ -550,13 +550,49 @@ func tcFilePerm(mode int64) os.FileMode {
 	return 0o644
 }
 
+// tcPathHostile is the tar-slip gate's shape test, shared by the
+// member-name gate and the link-target gate (final-review C1: the
+// two gates had drifted into separate IsAbs-only checks, and
+// filepath.IsAbs is platform-LOADEN — on windows it says false for
+// "/tmp/x" (no volume) and on unix it says false for "C:/x" (no
+// volumes at all), so each platform had its own blind spot). The
+// refusal set is evaluated LEXICALLY so it means the same on every
+// host: empty, NUL, backslash (a path separator on windows), "..", a
+// leading "/" (absolute on unix, drive-root-relative on windows), a
+// windows volume prefix ("C:/x", "c:x" — filepath.VolumeName catches
+// it on windows; tcVolumePrefix keeps it refused on unix too, where a
+// drive-letter colon is never a legitimate toolchain member and the
+// literal "C:" tree it would land inside the cache is windows-shaped
+// malice either way), and the host's own filepath.IsAbs as the belt
+// behind all of it.
+func tcPathHostile(p string) bool {
+	return p == "" || strings.ContainsAny(p, "\x00\\") ||
+		strings.HasPrefix(p, "/") || strings.Contains(p, "..") ||
+		filepath.IsAbs(p) || filepath.VolumeName(p) != "" ||
+		tcVolumePrefix(p)
+}
+
+// tcVolumePrefix reports the windows drive-letter form "X:" at the
+// start of p (single ASCII letter + colon). On windows
+// filepath.VolumeName already rejects it; on unix — where VolumeName
+// is identically empty — this keeps the refusal set platform-blind
+// (final-review C1: "C:/evil" used to land on linux as a contained
+// but garbage "C:" tree, and on windows "/etc/passwd" as a symlink
+// the OS resolves against the current drive's root — outside the
+// cache).
+func tcVolumePrefix(p string) bool {
+	return len(p) >= 2 && p[1] == ':' &&
+		((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z'))
+}
+
 // extractTarGz unpacks a .tar.gz stream into dst, refusing hostile
-// members outright: absolute paths, any "..", backslashes (a path
-// separator on windows — the off-matrix member a unix tar would
-// shrug at), NUL bytes, and everything that resolves outside dst
-// after cleaning (belt and braces: the resolved path is re-checked
-// relative to dst). Directories land 0755, files 0644 + header exec
-// bits.
+// members outright (tcPathHostile, platform-blind): absolute paths —
+// including the windows-shaped leading-"/" and "C:/x" volume forms —
+// any "..", backslashes (a path separator on windows — the
+// off-matrix member a unix tar would shrug at), NUL bytes, and
+// everything that resolves outside dst after cleaning (belt and
+// braces: the resolved path is re-checked relative to dst).
+// Directories land 0755, files 0644 + header exec bits.
 //
 // Link members (tar.TypeSymlink / tar.TypeLink) LAND when their
 // target is a contained RELATIVE path — the official wasi-sdk
@@ -584,12 +620,11 @@ func extractTarGz(src io.Reader, dst string) error {
 	var total int64
 	var links []tcLink
 	// linkTargetOK gates one link target: a non-empty RELATIVE path
-	// with no "..", no backslash, no NUL, whose resolution (relative
+	// whose shape passes tcPathHostile and whose resolution (relative
 	// to the link's own directory for symlinks, to the archive root
 	// for hardlinks) stays lexically inside dst.
 	linkTargetOK := func(name, target string, hard bool) bool {
-		if target == "" || strings.ContainsAny(target, "\x00\\") ||
-			filepath.IsAbs(target) || strings.Contains(target, "..") {
+		if tcPathHostile(target) {
 			return false
 		}
 		resolved := target
@@ -609,8 +644,8 @@ func extractTarGz(src io.Reader, dst string) error {
 			return fmt.Errorf("tar stream: %w", err)
 		}
 		name := hdr.Name
-		if name == "" || strings.ContainsAny(name, "\x00\\") || filepath.IsAbs(name) || strings.Contains(name, "..") {
-			return fmt.Errorf("member %q is not a safe relative path (absolute, \"..\", or backslash members are refused)", name)
+		if tcPathHostile(name) {
+			return fmt.Errorf("member %q is not a safe relative path (absolute — including windows leading-slash and volume forms — \"..\", or backslash members are refused)", name)
 		}
 		target := filepath.Join(dst, name)
 		if rel, rerr := filepath.Rel(dst, target); rerr != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
