@@ -95,8 +95,10 @@ func main() {
 		os.Exit(runB10T7Loop(*attempt, *daemonBin, *runDir, *outDir, *refGeom, *tolPx))
 	case "spawnidle":
 		os.Exit(runSpawnIdle(*attempt, *daemonBin, *runDir))
+	case "b11toolchain":
+		os.Exit(runB11Toolchain(*attempt, *daemonBin, *runDir))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|b10t7aim|b10t7|b10t8b|spawnidle [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR] [-round N] [-outdir DIR] [-ref x,y,w,h] [-tol PX]")
+		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|b10t7aim|b10t7|b10t8b|spawnidle|b11toolchain [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR] [-round N] [-outdir DIR] [-ref x,y,w,h] [-tol PX]")
 		os.Exit(2)
 	}
 }
