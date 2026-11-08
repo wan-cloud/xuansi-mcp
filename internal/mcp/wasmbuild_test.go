@@ -591,3 +591,55 @@ void setup(void) { xuansi_millis(&boot_ms); }
 	}
 	t.Logf("real build: %d bytes, warnings %q", len(wasm), warnings)
 }
+
+// TestTCClangName (final-review I1): the compiler binary's name is
+// resolved per-host — bin/clang.exe on windows (the official SDK's
+// shape there), bin/clang everywhere else. Parameterized by goos so
+// every branch is pinned from ANY host (the linux leg proves the
+// windows branch's spelling, and vice versa); wasmBuildInner's stat
+// probe and its exec share the one resolution.
+func TestTCClangName(t *testing.T) {
+	for goos, want := range map[string]string{
+		"linux":   "clang",
+		"darwin":  "clang",
+		"windows": "clang.exe",
+		"freebsd": "clang", // off-matrix hosts keep the bare name
+	} {
+		if got := tcClangName(goos); got != want {
+			t.Errorf("tcClangName(%q) = %q, want %q", goos, got, want)
+		}
+	}
+}
+
+// TestRunCompileTimeout (final-review M4): one compile is internally
+// capped — a "compiler" that outlives tcCompileTimeout is killed and
+// the refusal names the cap. The child is this test binary itself
+// (the os/exec self-exec pattern), so the real kill path runs on
+// every CI leg, windows included.
+func TestRunCompileTimeout(t *testing.T) {
+	old := tcCompileTimeout
+	tcCompileTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { tcCompileTimeout = old })
+	// arm the sleeper child: exec.CommandContext with a nil Env
+	// inherits OUR environ, so the var rides to the child; unset on
+	// the way out so later tests in this process never see it
+	os.Setenv("GO_WANT_COMPILE_SLEEPER", "1")
+	t.Cleanup(func() { os.Unsetenv("GO_WANT_COMPILE_SLEEPER") })
+
+	stdout, stderr, err, timedOut := tcRunCompile(context.Background(), os.Args[0],
+		[]string{"-test.run=TestCompileSleeperHelper"})
+	if !timedOut {
+		t.Fatalf("want the compile cap to fire (timedOut=false err=%v stdout=%q stderr=%q)", err, stdout, stderr)
+	}
+	tcAPIErr(t, err, "compile timeout")
+}
+
+// TestCompileSleeperHelper is the self-exec child of
+// TestRunCompileTimeout: armed by env var, it sleeps past any sane
+// cap; unarmed (a normal test run) it skips.
+func TestCompileSleeperHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_COMPILE_SLEEPER") != "1" {
+		t.Skip("helper: only acts as the self-exec child of TestRunCompileTimeout")
+	}
+	time.Sleep(10 * time.Second)
+}

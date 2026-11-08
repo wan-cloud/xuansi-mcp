@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -126,6 +127,19 @@ func tcBuildFlags(r buildReq, sdkRoot, includeDir string) []string {
 	}
 }
 
+// tcClangName is the compiler binary's name inside the resolved
+// wasi-sdk tree: the official windows SDK ships bin/clang.exe, every
+// other platform bin/clang (final-review I1 — the stat probe and the
+// exec must agree on ONE name, resolved once here). Parameterized by
+// goos (not runtime.GOOS directly) so the test pins every platform's
+// branch from any host.
+func tcClangName(goos string) string {
+	if goos == "windows" {
+		return "clang.exe"
+	}
+	return "clang"
+}
+
 // aotGate is the split-track pairing gate's aot half (§6.2, spec
 // wording verbatim): P1's toolchain-v2 carries an EMPTY aot domain —
 // the current fw stack cannot load .aot at all (the S3 deficiency) —
@@ -169,6 +183,33 @@ func fwGateWasm(fw string) error {
 // TODO(T5+): the real wamrc exec + the aot artifact's own shape gate.
 func wamrcExec(_ context.Context, _ buildReq, _ string) (aotBytes []byte, warnings string, err error) {
 	return nil, "", errWs("xuansi_wasm_build: wamrc exec lands with A1 — .aot compilation is not in this daemon yet (the gate passed because wamrc_path was given; the runtime that would load .aot arrives with A1/A3)")
+}
+
+// tcCompileTimeout bounds ONE clang compile (final-review M4: the
+// tool call's ctx is caller-bounded and fetch has its timeout_sec
+// discipline — the build had no internal bound, so a wedged compiler
+// could hold the tool hostage indefinitely). A var (not a const)
+// only as the timeout test's seam, tcExtractMax's discipline: no
+// production path assigns it.
+var tcCompileTimeout = 120 * time.Second
+
+// tcRunCompile execs the compiler under the compile cap and returns
+// its stdout/stderr VERBATIM (captured separately — one shared buffer
+// would race exec's two copy goroutines) plus the run error. A cap
+// firing is reported as timedOut=true with a shaped api refusal
+// naming the timeout and the manual fallback.
+func tcRunCompile(ctx context.Context, clang string, args []string) (stdout, stderr string, runErr error, timedOut bool) {
+	cctx, cancel := context.WithTimeout(ctx, tcCompileTimeout)
+	defer cancel()
+	var out, errB bytes.Buffer
+	cmd := exec.CommandContext(cctx, clang, args...)
+	cmd.Stdout, cmd.Stderr = &out, &errB
+	runErr = cmd.Run()
+	stdout, stderr = out.String(), errB.String()
+	if runErr != nil && cctx.Err() == context.DeadlineExceeded {
+		return stdout, stderr, errWs("xuansi_wasm_build: compile timeout after %s (clang killed mid-compile — a <=1 MiB source compiles in seconds; retry, or build the module manually per the xuansi-drivers README's User-compiled modules section)", tcCompileTimeout), true
+	}
+	return stdout, stderr, runErr, false
 }
 
 // tcWarnTail bounds a compiler transcript to its tail — the part with
@@ -222,19 +263,21 @@ func (ts *toolset) wasmBuildInner(ctx context.Context, r buildReq) (wasmBytes []
 		}
 		rec, ok := st.Installed["wasi_sdk"]
 		if !ok || rec.Dir == "" || !tcPathExists(filepath.Join(root, rec.Dir)) {
-			return nil, "", errWs("xuansi_wasm_build: no wasi-sdk installed in the toolchain cache — call xuansi_toolchain_fetch (recommended), or pass wasi_sdk_path to point at a local tree")
+			return nil, "", errWs("xuansi_wasm_build: no wasi-sdk installed in the toolchain cache — call xuansi_toolchain_fetch (recommended), or pass wasi_sdk_path to point at a local tree; manual steps: see the xuansi-drivers README's User-compiled modules section")
 		}
 		sdkRoot = filepath.Join(root, rec.Dir)
 	}
 
 	// the compiler itself: an absolute path inside the resolved tree,
-	// never a PATH lookup. The probe gives the broken-tree case (an
-	// override at a tree with no bin/clang, or a cache tree that
-	// lost its compiler) a refusal that names the missing binary —
-	// M3's fetch-side shape gate, build-side twin.
-	clang := filepath.Join(sdkRoot, "bin", "clang")
+	// never a PATH lookup — named for the HOST (bin/clang.exe on
+	// windows, final-review I1; the probe and the exec share the one
+	// tcClangName resolution). The probe gives the broken-tree case
+	// (an override at a tree with no compiler, or a cache tree that
+	// lost its) a refusal that names the missing binary — M3's
+	// fetch-side shape gate, build-side twin.
+	clang := filepath.Join(sdkRoot, "bin", tcClangName(runtime.GOOS))
 	if _, serr := os.Stat(clang); serr != nil {
-		return nil, "", errWs("xuansi_wasm_build: no clang at %s — the wasi-sdk tree is not usable (unexpected wasi-sdk layout); call xuansi_toolchain_fetch to reinstall, or point wasi_sdk_path at a tree with bin/clang", clang)
+		return nil, "", errWs("xuansi_wasm_build: no clang at %s — the wasi-sdk tree is not usable (unexpected wasi-sdk layout); call xuansi_toolchain_fetch to reinstall, or point wasi_sdk_path at a tree with bin/clang; manual steps: see the xuansi-drivers README's User-compiled modules section", clang)
 	}
 
 	// staging: one temp dir holding the expanded host header, the
@@ -273,19 +316,18 @@ func (ts *toolset) wasmBuildInner(ctx context.Context, r buildReq) (wasmBytes []
 	}
 	outPath := filepath.Join(tmp, base+".wasm")
 
-	// compile. stdout and stderr are captured separately (exec copies
-	// them from two goroutines — one shared buffer would race) and
-	// surface VERBATIM, concatenated, as warnings; a failed clang
-	// repeats the stderr tail inside the refusal so the error itself
-	// carries the diagnostic.
+	// compile (M4: under tcRunCompile's own cap — a wedged compiler
+	// cannot hold the tool past it). stdout and stderr surface VERBATIM,
+	// concatenated, as warnings; a failed clang repeats the stderr tail
+	// inside the refusal so the error itself carries the diagnostic.
 	args := append(tcBuildFlags(r, sdkRoot, incDir), "-o", outPath, srcPath)
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, clang, args...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	runErr := cmd.Run()
-	warnings = stdout.String() + stderr.String()
+	stdoutS, stderrS, runErr, timedOut := tcRunCompile(ctx, clang, args)
+	warnings = stdoutS + stderrS
+	if timedOut {
+		return nil, warnings, runErr
+	}
 	if runErr != nil {
-		return nil, warnings, errWs("xuansi_wasm_build: clang failed (%v): %s", runErr, tcWarnTail(stderr.String()))
+		return nil, warnings, errWs("xuansi_wasm_build: clang failed (%v): %s", runErr, tcWarnTail(stderrS))
 	}
 
 	wasm, rerr := os.ReadFile(outPath)
