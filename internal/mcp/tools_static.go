@@ -281,8 +281,9 @@ type opResultOut = map[string]any
 // displace a static one (server_test.go pins the served list to the
 // same names). B8 appends fs_rm + driver_pull after capture, then
 // session_reset after those; B9 appended camera_shot; B10 task 5
-// appended driver_fetch; B11 task 2 appends toolchain_status: the
-// existing tools keep their positions (nothing renumbers).
+// appended driver_fetch; B11 task 2 appended toolchain_status; B11
+// task 3 appends toolchain_fetch: the existing tools keep their
+// positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -307,6 +308,7 @@ var staticToolNames = []string{
 	"xuansi_camera_shot",
 	"xuansi_driver_fetch",
 	"xuansi_toolchain_status",
+	"xuansi_toolchain_fetch",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -431,6 +433,17 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_toolchain_status",
 		Description: "One read-only view of the local wasm toolchain cache x the toolchain index: per piece (wasi_sdk, wamrc) whether toolchain-state.json records it AND its files still exist under cache_root, the installed generation vs the index's latest, and the board-fw pairing matrix — wasm >=0.2.0 (wide domain: bytecode is version-less), aot = null (empty domain: P1 refuses .aot on every fw — the aot runtime lands with A1). The index is read from " + defaultToolchainIndexURL + " (index_url overrides; http(s) only, file:// refused); an unreachable index degrades to the daemon's embedded known-good snapshot with a note — a status answer never dies on the network, but an index that arrives and fails the version gate is a hard refusal (a newer index needs a newer daemon). Missing pieces carry their next step automatically: install with xuansi_toolchain_fetch (opt-in, sha-pinned, atomic). No lease, no daemon call.",
 	}, ts.toolchainStatus)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "xuansi_toolchain_fetch",
+		Description: "Install this host's wasm toolchain pieces (wasi_sdk, wamrc) from the toolchain index (" + defaultToolchainIndexURL + "; index_url overrides, http(s) only) into the local cache — the write half of the toolchain face, xuansi_toolchain_status's install step. " +
+			"PLATFORM is chosen automatically from the host (linux-x64, macos-arm64, ...) — there is no platform input. " +
+			"IDEMPOTENT: a piece whose state record already pins the index's sha AND whose files still exist is skipped untouched, so re-calling is the safe sync verb. " +
+			"ATOMIC: every piece downloads into a random staging dir, its sha256 + byte count verified against the index pin as it streams, re-verified staged, then renamed into place and recorded in toolchain-state.json — any failure at any step (bad sha, HTTP error, mid-download cut) leaves the cache byte-for-byte untouched. " +
+			"FIRST PULL IS BIG: wasi-sdk is ~120MB (linux) / ~495MB (win) compressed; timeout_sec bounds the whole fetch (default 600s, max 3600). " +
+			"PAIRING: installing a generation is what makes xuansi_toolchain_status's fw-compat answer current (P1: wasm >=0.2.0 wide domain, aot empty — refused until A1); a generation this platform has no wamrc asset for installs wasi_sdk alone and says so in the note. " +
+			"No lease, no daemon call.",
+	}, ts.toolchainFetch)
 
 	ts.registerCapture(srv)
 }
