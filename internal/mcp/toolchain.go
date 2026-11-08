@@ -408,7 +408,7 @@ func (ts *toolset) toolchainStatus(ctx context.Context, _ *mcpsdk.CallToolReques
 		}
 		switch {
 		case hasAsset:
-			g = append(g, fmt.Sprintf("%s missing — install: call xuansi_toolchain_fetch", kind))
+			g = append(g, fmt.Sprintf("%s missing — install: call xuansi_toolchain_fetch (manual steps: the xuansi-drivers README's User-compiled modules section)", kind))
 		case plat == "":
 			g = append(g, fmt.Sprintf("%s missing and this host has no index platform key, so no asset can exist for it", kind))
 		default:

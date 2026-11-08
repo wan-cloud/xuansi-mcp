@@ -143,7 +143,18 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	fmt.Printf("=== b11 task-11 toolchain-distribution HIL (linux leg) - %s ===\n", time.Now().Format(time.RFC3339))
 	fmt.Printf("attempt: %d (honest count - any failure is fixed and the WHOLE capture rerun)\n", attempt)
 	fmt.Printf("serving daemon: %s (freshly built at HEAD by the orchestrating script; the RESIDENT npm daemon is stopped there for the duration - b10t5 contract)\n", daemonBin)
-	fmt.Printf("board: %s over TCP %s (daemon never opens CDC - that reboots); fw expect %s (protocol_ver 5)\n", b11Board, b11TCPEndp, b11FwBuild)
+	// mac leg (T11 step-2 prep, measured on the mac host): Go's Dial
+	// with a .local name — LookupHost succeeds but the dialer's
+	// internal lookup path times out — while dialing the board's IP
+	// directly works. B11_TCP_ENDP overrides the endpoint for exactly
+	// that (e.g. B11_TCP_ENDP=10.1.51.205:7777); the .local default
+	// stays the linux bench's shape.
+	endp := b11TCPEndp
+	if v := os.Getenv("B11_TCP_ENDP"); v != "" {
+		endp = v
+		fmt.Printf("endpoint override: B11_TCP_ENDP=%s (the mac leg's .local dial workaround)\n", endp)
+	}
+	fmt.Printf("board: %s over TCP %s (daemon never opens CDC - that reboots); fw expect %s (protocol_ver 5)\n", b11Board, endp, b11FwBuild)
 	fmt.Printf("index: the live public one, default URL (raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json)\n")
 	fmt.Printf("chain: status(missing) -> fetch(real 119MB sdk + 33MB wamrc download) -> fetch#2(all Skipped) -> status(present) ->\n")
 	fmt.Printf("  wasm_build(hilhello@1.0.0 from C source) -> driver_push -> bench.wasm load/call echo -> ws_list reconcile\n")
@@ -181,13 +192,13 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	} else {
 		h.note("pgrep: no xuansi processes found (clean bench)")
 	}
-	if conn, err := net.DialTimeout("tcp", b11TCPEndp, 3*time.Second); err != nil {
-		h.check(false, fmt.Sprintf("board TCP face reachable at %s: %v (dial only - no reboot, no USB open)", b11TCPEndp, err))
+	if conn, err := net.DialTimeout("tcp", endp, 3*time.Second); err != nil {
+		h.check(false, fmt.Sprintf("board TCP face reachable at %s: %v (dial only - no reboot, no USB open)", endp, err))
 		fmt.Println("  BLOCKED: the bench board is not reachable - report and stop (no spin)")
 		return finish()
 	} else {
 		conn.Close()
-		h.check(true, fmt.Sprintf("board TCP face reachable at %s (dial only)", b11TCPEndp))
+		h.check(true, fmt.Sprintf("board TCP face reachable at %s (dial only)", endp))
 	}
 
 	xdg := filepath.Join(runDir, "xdg")
