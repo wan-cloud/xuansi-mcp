@@ -25,7 +25,8 @@ package mcp
 //     work; the aot lane's override half dies there, explicitly.
 //   - wasmBuild (T5): the tool face — input gates, the gates above,
 //     the compile, then drivers/<name>@<ver>.wasm + one manifest
-//     cycle (kind "wasm", or "wasm-dev" on the wamrc_path override).
+//     cycle (kind "wasm", or "wasm-dev" when ANY §6.4 override —
+//     wamrc_path or wasi_sdk_path — is in play).
 
 import (
 	"bytes"
@@ -190,8 +191,8 @@ func tcWarnTail(s string) string {
 // workspace landing). Resolution order (§6.4): WasiSDKPath override
 // first — the developer's explicit "compile with my local tree",
 // which deliberately bypasses the cache-state pairing evidence
-// (T5's manifest marks the override lane by Kind: wamrc_path lands
-// "wasm-dev") and derives the
+// (T5's manifest marks the artifact dev — any §6.4 override, this
+// one included, lands Kind "wasm-dev") and derives the
 // sysroot from ITS root — then the cache state's landed wasi_sdk
 // record (the T3 path contract: tcCacheRoot() + the record's Dir),
 // then the self-guiding fetch refusal (§6.3 UX: the error carries
@@ -319,12 +320,14 @@ type wasmBuildIn struct {
 	FW string `json:"fw,omitempty" jsonschema:"an EXPLICIT fw-compat pre-check, not a gate the interp track needs (wasm bytecode is version-less): supply the target board's fw version to refuse early below the 0.2.0 floor — the first fw with a wasm loader; omit to build with no check"`
 	// WamrcPath / WasiSDKPath are the §6.4 developer overrides:
 	// explicit, deliberately outside the toolchain cache's pairing
-	// evidence. WamrcPath marks the manifest entry kind "wasm-dev"
-	// (the .aot compile itself arrives with the A1 runtime);
-	// WasiSDKPath compiles with a local wasi-sdk tree (bin/clang
-	// inside it) instead of the cache's landed record.
+	// evidence — and EITHER one marks the manifest entry kind
+	// "wasm-dev" (the artifact is visibly not an index-paired build,
+	// however the unpaired compile was requested). WamrcPath is the
+	// aot lane's knob (the .aot compile itself arrives with the A1
+	// runtime); WasiSDKPath compiles with a local wasi-sdk tree
+	// (bin/clang inside it) instead of the cache's landed record.
 	WamrcPath   string `json:"wamrc_path,omitempty" jsonschema:"the §6.4 developer override: an explicit wamrc marks this a dev build — the manifest entry records kind \"wasm-dev\" instead of \"wasm\" (the .aot lane itself arrives with the A1 runtime)"`
-	WasiSDKPath string `json:"wasi_sdk_path,omitempty" jsonschema:"the §6.4 developer override: compile with this local wasi-sdk tree (its bin/clang, never a PATH lookup) instead of the toolchain cache's landed record — explicitly bypassing the index pairing evidence"`
+	WasiSDKPath string `json:"wasi_sdk_path,omitempty" jsonschema:"the §6.4 developer override: compile with this local wasi-sdk tree (its bin/clang, never a PATH lookup) instead of the toolchain cache's landed record — explicitly bypassing the index pairing evidence, and marks the manifest entry kind \"wasm-dev\""`
 }
 
 // wasmBuildOut is the build's answer: what landed, where, and the one
@@ -403,8 +406,12 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	// the compile itself stayed outside the lock — it is the slow
 	// half and touches only its temp dir).
 	kind := "wasm"
-	if in.WamrcPath != "" {
-		kind = "wasm-dev" // the §6.4 override lane: visibly not an index-paired build
+	if in.WamrcPath != "" || in.WasiSDKPath != "" {
+		// the §6.4 override lane, EITHER override (spec's symmetric
+		// pair): the artifact was compiled outside the cache state's
+		// pairing evidence, and the manifest says so — visibly not an
+		// index-paired build.
+		kind = "wasm-dev"
 	}
 	sha := sha256hex(wasm)
 	wsMu.Lock()

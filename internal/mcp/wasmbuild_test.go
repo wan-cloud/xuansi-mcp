@@ -245,22 +245,21 @@ echo "fake clang: 1 warning generated" >&2
 // xuansi_wasm_build (B11 task 5) — the tool handler, handler-direct
 // (the toolchain-test pattern: the build face crosses no daemon wire,
 // so there is nothing to script — the workspace root is injected and
-// the sdk resolution rides a fake clang fixture or a fresh cache).
+// the sdk resolution rides a fake clang fixture: as the wasi_sdk_path
+// override target, as the cache state's landed record, or a fresh
+// cache for the refusal shapes).
 
-// fakeWasmSDK plants a fixture wasi-sdk tree whose bin/clang is a
+// plantFakeClang plants the fixture compiler under dir (bin/clang, a
 // shell script that writes fixed .wasm-magic bytes to the -o target
-// and one line on stderr — the tool tests' compile stand-in (the
+// and one line on stderr) — the tool tests' compile stand-in (the
 // argv-shape pins live in TestWasmBuildInnerFakeClang; here only the
-// landing is under test). Returns the sdk root to pass as
-// wasi_sdk_path (the §6.4 override: the inner execs <root>/bin/clang
-// directly, no state/bin gate on this path).
-func fakeWasmSDK(t *testing.T) string {
+// landing is under test).
+func plantFakeClang(t *testing.T, dir string) {
 	t.Helper()
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("/bin/sh absent: the fake clang is a shell script")
 	}
-	sdk := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(sdk, "bin"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
 		t.Fatalf("fake sdk bin: %v", err)
 	}
 	script := `#!/bin/sh
@@ -273,10 +272,39 @@ done
 printf '\000\141\163\155\000\000fake-module-body' > "$out"
 echo "fake clang: ok" >&2
 `
-	if err := os.WriteFile(filepath.Join(sdk, "bin", "clang"), []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "bin", "clang"), []byte(script), 0o755); err != nil {
 		t.Fatalf("plant fake clang: %v", err)
 	}
+}
+
+// fakeWasmSDK plants the fixture in its own temp dir and returns the
+// root — the wasi_sdk_path override target (the §6.4 lane: the inner
+// execs <root>/bin/clang directly, no state/bin gate on this path).
+func fakeWasmSDK(t *testing.T) string {
+	t.Helper()
+	sdk := t.TempDir()
+	plantFakeClang(t, sdk)
 	return sdk
+}
+
+// plantFakeSDKCache lands the fixture as the toolchain cache's OWN
+// record — the PRODUCT path: XUANSI_WASM_CACHE points at a fresh
+// cache whose state records a wasi_sdk whose Dir exists, so a build
+// with NO override resolves the fake tree through the pairing
+// evidence (kind stays "wasm").
+func plantFakeSDKCache(t *testing.T) {
+	t.Helper()
+	cache := tcCacheEnv(t)
+	dir := "wasi-sdk-24.0-fake"
+	plantFakeClang(t, filepath.Join(cache, dir))
+	if err := saveTCState(filepath.Join(cache, toolchainStateFile), &tcState{
+		Generation: "toolchain-v2",
+		Installed: map[string]tcInstalled{
+			"wasi_sdk": {SHA256: strings.Repeat("a", 64), Bytes: 1, Dir: dir},
+		},
+	}); err != nil {
+		t.Fatalf("plant landed sdk state: %v", err)
+	}
 }
 
 // fakeWasmBody is the fake clang's exact output: the \0asm magic, two
@@ -331,20 +359,24 @@ func TestWasmBuildToolMissingTCGuidance(t *testing.T) {
 }
 
 // TestWasmBuildToolLandsWorkspace (brief-named): the whole tool path
-// against the fake sdk — the artifact lands at drivers/<name>@<ver>.wasm
-// with the fake's exact bytes, the manifest entry records kind "wasm"
-// plus the FileMeta (sha/size of the built bytes, built-at time,
-// Active untouched), and every out field answers (File the
-// workspace-relative path, Next the fixed push sentence, Warnings the
-// transcript verbatim).
+// against the fake sdk landed as the toolchain cache's OWN record —
+// the PRODUCT lane (fix round 1: no override input, the build
+// resolves the tree through the pairing evidence, exactly what a
+// user with a fetched toolchain rides) — the artifact lands at
+// drivers/<name>@<ver>.wasm with the fake's exact bytes, the
+// manifest entry records kind "wasm" plus the FileMeta (sha/size of
+// the built bytes, built-at time, Active untouched), and every out
+// field answers (File the workspace-relative path, Next the fixed
+// push sentence, Warnings the transcript verbatim).
 func TestWasmBuildToolLandsWorkspace(t *testing.T) {
-	sdk := fakeWasmSDK(t)
+	plantFakeSDKCache(t)
 	root := t.TempDir()
 	ts := &toolset{ws: newWSState(root)}
 	out, err := wasmBuildRun(t, ts, wasmBuildIn{
 		Name: "hello", Version: "1.2.0", Source: "int x;\n",
 		InitialMemory: 131072, // an explicit 2-page value rides through the gates
-		WasiSDKPath:   sdk,
+		// no wamrc_path/wasi_sdk_path: the cache state's landed record
+		// compiles, kind stays "wasm" — the index-paired lane
 	})
 	if err != nil {
 		t.Fatalf("wasmBuild: %v", err)
@@ -386,7 +418,7 @@ func TestWasmBuildToolLandsWorkspace(t *testing.T) {
 		t.Fatal("manifest: no hello entry after the build")
 	}
 	if e.Kind != "wasm" {
-		t.Errorf("kind = %q: want wasm (no dev override in play)", e.Kind)
+		t.Errorf("kind = %q: want wasm (the cache state's landed record compiled — no override in play)", e.Kind)
 	}
 	if e.Active != "" {
 		t.Errorf("active = %q: storing is NOT activating (a push moves it)", e.Active)
@@ -440,19 +472,26 @@ func TestWasmBuildToolVersionGate(t *testing.T) {
 	tcAPIErr(t, err, "65536")
 }
 
-// TestWasmBuildToolDevOverrideKind (the added cases): wamrc_path
-// marks the manifest entry kind "wasm-dev" (the §6.4 override lane —
-// visibly not an index-paired build), and an omitted version lands
-// the first-build default 0.0.1.
+// TestWasmBuildToolDevOverrideKind (the added cases, fix round 1's
+// ruling): ANY §6.4 override marks the manifest entry kind
+// "wasm-dev" — the artifact is visibly not an index-paired build,
+// however the unpaired compile was requested. Both halves: wamrc_path
+// (fired over the cache state's OWN landed record — the mark rides
+// the request's override, not the sdk the build resolved), and
+// wasi_sdk_path alone (a local tree compiling with no cache in
+// play). The omitted version lands the first-build default 0.0.1.
 func TestWasmBuildToolDevOverrideKind(t *testing.T) {
-	sdk := fakeWasmSDK(t)
+	// half 1: wamrc_path over the PAIRED cache lane — the request's
+	// override marks, even though the sdk resolved through the
+	// pairing evidence.
+	plantFakeSDKCache(t)
 	ts := &toolset{ws: newWSState(t.TempDir())}
 	out, err := wasmBuildRun(t, ts, wasmBuildIn{
 		Name: "hello", Source: "int x;\n",
-		WamrcPath: "/opt/wamrc", WasiSDKPath: sdk, // no Version: the 0.0.1 default
+		WamrcPath: "/opt/wamrc", // no Version: the 0.0.1 default
 	})
 	if err != nil {
-		t.Fatalf("wasmBuild (dev): %v", err)
+		t.Fatalf("wasmBuild (wamrc dev): %v", err)
 	}
 	if out.Version != wasmBuildFirstVersion {
 		t.Fatalf("out.Version = %q: want the %s first-build default", out.Version, wasmBuildFirstVersion)
@@ -471,6 +510,25 @@ func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 	fm, ok := e.Files[wasmBuildFirstVersion]
 	if !ok || fm.Sha256 != out.Sha256 || fm.Size != out.Bytes {
 		t.Fatalf("files[%s] = %+v (ok=%v): want the built artifact's meta matching out", wasmBuildFirstVersion, fm, ok)
+	}
+
+	// half 2: wasi_sdk_path ALONE (probe-22's symmetric pair) — a
+	// local tree compiles with no cache record at all, and the
+	// manifest must not pass the artifact off as index-paired.
+	tcCacheEnv(t) // fresh cache: the override is the only resolution
+	ts2 := &toolset{ws: newWSState(t.TempDir())}
+	if _, err := wasmBuildRun(t, ts2, wasmBuildIn{
+		Name: "hello", Version: "2.0.0", Source: "int x;\n",
+		WasiSDKPath: fakeWasmSDK(t),
+	}); err != nil {
+		t.Fatalf("wasmBuild (sdk dev): %v", err)
+	}
+	m2, merr2 := loadManifest(ts2.ws.manifestPath())
+	if merr2 != nil {
+		t.Fatalf("loadManifest (sdk dev): %v", merr2)
+	}
+	if e2 := m2.Drivers["hello"]; e2.Kind != "wasm-dev" {
+		t.Fatalf("kind = %q: want wasm-dev (wasi_sdk_path alone marks the override lane too)", e2.Kind)
 	}
 }
 
