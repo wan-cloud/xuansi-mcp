@@ -681,6 +681,19 @@ func tcAPIErr(t *testing.T, err error, want string) {
 	}
 }
 
+// tcExecOK is the platform-honest exec assertion for extracted files:
+// off-windows the exec bit must survive extraction (perm&0o111 — the
+// toolchain runs these); on windows NTFS a Go file mode carries only
+// the read-only bit (0666 writable / 0444 read-only, exec is
+// unrepresentable), so the honest pin there is a landed, writable
+// file — existence plus non-read-only semantics, no skip.
+func tcExecOK(fi os.FileInfo) bool {
+	if runtime.GOOS == "windows" {
+		return fi.Mode().Perm()&0o222 != 0
+	}
+	return fi.Mode().Perm()&0o111 != 0
+}
+
 // TestFetchTCArchiveShaMismatch (brief-named): a bad sha pin refuses
 // — at the unit level the error names the sha mismatch, and at the
 // pipeline level the refusal leaves the CACHE untouched (zero
@@ -759,8 +772,8 @@ func TestExtractTarGzSlip(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(dst, "top", "bin", "tool")); err != nil || string(b) != "x\n" {
 		t.Fatalf("safe extract: %q, %v", b, err)
 	}
-	if fi, err := os.Stat(filepath.Join(dst, "top", "bin", "tool")); err != nil || fi.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("exec member must keep an exec bit, got %v, %v", fi, err)
+	if fi, err := os.Stat(filepath.Join(dst, "top", "bin", "tool")); err != nil || !tcExecOK(fi) {
+		t.Fatalf("exec member must keep an exec bit (windows: landed + writable), got %v, %v", fi, err)
 	}
 
 	for _, evil := range []tcEnt{
@@ -844,12 +857,12 @@ func TestToolchainFetchIdempotent(t *testing.T) {
 	// layout: the tarball's top dir flattened into wasi-sdk-24.0-<plat>,
 	// the exec bit the toolchain needs intact; wamrc at wamrc/wamrc.
 	clang := filepath.Join(cache, "wasi-sdk-24.0-"+plat, "bin", "clang")
-	if fi, ferr := os.Stat(clang); ferr != nil || fi.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("sdk bin/clang: %v (mode %v) — want present + exec bit", ferr, fi)
+	if fi, ferr := os.Stat(clang); ferr != nil || !tcExecOK(fi) {
+		t.Fatalf("sdk bin/clang: %v (mode %v) — want present + exec bit (windows: landed + writable)", ferr, fi)
 	}
 	wamrcBin := filepath.Join(cache, "wamrc", "wamrc")
-	if fi, ferr := os.Stat(wamrcBin); ferr != nil || fi.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("wamrc/wamrc: %v (mode %v) — want present + exec bit", ferr, fi)
+	if fi, ferr := os.Stat(wamrcBin); ferr != nil || !tcExecOK(fi) {
+		t.Fatalf("wamrc/wamrc: %v (mode %v) — want present + exec bit (windows: landed + writable)", ferr, fi)
 	}
 
 	statePath := filepath.Join(cache, toolchainStateFile)
