@@ -33,28 +33,36 @@ const (
 	hostSuffix  = ".local"
 )
 
-// DiscoverMDNS browses _xuansi._tcp within the 3s budget (two 1.5s
+// DiscoverMDNS sweeps _xuansi._tcp within the 3s budget (two 1.5s
 // windows, see mdnsTimeout) and returns the answering boards merged
-// field-wise. Each window browses on EVERY usable interface
-// concurrently — the multihomed fix: a win real host with 10.1.50.x /
-// 10.1.51.x NICs and the board on the 51 link got zero entries from
-// the default resolver (one 0.0.0.0:5353 socket, default-route sends),
-// while a resolver pinned to the board's link saw it — so each
-// interface gets its own SelectIfaces-pinned resolver sharing the
-// window deadline. Interfaces are enumerated ONCE per sweep: the 3s
-// budget is far shorter than any interface churn (cable pulls, VPN
-// ramps), so per-window re-enumeration buys nothing. The budget
-// expiring on the internal deadline is the normal end of a sweep (a
-// clean empty set is real knowledge that no service answered — boards
-// off WiFi, or an AP that drops multicast); a TOTAL browse failure
-// (every interface's resolver failed to launch, or no usable interface
-// and the default resolver failed) or a canceled caller context
-// returns the error instead — Registry.Refresh treats those as
-// environment degradation and freezes the mdns face at last-known
-// rather than trusting a blind empty sweep. ctx-driven only: every
-// goroutine a browse spawns dies with the derived context; each
-// resolver's entries channel is closed by the library when its window
-// ends.
+// field-wise. Each window runs TWO concurrent lanes over EVERY usable
+// interface:
+//
+//   - the zeroconf browse lane (c464846, the linux/mac primary road):
+//     a SelectIfaces-pinned resolver per interface — the multihomed
+//     fix; a win real host with 10.1.50.x / 10.1.51.x NICs and the
+//     board on the 51 link got zero entries from the default resolver
+//     (one 0.0.0.0:5353 socket, default-route sends), while a resolver
+//     pinned to the board's link saw it.
+//   - the unicast lane (mdnsuni.go): a source-bound PTR query per
+//     interface whose reply comes back unicast to the query socket —
+//     the road that does not depend on multicast response reception,
+//     which is the half the win multihomed bench proved unreliable.
+//
+// Interfaces are enumerated ONCE per sweep: the 3s budget is far
+// shorter than any interface churn (cable pulls, VPN ramps), so
+// per-window re-enumeration buys nothing. The budget expiring on the
+// internal deadline is the normal end of a sweep (a clean empty set is
+// real knowledge that no service answered — boards off WiFi, or an AP
+// that drops multicast); a TOTAL sweep failure — every lane blind:
+// every interface's browse resolver AND every interface's unicast
+// socket failed to launch (or no usable interface and the default
+// resolver failed) — or a canceled caller context returns the error
+// instead; Registry.Refresh treats those as environment degradation
+// and freezes the mdns face at last-known rather than trusting a blind
+// empty sweep. ctx-driven only: every goroutine a lane spawns dies
+// with the derived context; each resolver's entries channel is closed
+// by the library when its window ends.
 func DiscoverMDNS(ctx context.Context) ([]Board, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -66,7 +74,7 @@ func DiscoverMDNS(ctx context.Context) ([]Board, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := browseOnce(ctx, ifaces, accum); err != nil {
+		if err := sweepWindow(ctx, ifaces, accum); err != nil {
 			return nil, err
 		}
 	}
@@ -74,6 +82,49 @@ func DiscoverMDNS(ctx context.Context) ([]Board, error) {
 		return nil, err
 	}
 	return accum.snapshot(), nil
+}
+
+// sweepWindow runs ONE window's two lanes concurrently — the browse
+// (multicast) and unicast (source-bound query) lanes each derive the
+// same 1.5s window from ctx, so the window budget is shared, not
+// doubled, and the total sweep stays pinned at 3s. Lanes accumulate
+// into their own accumulators (mdnsAccum is not safe for concurrent
+// writes) and merge serially into the sweep accumulator afterwards,
+// browse first then unicast — deterministic, and the accumulator's
+// field-wise merge dedups a board seen by both lanes. Error rule: a
+// lane errors only when EVERY one of its interfaces failed; the sweep
+// errors only when BOTH lanes are blind (one blind lane degrades — the
+// other lane's data is still an honest sweep).
+func sweepWindow(ctx context.Context, ifaces []net.Interface, accum mdnsAccum) error {
+	browseAcc, uniAcc := mdnsAccum{}, mdnsAccum{}
+	var (
+		wg   sync.WaitGroup
+		berr error
+		uerr error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		berr = browseOnce(ctx, ifaces, browseAcc)
+	}()
+	go func() {
+		defer wg.Done()
+		uerr = unicastOnce(ctx, ifaces, uniAcc)
+	}()
+	wg.Wait()
+	for _, b := range browseAcc.snapshot() {
+		accum.add(b)
+	}
+	for _, b := range uniAcc.snapshot() {
+		accum.add(b)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if berr != nil && uerr != nil {
+		return berr
+	}
+	return nil
 }
 
 // mdnsBrowser is the resolver seam: *zeroconf.Resolver satisfies it;
@@ -92,9 +143,10 @@ var newResolverFunc = func(opts ...zeroconf.ClientOption) (mdnsBrowser, error) {
 
 // browseIfaces enumerates the interfaces that each get a dedicated
 // browse (seam: tests inject a fake list). Usable = up,
-// multicast-capable, not loopback, holding an IPv4 address: the
-// pinned resolver joins the v4 multicast group on its one interface,
-// and a v6-only interface would fail resolver construction outright.
+// multicast-capable, not loopback, holding an IPv4 address (ifaceIPv4,
+// shared with the unicast lane's source binding): the pinned resolver
+// joins the v4 multicast group on its one interface, and a v6-only
+// interface would fail resolver construction outright.
 // Virtual switches (vEthernet, docker0, VPN tun...) stay in on
 // purpose — harmless: each gets its own browse and an empty result is
 // honest. Enumeration failure or nothing qualifying returns nil — the
@@ -110,23 +162,31 @@ var browseIfaces = func() []net.Interface {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		hasV4 := false
-		for _, a := range addrs {
-			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
-				hasV4 = true
-				break
-			}
-		}
-		if !hasV4 {
+		if ifaceIPv4(iface) == nil {
 			continue
 		}
 		out = append(out, iface)
 	}
 	return out
+}
+
+// ifaceIPv4 returns the interface's first IPv4 address, nil if none —
+// the single source of "which address belongs to this interface" for
+// BOTH lanes: browseIfaces' usability filter and the unicast lane's
+// query source binding (seam: tests override).
+var ifaceIPv4 = func(iface net.Interface) net.IP {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			if ip4 := ipn.IP.To4(); ip4 != nil {
+				return ip4
+			}
+		}
+	}
+	return nil
 }
 
 // browseOnce runs one browse window into the shared accumulator: one
