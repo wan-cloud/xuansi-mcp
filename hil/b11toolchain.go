@@ -60,6 +60,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -166,6 +167,90 @@ func b11SDKDirName() string {
 	return "wasi-sdk-24.0-unknown"
 }
 
+// b11LegName names this run's leg for the banner (the evidence line
+// says which platform the chain ran on).
+func b11LegName() string {
+	switch runtime.GOOS {
+	case "linux":
+		return "linux"
+	case "darwin":
+		return "mac"
+	case "windows":
+		return "win"
+	default:
+		return runtime.GOOS
+	}
+}
+
+// b11ClangName is the compiler binary inside the fetched SDK tree on
+// this host — bin/clang.exe on windows, bin/clang elsewhere (the
+// daemon-side tcClangName's twin; the W21 probe must match what the
+// fetch actually landed).
+func b11ClangName() string {
+	if runtime.GOOS == "windows" {
+		return "clang.exe"
+	}
+	return "clang"
+}
+
+// b11SandboxEnv is the platform-trio sandbox env the daemon + mcp
+// children run under: the daemon's DataDir (internal/paths
+// dataDirFor) is $XDG_DATA_HOME/xuansi on linux, $HOME/Library/
+// Application Support/xuansi on darwin (os.UserHomeDir reads $HOME),
+// %LOCALAPPDATA%\xuansi on windows — so ONE var per OS must be
+// steered into the run dir, and setting all three steers every host:
+// linux keeps its XDG behavior byte-identical, darwin's HOME (and
+// with it StateDir's ~/Library/Logs) lands inside, windows'
+// LOCALAPPDATA (DataDir + StateDir + the default sock) lands inside.
+// XUANSI_WASM_CACHE is set separately (an absolute path, immune to
+// all of these).
+type b11Sandbox struct {
+	fakeHome string // = <run>/fakehome  (darwin home, linux state/config fallbacks)
+	xdgData  string // = <run>/xdg       (linux DataDir root)
+	localAD  string // = <run>/localappdata (windows DataDir root)
+}
+
+func b11NewSandbox(runDir string) (*b11Sandbox, error) {
+	s := &b11Sandbox{
+		fakeHome: filepath.Join(runDir, "fakehome"),
+		xdgData:  filepath.Join(runDir, "xdg"),
+		localAD:  filepath.Join(runDir, "localappdata"),
+	}
+	for _, d := range []string{s.fakeHome, s.xdgData, s.localAD} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	// os.Setenv rides os.Environ() into BOTH children (the mcp child
+	// is the one whose toolset reads the workspace); the harness
+	// process itself is a throwaway, so mutating its env is safe.
+	for k, v := range map[string]string{
+		"HOME":          s.fakeHome,
+		"XDG_DATA_HOME": s.xdgData,
+		"LOCALAPPDATA":  s.localAD,
+	} {
+		if err := os.Setenv(k, v); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
+}
+
+// dataDir mirrors the daemon's dataDirFor against the sandbox env:
+// the directory whose "workspace"/ child holds the driver store, so
+// the W41 disk probe reads the artifact through the SAME derivation
+// the serving daemon used — on every host.
+func (s *b11Sandbox) dataDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(s.localAD, "xuansi")
+	case "darwin":
+		return filepath.Join(s.fakeHome, "Library", "Application Support", "xuansi")
+	default:
+		return filepath.Join(s.xdgData, "xuansi")
+	}
+}
+
 // b11HelloSrc is the hello-scale module the build compiles: the
 // drivers repo's src/hello/hello.c cut to the ABI's mandatory trio
 // (xuansi_abi / xuansi_alloc / one exported fn). echo returns the
@@ -213,7 +298,28 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	h := &harness{}
 	ctx := context.Background()
 
-	fmt.Printf("=== b11 task-11 toolchain-distribution HIL (linux leg) - %s ===\n", time.Now().Format(time.RFC3339))
+	// the platform context every per-leg assertion below rides: this
+	// host's index key, its pinned asset row, and whether the row
+	// carries a wamrc leg at all ("wamrc": null on win-x64 and
+	// linux-arm64 — those platforms install wasi_sdk ALONE and every
+	// two-piece assertion generalizes through hasWamrc). An off-table
+	// host fails loudly here and the fetch's own matrix refusal below
+	// names the same fact.
+	platKey := b11PlatformKey()
+	pin, pinKnown := b11Pins[platKey]
+	hasWamrc := pinKnown && pin.wamrcSHA != ""
+	fetchSizes := func() string {
+		if !pinKnown {
+			return "unknown-size sdk"
+		}
+		sdkMB := int(math.Round(float64(pin.sdkBytes) / 1e6))
+		if hasWamrc {
+			return fmt.Sprintf("%dMB sdk + %dMB wamrc", sdkMB, int(math.Round(float64(pin.wamrcBytes)/1e6)))
+		}
+		return fmt.Sprintf("%dMB sdk", sdkMB)
+	}
+
+	fmt.Printf("=== b11 task-11 toolchain-distribution HIL (%s leg) - %s ===\n", b11LegName(), time.Now().Format(time.RFC3339))
 	fmt.Printf("attempt: %d (honest count - any failure is fixed and the WHOLE capture rerun)\n", attempt)
 	fmt.Printf("serving daemon: %s (freshly built at HEAD by the orchestrating script; the RESIDENT npm daemon is stopped there for the duration - b10t5 contract)\n", daemonBin)
 	// mac leg (T11 step-2 prep, measured on the mac host): Go's Dial
@@ -228,10 +334,11 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		fmt.Printf("endpoint override: B11_TCP_ENDP=%s (the mac leg's .local dial workaround)\n", endp)
 	}
 	fmt.Printf("board: %s over TCP %s (daemon never opens CDC - that reboots); fw expect %s (protocol_ver 5)\n", b11Board, endp, b11FwBuild)
-	fmt.Printf("index: the live public one, default URL (raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json)\n")
-	fmt.Printf("chain: status(missing) -> fetch(real 119MB sdk + 33MB wamrc download) -> fetch#2(all Skipped) -> status(present) ->\n")
+	fmt.Printf("index: the live public one, default URL (raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json); platform key %s (wamrc leg: %v)\n", platKey, hasWamrc)
+	fmt.Printf("chain: status(missing) -> fetch(real %s download) -> fetch#2(all Skipped) -> status(present) ->\n", fetchSizes())
 	fmt.Printf("  wasm_build(hilhello@1.0.0 from C source) -> driver_push -> bench.wasm load/call echo -> ws_list reconcile\n")
 	fmt.Printf("discipline: evidence ASCII only; verdicts in-file; cache ISOLATED under the run dir (XUANSI_WASM_CACHE - the real user cache untouched)\n")
+	h.check(pinKnown, fmt.Sprintf("host platform key %q has toolchain-v2 pins tabled in b11Pins (off-matrix hosts cannot run this chain - the fetch would refuse the matrix too)", platKey))
 
 	var serve, mcp *b6Proc
 	defer func() { // die-safe: never leave processes or a lease behind
@@ -274,18 +381,25 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		h.check(true, fmt.Sprintf("board TCP face reachable at %s (dial only)", endp))
 	}
 
-	xdg := filepath.Join(runDir, "xdg")
-	if err := os.MkdirAll(xdg, 0o755); err != nil {
-		h.check(false, "mkdir run/XDG dir: "+err.Error())
+	// WORKSPACE SANDBOX, platform trio (the biggest portability fix of
+	// the sweep): the daemon/mcp children run with HOME, XDG_DATA_HOME
+	// AND LOCALAPPDATA all steered into the run dir — each OS's
+	// DataDir derivation (internal/paths dataDirFor) follows exactly
+	// one of them, so the workspace, the state dir and every
+	// home-relative fallback land inside the sandbox on every host
+	// (linux: the XDG var, byte-identical to before; darwin: $HOME;
+	// windows: %LOCALAPPDATA%). XUANSI_WASM_CACHE is absolute and
+	// immune to all three.
+	sb, sberr := b11NewSandbox(runDir)
+	if sberr != nil {
+		h.check(false, "sandbox dirs: "+sberr.Error())
 		return finish()
 	}
 	// CACHE ISOLATION (the brief's hard rule): XUANSI_WASM_CACHE points
 	// INSIDE the run dir, and the wrapper wipes the run dir per attempt
 	// - so S1's "missing" premise holds honestly every run and the
-	// fetch's ~152MB lands in the sandbox, never in the real
-	// ~/.cache/xuansi-wasm. os.Setenv here rides os.Environ() into BOTH
-	// children (startB6Daemon/startB6MCP); the mcp child is the one
-	// whose toolset reads it.
+	// fetch's real bytes land in the sandbox, never in the real
+	// ~/.cache/xuansi-wasm (absolute - unaffected by the HOME steer).
 	wasmCache := filepath.Join(runDir, "wasm-cache")
 	if err := os.Setenv("XUANSI_WASM_CACHE", wasmCache); err != nil {
 		h.check(false, "set XUANSI_WASM_CACHE: "+err.Error())
@@ -297,10 +411,11 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		h.check(false, "write boards.conf: "+err.Error())
 		return finish()
 	}
-	h.note("XDG sandbox: XDG_DATA_HOME=%s (the workspace lands inside; the real user workspace untouched)", xdg)
+	h.note("sandbox trio: HOME=%s XDG_DATA_HOME=%s LOCALAPPDATA=%s (the ONE of them this OS's DataDir reads steers the workspace; the others are inert)", sb.fakeHome, sb.xdgData, sb.localAD)
+	h.note("workspace root under this host's derivation: %s (the real user workspace untouched)", sb.dataDir())
 	h.note("CACHE ISOLATION: XUANSI_WASM_CACHE=%s (run-scoped, wiped per attempt; the real user cache is never read or written)", wasmCache)
 
-	serve = startB6Daemon(h, daemonBin, sock, boardsCfg, "XDG_DATA_HOME="+xdg)
+	serve = startB6Daemon(h, daemonBin, sock, boardsCfg, "XDG_DATA_HOME="+sb.xdgData)
 	if serve == nil {
 		return finish()
 	}
@@ -317,7 +432,7 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	})
 	h.check(ok, fmt.Sprintf("initial discovery sweep found 1 board (%s)", last))
 
-	mcp, mcpR, mcpW := startB6MCP(h, daemonBin, sock, "XDG_DATA_HOME="+xdg)
+	mcp, mcpR, mcpW := startB6MCP(h, daemonBin, sock, "XDG_DATA_HOME="+sb.xdgData)
 	if mcp == nil {
 		return finish()
 	}
@@ -402,25 +517,34 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		fmt.Sprintf("W13 guidance self-guides to fetch (%.120s)", asciiLine(guidance)))
 
 	// ---------- S2: the real fetch ----------
-	fmt.Println("\n- S2: xuansi_toolchain_fetch - the REAL download (119MB wasi-sdk + 33MB wamrc) from the live index -")
+	fmt.Printf("\n- S2: xuansi_toolchain_fetch - the REAL download (%s) from the live index -\n", fetchSizes())
 	tFetch := time.Now()
 	m, text, isErr, _ = b.call(ctx, 15*time.Minute, "xuansi_toolchain_fetch", map[string]any{}) // NO timeout_sec: the tool's own 600s default is under test
 	fetchMS := time.Since(tFetch).Milliseconds()
 	dl, sk := tcList(m, "downloaded"), tcList(m, "skipped")
+	// the platform's piece set: wasi_sdk always, wamrc only where the
+	// index row carries one (linux-x64/macos-x64/macos-arm64 do;
+	// win-x64/linux-arm64 install the sdk alone)
+	wantPieces := 1
+	if hasWamrc {
+		wantPieces = 2
+	}
 	h.check(!isErr && b6Str(m, "generation") == b11Gen && b6Str(m, "cache_root") == wasmCache &&
-		len(dl) == 2 && containsKind(dl, "wasi_sdk") && containsKind(dl, "wamrc") && len(sk) == 0,
-		fmt.Sprintf("W20 fetch downloaded BOTH pieces in one call: generation=%s downloaded=%v skipped=%v (%.1fs real network time; text=%.80s)",
-			b6Str(m, "generation"), dl, sk, float64(fetchMS)/1000, text))
+		len(dl) == wantPieces && containsKind(dl, "wasi_sdk") && (!hasWamrc || containsKind(dl, "wamrc")) && len(sk) == 0,
+		fmt.Sprintf("W20 fetch downloaded the platform's %d piece(s) in one call: generation=%s downloaded=%v skipped=%v (%.1fs real network time; text=%.80s)",
+			wantPieces, b6Str(m, "generation"), dl, sk, float64(fetchMS)/1000, text))
 	// disk probes: the landed trees, exactly where §6.1 says
 	sdkDir := b11SDKDirName()
-	sdkClang := filepath.Join(wasmCache, sdkDir, "bin", "clang")
+	sdkClang := filepath.Join(wasmCache, sdkDir, "bin", b11ClangName())
 	wamrcBin := filepath.Join(wasmCache, "wamrc", "wamrc")
 	if fi, err := os.Stat(sdkClang); err == nil {
-		h.check(fi.Mode()&0o111 != 0, fmt.Sprintf("W21 wasi-sdk landed: %s (executable, %dB tree root %s)", sdkClang, fi.Size(), sdkDir))
+		h.check(fi.Mode()&0o111 != 0, fmt.Sprintf("W21 wasi-sdk landed: %s (executable, %dB tree root %s; compiler name %s per this host)", sdkClang, fi.Size(), sdkDir, b11ClangName()))
 	} else {
 		h.check(false, "W21 wasi-sdk landed: "+err.Error())
 	}
-	if fi, err := os.Stat(wamrcBin); err == nil {
+	if !hasWamrc {
+		h.note("W22 skipped: platform %s carries \"wamrc\": null in toolchain-v2 - no wamrc binary can land (wasi_sdk alone installed)", platKey)
+	} else if fi, err := os.Stat(wamrcBin); err == nil {
 		// the INDEX pin is on the ARCHIVE - that pin is
 		// reconciled via S3's status rows (W33); here the probe is the
 		// EXTRACTED binary itself: present and executable
@@ -437,7 +561,7 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	// the idempotent re-call: everything pinned on disk -> all Skipped
 	m, text, isErr, _ = b.call(ctx, 120*time.Second, "xuansi_toolchain_fetch", map[string]any{})
 	dl2, sk2 := tcList(m, "downloaded"), tcList(m, "skipped")
-	h.check(!isErr && len(dl2) == 0 && len(sk2) == 2 && containsKind(sk2, "wasi_sdk") && containsKind(sk2, "wamrc"),
+	h.check(!isErr && len(dl2) == 0 && len(sk2) == wantPieces && containsKind(sk2, "wasi_sdk") && (!hasWamrc || containsKind(sk2, "wamrc")),
 		fmt.Sprintf("W24 SECOND fetch is the idempotent sync verb: downloaded=%v skipped=%v (nothing re-downloaded; text=%.80s)", dl2, sk2, text))
 
 	// ---------- S3: complete status ----------
@@ -450,26 +574,39 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	wamrcSHA, wamrcBytes := pins["wamrc_sha"], pins["wamrc_bytes"]
 	h.check(!isErr && b6Str(m, "generation") == b11Gen,
 		fmt.Sprintf("W30 generation=%q (the state's one-generation label)", b6Str(m, "generation")))
-	h.check(len(rows) == 2 && rows["wasi_sdk"] == true && rows["wamrc"] == true,
-		fmt.Sprintf("W31 both pieces present=true (rows=%v)", rows))
+	// present follows the platform's piece set: wasi_sdk always true;
+	// wamrc true only where the index row carries one (else the state
+	// records nothing for it and present=false BY DESIGN)
+	h.check(len(rows) == 2 && rows["wasi_sdk"] == true && rows["wamrc"] == hasWamrc,
+		fmt.Sprintf("W31 present=true for the platform's piece set (rows=%v; wamrc has a leg: %v)", rows, hasWamrc))
 	// W32/W33 reconcile against THIS platform's index pins
 	// (b11Pins, keyed by the same platform key the dir probe uses).
-	platKey := b11PlatformKey()
-	pin, pinKnown := b11Pins[platKey]
 	if !pinKnown {
 		h.check(false, fmt.Sprintf("W32 no toolchain-v2 pins tabled for platform key %q (this host) — extend b11Pins from the index (W33 also skipped)", platKey))
 	} else {
 		h.check(sdkSHA == pin.sdkSHA && sdkBytes == float64(pin.sdkBytes),
 			fmt.Sprintf("W32 wasi_sdk pins == the live index's (%s): sha=%.16s... bytes=%.0f (want %d)", platKey, sdkSHA, sdkBytes, pin.sdkBytes))
-		if pin.wamrcSHA == "" {
+		if !hasWamrc {
 			h.note("W33 skipped: platform %s carries \"wamrc\": null in toolchain-v2 — wasi_sdk alone installs, no wamrc pin to reconcile (the status wamrc row reads not-present by design)", platKey)
 		} else {
 			h.check(wamrcSHA == pin.wamrcSHA && wamrcBytes == float64(pin.wamrcBytes),
 				fmt.Sprintf("W33 wamrc pins == the live index's (%s): sha=%.16s... bytes=%.0f (want %d)", platKey, wamrcSHA, wamrcBytes, pin.wamrcBytes))
 		}
 	}
-	h.check(guidance == "",
-		fmt.Sprintf("W34 a complete, current cache stays quiet (guidance=%q)", guidance))
+	// W34: on a wamrc-leg platform a complete, current cache stays
+	// quiet; on a no-leg platform the guidance generator (toolchain.go
+	// task 2) reports the one honest gap — the missing wamrc with NO
+	// installable asset for this platform — and that exact sentence is
+	// the assertion (nothing about wasi_sdk may ride in it).
+	if hasWamrc {
+		h.check(guidance == "",
+			fmt.Sprintf("W34 a complete, current cache stays quiet (guidance=%q)", guidance))
+	} else {
+		h.check(strings.Contains(asciiLine(guidance), fmt.Sprintf("wamrc missing and this index generation carries no %s asset", platKey)) &&
+			strings.Contains(asciiLine(guidance), "nothing to install yet") &&
+			!strings.Contains(guidance, "wasi_sdk"),
+			fmt.Sprintf("W34 the no-leg platform's one honest gap, verbatim: guidance=%q (wamrc has no asset for %s; wasi_sdk present stays unsaid)", guidance, platKey))
+	}
 
 	// ---------- S4: wasm_build ----------
 	fmt.Println("\n- S4: xuansi_wasm_build - compile the hello-scale module against the just-fetched sdk -")
@@ -484,7 +621,10 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		fmt.Sprintf("W40 build hilhello@%s: file=%s sha=%.16s... bytes=%v warnings-silent Next=%q (text=%.80s)",
 			b11ModVer, b6Str(m, "file"), buildSHA, buildBytes, b6Str(m, "next"), text))
 	// the workspace artifact, byte-verified from THIS process
-	artPath := filepath.Join(xdg, "xuansi", "workspace", "drivers", b11ModName+"@"+b11ModVer+".wasm")
+	// the workspace artifact, byte-verified from THIS process — through
+	// the SAME per-OS derivation the serving daemon used (the sandbox
+	// trio's dataDir), not a linux-only XDG join
+	artPath := filepath.Join(sb.dataDir(), "workspace", "drivers", b11ModName+"@"+b11ModVer+".wasm")
 	if wb, err := os.ReadFile(artPath); err == nil {
 		h.check(len(wb) > 0 && wb[0] == 0x00 && wb[1] == 'a' && wb[2] == 's' && wb[3] == 'm' && sha256Hex(wb) == buildSHA,
 			fmt.Sprintf("W41 sandbox workspace artifact byte-verified: %d bytes, \\0asm magic, sha256 == the build's answer", len(wb)))
@@ -570,7 +710,7 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		h.check(false, "daemon sock left behind: "+sock)
 	}
 	h.note("board as found: no /drv files, no loaded modules, no lease")
-	h.note("sandbox kept for inspection: workspace under %s, toolchain cache under %s (the wrapper wipes the run dir on the next attempt)", xdg, wasmCache)
+	h.note("sandbox kept for inspection: workspace under %s, toolchain cache under %s (the wrapper wipes the run dir on the next attempt)", sb.dataDir(), wasmCache)
 	return finish()
 }
 
