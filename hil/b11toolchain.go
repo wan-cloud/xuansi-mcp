@@ -84,33 +84,86 @@ const (
 	// pinned against the LIVE public index at writing time
 	// (2026-11-08); a released generation's assets are immutable
 	// upstream, so these pins are stability, not snapshot luck.
-	// NOTE: b11SDKSHA/b11SDKBytes/b11WamrcSHA/b11WamrcBytes are the
-	// LINUX-X64 asset pins (this bench's leg); the mac leg runs with
-	// its own index pins.
-	b11Gen      = "toolchain-v2"
-	b11SDKSHA   = "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5"
-	b11SDKBytes = 118879731
-	b11WamrcSHA = "209a6a51b6066f05e91060d95c2506ec0bad97cb898fec1fe634cd68865b9c42"
-	// wamrc asset bytes (the fetch downloads it alongside the sdk —
-	// the linux-x64 matrix carries BOTH pieces)
-	b11WamrcBytes = 33053698
+	// The per-ASSET pins live in b11Pins below (all five index
+	// platforms, verbatim from the drivers repo's
+	// toolchain-index.json) — W32/W33 reconcile against THIS host's
+	// row.
+	b11Gen = "toolchain-v2"
 )
 
-// b11SDKDirName maps THIS host onto the index's platform key the way
+// b11Pin is one platform's toolchain-v2 asset pins: the wasi_sdk
+// archive's sha/bytes and the wamrc archive's. wamrcSHA == "" (with
+// wamrcBytes == 0) expresses the index's "wamrc": null — that
+// platform's matrix row carries NO wamrc asset (linux-arm64 and
+// win-x64), its fetch installs wasi_sdk ALONE, and W33 skips with a
+// note instead of pinning.
+type b11Pin struct {
+	sdkSHA     string
+	sdkBytes   int
+	wamrcSHA   string
+	wamrcBytes int
+}
+
+// b11Pins are the index's toolchain-v2 pins, VERBATIM from
+// code/xuansi-drivers/toolchain-index.json (read 2026-11-09; a
+// released generation's assets are immutable upstream, so these are
+// stability, not snapshot luck).
+var b11Pins = map[string]b11Pin{
+	"linux-x64": {
+		sdkSHA:     "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5",
+		sdkBytes:   118879731,
+		wamrcSHA:   "209a6a51b6066f05e91060d95c2506ec0bad97cb898fec1fe634cd68865b9c42",
+		wamrcBytes: 33053698,
+	},
+	"linux-arm64": {
+		sdkSHA:   "ae6c1417ea161e54bc54c0a168976af57a0c6e53078857886057a71a0d928646",
+		sdkBytes: 119660865,
+		// wamrc: null on this platform — no pin, W33 skips
+	},
+	"macos-x64": {
+		sdkSHA:     "4bfc274ae8b68c771dd93e32ad4bd695336ca46b585beb3b1260e5602dbc11a2",
+		sdkBytes:   109975956,
+		wamrcSHA:   "b87c91e5b6bd907937f8b5f79053212abfc297ee810d2dc348488d8c0089bdc1",
+		wamrcBytes: 23784250,
+	},
+	"macos-arm64": {
+		sdkSHA:     "aeae999396d5f5caa5ce419f52e83c35869d5fd21d40af80acba2c80f51b0b3a",
+		sdkBytes:   108199177,
+		wamrcSHA:   "e73c84a24abbc50e5122a5dc8221aa2c579594ea1559224d156f8bb1778fca30",
+		wamrcBytes: 22421504,
+	},
+	"win-x64": {
+		sdkSHA:   "0f934c6e7e171b5627c81b697a9e57e96d65cd889f56ce6077350de48978afd3",
+		sdkBytes: 495098073,
+		// wamrc: null on this platform — no pin, W33 skips
+	},
+}
+
+// b11PlatformKey maps THIS host onto the index's platform key the way
 // the daemon's tcPlatKey does (the index says "macos"/"win" where Go
-// says "darwin"/"windows", "x64" where Go says "amd64"): the SDK tree
-// the fetch lands is named wasi-sdk-24.0-<platkey>, so the W21 disk
-// probe must look in the directory the FETCH ACTUALLY installed — the
-// mac leg (darwin/arm64 -> macos-arm64) would otherwise look for this
-// linux bench's spelling. Local map on purpose: hil is a standalone
-// package main and does not import internal/.
-func b11SDKDirName() string {
+// says "darwin"/"windows", "x64" where Go says "amd64"); "" = the
+// host is off the index matrix entirely.
+func b11PlatformKey() string {
 	osName := map[string]string{"linux": "linux", "darwin": "macos", "windows": "win"}[runtime.GOOS]
 	arch := map[string]string{"amd64": "x64", "arm64": "arm64"}[runtime.GOARCH]
 	if osName == "" || arch == "" {
-		return "wasi-sdk-24.0-unknown" // off-matrix host: the W21 probe fails loudly, the name in the log
+		return ""
 	}
-	return "wasi-sdk-24.0-" + osName + "-" + arch
+	return osName + "-" + arch
+}
+
+// b11SDKDirName names the SDK tree the fetch lands on this host
+// (wasi-sdk-24.0-<platform key>); the W21 disk probe must look in the
+// directory the FETCH ACTUALLY installed — the mac leg
+// (darwin/arm64 -> macos-arm64) would otherwise look for this linux
+// bench's spelling. Off-matrix hosts get the loud -unknown spelling
+// so the probe fails naming it. Local maps on purpose: hil is a
+// standalone package main and does not import internal/.
+func b11SDKDirName() string {
+	if k := b11PlatformKey(); k != "" {
+		return "wasi-sdk-24.0-" + k
+	}
+	return "wasi-sdk-24.0-unknown"
 }
 
 // b11HelloSrc is the hello-scale module the build compiles: the
@@ -368,7 +421,7 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		h.check(false, "W21 wasi-sdk landed: "+err.Error())
 	}
 	if fi, err := os.Stat(wamrcBin); err == nil {
-		// the INDEX pin (b11WamrcBytes) is on the ARCHIVE - that pin is
+		// the INDEX pin is on the ARCHIVE - that pin is
 		// reconciled via S3's status rows (W33); here the probe is the
 		// EXTRACTED binary itself: present and executable
 		h.check(fi.Size() > 0 && fi.Mode()&0o111 != 0,
@@ -399,10 +452,22 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 		fmt.Sprintf("W30 generation=%q (the state's one-generation label)", b6Str(m, "generation")))
 	h.check(len(rows) == 2 && rows["wasi_sdk"] == true && rows["wamrc"] == true,
 		fmt.Sprintf("W31 both pieces present=true (rows=%v)", rows))
-	h.check(sdkSHA == b11SDKSHA && sdkBytes == float64(b11SDKBytes),
-		fmt.Sprintf("W32 wasi_sdk pins == the live index's: sha=%.16s... bytes=%.0f (want %d)", sdkSHA, sdkBytes, b11SDKBytes))
-	h.check(wamrcSHA == b11WamrcSHA && wamrcBytes == float64(b11WamrcBytes),
-		fmt.Sprintf("W33 wamrc pins == the live index's: sha=%.16s... bytes=%.0f (want %d)", wamrcSHA, wamrcBytes, b11WamrcBytes))
+	// W32/W33 reconcile against THIS platform's index pins
+	// (b11Pins, keyed by the same platform key the dir probe uses).
+	platKey := b11PlatformKey()
+	pin, pinKnown := b11Pins[platKey]
+	if !pinKnown {
+		h.check(false, fmt.Sprintf("W32 no toolchain-v2 pins tabled for platform key %q (this host) — extend b11Pins from the index (W33 also skipped)", platKey))
+	} else {
+		h.check(sdkSHA == pin.sdkSHA && sdkBytes == float64(pin.sdkBytes),
+			fmt.Sprintf("W32 wasi_sdk pins == the live index's (%s): sha=%.16s... bytes=%.0f (want %d)", platKey, sdkSHA, sdkBytes, pin.sdkBytes))
+		if pin.wamrcSHA == "" {
+			h.note("W33 skipped: platform %s carries \"wamrc\": null in toolchain-v2 — wasi_sdk alone installs, no wamrc pin to reconcile (the status wamrc row reads not-present by design)", platKey)
+		} else {
+			h.check(wamrcSHA == pin.wamrcSHA && wamrcBytes == float64(pin.wamrcBytes),
+				fmt.Sprintf("W33 wamrc pins == the live index's (%s): sha=%.16s... bytes=%.0f (want %d)", platKey, wamrcSHA, wamrcBytes, pin.wamrcBytes))
+		}
+	}
 	h.check(guidance == "",
 		fmt.Sprintf("W34 a complete, current cache stays quiet (guidance=%q)", guidance))
 
