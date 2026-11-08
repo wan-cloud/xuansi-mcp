@@ -16,13 +16,14 @@ package mcp
 // hostile-member refusal, and an all-or-nothing staging→re-verify→
 // rename→state commit whose any failure leaves the cache untouched.
 //
-// Placeholder discipline: the snapshot mirrors the drivers repo's
-// index FIRST VERSION; task 6 cross-checks it against the release
-// manifest and fills the real asset values. The TBD-BY-T6 sha256
-// placeholders (and 0 bytes) are deliberately harmless to status —
-// but the FETCH tool refuses them explicitly (an unpinned asset must
-// never pass the sha/bytes pin check), so a placeholder can never
-// install; the snapshot's T6 sync turns those entries real naturally.
+// Placeholder discipline: the snapshot mirrored the drivers repo's
+// index FIRST VERSION with TBD-BY-T6 sha256 placeholders (0 bytes) —
+// deliberately harmless to status, but the FETCH tool refuses them
+// explicitly (an unpinned asset must never pass the sha/bytes pin
+// check), so a placeholder can never install. Task 6 cross-checked
+// the wasi-sdk values; task 8 synced the snapshot to the published
+// index verbatim (all five wasi_sdk entries real; wamrc real on
+// linux-x64 + both mac legs — snapshot == index, byte-identical).
 
 import (
 	"archive/tar"
@@ -481,12 +482,12 @@ type tcFetchOut struct {
 }
 
 // tcPinComplete: a usable pin = a 64-char hex sha256 AND bytes > 0.
-// The embedded snapshot's pre-T6 placeholders ("TBD-BY-T6" + 0 bytes)
-// fail here ON PURPOSE — an unpinned asset must never reach the
+// The pre-T6 snapshot placeholders ("TBD-BY-T6" + 0 bytes) failed
+// here ON PURPOSE — an unpinned asset must never reach the
 // sha/bytes pin check (0 bytes would "pass" a 0-byte expectation);
-// the snapshot's T6 sync turns those entries real, and this gate
-// opens for them without a code change. A remote index carrying
-// placeholders gets the same refusal.
+// the T6/T8 syncs turned the entries real and this gate opened for
+// them without a code change. A remote index carrying placeholders
+// still gets the same refusal.
 func tcPinComplete(a *tcAsset) bool {
 	if len(a.SHA256) != 64 || a.Bytes <= 0 {
 		return false

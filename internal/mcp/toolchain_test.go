@@ -84,13 +84,15 @@ func TestParseToolchainIndexVerGate(t *testing.T) {
 	}
 }
 
-// TestEmbeddedSnapshotParses pins the embedded snapshot's shape — the
-// mirror T6 cross-checks the drivers repo's index first version
-// against. The four non-linux platforms' sha256/bytes ride TBD-BY-T6
-// placeholders (the parse layer deliberately does not validate asset
-// fields — verification is the fetch tool's job), so this test pins
-// URLs (real, official) but not those placeholder values; linux-x64
-// carries its already-known real pins.
+// TestEmbeddedSnapshotParses pins the embedded snapshot's shape AND,
+// since the T8 sync, every real pin verbatim: all five wasi_sdk
+// entries and the three built wamrc assets (linux-x64 + both mac
+// legs) against hardcoded truth — the drift lock. A snapshot that no
+// longer mirrors the drivers repo's published toolchain-index.json
+// (stale copy, bad manual transcription) fails HERE, in every test
+// run, instead of at a user's fetch. linux-arm64/win-x64 wamrc stay
+// honest nulls (no leg built; the win best-effort leg failed its
+// MSVC probe — tracked P2).
 func TestEmbeddedSnapshotParses(t *testing.T) {
 	ix := embeddedToolchainIndex()
 	if ix.IndexVer != 1 { // trivially true past the gate; pins that the gate ran
@@ -133,26 +135,53 @@ func TestEmbeddedSnapshotParses(t *testing.T) {
 		}
 	}
 
-	// The one fully-pinned asset: linux-x64 wasi-sdk carries real
-	// sha256 + bytes (the numbers T6 must reproduce byte-for-byte).
-	if ws := gen.Platforms["linux-x64"].WasiSDK; ws.SHA256 != "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5" || ws.Bytes != 118879731 {
-		t.Fatalf("embedded linux-x64 wasi_sdk pins: got %+v", ws)
+	// T8 drift lock: every wasi_sdk entry pinned real (sha256 + bytes
+	// hardcoded from the drivers repo's toolchain-index.json main).
+	wantSDK := map[string]struct {
+		sha   string
+		bytes int64
+	}{
+		"linux-x64":   {"c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5", 118879731},
+		"linux-arm64": {"ae6c1417ea161e54bc54c0a168976af57a0c6e53078857886057a71a0d928646", 119660865},
+		"macos-x64":   {"4bfc274ae8b68c771dd93e32ad4bd695336ca46b585beb3b1260e5602dbc11a2", 109975956},
+		"macos-arm64": {"aeae999396d5f5caa5ce419f52e83c35869d5fd21d40af80acba2c80f51b0b3a", 108199177},
+		"win-x64":     {"0f934c6e7e171b5627c81b697a9e57e96d65cd889f56ce6077350de48978afd3", 495098073},
+	}
+	for plat, want := range wantSDK {
+		ws := gen.Platforms[plat].WasiSDK
+		if ws.SHA256 != want.sha || ws.Bytes != want.bytes {
+			t.Errorf("embedded %s wasi_sdk pins: got sha=%s bytes=%d, want sha=%s bytes=%d", plat, ws.SHA256, ws.Bytes, want.sha, want.bytes)
+		}
 	}
 
-	// wamrc matrix: linux-x64 only in P1 (mac legs land with T8, win is
-	// best-effort); every other platform's slot is an honest null.
-	if gen.Platforms["linux-x64"].Wamrc == nil {
-		t.Fatal("embedded linux-x64 wamrc: want asset, got null")
+	// wamrc matrix after T8: linux-x64 + both mac legs carry real
+	// assets (URL/sha256/bytes verbatim — a guessed URL would plant a
+	// dead release link; a stale sha would fail every fetch);
+	// linux-arm64 and win-x64 are honest nulls.
+	wamrcAssetURL := func(file string) string {
+		return "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/" + file
 	}
-	// T1 review M1: the linux-x64 wamrc URL pinned verbatim — the one
-	// self-built asset the P1 fetch downloads; a guessed URL would
-	// plant a dead release link only task 6's cross-check would catch.
-	if w := gen.Platforms["linux-x64"].Wamrc; w.URL != "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/wamrc-2.4.0-xtensa-18.1.2-linux-x64.tar.gz" {
-		t.Fatalf("embedded linux-x64 wamrc URL = %q, want the toolchain-v2 release URL verbatim", w.URL)
+	wantWamrc := map[string]struct {
+		url, sha string
+		bytes    int64
+	}{
+		"linux-x64":   {wamrcAssetURL("wamrc-2.4.0-xtensa-18.1.2-linux-x64.tar.gz"), "209a6a51b6066f05e91060d95c2506ec0bad97cb898fec1fe634cd68865b9c42", 33053698},
+		"macos-x64":   {wamrcAssetURL("wamrc-2.4.0-xtensa-18.1.2-macos-x64.tar.gz"), "b87c91e5b6bd907937f8b5f79053212abfc297ee810d2dc348488d8c0089bdc1", 23784250},
+		"macos-arm64": {wamrcAssetURL("wamrc-2.4.0-xtensa-18.1.2-macos-arm64.tar.gz"), "e73c84a24abbc50e5122a5dc8221aa2c579594ea1559224d156f8bb1778fca30", 22421504},
 	}
-	for _, plat := range []string{"linux-arm64", "macos-x64", "macos-arm64", "win-x64"} {
+	for plat, want := range wantWamrc {
+		w := gen.Platforms[plat].Wamrc
+		if w == nil {
+			t.Errorf("embedded %s wamrc: want asset, got null", plat)
+			continue
+		}
+		if w.URL != want.url || w.SHA256 != want.sha || w.Bytes != want.bytes {
+			t.Errorf("embedded %s wamrc: got url=%s sha=%s bytes=%d, want url=%s sha=%s bytes=%d", plat, w.URL, w.SHA256, w.Bytes, want.url, want.sha, want.bytes)
+		}
+	}
+	for _, plat := range []string{"linux-arm64", "win-x64"} {
 		if gen.Platforms[plat].Wamrc != nil {
-			t.Fatalf("embedded %s wamrc: want null (P1 matrix), got %+v", plat, gen.Platforms[plat].Wamrc)
+			t.Fatalf("embedded %s wamrc: want null (no leg built; win best-effort leg failed — tracked P2), got %+v", plat, gen.Platforms[plat].Wamrc)
 		}
 	}
 }
