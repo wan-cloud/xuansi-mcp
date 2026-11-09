@@ -4,16 +4,16 @@ package board
 // §5.6): whatever frames arrive on a connection inside a consumer's
 // window ride that consumer's result — an eval reply or a pending-job
 // event — bounded and honestly counted. The reassembler generalizes
-// camera.go's cameraSeq/cameraCollector (the T2 bookkeeping:
+// the retired stills face's seq bookkeeping (the T2 rules:
 // seq/idx/total, one-loss abandonments, tombstones) along two axes:
 // any channel, and the fw's ch=2 stream_send host stamp (xs_wasm.c):
 // EVERY chunk of a module frame carries [u8 name_len][name][data
 // part], so the stamp is parsed per chunk and only the data parts
-// concatenate. Where cameraSeq required in-order idx (an append
-// cursor; a jump abandons), this collector buffers chunks per idx — a
-// lower idx arriving late still completes the frame (the seam can
-// present chunks out of cursor order); a sequence that never completes
-// counts lost at window close.
+// concatenate. Where the T2 reassembler required in-order idx (an
+// append cursor; a jump abandons), this collector buffers chunks per
+// idx — a lower idx arriving late still completes the frame (the seam
+// can present chunks out of cursor order); a sequence that never
+// completes counts lost at window close.
 
 import (
 	"sync"
@@ -29,7 +29,7 @@ const moduleStreamCh = 2
 
 // §5.6 bounds: at most 16 completed frames / 1 MiB cumulative payload
 // per window; the excess is truncated with an honest frames_dropped
-// count (the camera path's gaps-honesty, moved over).
+// count (the retired stills face's gaps-honesty, moved over).
 const (
 	FramesMax      = 16
 	FramesBytesMax = 1 << 20
@@ -61,7 +61,8 @@ type streamKey struct {
 	seq uint32
 }
 
-// frameSeq is one in-flight sequence, generalized from cameraSeq: the
+// frameSeq is one in-flight sequence, generalized from the T2
+// reassembler's per-key bookkeeping: the
 // T2 bookkeeping (seq/idx/total, one-loss abandonments, tombstones)
 // with TOLERANT chunk storage — parts buffer per idx instead of an
 // append cursor, so a lower idx that arrives late still completes the
@@ -79,7 +80,7 @@ type frameSeq struct {
 
 // FrameCollector is the sink-side reassembler for one consumer window
 // (one eval call, or the pending-job buffer's span between drains).
-// Like cameraCollector it needs no stale eviction: a window's
+// Like a per-call collector it needs no stale eviction: a window's
 // collector lives exactly as long as its window, and a lost sequence's
 // bucket is tombstoned on first loss.
 type FrameCollector struct {
@@ -121,6 +122,10 @@ func (c *FrameCollector) Sink(ch byte, seq uint32, idx, total uint16, payload []
 		c.buckets[k] = b
 	} else if b.total != total {
 		c.abandon(k) // the emitter disagrees with itself about the count
+		return
+	}
+	if idx >= b.total {
+		c.abandon(k) // an out-of-range idx can never be part of the frame
 		return
 	}
 	if name != "" {
@@ -234,11 +239,11 @@ func (c *FrameCollector) Reset() {
 // consumer. It exists because the connection's sink slot is single
 // (router swap semantics — set-only, no stacking): the per-call
 // collectors of overlapping evals and the pending-job buffer share one
-// warm link, and (pre-v6) the camera path's per-call install clobbers
-// the slot — the hub is re-asserted around every streaming op so every
-// clobber self-heals. Installed via Controller.OnStream (per
-// supervisor.go's contract a redial's fresh connection starts empty;
-// the next warm re-asserts the hub on the link it returns).
+// warm link, and any per-call install would clobber the slot — the hub
+// is re-asserted around every streaming op so every clobber
+// self-heals. Installed via Controller.OnStream (per supervisor.go's
+// contract a redial's fresh connection starts empty; the next warm
+// re-asserts the hub on the link it returns).
 type FrameHub struct {
 	mu    sync.Mutex
 	next  uint64

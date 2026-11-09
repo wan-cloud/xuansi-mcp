@@ -175,8 +175,8 @@ type sessionResetIn struct {
 	// explicit number targets a script namespace (a lease's reply
 	// names the namespace its script_start scripts run under).
 	// Negative values are refused daemon- AND board-side: -1 is the
-	// board's internal op-face pin sentinel (the camera's slots),
-	// never a user namespace.
+	// board's internal op-face pin sentinel (the on-board device
+	// face's slots), never a user namespace.
 	Session int    `json:"session,omitempty" jsonschema:"board session namespace to reset; 0 or positive (negatives are refused — -1 is the board's INTERNAL op-face pin sentinel, never a user namespace). Omit for 0 — the shared membership BARE EVALS claim pins under (owner _eval): pins claimed by one eval persist into every later eval, and this is the in-pipeline release for them (no release/re-lease dance). An explicit number targets a script namespace — the lease reply's session field names the namespace its xuansi_script_start scripts run under, so naming it stops those scripts without giving up the lease"`
 	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
@@ -186,16 +186,9 @@ type boardOpIn struct {
 	// Op's tag list is hand-maintained (a struct tag cannot render
 	// from the daemon's table) and pinned to server.AllowlistedOps()
 	// by TestBoardOpAllowlistSingleSource — update both together.
-	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, camera.capture, camera.off, camera.status, caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats, log.read, wifi.off, wifi.setup, wifi.status (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools)"`
+	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats, log.read, wifi.off, wifi.setup, wifi.status (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools)"`
 	Args   map[string]any `json:"args,omitempty" jsonschema:"the op's parameters as a JSON object; numbers must be integers with absolute value below 2^53 (validated daemon-side with an \"api\" error); every other value shape crosses verbatim — the board is the authority"`
 	Holder string         `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
-}
-
-type cameraShotIn struct {
-	Board     string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Frames    int    `json:"frames,omitempty" jsonschema:"frames per shot, 1..4 (default 1); each frame lands as its own JPEG file"`
-	Framesize string `json:"framesize,omitempty" jsonschema:"sensor frame size: \"QVGA\" (320x240) or \"VGA\" (640x480, the default); a size switch is a full camera restart on the board (~2.5s)"`
-	Holder    string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +204,12 @@ type boardInfo struct {
 	USBPath   string   `json:"usb_path,omitempty"`
 	Fw        string   `json:"fw,omitempty" jsonschema:"firmware build id (git short hash), when the daemon enriched the board"`
 	FwVersion string   `json:"fw_version,omitempty" jsonschema:"firmware semantic version (aligned with the npm wave version), when the daemon enriched the board"`
+	// Boot identity (B12-P2 T6): the daemon's last hello sighting —
+	// omitempty keeps each field honestly absent before the first
+	// crossing (boot_epoch 0 = firmware without the counter).
+	BootEpoch   int64  `json:"boot_epoch,omitempty" jsonschema:"the firmware's NVS per-boot counter at the daemon's last hello sighting — present once the daemon has touched the board; 0/absent = firmware without the counter. A CHANGE between reads (or a board.reboot event) means the board rebooted"`
+	ResetReason string `json:"reset_reason,omitempty" jsonschema:"this boot's reset cause at the last sighting (esp_reset_reason name: power-on / usb / software / panic / task-wdt / ...); the reboot-judgment table rides the events face's description"`
+	LastSeen    string `json:"last_seen,omitempty" jsonschema:"RFC3339 UTC of the daemon's most recent protocol crossing with the board (hello or op reply) — the freshness of the identity above; absent before the first crossing"`
 }
 
 type listBoardsOut struct {
@@ -227,8 +226,8 @@ type leaseView struct {
 }
 
 type boardStatusOut struct {
-	Board        map[string]any `json:"board" jsonschema:"the board's identity view (same shape as xuansi_list_boards entries)"`
-	Connected    bool           `json:"connected" jsonschema:"whether the daemon holds a live controller connection to the board"`
+	Board        map[string]any `json:"board" jsonschema:"the board's identity view (same shape as xuansi_list_boards entries: fw, boot identity boot_epoch/reset_reason/last_seen, ...)"`
+	Connected    bool           `json:"connected" jsonschema:"whether the daemon holds a live warm controller connection to the board — a daemon-side link fact, NOT board liveness: false only means no contact yet or the last link died; judge board survival from boot_epoch/reset_reason/last_seen and board.reboot events"`
 	Lease        *leaseView     `json:"lease,omitempty" jsonschema:"the current lease; absent when the board is free"`
 	Scripts      []any          `json:"scripts,omitempty" jsonschema:"running scripts (present when connected); shapes are the board's script list"`
 	ScriptsError string         `json:"scripts_error,omitempty" jsonschema:"why the script list is missing, when the board refused it"`
@@ -276,21 +275,6 @@ type fsReadOut struct {
 	DataB64 string `json:"data_b64" jsonschema:"the file's full contents, standard base64"`
 }
 
-// cameraFileOut is one landed JPEG's record.
-type cameraFileOut struct {
-	Path   string `json:"path" jsonschema:"absolute path of the landed JPEG on the daemon's host — fetch or visually verify it by this path"`
-	Bytes  int64  `json:"bytes" jsonschema:"the file's byte count"`
-	SHA256 string `json:"sha256" jsonschema:"hex sha256 of the file's bytes"`
-	W      int    `json:"w" jsonschema:"frame width as the board reported"`
-	H      int    `json:"h" jsonschema:"frame height as the board reported"`
-}
-
-type cameraShotOut struct {
-	Files  []cameraFileOut `json:"files"`
-	Gaps   int             `json:"gaps" jsonschema:"stream reassembly losses (0 on a healthy link); each lost frame is simply absent from files while the board's own frame count rode the board reply"`
-	Sensor string          `json:"sensor" jsonschema:"the board's sensor id, e.g. \"GC2145\""`
-}
-
 // boardAckOut and opResultOut are the board's OWN reply results passed
 // through verbatim — their shapes are the firmware's to define.
 type boardAckOut = map[string]any
@@ -303,10 +287,10 @@ type opResultOut = map[string]any
 // face seeds its name-claiming with it so no per-board tool can ever
 // displace a static one (server_test.go pins the served list to the
 // same names). B8 appends fs_rm + driver_pull after capture, then
-// session_reset after those; B9 appended camera_shot; B10 task 5
-// appended driver_fetch; B11 task 2 appended toolchain_status, task 3
-// toolchain_fetch, task 5 wasm_build: the existing tools keep their
-// positions (nothing renumbers).
+// session_reset after those; B10 task 5 appended driver_fetch; B11
+// task 2 appended toolchain_status, task 3 toolchain_fetch, task 5
+// wasm_build; B12-P2 T6 removed the stills tool (24 now): the
+// surviving tools keep their positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -328,7 +312,6 @@ var staticToolNames = []string{
 	"xuansi_fs_rm",
 	"xuansi_driver_pull",
 	"xuansi_session_reset",
-	"xuansi_camera_shot",
 	"xuansi_driver_fetch",
 	"xuansi_toolchain_status",
 	"xuansi_toolchain_fetch",
@@ -345,12 +328,12 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path) and firmware build. Read-only, no lease.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table). Read-only, no lease.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_status",
-		Description: "One board's status: identity, whether the daemon holds a live controller connection, the current lease (holder/session/grace deadline; absent when free) and its running scripts. Read-only, no lease. " + boardDesc + ".",
+		Description: "One board's status: identity, connected — whether the daemon holds a live warm controller connection, a daemon-side LINK fact, not board liveness (false only means no contact yet or the last link died; a rebooted or unreachable board can still read true until the next crossing fails — judge survival from the board view's boot_epoch/reset_reason/last_seen and board.reboot events instead) — plus the current lease (holder/session/grace deadline; absent when free) and its running scripts. Read-only, no lease. " + boardDesc + ".",
 	}, ts.boardStatus)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -405,7 +388,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_events_recent",
-		Description: "Read one board's most recent events from this process's local rings — no daemon call, no lease. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
+		Description: "Read one board's most recent events from this process's local rings — no daemon call, no lease. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. " + boardRebootDesc + ". For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
 	}, ts.eventsRecent)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -435,18 +418,8 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_session_reset",
-		Description: "Reset one board session: stops every script running in it and releases every pin it claimed (the board's own session.reset — pins go to the safe state, high-Z). The session number is 0 or positive: negatives are refused daemon- and board-side because -1 is the board's INTERNAL op-face pin sentinel (the camera's slots), never a user namespace. Omit session for namespace 0, the shared membership BARE EVALS claim pins under (owner _eval): a pin claimed by one eval persists into every later eval on the board, and THIS tool is the in-pipeline release for those claims — no more release-lease/re-lease dance (the b7 S4b detour this tool replaces; the lease itself is untouched). An explicit session number targets a script namespace: a lease's reply names the session its xuansi_script_start scripts run under, so naming that number stops those scripts mid-lease. The reply is the board's own {stopped:n} where n counts SCRIPTS stopped — a pins-only ns-0 sweep answers 0 while still releasing the pins (verify with xuansi_board_op diag.pins). The board's error class/msg crosses verbatim. Holder semantics: " + holderDesc + ".",
+		Description: "Reset one board session: stops every script running in it and releases every pin it claimed (the board's own session.reset — pins go to the safe state, high-Z). The session number is 0 or positive: negatives are refused daemon- and board-side because -1 is the board's INTERNAL op-face pin sentinel (the on-board device face's slots), never a user namespace. Omit session for namespace 0, the shared membership BARE EVALS claim pins under (owner _eval): a pin claimed by one eval persists into every later eval on the board, and THIS tool is the in-pipeline release for those claims — no more release-lease/re-lease dance (the b7 S4b detour this tool replaces; the lease itself is untouched). An explicit session number targets a script namespace: a lease's reply names the session its xuansi_script_start scripts run under, so naming that number stops those scripts mid-lease. The reply is the board's own {stopped:n} where n counts SCRIPTS stopped — a pins-only ns-0 sweep answers 0 while still releasing the pins (verify with xuansi_board_op diag.pins). The board's error class/msg crosses verbatim. Holder semantics: " + holderDesc + ".",
 	}, ts.sessionReset)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "xuansi_camera_shot",
-		Description: "Capture stills from the board's camera and land them as JPEG files on the daemon's host (the 0x02 stream face's first consumer): one call = one camera.capture under the lease; every frame arrives as stream chunks the daemon reassembles and writes under its captures root as <UTC epoch>-<mac6>-camera[-N].jpg — one file per frame, unique by construction. " +
-			"Input: frames 1..4 (default 1); framesize \"QVGA\" (320x240) or \"VGA\" (640x480, the default). " +
-			"LATENCY — set timeout expectations: the FIRST shot after idle includes the sensor power-up + auto-exposure settle (~3s); a framesize SWITCH is a full camera restart (~2.5s on top); warm shots run well under a second per frame (software JPEG encode on the GC2145-class sensor). " +
-			"Returns {files:[{path,bytes,sha256,w,h}], gaps, sensor}: verify or fetch the landed files by path; gaps counts stream reassembly losses (each lost frame is simply absent from files — 0 on a healthy link). " +
-			"camera.status and camera.off are also reachable through xuansi_board_op; camera.capture via xuansi_board_op returns the board's metadata reply but its stream frames are dropped daemon-side — THIS tool is the consuming face. " +
-			"Holder semantics: " + holderDesc + ".",
-	}, ts.cameraShot)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_driver_fetch",
@@ -498,14 +471,17 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			continue // a non-object entry is daemon drift; keep the rest
 		}
 		out.Boards = append(out.Boards, boardInfo{
-			MAC6:      str(m, "mac6"),
-			Alias:     str(m, "alias"),
-			Sources:   strSlice(m["sources"]),
-			Host:      str(m, "host"),
-			Port:      num(m, "port"),
-			USBPath:   str(m, "usb_path"),
-			Fw:        str(m, "fw"),
-			FwVersion: str(m, "fw_version"),
+			MAC6:        str(m, "mac6"),
+			Alias:       str(m, "alias"),
+			Sources:     strSlice(m["sources"]),
+			Host:        str(m, "host"),
+			Port:        num(m, "port"),
+			USBPath:     str(m, "usb_path"),
+			Fw:          str(m, "fw"),
+			FwVersion:   str(m, "fw_version"),
+			BootEpoch:   int64(num(m, "boot_epoch")),
+			ResetReason: str(m, "reset_reason"),
+			LastSeen:    str(m, "last_seen"),
 		})
 	}
 	return nil, out, nil
@@ -711,33 +687,6 @@ func (ts *toolset) boardOp(ctx context.Context, _ *mcpsdk.CallToolRequest, in bo
 		return nil, opResultOut{}, err
 	}
 	return nil, opResultOut(res), nil
-}
-
-// cameraShot crosses the camera face as the camera_shot request — the
-// synchronous held-call shape (no done-push wait: the op reply itself
-// closes the capture; the stream chunks preceded it on the same
-// connection). The daemon validates frames/framesize and lands the
-// files; this side decodes the files array.
-func (ts *toolset) cameraShot(ctx context.Context, _ *mcpsdk.CallToolRequest, in cameraShotIn) (*mcpsdk.CallToolResult, cameraShotOut, error) {
-	res, err := ts.callHeld(ctx, server.Request{
-		Type: "camera_shot", Board: in.Board, Frames: in.Frames,
-		Framesize: in.Framesize, Holder: in.Holder,
-	})
-	if err != nil {
-		return nil, cameraShotOut{}, err
-	}
-	out := cameraShotOut{Gaps: num(res, "gaps"), Sensor: str(res, "sensor")}
-	for _, f := range arr(res["files"]) {
-		fm, ok := f.(map[string]any)
-		if !ok {
-			continue // a non-object entry is daemon drift; keep the rest
-		}
-		out.Files = append(out.Files, cameraFileOut{
-			Path: str(fm, "path"), Bytes: int64(num(fm, "bytes")),
-			SHA256: str(fm, "sha256"), W: num(fm, "w"), H: num(fm, "h"),
-		})
-	}
-	return nil, out, nil
 }
 
 // ---------------------------------------------------------------------------

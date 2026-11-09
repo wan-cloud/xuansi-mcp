@@ -357,6 +357,69 @@ func TestRegistersExactStaticToolset(t *testing.T) {
 	}
 }
 
+// TestStaticToolsDeCamerad (B12-P2 T6): the camera face is retired —
+// tools/list serves exactly 24 static tools and none of them is a
+// camera tool. This is the seat-facing pin (an agent reads tools/list,
+// not Go tables): a camera tool reappearing fails here even if
+// staticToolNames were internally consistent with it.
+func TestStaticToolsDeCamerad(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lr.Tools) != 24 {
+		names := make([]string, len(lr.Tools))
+		for i, tool := range lr.Tools {
+			names[i] = tool.Name
+		}
+		t.Fatalf("tools/list serves %d tools, want exactly 24: %v", len(lr.Tools), names)
+	}
+	for _, tool := range lr.Tools {
+		if strings.Contains(tool.Name, "camera") {
+			t.Errorf("tool %s survived the camera retirement", tool.Name)
+		}
+	}
+}
+
+// TestListBoardsBootIdentity (B12-P2 T6): the daemon's boot-identity
+// fields cross the MCP mapping — a list_boards entry carrying
+// boot_epoch/reset_reason/last_seen answers with all three (B12: the
+// agent seat could not see a board's boot identity at all).
+func TestListBoardsBootIdentity(t *testing.T) {
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"boards": []any{map[string]any{
+			"mac6": "d75884", "alias": "bench1",
+			"sources": []any{"usb", "mdns"}, "host": "xuansi-d75884.local",
+			"port": 7777.0, "fw": "dcaa9ae", "fw_version": "0.2.0",
+			"boot_epoch":   8.0,
+			"reset_reason": "usb",
+			"last_seen":    "2026-11-09T12:34:56Z",
+		}},
+	}}}, Options{})
+	res := e.call("xuansi_list_boards", map[string]any{})
+	if res.IsError {
+		t.Fatalf("list_boards failed: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	boards, _ := m["boards"].([]any)
+	if len(boards) != 1 {
+		t.Fatalf("boards = %#v, want the one board", m["boards"])
+	}
+	b0, _ := boards[0].(map[string]any)
+	if b0["boot_epoch"] != 8.0 {
+		t.Errorf("boot_epoch = %#v, want 8", b0["boot_epoch"])
+	}
+	if b0["reset_reason"] != "usb" {
+		t.Errorf("reset_reason = %#v, want usb", b0["reset_reason"])
+	}
+	if b0["last_seen"] != "2026-11-09T12:34:56Z" {
+		t.Errorf("last_seen = %#v, want the daemon's RFC3339 crossing time", b0["last_seen"])
+	}
+}
+
 // TestDefaultHolderFormat: a zero Options generates a per-process
 // holder "mcp-<8 hex>" — short, unique per process.
 func TestDefaultHolderFormat(t *testing.T) {
