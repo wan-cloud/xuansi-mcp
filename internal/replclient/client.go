@@ -66,6 +66,43 @@ func opTimeout(op string) time.Duration {
 	return defaultOpTimeout
 }
 
+// budgetWaitMargin is the daemon-side slack added on top of a per-call
+// eval budget when deriving the reply wait (§9.6, F-2): room for the
+// board's epilogue after the budget itself expires plus the result
+// bridge and reply transit. ONE place — keep in lockstep with the fw's
+// budget domain (1..30000ms, protocol v6), never a second ceiling.
+const budgetWaitMargin = 2 * time.Second
+
+// opTimeoutFor resolves an op's wait bound the way Op uses it: a
+// per-call budget_ms key in the args (eval/submit only, §9.6 — 1..30000,
+// this call's override) derives budget+budgetWaitMargin, retiring the
+// fixed table entry for the keyed call; every other call — key absent,
+// budget 0, any other op — gets the §6 table value unchanged.
+func opTimeoutFor(op string, args map[string]any) time.Duration {
+	if op == "eval" || op == "submit" {
+		if ms := budgetMsOf(args); ms > 0 {
+			return time.Duration(ms)*time.Millisecond + budgetWaitMargin
+		}
+	}
+	return opTimeout(op)
+}
+
+// budgetMsOf extracts the args' budget_ms override as whole
+// milliseconds (0 = absent/non-numeric). In-process callers set int
+// (Eval/Submit) or int64 (the server forwarding Request.BudgetMs);
+// float64 covers any JSON-decoded face.
+func budgetMsOf(args map[string]any) int64 {
+	switch v := args["budget_ms"].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	}
+	return 0
+}
+
 // Client is one frame-protocol connection to a board over a Link.
 // Transports come from DialUSB/DialTCP and carry a redial route, so a
 // dead client has a Reconnect path back to a live one. When the
@@ -141,7 +178,7 @@ func (c *Client) Op(ctx context.Context, op string, args map[string]any) (map[st
 		return nil, fmt.Errorf("%w: write %s: %v", ErrDead, op, err)
 	}
 
-	timer := time.NewTimer(opTimeout(op))
+	timer := time.NewTimer(opTimeoutFor(op, args))
 	defer timer.Stop()
 	select {
 	case msg := <-ch:
@@ -191,11 +228,18 @@ func (c *Client) write(f []byte) (int, error) {
 // stdout text and value the first return value when the board could
 // bridge one (v3: the value key is present only then, nil otherwise).
 // args, when non-nil, is sent as the request's args key and becomes the
-// Lua global ARGS during the evaluation (v3).
-func (c *Client) Eval(ctx context.Context, code string, args any) (out string, value any, err error) {
+// Lua global ARGS during the evaluation (v3). budgetMs, when > 0, is
+// sent as the per-call budget_ms override (§9.6, protocol v6 — domain
+// 1..30000, this evaluation only; 0 = the session budget, wire key
+// absent) and the reply wait derives from it: budget+margin instead of
+// the §6 table's 5s (opTimeoutFor).
+func (c *Client) Eval(ctx context.Context, code string, args any, budgetMs int) (out string, value any, err error) {
 	a := map[string]any{"code": code}
 	if args != nil {
 		a["args"] = args
+	}
+	if budgetMs > 0 {
+		a["budget_ms"] = budgetMs
 	}
 	res, err := c.Op(ctx, "eval", a)
 	if err != nil {
@@ -210,9 +254,16 @@ func (c *Client) Eval(ctx context.Context, code string, args any) (out string, v
 // the ack — as soon as the job is queued — and the result arrives later
 // as a job event on this same connection; receive it with
 // OnEvent("job", ...) (§8: job results are direct-delivered to the
-// submitting connection and are not a subscribable source).
-func (c *Client) Submit(ctx context.Context, code, tag string) error {
-	_, err := c.Op(ctx, "submit", map[string]any{"code": code, "tag": tag})
+// submitting connection and are not a subscribable source). budgetMs
+// carries the same per-call budget_ms override as Eval (the board runs
+// the job under it; the ack itself is immediate, so the derived wait
+// only widens the ceiling).
+func (c *Client) Submit(ctx context.Context, code, tag string, budgetMs int) error {
+	a := map[string]any{"code": code, "tag": tag}
+	if budgetMs > 0 {
+		a["budget_ms"] = budgetMs
+	}
+	_, err := c.Op(ctx, "submit", a)
 	return err
 }
 

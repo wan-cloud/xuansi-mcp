@@ -757,6 +757,49 @@ func TestEvalRequiresLease(t *testing.T) {
 	}
 }
 
+// TestEvalBudgetMsForwards: eval/submit's per-call budget_ms (§9.6,
+// protocol v6) crosses the daemon untouched into the board op args —
+// key present when sent, absent when omitted — so the board runs this
+// call under the override and the reply wait derives from it
+// (replclient side).
+func TestEvalBudgetMsForwards(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "h1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"out": "ok"}, nil
+	})
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "budget_ms": 8000})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("budgeted eval: %#v", rep)
+	}
+	rep, _ = c.call(3, map[string]any{"type": "eval", "board": "d75884", "code": "return 2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("plain eval: %#v", rep)
+	}
+
+	var evals []mockCall
+	for _, call := range e.fakes["d75884"].got() {
+		if call.op == "eval" {
+			evals = append(evals, call)
+		}
+	}
+	if len(evals) != 2 {
+		t.Fatalf("board eval calls = %d, want 2", len(evals))
+	}
+	if evals[0].args["budget_ms"] != int64(8000) {
+		t.Fatalf("budgeted eval board args = %#v, want budget_ms int64(8000)", evals[0].args)
+	}
+	if _, ok := evals[1].args["budget_ms"]; ok {
+		t.Fatalf("plain eval must not carry budget_ms: %#v", evals[1].args)
+	}
+}
+
 // TestLeaseEvalValueFaceAndReleaseTeardown: the full holder flow —
 // lease (session granted), eval (out + bridged value), release (board
 // session.reset of the holder namespace AND the eval namespace 0, per

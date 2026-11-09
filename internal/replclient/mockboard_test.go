@@ -325,6 +325,14 @@ func (b *mockBoard) on(op string, fn func(args map[string]any) (map[string]any, 
 	b.handlers[op] = fn
 }
 
+// setHello replaces the hello result face (locked: serve's
+// helloHandler reads it concurrently).
+func (b *mockBoard) setHello(h map[string]any) {
+	b.mu.Lock()
+	b.hello = h
+	b.mu.Unlock()
+}
+
 // got returns the requests received so far, in order.
 func (b *mockBoard) got() []mockRequest {
 	b.mu.Lock()
@@ -443,7 +451,7 @@ func TestMockBoardDefaultScript(t *testing.T) {
 	b.on("eval", func(args map[string]any) (map[string]any, *boardError) {
 		return map[string]any{"out": "ok", "value": int64(7)}, nil
 	})
-	out, value, err := c.Eval(ctx, "return 7", nil)
+	out, value, err := c.Eval(ctx, "return 7", nil, 0)
 	if err != nil || out != "ok" || value != int64(7) {
 		t.Fatalf("eval = (%q, %#v, %v)", out, value, err)
 	}
@@ -452,7 +460,7 @@ func TestMockBoardDefaultScript(t *testing.T) {
 	cancel := c.OnEvent("job", func(e Event) { jobs <- e })
 	defer cancel()
 	b.setJob(map[string]any{"tag": "j1", "ok": true, "out": "done"})
-	if err := c.Submit(ctx, "return 1", "j1"); err != nil {
+	if err := c.Submit(ctx, "return 1", "j1", 0); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	select {

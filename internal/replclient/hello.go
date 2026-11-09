@@ -6,9 +6,9 @@ import (
 )
 
 // HelloInfo is the parsed hello result — the §2 full picture at
-// protocol_ver 5 (ver 4 + the B10-T1 fs chunked-transport trio, plus
-// the B10-T8b boot-identity pair boot_epoch/reset_reason).
-// Daemon-relevant fields are surfaced as Go
+// protocol_ver 6 (ver 5 + the v6 pair: eval/submit's per-call
+// budget_ms face and hello's reset_history ring; see the per-field
+// notes). Daemon-relevant fields are surfaced as Go
 // values; the nested snapshots (net/heap/gc/caps) stay maps, faithful
 // to the wire shape.
 type HelloInfo struct {
@@ -37,12 +37,20 @@ type HelloInfo struct {
 	// side, so they are equal whenever both exist).
 	BootEpoch   uint32
 	ResetReason string
+
+	// ResetHistory (protocol v6) is the fw's NVS last-8 reset-reason
+	// ring in wire order, oldest→newest — the final entry is this
+	// boot's reason (same mapping table as ResetReason). Empty (not
+	// nil) on fw predating the key; the entries between this boot and
+	// a previously seen one fill in the boot-causes an epoch delta > 1
+	// would otherwise lose.
+	ResetHistory []string
 }
 
 // parseHello tolerates missing keys (older protocol faces): absent
 // fields stay zero.
 func parseHello(res map[string]any) *HelloInfo {
-	h := &HelloInfo{Caps: map[string]any{}}
+	h := &HelloInfo{Caps: map[string]any{}, ResetHistory: []string{}}
 	h.ProtocolVer, _ = res["protocol_ver"].(int64)
 	h.Role, _ = res["role"].(string)
 	h.APIVersion, _ = res["api_version"].(int64)
@@ -63,6 +71,15 @@ func parseHello(res map[string]any) *HelloInfo {
 	h.ResetReason, _ = res["reset_reason"].(string)
 	if h.ResetReason == "" {
 		h.ResetReason = h.Reset // legacy key, same fw-side mapping table
+	}
+	// v6 ring: strings in wire order (oldest→newest); non-string
+	// entries and the absent key leave it as the empty slice.
+	if rh, ok := res["reset_history"].([]any); ok {
+		for _, v := range rh {
+			if s, ok := v.(string); ok {
+				h.ResetHistory = append(h.ResetHistory, s)
+			}
+		}
 	}
 	if c, ok := res["caps"].(map[string]any); ok {
 		h.Caps = c

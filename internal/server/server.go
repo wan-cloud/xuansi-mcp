@@ -1284,6 +1284,9 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 		}
 		args["args"] = v
 	}
+	if req.BudgetMs > 0 {
+		args["budget_ms"] = req.BudgetMs // per-call override, §9.6 — this key only
+	}
 	op := "eval"
 	if async {
 		op = "submit"

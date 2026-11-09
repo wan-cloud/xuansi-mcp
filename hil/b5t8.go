@@ -208,13 +208,13 @@ func runUSB() int {
 	h.check(info.Role == "controller", fmt.Sprintf("fresh CDC session role=%s (want controller)", info.Role))
 
 	// — eval: plain string value through the v3 bridge —
-	out, v, err := c.Eval(ctx, "return 6*7", nil)
+	out, v, err := c.Eval(ctx, "return 6*7", nil, 0)
 	h.check(err == nil && v == int64(42), fmt.Sprintf("eval return 6*7 → value=%v out=%q err=%v", v, out, err))
 
 	// — eval: structured round-trip (T1 bridge): ARGS map in, ARGS back —
 	args := map[string]any{"s": "xuansi", "n": int64(7), "b": true,
 		"arr": []any{int64(1), int64(2), int64(3)}}
-	_, v, err = c.Eval(ctx, "return ARGS", args)
+	_, v, err = c.Eval(ctx, "return ARGS", args, 0)
 	h.check(err == nil && reflect.DeepEqual(v, args),
 		fmt.Sprintf("eval return ARGS round-trip byte-shaped equal (err=%v)", err))
 
@@ -224,7 +224,7 @@ func runUSB() int {
 	//   decode depth budget — different limit, same number). A returned
 	//   table's out is its type name ("table", format_results), so only
 	//   the bridged value is asserted. —
-	out, v, err = c.Eval(ctx, `local t=42 for i=1,7 do t={k=t} end return {t=t}`, nil)
+	out, v, err = c.Eval(ctx, `local t=42 for i=1,7 do t={k=t} end return {t=t}`, nil, 0)
 	want := map[string]any{"t": map[string]any{"k": map[string]any{"k": map[string]any{"k": map[string]any{"k": map[string]any{"k": map[string]any{"k": map[string]any{"k": int64(42)}}}}}}}}
 	ok8 := err == nil && reflect.DeepEqual(v, want)
 	h.check(ok8, fmt.Sprintf("eval depth-8 table via value bridge (err=%v)", err))
@@ -284,7 +284,7 @@ func runUSB() int {
 	cancelJobSub := c.OnEvent("job", func(e replclient.Event) { jobs <- e })
 	defer cancelJobSub()
 	t0 := time.Now()
-	err = c.Submit(ctx, `local t=os.clock() while os.clock()-t < 4 do end return "job4s-value"`, "t8job")
+	err = c.Submit(ctx, `local t=os.clock() while os.clock()-t < 4 do end return "job4s-value"`, "t8job", 0)
 	ackLat := time.Since(t0)
 	h.check(err == nil && ackLat < time.Second,
 		fmt.Sprintf("submit ack in %v (err=%v) — immediate, job queued", ackLat, err))
@@ -310,14 +310,14 @@ func runUSB() int {
 
 	// — gpio events: claim the wired pair GPIO1(out)↔GPIO2(in), subscribe,
 	//   drive edges, observe rising+falling on gpio.2 —
-	_, v, err = c.Eval(ctx, `bench.gpio.mode(1,"out") bench.gpio.mode(2,"in") return "claimed"`, nil)
+	_, v, err = c.Eval(ctx, `bench.gpio.mode(1,"out") bench.gpio.mode(2,"in") return "claimed"`, nil, 0)
 	h.check(err == nil && v == "claimed", fmt.Sprintf("claim GPIO1 out / GPIO2 in (err=%v)", err))
 	_, err = c.Op(ctx, "events.subscribe", map[string]any{"source": "gpio.2"})
 	h.check(err == nil, fmt.Sprintf("events.subscribe gpio.2 (err=%v)", err))
 	evs := make(chan replclient.Event, 8)
 	cancelGpioSub := c.OnEvent("gpio.", func(e replclient.Event) { evs <- e })
 	defer cancelGpioSub()
-	_, v, err = c.Eval(ctx, `bench.gpio.write(1,1) bench.gpio.write(1,0) return "drove"`, nil)
+	_, v, err = c.Eval(ctx, `bench.gpio.write(1,1) bench.gpio.write(1,0) return "drove"`, nil, 0)
 	h.check(err == nil && v == "drove", fmt.Sprintf("drive GPIO1 edges (err=%v)", err))
 	var edges []string
 collect:
@@ -367,7 +367,7 @@ collect:
 		return h.finish("usb")
 	}
 	h.check(h2.Role == "controller", fmt.Sprintf("post-reconnect role=%s (fresh session re-took controller)", h2.Role))
-	_, v, err = c2.Eval(ctx, `return "recovered"`, nil)
+	_, v, err = c2.Eval(ctx, `return "recovered"`, nil, 0)
 	h.check(err == nil && v == "recovered", fmt.Sprintf("reconnected client evaluates (value=%v err=%v)", v, err))
 
 	return h.finish("usb")
