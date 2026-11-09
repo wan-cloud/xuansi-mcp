@@ -266,6 +266,30 @@ func TestFrameCollectorResetBetweenAttempts(t *testing.T) {
 	}
 }
 
+// TestFrameCollectorCompletedSeqTombstonesStraggler (final-review
+// minor): completing a sequence leaves its seq tombstoned, the retired
+// camera collector's rule — a straggler chunk re-delivered after
+// completion must find the dead bucket and drop silently. Without the
+// tombstone a full re-delivery founds a fresh bucket that completes
+// AGAIN (a duplicate frame), and a partial one an open tail that
+// counts lost at window close.
+func TestFrameCollectorCompletedSeqTombstonesStraggler(t *testing.T) {
+	c := NewFrameCollector()
+	c.Sink(2, 1, 0, 1, stampChunk("jpge", []byte("one"))) // completes
+	c.Sink(2, 1, 0, 1, stampChunk("jpge", []byte("one"))) // straggler: full re-delivery
+	c.Sink(2, 2, 0, 2, stampChunk("jpge", []byte("A")))   // completes (chunked frame)
+	c.Sink(2, 2, 1, 2, stampChunk("jpge", []byte("B")))
+	c.Sink(2, 2, 0, 2, stampChunk("jpge", []byte("A")))   // straggler: partial re-delivery
+	c.Sink(2, 3, 0, 1, stampChunk("jpge", []byte("two"))) // a later frame is unaffected
+	snap := c.Drain()
+	if len(snap.Frames) != 3 || snap.Dropped != 0 {
+		t.Fatalf("snap = %+v, want exactly three frames (one, AB, two) and zero drops", snap)
+	}
+	if d := string(snap.Frames[0].Data) + string(snap.Frames[1].Data) + string(snap.Frames[2].Data); d != "oneABtwo" {
+		t.Fatalf("frames = %q, want oneABtwo in completion order", d)
+	}
+}
+
 // TestFrameHubFansOutAndRemoves: the hub fans one connection's chunks
 // out to every registered consumer; a removed consumer stops receiving;
 // the hub tolerates a nil-ish empty registration set.
