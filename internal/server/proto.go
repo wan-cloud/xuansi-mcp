@@ -305,6 +305,13 @@ type Request struct {
 	// ("" = the default VGA). See the camera contract above.
 	Frames    int    `json:"frames,omitempty"`
 	Framesize string `json:"framesize,omitempty"`
+	// BudgetMs is eval/submit's per-call budget override (§9.6, protocol
+	// v6): 1..30000 forwarded to the board as the args key budget_ms for
+	// THIS call only; 0 (omitted) = the session budget, wire key absent.
+	// The reply wait derives from it daemon-side (replclient's
+	// opTimeoutFor: budget+margin), so a budgeted call is never cut off
+	// by the fixed eval ceiling.
+	BudgetMs int64 `json:"budget_ms,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.

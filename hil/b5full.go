@@ -1102,7 +1102,7 @@ edgeLoop:
 		fmt.Sprintf("board op through the daemon with TCP down: class=%s after %v (the daemon never dials USB — owner ruling: USB fallback is the caller's explicit last resort; recorded honestly)",
 			classOf(urerr), time.Since(ut).Round(time.Millisecond)))
 
-	uv, _, uverr := uc.Eval(ctx, `return "usb-ok"`, nil)
+	uv, _, uverr := uc.Eval(ctx, `return "usb-ok"`, nil, 0)
 	h.check(uverr == nil && uv == "usb-ok",
 		fmt.Sprintf("[driver-direct] USB transport itself ALIVE with wifi down (eval value=%v err=%v)", uv, uverr))
 

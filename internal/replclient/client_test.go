@@ -108,6 +108,77 @@ func TestHelloParsesAndCachesCaps(t *testing.T) {
 	}
 }
 
+// TestHelloParsesResetHistory: protocol v6's hello carries the fw's
+// NVS last-8 reset-reason ring as reset_history, oldest→newest, in
+// order; an older (v5) board sends no key and parses to an empty
+// history.
+func TestHelloParsesResetHistory(t *testing.T) {
+	c, b := newTestClient(t)
+	v6 := defaultHello()
+	v6["protocol_ver"] = int64(6)
+	v6["reset_history"] = []any{"poweron", "sw", "usb"} // oldest→newest
+	b.setHello(v6)
+
+	h, err := c.Hello(false, "daemon-test")
+	if err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	want := []string{"poweron", "sw", "usb"}
+	if len(h.ResetHistory) != len(want) {
+		t.Fatalf("reset history = %#v, want %v", h.ResetHistory, want)
+	}
+	for i, r := range h.ResetHistory {
+		if r != want[i] {
+			t.Fatalf("reset history = %#v, want %v (oldest→newest order preserved)", h.ResetHistory, want)
+		}
+	}
+
+	// Older board: no key → empty history, parse still succeeds.
+	b.setHello(defaultHello())
+	h2, err := c.Hello(false, "daemon-test")
+	if err != nil {
+		t.Fatalf("old-board hello: %v", err)
+	}
+	if h2.ResetHistory == nil || len(h2.ResetHistory) != 0 {
+		t.Fatalf("old-board reset history = %#v, want empty non-nil", h2.ResetHistory)
+	}
+}
+
+// TestParseHelloResetHistoryFaces: the parser is tolerant on every
+// face — absent key → empty, non-string entries skipped, and a v6
+// hello carrying keys this daemon does not know yet parses clean with
+// the known fields intact (forward compatibility).
+func TestParseHelloResetHistoryFaces(t *testing.T) {
+	empty := parseHello(defaultHello())
+	if empty.ResetHistory == nil || len(empty.ResetHistory) != 0 {
+		t.Fatalf("absent reset_history = %#v, want empty non-nil", empty.ResetHistory)
+	}
+
+	mixed := parseHello(map[string]any{
+		"protocol_ver":  int64(6),
+		"fw":            "xuansi-fw v0.3.0",
+		"reset_reason":  "usb",
+		"reset_history": []any{"poweron", int64(7), "task_wdt"}, // middle entry skipped
+		"boot_epoch":    int64(12),
+	})
+	if got := mixed.ResetHistory; len(got) != 2 || got[0] != "poweron" || got[1] != "task_wdt" {
+		t.Fatalf("mixed reset_history = %#v, want [poweron task_wdt]", got)
+	}
+
+	future := defaultHello()
+	future["protocol_ver"] = int64(6)
+	future["reset_history"] = []any{"sw"}
+	future["reset_detail"] = map[string]any{"subtle": true} // unknown v6+ key
+	future["later_face"] = []any{int64(1), "x"}
+	h := parseHello(future)
+	if h.ProtocolVer != 6 || h.Fw != "xuansi-fw v0.1.0" || h.BootEpoch != 0 {
+		t.Fatalf("unknown keys must not disturb known fields: %#v", h)
+	}
+	if len(h.ResetHistory) != 1 || h.ResetHistory[0] != "sw" {
+		t.Fatalf("reset_history = %#v, want [sw]", h.ResetHistory)
+	}
+}
+
 // TestPingOp: a plain op round-trips its result map.
 func TestPingOp(t *testing.T) {
 	c, _ := newTestClient(t)
@@ -131,7 +202,7 @@ func TestEvalPassesCodeAndArgs(t *testing.T) {
 		return map[string]any{"out": "ran", "value": []any{"a", int64(1)}}, nil
 	})
 
-	out, value, err := c.Eval(context.Background(), "return ARGS[1]", []any{"a", int64(1)})
+	out, value, err := c.Eval(context.Background(), "return ARGS[1]", []any{"a", int64(1)}, 0)
 	if err != nil {
 		t.Fatalf("eval: %v", err)
 	}
@@ -153,7 +224,7 @@ func TestEvalPassesCodeAndArgs(t *testing.T) {
 		t.Fatal("eval handler did not run")
 	}
 
-	if _, _, err := c.Eval(context.Background(), "return 1", nil); err != nil {
+	if _, _, err := c.Eval(context.Background(), "return 1", nil, 0); err != nil {
 		t.Fatalf("args-less eval: %v", err)
 	}
 	select {
@@ -174,7 +245,7 @@ func TestEvalErrorPreservesClassAndByteOffset(t *testing.T) {
 	b.on("eval", func(args map[string]any) (map[string]any, *boardError) {
 		return nil, &boardError{class: "rt", msg: "cannot bridge float at byte 3"}
 	})
-	out, _, err := c.Eval(context.Background(), "return 3.0", nil)
+	out, _, err := c.Eval(context.Background(), "return 3.0", nil, 0)
 	if out != "" {
 		t.Fatalf("out = %q, want empty on error", out)
 	}
@@ -225,7 +296,7 @@ func TestSubmitAckAndJobEvent(t *testing.T) {
 	defer cancel()
 
 	b.setJob(map[string]any{"tag": "j1", "ok": true, "out": "done"})
-	if err := c.Submit(context.Background(), "return 1", "j1"); err != nil {
+	if err := c.Submit(context.Background(), "return 1", "j1", 0); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	select {
@@ -473,7 +544,7 @@ func TestFragmentedBoardWrites(t *testing.T) {
 	b.on("eval", func(args map[string]any) (map[string]any, *boardError) {
 		return map[string]any{"out": "chunked", "value": map[string]any{"k": []any{int64(1), int64(2)}}}, nil
 	})
-	out, value, err := c.Eval(context.Background(), "return {k={1,2}}", nil)
+	out, value, err := c.Eval(context.Background(), "return {k={1,2}}", nil, 0)
 	if err != nil {
 		t.Fatalf("eval: %v", err)
 	}

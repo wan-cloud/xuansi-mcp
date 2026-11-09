@@ -297,7 +297,7 @@ func TestClientStreamSinkInterleaved(t *testing.T) {
 	cancel := c.OnEvent("job", func(e Event) { events <- e })
 	defer cancel()
 
-	if out, _, err := c.Eval(ctx, "return 1", nil); err != nil || out != "ok" {
+	if out, _, err := c.Eval(ctx, "return 1", nil, 0); err != nil || out != "ok" {
 		t.Fatalf("eval during data burst = (%q, %v)", out, err)
 	}
 	e := recvEvent(t, events)
@@ -428,7 +428,7 @@ func TestClientStreamGapScenario(t *testing.T) {
 		chunks <- streamChunk{ch: ch, seq: seq, idx: idx, total: total, payload: payload}
 	})
 
-	if out, _, err := c.Eval(ctx, "return 1", nil); err != nil || out != "ok" {
+	if out, _, err := c.Eval(ctx, "return 1", nil, 0); err != nil || out != "ok" {
 		t.Fatalf("eval after gapped bursts = (%q, %v)", out, err)
 	}
 	if c.Dead() {
@@ -461,7 +461,7 @@ func TestClientStreamWithoutSink(t *testing.T) {
 		b.sendData(1, 0, 0, 1, []byte("nobody-listening"))
 		return map[string]any{"out": "ok"}, nil
 	})
-	if out, _, err := c.Eval(ctx, "return 1", nil); err != nil || out != "ok" {
+	if out, _, err := c.Eval(ctx, "return 1", nil, 0); err != nil || out != "ok" {
 		t.Fatalf("eval beside uncollected data = (%q, %v)", out, err)
 	}
 	if c.Dead() {
