@@ -421,6 +421,8 @@ func (ts *toolset) dynHandler(spec dynSpec) mcpsdk.ToolHandler {
 		if v, ok := res["value"]; ok {
 			out.Value = v
 		}
+		out.Frames = decodeFrames(res) // the same §5.6 face run_lua carries
+		out.FramesDropped = num(res, "frames_dropped")
 		return structuredResult(out)
 	}
 }
