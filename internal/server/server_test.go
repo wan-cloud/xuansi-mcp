@@ -47,6 +47,8 @@ type fakeCtl struct {
 	nextHID  int
 	hellos   int
 	sink     replclient.StreamSink // the connection's current 0x02 sink (frames-face scripting drives it synchronously)
+	dieOnOp  string                // the half-open death script (dieOn): this op's next call fails ErrDead
+	onDie    func()                // …after running this hook
 }
 
 type mockCall struct {
@@ -131,6 +133,18 @@ func (f *fakeCtl) markDead() {
 	f.mu.Unlock()
 }
 
+// dieOn scripts the half-open variant (§13): the named op's NEXT call
+// discovers a dead link even though the dial and hello saw it alive —
+// the exact ErrDead shape boardOpStream's one-redial retry exists for.
+// One-shot; fn (optional) runs just before the failure so a test can
+// script the world the death leaves behind (e.g. install the next
+// dial's controller).
+func (f *fakeCtl) dieOn(op string, fn func()) {
+	f.mu.Lock()
+	f.dieOnOp, f.onDie = op, fn
+	f.mu.Unlock()
+}
+
 // OnStream stores the connection's 0x02 sink (nil clears).
 func (f *fakeCtl) OnStream(sink replclient.StreamSink) {
 	f.mu.Lock()
@@ -165,6 +179,15 @@ func (f *fakeCtl) Op(ctx context.Context, op string, args map[string]any) (map[s
 	if f.dead {
 		f.mu.Unlock()
 		return nil, fmt.Errorf("%w: fake closed", replclient.ErrDead)
+	}
+	if op == f.dieOnOp {
+		hook := f.onDie
+		f.dieOnOp, f.onDie = "", nil
+		f.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+		return nil, fmt.Errorf("%w: half-open link discovered mid-op", replclient.ErrDead)
 	}
 	f.calls = append(f.calls, mockCall{op: op, args: args})
 	h := f.ops[op]
@@ -3919,5 +3942,94 @@ func TestSubmitJobEventCarriesFrames(t *testing.T) {
 	}
 	if string(b) != `{"ok":true,"out":"quiet","tag":"j2"}` {
 		t.Fatalf("no-stream job event data = %s, want the exact pre-frames shape", b)
+	}
+}
+
+// TestSubmitRedialKeepsFrameWindow (final-review Important-1): a submit
+// whose link dies mid-op retries on a redialed controller. The tap's
+// controller-identity jobReset correctly orphans the OLD link's pending
+// windows — but the retrying submit's window is not one of them: its
+// job is about to be acked on the NEW link. The window must survive the
+// redial, or the job's stream chunks pass the sink uncollected and its
+// event drains an empty buffer — frames silently lost with no
+// frames_dropped, the honest-drops violation. Here: warm link dies →
+// redial lands a half-open controller → submit discovers the death →
+// one-redial retry → healthy controller acks → the job streams on THAT
+// connection → its event carries the frames.
+func TestSubmitRedialKeepsFrameWindow(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	w := dialSock(t, e.sock)
+	rep, _ := w.call(1, map[string]any{"type": "watch_events", "board": "d75884"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("watch: %#v", rep)
+	}
+	rep, _ = w.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "fr7"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	// the warm link dies; the next dial returns a half-open controller
+	// whose FIRST submit discovers the death, and the dial after that a
+	// healthy one — dead link → ErrDead retry → redial, scripted with
+	// no races
+	e.fakes["d75884"].markDead()
+	healthy := newFakeCtl()
+	half := newFakeCtl()
+	half.dieOn("submit", func() {
+		e.dmu.Lock()
+		e.fakes["d75884"] = healthy
+		e.dmu.Unlock()
+	})
+	e.dmu.Lock()
+	e.fakes["d75884"] = half
+	e.dmu.Unlock()
+
+	tcpBefore := e.dialedTCP("d75884")
+	rep, _ = w.call(3, map[string]any{"type": "submit", "board": "d75884", "code": "shot()", "tag": "j1", "holder": "fr7"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("submit after redial: %#v", rep)
+	}
+	b, err := json.Marshal(asMap(rep["result"]))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != `{"queued":true,"tag":"j1"}` {
+		t.Fatalf("submit ack = %s, want the exact pre-frames ack shape", b)
+	}
+	if n := e.dialedTCP("d75884") - tcpBefore; n < 2 {
+		t.Fatalf("tcp dials since death = %d, want ≥2 (the half-open link, then the redial)", n)
+	}
+	sawSubmit := false
+	for _, c := range healthy.got() {
+		if c.op == "submit" {
+			sawSubmit = true
+		}
+	}
+	if !sawSubmit {
+		t.Fatal("the retried submit never rode the healthy controller")
+	}
+
+	// the job streams on the REDIALED connection, then its event lands
+	jpeg := []byte{0xFF, 0xD8, 9, 9, 0xFF, 0xD9}
+	sink := healthy.sinkSnapshot()
+	sink(2, 1, 0, 1, stampStreamChunk("jpge", jpeg))
+	healthy.push("job", map[string]any{"tag": "j1", "ok": true, "out": "done"})
+
+	ev := w.recv()
+	if asStr(ev["type"]) != "event" {
+		t.Fatalf("event push = %#v", ev)
+	}
+	data := asMap(asMap(ev["event"])["data"])
+	frames, ok := data["frames"].([]any)
+	if !ok || len(frames) != 1 {
+		t.Fatalf("job event data = %#v — the redial silently swallowed the frame window (honest-drops violation)", data)
+	}
+	fm := asMap(frames[0])
+	if asInt(fm["ch"]) != 2 || asStr(fm["name"]) != "jpge" {
+		t.Fatalf("frame meta = %#v, want ch=2 name=jpge", fm)
+	}
+	got, derr := base64.StdEncoding.DecodeString(asStr(fm["data_b64"]))
+	if derr != nil || !bytes.Equal(got, jpeg) {
+		t.Fatalf("data_b64 = %x (err %v), want %x", got, derr, jpeg)
 	}
 }

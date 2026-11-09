@@ -208,11 +208,18 @@ type daemonBoard struct {
 	// pending (jobsPending > 0); each job event drains it onto the
 	// event's data (spec §5.6 — submit is the same primitive, its
 	// window ends at the event, not the ack). jobsMu guards
-	// jobsPending; the buffer's own lock guards its state.
+	// jobsPending and jobGen; the buffer's own lock guards its state.
 	frames      *board.FrameHub
 	jobBuf      *board.FrameCollector
 	jobsMu      sync.Mutex
 	jobsPending int
+	// jobGen counts controller-identity resets (jobReset): a pending
+	// window opened at generation g is only alive while jobGen == g —
+	// a submit retrying across a redial re-arms its window when it
+	// sees the generation move (jobEnsure, the final-review honest-
+	// drops fix: the retry's job is acked on the NEW link, so the
+	// reset must not swallow its window).
+	jobGen uint64
 	// bootSeen is the last hello sighting's boot identity (B10-T8b):
 	// a CHANGED boot_epoch on the next sighting means the board
 	// rebooted while we were not connected (panic auto-reboot included
@@ -1330,8 +1337,15 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 		// router dispatches stream chunks in arrival order — opening
 		// after the ack reply would race the job's first chunks. The
 		// window ends at the job event (tap drains jobBuf onto it).
-		db.jobSubmit()
-		res, err := s.boardOpStream(ctx, b, op, args, db, nil)
+		// Across a redial the tap's jobReset retires the window (it
+		// must — the old link's OTHER jobs are orphans); the ensure
+		// closure re-arms THIS submit's window right before every
+		// attempt's op, wherever the redial landed (final-review
+		// Important-1: the retry acks on the new link, its frames are
+		// ours to report — never silently dropped).
+		gen := db.jobSubmit()
+		ensure := func() { gen = db.jobEnsure(gen) }
+		res, err := s.boardOpStream(ctx, b, op, args, db, nil, ensure)
 		if err != nil {
 			db.jobRollback() // never queued: close the window
 			return nil, err
@@ -1344,7 +1358,7 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 	col := board.NewFrameCollector()
 	remove := db.frames.Add(col.Sink)
 	defer remove()
-	res, err := s.boardOpStream(ctx, b, op, args, db, col)
+	res, err := s.boardOpStream(ctx, b, op, args, db, col, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1805,10 +1819,30 @@ func (db *daemonBoard) jobActive() bool {
 // jobSubmit opens the pending-job frame window BEFORE the submit op is
 // issued (the board may start the job — and streaming — the moment the
 // ack is written; opening after the ack would race the first chunks).
-func (db *daemonBoard) jobSubmit() {
+// It returns the window's generation: a controller identity change
+// (jobReset, below) retires every window of an older generation.
+func (db *daemonBoard) jobSubmit() uint64 {
 	db.jobsMu.Lock()
+	defer db.jobsMu.Unlock()
 	db.jobsPending++
-	db.jobsMu.Unlock()
+	return db.jobGen
+}
+
+// jobEnsure re-arms a window a controller reset may have retired: a
+// no-op while the generation has not moved, a reopen (pending++) when
+// it has. boardOpStream calls it immediately before EVERY submit
+// attempt's op, so the window is provably open across the op whichever
+// way the redial landed — the reset that orphans the old link's jobs
+// must not swallow THIS submit's window: its retry is acked on the new
+// link, its job's frames and drops are ours to report (honest drops).
+func (db *daemonBoard) jobEnsure(gen uint64) uint64 {
+	db.jobsMu.Lock()
+	defer db.jobsMu.Unlock()
+	if db.jobGen == gen {
+		return gen
+	}
+	db.jobsPending++ // reopen on the current generation
+	return db.jobGen
 }
 
 // jobRollback closes a window whose submit never queued (op error).
@@ -1824,9 +1858,13 @@ func (db *daemonBoard) jobRollback() {
 // identity change: the board direct-delivers job events to the
 // SUBMITTING connection — xs_repl.c — so a redial orphans the old
 // connection's pending jobs board-side; their events never arrive).
+// The generation bump is what a retrying submit's jobEnsure looks for:
+// the retry rides the NEW controller, so its window re-opens while the
+// old link's other windows stay retired.
 func (db *daemonBoard) jobReset() {
 	db.jobsMu.Lock()
 	db.jobsPending = 0
+	db.jobGen++
 	db.jobsMu.Unlock()
 	db.jobBuf.Reset()
 }
@@ -2029,7 +2067,7 @@ func (s *Server) broadcast(mac6 string, ev replclient.Event) {
 // boardOp runs one op over the warm controller connection, redialing
 // once when the link died under it (§13: redial ≠ reboot).
 func (s *Server) boardOp(ctx context.Context, b discover.Board, op string, args map[string]any) (map[string]any, error) {
-	return s.boardOpStream(ctx, b, op, args, nil, nil)
+	return s.boardOpStream(ctx, b, op, args, nil, nil, nil)
 }
 
 // boardOpStream is boardOp with an optional stream-frames window
@@ -2042,9 +2080,14 @@ func (s *Server) boardOp(ctx context.Context, b discover.Board, op string, args 
 // attempts: the redial retry re-executes the op board-side, and the
 // dead attempt's partial sequences must not graft onto the retry's
 // frames (a nondeterministic payload would reassemble corrupt
-// otherwise). A successful reply is a protocol crossing — the board's
-// last_seen advances (B12-P2 T6).
-func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string, args map[string]any, db *daemonBoard, col *board.FrameCollector) (map[string]any, error) {
+// otherwise). A non-nil ensure runs immediately before EVERY attempt's
+// op (after warmController, so any identity-change jobReset the redial
+// triggered has already landed): the submit path re-arms its pending
+// window there — a redial's reset must retire the old link's windows
+// without swallowing THIS submit's (final-review Important-1). A
+// successful reply is a protocol crossing — the board's last_seen
+// advances (B12-P2 T6).
+func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string, args map[string]any, db *daemonBoard, col *board.FrameCollector, ensure func()) (map[string]any, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 && col != nil {
@@ -2056,6 +2099,9 @@ func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string,
 		}
 		if db != nil {
 			ctl.OnStream(db.frames.Sink) // assert the hub for this window
+		}
+		if ensure != nil {
+			ensure() // re-arm a pending-job window a redial's jobReset retired
 		}
 		res, err := ctl.Op(ctx, op, args)
 		if err == nil {

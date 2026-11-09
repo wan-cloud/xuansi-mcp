@@ -147,11 +147,19 @@ func (c *FrameCollector) Sink(ch byte, seq uint32, idx, total uint16, payload []
 	if b.have < int(b.total) {
 		return
 	}
-	delete(c.buckets, k) // complete: the frame is done
 	assembled := make([]byte, 0, b.buffered)
 	for i := uint16(0); i < b.total; i++ {
 		assembled = append(assembled, b.parts[i]...)
 	}
+	// Complete: tombstone the seq rather than delete it (the retired
+	// camera collector's rule) — a straggler chunk re-delivered after
+	// completion finds the dead bucket and drops silently instead of
+	// founding a fresh sequence that either duplicates the frame (a
+	// full re-delivery) or counts lost at window close (a partial
+	// one). Buckets release at window end (Snapshot/Drain/Reset).
+	b.dead = true
+	b.parts = nil
+	b.buffered = 0
 	if len(c.frames) >= FramesMax || c.bytes+len(assembled) > FramesBytesMax {
 		c.dropped++ // bound truncation: honest, first-come-first-kept
 		return
