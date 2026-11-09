@@ -1159,6 +1159,7 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 				res["scripts_error"] = serr.Error()
 			} else {
 				res["scripts"] = scripts
+				s.noteBoardContact(b.MAC6) // script.list's reply is a protocol crossing (last_seen)
 			}
 		}
 	}
@@ -1727,6 +1728,7 @@ func (s *Server) hWatchEvents(ctx context.Context, cc *clientConn, req *Request)
 		if _, err := ctl.Op(ctx, "events.subscribe", map[string]any{"source": req.Source}); err != nil {
 			return nil, err
 		}
+		s.noteBoardContact(b.MAC6) // the subscribe's reply is a protocol crossing (last_seen)
 	}
 	s.mu.Lock()
 	set := s.watchers[b.MAC6]
@@ -1992,9 +1994,14 @@ func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.He
 
 // noteBoardContact records the daemon's most recent protocol crossing
 // (a successful op reply) on the board's daemon-side state — the
-// last_seen field's op leg (noteBootSighting carries the hello leg).
-// Read-only lookup: a board with no supervisor entry has never been
-// crossed, so there is nothing to record.
+// last_seen field's op leg. ONE helper, every direct-crossing call
+// site: boardOpStream (eval/submit/op/budget.get...), withController
+// (fs_write/fs_read chunked), hBoardStatus's ScriptList,
+// hWatchEvents's and hCaptureStart's events.subscribe, and
+// leaseTeardown's session sweeps — alongside noteBootSighting, which
+// carries the hello leg (the tap hello). Read-only lookup: a board
+// with no supervisor entry has never been crossed, so there is
+// nothing to record.
 func (s *Server) noteBoardContact(mac6 string) {
 	s.mu.Lock()
 	if db, ok := s.sups[mac6]; ok {
@@ -2115,7 +2122,11 @@ func (s *Server) leaseTeardown(ctx context.Context, mac6, holder string, session
 	db := s.supervisor(b)
 	db.connectMu.Lock()
 	defer db.connectMu.Unlock()
-	return db.sup.LeaseTeardown(tctx, mac6, holder, sessions)
+	err := db.sup.LeaseTeardown(tctx, mac6, holder, sessions)
+	if err == nil {
+		s.noteBoardContact(mac6) // the teardown sweeps' replies are protocol crossings (last_seen)
+	}
+	return err
 }
 
 // ---------------------------------------------------------------------------

@@ -2372,6 +2372,88 @@ func TestBoardViewBootIdentity(t *testing.T) {
 	checkView(asMap(asMap(rep["result"])["board"]), "board_status")
 }
 
+// TestLastSeenAdvancesOnPollCrossings (T6 fix round 1): last_seen's
+// claimed width — "the daemon's most recent protocol crossing (hello
+// or op reply)" — must hold on the POLLING paths an agent actually
+// rides: board_status's script.list, watch_events's board-side
+// events.subscribe, and capture_start's. Each leaves last_seen
+// strictly advanced. The daemon-side state field is the witness (the
+// RFC3339 wire truncates to whole seconds — two sub-second crossings
+// would read equal there; noteBoardContact updates it at nanosecond
+// resolution).
+func TestLastSeenAdvancesOnPollCrossings(t *testing.T) {
+	b := usbOnlyBoard("d75884", "xuansi-d75884.local")
+	e := newEnv(t, nil, b)
+	c := dialSock(t, e.sock)
+	e.srv.mu.Lock()
+	e.srv.captureRoot = t.TempDir()
+	e.srv.mu.Unlock()
+
+	lastSeen := func() time.Time {
+		t.Helper()
+		e.srv.mu.Lock()
+		defer e.srv.mu.Unlock()
+		db := e.srv.sups["d75884"]
+		if db == nil {
+			t.Fatal("no daemon-side board state")
+		}
+		return db.lastSeen
+	}
+	// settle: a hair between crossings so a coarse clock cannot stamp
+	// two legs identically (this host is nanosecond-precise; the sleep
+	// is the portability margin)
+	settle := func() { time.Sleep(5 * time.Millisecond) }
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "poller"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ = c.call(2, map[string]any{"type": "op", "board": "d75884", "op": "wifi.status"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op wifi.status (warm connect + tap hello): %#v", rep)
+	}
+	t0 := lastSeen()
+	if t0.IsZero() {
+		t.Fatal("no hello sighting recorded after the first crossing")
+	}
+
+	// ① board_status's own script.list — the reply the field's own
+	// tool elicits must advance it
+	settle()
+	rep, _ = c.call(3, map[string]any{"type": "board_status", "board": "d75884"})
+	if asMap(rep["error"]) != nil || asMap(rep["result"])["scripts"] == nil {
+		t.Fatalf("board_status: %#v", rep)
+	}
+	if t1 := lastSeen(); !t1.After(t0) {
+		t.Fatalf("last_seen did not advance over board_status's script.list: %v → %v", t0, t1)
+	}
+
+	// ② watch_events's board-side events.subscribe
+	settle()
+	rep, _ = c.call(4, map[string]any{"type": "watch_events", "board": "d75884", "source": "stdout"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("watch_events: %#v", rep)
+	}
+	if t2 := lastSeen(); !t2.After(t0) {
+		t.Fatalf("last_seen did not advance over watch_events's events.subscribe: %v → %v", t0, t2)
+	}
+
+	// ③ capture_start's board-side events.subscribe
+	settle()
+	rep, _ = c.call(5, map[string]any{"type": "capture_start", "board": "d75884", "source": "gpio.4"})
+	res := asMap(rep["result"])
+	if res == nil {
+		t.Fatalf("capture_start: %#v", rep)
+	}
+	if t3 := lastSeen(); !t3.After(t0) {
+		t.Fatalf("last_seen did not advance over capture_start's events.subscribe: %v → %v", t0, t3)
+	}
+	rep, _ = c.call(6, map[string]any{"type": "capture_stop", "capture_id": asStr(res["capture_id"])})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("capture_stop: %#v", rep)
+	}
+}
+
 // TestOutboundQueueEvictionPolicy pins the delivery policy on one
 // connection's queue: a full queue drops an incoming EVENT
 // (fire-and-forget, unchanged) but a REPLY is never dropped — the
