@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
-# Batch-10 task-7 HIL: the eyes+hands CLOSED LOOP - MCP drives the
-# st7789 screen, the GC2145 camera watches it, ledwatch judges the
-# frame (geometry pairing vs the aim reference + the R/B color-order
-# verdict), and the GPIO1->2 wired pair confirms electrically - one
-# continuous capture from driver_fetch(ledwatch+st7789) off the real
-# public index to a board-clean teardown.
+# b10 task-7 HIL (B12-P2 v6 all-module upgrade): the eyes+hands CLOSED
+# LOOP with every device on the module path - MCP drives the st7789
+# screen (wasm), the GC2145 camera rides gc2145+jpge (init/settle/shot
+# through per-call budget_ms run_lua; the reply frames land the JPEG),
+# ledwatch@2 judges the frame (geometry pairing vs the aim reference +
+# the R/B color-order verdict through the clear-RED/clear-BLUE
+# mirrors), and the GPIO1->2 wired pair confirms electrically - one
+# continuous capture from driver_fetch of ALL FOUR modules (gc2145,
+# jpge, ledwatch@2, st7789 — co-resident in the 2MiB-pool era) off the
+# real public index to a board-clean teardown. The fw op camera face
+# is gone (protocol_ver 6): there is no camera.off op and no
+# camera_shot tool anywhere in this scenario.
 #
-# MODE=aim  : one interactive aim round (ROUND=N) - camera-alone FPC
-#             differential, border pattern up, two shot+analyze passes,
-#             AIM_OK / AIM_ADJUST / BLOCKED-FPC verdict, JPEGs to
-#             OUTDIR (2026-11-08-b10-t7-aim-N-*.jpg for the owner).
+# MODE=aim  : one interactive aim round (ROUND=N) - the module
+#             pipeline, camera-alone FPC differential (module shot, no
+#             screen work), border pattern up, two shot+analyze
+#             passes, AIM_OK / AIM_ADJUST / BLOCKED-FPC verdict, JPEGs
+#             to OUTDIR for the owner.
 # MODE=loop : the closed loop (ATTEMPT=N honest count; REF=x,y,w,h
 #             reference screen bbox from a converged aim round, TOL px
 #             default 20; no REF = the brief's step-2 honest red).
 #
 # SERVING DAEMON (honesty note, b10t5 pattern): the RESIDENT
-# user-session daemon is the npm 0.1.1 binary - it lacks B10-T5's
-# driver_fetch (MCP static 22). This script SIGINTs it for the
-# duration, serves the run with a freshly built HEAD binary on a
-# private socket + XDG sandbox, and RESTORES the resident daemon on
-# exit.
+# user-session daemon may be an older npm binary - this script SIGINTs
+# it for the duration, serves the run with a freshly built HEAD binary
+# on a private socket + XDG sandbox, and RESTORES the resident daemon
+# on exit.
 #
 # Evidence (owner ruling 2026-11-06): daemon HIL transcripts live in
 # the PRIVATE knowledge base's evidence dir, never in this public repo

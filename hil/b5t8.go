@@ -37,7 +37,7 @@ import (
 
 const (
 	expectProtocolVer = int64(5)  // B10-T1: fs chunked-transport overlay era
-	expectFwBuild     = "0b6cc4e" // B10-T8c canonical (fw_version semver + CI build proof; supersedes the T8b canonical)
+	expectFwBuild     = "dcaa9ae" // B12-P2 fullclean canonical (protocol_ver 6); the B5-era suites (usb/tcp/full) additionally bind protocol_ver 5 below and run red-by-design on v6 — era evidence, kept
 
 	// HOUSE RULE (B10-T1 fix rounds 1-2): a fw canonical bump rebinds EVERY
 	// *FwBuild constant in hil/ IN THE SAME COMMIT — expectFwBuild/b6FwBuild/

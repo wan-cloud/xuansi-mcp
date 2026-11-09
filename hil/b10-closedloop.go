@@ -67,6 +67,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -81,18 +83,21 @@ import (
 
 const (
 	b10t7Board   = "d75884"
-	b10t7FwBuild = "0b6cc4e" // B10-T8c canonical (fw_version semver); HOUSE RULE: same commit as the other hil constants
+	b10t7FwBuild = "dcaa9ae" // B12-P2 fullclean canonical (protocol_ver 6, the camera op face out); HOUSE RULE: same commit as the other hil constants
 	b10t7Holder  = "b10t7-hil"
 	b10t7TCPEndp = "xuansi-d75884.local:7777"
 
 	// pinned against the live public index (wan-cloud/xuansi-drivers);
 	// released version dirs are immutable upstream.
-	b10t7WatchSHA   = "3454105a7233f29dd405a2de4900534672269587a4232d2f244e450f0fe54f66"
-	b10t7WatchByt   = 7547
+	b10t7CamSHA     = "701236ca76f9c97fac65ce75a1717c7cf52bb18812f9ae31377c9ff0cdaf26ff"
+	b10t7JpgSHA     = "c0d6a97c31c516c03a1af795c6376dfb52de5a77474990f4d9b791408916472c"
+	b10t7WatchSHA   = "4f2e04c0a79ac7d980520d51176c93f697ef60adb8a58e154da3760a4feaa9f4" // ledwatch@2.0.0 (abi=2 recompile)
+	b10t7WatchByt   = 7530
 	b10t7StSHA      = "3ab5f5149f0db79953a80404fcf19685b3f3b123f2a6155eaa352acfe1ccbf73"
 	b10t7StByt      = 12538
-	b10t7BudgetEval = 4000 // the fw's HARD ceiling (api: eval_ms out of range 0..4000, conn-task TWDT ceiling); analyze overruns fall back to the script.start VM-task path (the vec-suite long-op convention)
-	b10t7BudgetEv   = 4000
+	b10t7CamByt     = 6898
+	b10t7JpgByt     = 28411
+	b10t7BudgetEval = 200 // the SESSION budget stays at defaults for the whole v6 scenario — long calls ride per-call budget_ms (F-2), not a raised session face
 )
 
 // b10t7ScreenPins: the st7789 face's spi0 + control-pin occupancy (T6):
@@ -113,59 +118,14 @@ func (r b10t7Reg) String() string {
 }
 
 // b10t7Analyze runs one ledwatch analyze with cfg and decodes regions
-// (area-descending contract: index 0 is the dominant region). If the
-// direct conn-task eval busts the fw's 4000ms budget ceiling (a bright
-// full-screen pattern can outrun it), the call retries through the
-// script.start VM-task path (the vec-suite long-op convention: the
-// wasm call runs in a resident script's timer callback — not under the
-// conn-task eval budget — stores the result in _G, and the cheap poll
-// eval reads it back).
+// (area-descending contract: index 0 is the dominant region). The v6
+// face: the call rides per-call budget_ms (F-2) — the conn-task wait
+// derives from it, no session-face raise and no script fallback needed.
 func b10t7Analyze(b *b6Client, ctx context.Context, cfg string) ([]b10t7Reg, string, bool) {
 	code := fmt.Sprintf("return bench.wasm.call('ledwatch','analyze',{%s})", cfg)
-	m, text, isErr, _ := b.call(ctx, 40*time.Second, "xuansi_run_lua",
-		map[string]any{"board": b10t7Board, "code": code})
-	if isErr && (strings.Contains(text, "budget") || strings.Contains(text, "out of range")) {
-		b.h.note("analyze busts the conn-task budget (%.90s) - falling back to the script.start VM-task path", text)
-		return b10t7AnalyzeViaScript(b, ctx, cfg)
-	}
+	m, text, isErr, _ := b.call(ctx, 60*time.Second, "xuansi_run_lua",
+		map[string]any{"board": b10t7Board, "code": code, "budget_ms": float64(15000)})
 	return b10t7DecodeRegs(m, text, isErr)
-}
-
-// b10t7AnalyzeViaScript is the budget-free path: a resident script
-// under the LEASE session (hScriptStart pins it there — the same
-// namespace the evals ride, so _G hands the result over), one analyze
-// in a self-disarming timer callback, bounded poll.
-func b10t7AnalyzeViaScript(b *b6Client, ctx context.Context, cfg string) ([]b10t7Reg, string, bool) {
-	b.call(ctx, 15*time.Second, "xuansi_script_stop", map[string]any{"board": b10t7Board, "name": "t7an"})
-	_, text, isErr, _ := b.call(ctx, 20*time.Second, "xuansi_script_start",
-		map[string]any{"board": b10t7Board, "name": "t7an",
-			"code": "_G.t7an=nil\n" +
-				"bench.timer_ms(50, function()\n" +
-				"  if _G.t7an ~= nil then return end\n" + // self-disarm: timer_ms is periodic
-				"  local ok,e = pcall(bench.wasm.call,'ledwatch','analyze',{" + cfg + "})\n" +
-				"  if ok then _G.t7an=e else _G.t7an={script_err=tostring(e)} end\n" +
-				"end)\n" +
-				"while true do local f=coroutine.yield() if f then f() end end"})
-	if isErr {
-		return nil, "script start: " + text, false
-	}
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(1500 * time.Millisecond)
-		m, _, isErr, _ := b.call(ctx, 15*time.Second, "xuansi_run_lua",
-			map[string]any{"board": b10t7Board, "code": "return _G.t7an"})
-		if !isErr && gAny(m, "value") != nil {
-			b.call(ctx, 15*time.Second, "xuansi_script_stop", map[string]any{"board": b10t7Board, "name": "t7an"})
-			av, _ := m["value"].(map[string]any)
-			if _, has := av["script_err"]; has {
-				return nil, fmt.Sprint(av["script_err"]), false
-			}
-			regs, _, ok := b10t7DecodeRegs(m, "", false)
-			return regs, "script-path ok", ok
-		}
-	}
-	b.call(ctx, 15*time.Second, "xuansi_script_stop", map[string]any{"board": b10t7Board, "name": "t7an"})
-	return nil, "script-path poll timeout (30s)", false
 }
 
 // b10t7DecodeRegs decodes the run_lua reply of an analyze call.
@@ -203,36 +163,86 @@ func b10t7Lua(b *b6Client, ctx context.Context, code string) (string, string, bo
 	return fmt.Sprint(gAny(m, "value")), text, true
 }
 
-// b10t7Shot takes one camera_shot (QVGA), verifies the JPEG, and copies
-// it to dst (when non-empty) as evidence. The 35s deadline (not 60)
-// detects a stalled sensor FAST - the fb_get/re-init stall wedges the
-// conn task for minutes and the caller must await the unwind.
-func b10t7Shot(h *harness, b *b6Client, ctx context.Context, dst string) bool {
-	m, text, isErr, _ := b.call(ctx, 35*time.Second, "xuansi_camera_shot",
-		map[string]any{"board": b10t7Board, "framesize": "QVGA"})
-	if isErr {
-		h.check(false, fmt.Sprintf("camera_shot QVGA failed (text=%.140s)", text))
-		return false
-	}
-	files, _ := m["files"].([]any)
-	if len(files) != 1 {
-		h.check(false, fmt.Sprintf("camera_shot reply carries %d files, want 1 (text=%.80s)", len(files), text))
-		return false
-	}
-	fm, _ := files[0].(map[string]any)
-	ok := b9VerifyJPEG(h, fm, 320, 240)
-	if dst != "" {
-		if body, rerr := os.ReadFile(b6Str(fm, "path")); rerr == nil {
-			if werr := os.WriteFile(dst, body, 0o644); werr != nil {
-				h.note("copy JPEG to %s: %v", dst, werr)
-			} else {
-				h.note("JPEG evidence: %s (%d bytes)", dst, len(body))
+// b10t7CamOff parks the camera through the module path (idempotent,
+// pcall'd — an unloaded gc2145 is not an error here). The v6 face has
+// no camera.off op: the recipe's own off() is the product path.
+func b10t7CamOff(b *b6Client, ctx context.Context) {
+	b10t7Lua(b, ctx, "local ok,e=pcall(bench.wasm.call,'gc2145','off') return 'parked'")
+}
+
+// b10t7CamOn powers the camera through the module path with the AWB
+// settle (init + three grab discards, per-call budget) and the
+// i2c-stuck retry armor (off + cooldown + retry — the P1 mod_init
+// convention). Returns whether the stream came up.
+func b10t7CamOn(h *harness, b *b6Client, ctx context.Context, tag string) bool {
+	for att := 1; att <= 3; att++ {
+		code := "local i=bench.wasm.call('gc2145','init',{framesize='QVGA'}) " +
+			"local d0=bench.wasm.call('jpge','grab') local d1=bench.wasm.call('jpge','grab') " +
+			"local d2=bench.wasm.call('jpge','grab') return i.ok..','..i.w"
+		v, text, okLua := b10t7Lua2(b, ctx, code, 15000, 60)
+		if okLua && strings.HasPrefix(v, "1,") {
+			if att > 1 {
+				h.note("%s: camera on at attempt %d", tag, att)
 			}
-		} else {
-			h.note("read landed JPEG %s: %v", b6Str(fm, "path"), rerr)
+			return true
 		}
+		h.note("%s: camera-on attempt %d refused (%.110s / %.60s) - off + cooldown, retry", tag, att, text, v)
+		b10t7CamOff(b, ctx)
+		time.Sleep(12 * time.Second)
 	}
+	return false
+}
+
+// b10t7Shot takes ONE module-path shot (the camera must already be on —
+// b10t7CamOn), lands the JPEG itself from the reply's frames, verifies
+// SOI/EOI + Go image/jpeg decode 320x240, and copies it to dst (when
+// non-empty) as evidence. The v6 face has no camera_shot tool: the
+// reply's frames[0] {ch:2,name:"jpge"} IS the photo; the agent decodes
+// and hashes it (no server-side capture path exists).
+func b10t7Shot(h *harness, b *b6Client, ctx context.Context, dst string) bool {
+	m, text, isErr, _ := b.call(ctx, 60*time.Second, "xuansi_run_lua",
+		map[string]any{"board": b10t7Board,
+			"code":      "local s=bench.wasm.call('jpge','shot',{quality=60}) return {len=s.len, w=s.w, h=s.h, enc_ms=s.enc_ms}",
+			"budget_ms": float64(10000)})
+	if isErr {
+		h.check(false, fmt.Sprintf("module shot (jpge.shot q60) failed (text=%.140s)", text))
+		return false
+	}
+	frames, _ := m["frames"].([]any)
+	if len(frames) != 1 {
+		h.check(false, fmt.Sprintf("shot reply carries %d frame(s), want 1 (text=%.80s)", len(frames), text))
+		return false
+	}
+	fm, _ := frames[0].(map[string]any)
+	body, derr := base64.StdEncoding.DecodeString(b6Str(fm, "data_b64"))
+	if derr != nil || len(body) < 4 {
+		h.check(false, fmt.Sprintf("frames[0].data_b64 decode (%d bytes, err=%v)", len(body), derr))
+		return false
+	}
+	ok := h.check(body[0] == 0xFF && body[1] == 0xD8 && body[len(body)-2] == 0xFF && body[len(body)-1] == 0xD9,
+		fmt.Sprintf("shot JPEG SOI/EOI in place (%d bytes)", len(body)))
+	val, _ := m["value"].(map[string]any)
+	if shotLen, has := b6Num(val, "len"); has {
+		ok = h.check(float64(len(body)) == shotLen,
+			fmt.Sprintf("landed bytes == reply len (%d == %.0f)", len(body), shotLen)) && ok
+	}
+	if werr := os.WriteFile(dst, body, 0o644); werr != nil {
+		h.note("write JPEG evidence %s: %v", dst, werr)
+	}
+	sum := sha256.Sum256(body)
+	h.note("shot landed: %s (%d bytes, sha256=%x)", dst, len(body), sum)
 	return ok
+}
+
+// b10t7Lua2 evals with a per-call budget (F-2) and returns
+// (value-as-string, text, ok).
+func b10t7Lua2(b *b6Client, ctx context.Context, code string, budgetMs, timeoutSec int) (string, string, bool) {
+	m, text, isErr, _ := b.call(ctx, time.Duration(timeoutSec)*time.Second, "xuansi_run_lua",
+		map[string]any{"board": b10t7Board, "code": code, "budget_ms": float64(budgetMs)})
+	if isErr {
+		return "", text, false
+	}
+	return fmt.Sprint(gAny(m, "value")), text, true
 }
 
 // b10t7Prelude is the shared S0: stale-daemon audit, TCP dial, sandbox,
@@ -350,25 +360,22 @@ func b10t7Prelude(h *harness, ctx context.Context, attemptLabel, daemonBin, runD
 	fw := last
 	h.check(good && fw == b10t7FwBuild, fmt.Sprintf("fw BUILD BINDING: %q == expected %q", fw, b10t7FwBuild))
 
-	m, text, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_lease", map[string]any{"board": b10t7Board, "holder": b10t7Holder})
+	m, _, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_lease", map[string]any{"board": b10t7Board, "holder": b10t7Holder})
 	leaseSess, _ := b6Num(m, "session")
 	h.check(!isErr && b6Str(m, "board") == b10t7Board && b6Str(m, "holder") == b10t7Holder && leaseSess > 0,
 		fmt.Sprintf("lease holder=%s session=%.0f (default TCP route, no reboot)", b10t7Holder, leaseSess))
 
-	// budget raise (analyze is a multi-second op; a lit full-screen can exceed 4s)
-	_, text, isErr, _ = b.call(ctx, 15*time.Second, "xuansi_board_op",
-		map[string]any{"board": b10t7Board, "op": "budget.set", "args": map[string]any{"eval_ms": b10t7BudgetEval, "event_ms": b10t7BudgetEv}})
-	h.check(!isErr, fmt.Sprintf("budget.set eval_ms=%d event_ms=%d (restored at teardown; text=%.60s)", b10t7BudgetEval, b10t7BudgetEv, text))
-
-	// self-healing sweep: whatever an earlier round left, converge to a
-	// clean slate (idempotent; honest notes only — no checks)
+	// SESSION budget stays at defaults in the v6 scenario — long module
+	// calls ride per-call budget_ms (F-2); the old 4000ms session raise
+	// is retired with the op face. Self-healing sweep: whatever an
+	// earlier round left, converge to a clean slate (idempotent).
 	if _, t2, ok2 := b10t7Lua(b, ctx, "for _,n in ipairs(bench.wasm.list()) do bench.wasm.unload(n) end return 'cleaned'"); !ok2 {
 		h.note("sweep unload-all: %.70s (tolerated)", t2)
 	}
-	for _, n := range []string{"ledwatch", "st7789"} {
+	for _, n := range []string{"gc2145", "jpge", "ledwatch", "st7789"} {
 		b.call(ctx, 15*time.Second, "xuansi_fs_rm", map[string]any{"board": b10t7Board, "path": "/drv/" + n + ".wasm"})
 	}
-	b.call(ctx, 30*time.Second, "xuansi_board_op", map[string]any{"board": b10t7Board, "op": "camera.off"})
+	b10t7CamOff(b, ctx)
 	b.call(ctx, 15*time.Second, "xuansi_session_reset", map[string]any{"board": b10t7Board, "session": float64(0)})
 	if v, _, ok2 := b10t7Lua(b, ctx, "return #bench.wasm.list()"); ok2 {
 		h.check(v == "0", fmt.Sprintf("precondition: wasm list empty after the sweep (list=%s)", v))
@@ -377,35 +384,34 @@ func b10t7Prelude(h *harness, ctx context.Context, attemptLabel, daemonBin, runD
 }
 
 // b10t7Teardown is the shared board-clean convergence: st7789 deinit,
-// camera off + cold check, unload x2, fs_rm x2 + not-found verify,
-// session reset, budget restore, diag.pins cleanliness, lease release.
-// deep=false (early-failure path: nothing was pushed) tolerates the
-// /drv steps as honest notes instead of checks.
+// camera off (module path) + cold check, unload-all, fs_rm x4 +
+// not-found verify, session reset, budget defaults, diag.pins
+// cleanliness, lease release. deep=false (early-failure path: nothing
+// was pushed) tolerates the /drv steps as honest notes instead of
+// checks.
 func b10t7Teardown(h *harness, b *b6Client, ctx context.Context, deep bool) {
 	fmt.Println("\n- Z: teardown - board clean: camera off + 14 pins, modules unloaded, /drv removed, budget default, no lease -")
 	b10t7AwaitBoard(h, b, ctx, "before teardown (stall residue check)")
 	if _, text, ok := b10t7Lua(b, ctx, "return bench.wasm.call('st7789','deinit')"); !ok {
 		h.note("st7789 deinit: %.80s (tolerated - claims converge via session reset below)", text)
 	}
-	m, text, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_board_op",
-		map[string]any{"board": b10t7Board, "op": "camera.off"})
-	h.check(!isErr, fmt.Sprintf("camera.off (text=%.60s)", text))
-	m, _, isErr, _ = b.call(ctx, 15*time.Second, "xuansi_board_op",
-		map[string]any{"board": b10t7Board, "op": "camera.status"})
-	h.check(!isErr && !bolAny(m, "inited"), fmt.Sprintf("camera.status cold after off (inited=%v)", bolAny(m, "inited")))
+	b10t7CamOff(b, ctx)
+	v, text, okInfo := b10t7Lua(b, ctx, "local ok,e=pcall(bench.wasm.call,'gc2145','info') if ok then return 'on='..(e.on or '?') else return 'no-module' end")
+	h.check(okInfo && (strings.Contains(v, "on=0") || strings.Contains(v, "no-module")),
+		fmt.Sprintf("camera cold after off (info=%s; an unloaded gc2145 counts as cold)", v))
 
-	for _, n := range []string{"ledwatch", "st7789"} {
-		if _, text, ok := b10t7Lua(b, ctx, fmt.Sprintf("return bench.wasm.unload('%s')", n)); !ok {
+	for _, n := range []string{"gc2145", "jpge", "ledwatch", "st7789"} {
+		if _, text, ok := b10t7Lua(b, ctx, fmt.Sprintf("bench.wasm.unload('%s')", n)); !ok {
 			h.note("unload %s: %.60s (tolerated)", n, text)
 		}
 	}
-	for _, n := range []string{"ledwatch", "st7789"} {
+	for _, n := range []string{"gc2145", "jpge", "ledwatch", "st7789"} {
 		_, text, isErr, _ := b.call(ctx, 15*time.Second, "xuansi_fs_rm",
 			map[string]any{"board": b10t7Board, "path": "/drv/" + n + ".wasm"})
 		if isErr && !deep {
 			h.note("fs_rm /drv/%s.wasm (shallow teardown - pipeline never completed): %.50s", n, text)
 		} else {
-			h.check(!isErr, fmt.Sprintf("fs_rm /drv/%s.wasm (direct fs_rm rather than driver_pull to keep this teardown lease-lean; driver_pull sweeps it too since B10-T8; text=%.50s)", n, text))
+			h.check(!isErr, fmt.Sprintf("fs_rm /drv/%s.wasm (text=%.50s)", n, text))
 		}
 	}
 	if deep {
@@ -414,14 +420,14 @@ func b10t7Teardown(h *harness, b *b6Client, ctx context.Context, deep bool) {
 		h.check(isErr && strings.Contains(text, "not found"), fmt.Sprintf("/drv/st7789.wasm gone (text=%.60s)", text))
 	}
 	if v, _, ok := b10t7Lua(b, ctx, "return #bench.wasm.list()"); ok {
-		h.check(v == "0", fmt.Sprintf("wasm list empty after unload x2 (list=%s)", v))
+		h.check(v == "0", fmt.Sprintf("wasm list empty after unload-all (list=%s)", v))
 	}
-	m, text, isErr, _ = b.call(ctx, 15*time.Second, "xuansi_session_reset",
+	m, text, isErr, _ := b.call(ctx, 15*time.Second, "xuansi_session_reset",
 		map[string]any{"board": b10t7Board, "session": float64(0)})
 	h.check(!isErr, fmt.Sprintf("session_reset 0 (the wasm-claims convergence path; text=%.50s)", text))
 	m, _, isErr, _ = b.call(ctx, 15*time.Second, "xuansi_board_op",
 		map[string]any{"board": b10t7Board, "op": "budget.set", "args": map[string]any{"eval_ms": 200, "event_ms": 50}})
-	h.check(!isErr, "budget restored to defaults (eval_ms=200 event_ms=50)")
+	h.check(!isErr, "budget at defaults (eval_ms=200 event_ms=50 - never moved in the v6 scenario)")
 
 	// pins: capture the diag.pins stdout dump (b9 S8 pattern)
 	capCh := b.callAsync("xuansi_capture", map[string]any{"board": b10t7Board, "source": "stdout", "seconds": float64(4)})
@@ -449,16 +455,23 @@ func b10t7Teardown(h *harness, b *b6Client, ctx context.Context, deep bool) {
 	h.check(!isErr && !hasLease, fmt.Sprintf("board_status shows NO lease (lease key %v)", hasLease))
 }
 
-// b10t7FetchPushLoad is the S1 real-index pipeline (shared by aim+loop).
+// b10t7FetchPushLoad is the S1 real-index pipeline (shared by aim+loop):
+// all four modules of the v6 closed loop, the live public index.
 func b10t7FetchPushLoad(h *harness, b *b6Client, ctx context.Context) bool {
 	all := true
 	for _, spec := range []struct {
-		name  string
-		sha   string
-		bytes int
-	}{{"ledwatch", b10t7WatchSHA, b10t7WatchByt}, {"st7789", b10t7StSHA, b10t7StByt}} {
+		name    string
+		version string
+		sha     string
+		bytes   int
+	}{
+		{"gc2145", "1.0.0", b10t7CamSHA, b10t7CamByt},
+		{"jpge", "1.0.0", b10t7JpgSHA, b10t7JpgByt},
+		{"ledwatch", "2.0.0", b10t7WatchSHA, b10t7WatchByt},
+		{"st7789", "1.0.0", b10t7StSHA, b10t7StByt},
+	} {
 		m, text, isErr, _ := b.call(ctx, 60*time.Second, "xuansi_driver_fetch",
-			map[string]any{"name": spec.name, "version": "1.0.0"})
+			map[string]any{"name": spec.name, "version": spec.version})
 		var fm map[string]any
 		if fl, ok := m["files"].([]any); ok && len(fl) > 0 {
 			fm, _ = fl[0].(map[string]any)
@@ -468,14 +481,19 @@ func b10t7FetchPushLoad(h *harness, b *b6Client, ctx context.Context) bool {
 			byt = int(n)
 		}
 		all = h.check(!isErr && sha == spec.sha && byt == spec.bytes,
-			fmt.Sprintf("W10 fetch %s@1.0.0 from the live index: sha=%.12s bytes=%d (pinned; text=%.50s)", spec.name, sha, byt, text)) && all
+			fmt.Sprintf("W10 fetch %s@%s from the live index: sha=%.12s bytes=%d (pinned; text=%.50s)", spec.name, spec.version, sha, byt, text)) && all
 		m, text, isErr, _ = b.call(ctx, 60*time.Second, "xuansi_driver_push",
-			map[string]any{"board": b10t7Board, "name": spec.name, "version": "1.0.0"})
+			map[string]any{"board": b10t7Board, "name": spec.name, "version": spec.version})
 		all = h.check(!isErr && b6Str(m, "path") == "/drv/"+spec.name+".wasm" && b6Str(m, "sha256") == spec.sha,
-			fmt.Sprintf("W11 push %s@1.0.0 -> %s sha-verified (text=%.50s)", spec.name, b6Str(m, "path"), text)) && all
-		v, text, okLua := b10t7Lua(b, ctx, fmt.Sprintf("return bench.wasm.load('%s')", spec.name))
-		all = h.check(okLua && v == "true", fmt.Sprintf("W12 wasm.load('%s') -> %s (text=%.50s)", spec.name, v, text)) && all
+			fmt.Sprintf("W11 push %s@%s -> %s sha-verified (text=%.50s)", spec.name, spec.version, b6Str(m, "path"), text)) && all
 	}
+	// the pool ruling echo (the AC4 datum): all FOUR load together
+	v, text, okLua := b10t7Lua2(b, ctx,
+		"bench.wasm.load('gc2145') bench.wasm.load('jpge') "+
+			"bench.wasm.load('ledwatch') bench.wasm.load('st7789') "+
+			"return table.concat(bench.wasm.list(), ',')", 10000, 60)
+	all = h.check(okLua && v == "gc2145,jpge,ledwatch,st7789",
+		fmt.Sprintf("W12 ALL FOUR modules co-resident (list=%q — the 2,162,688B initial-memory set loads; text=%.50s)", v, text)) && all
 	return all
 }
 
@@ -538,25 +556,30 @@ func runB10T7Aim(round int, daemonBin, runDir, outDir string) int {
 		return finish()
 	}
 
-	fmt.Println("\n- A1: camera-ALONE sanity (the FPC differential - no module loaded) -")
+	fmt.Println("\n- A1: the module pipeline first (the v6 camera rides gc2145+jpge - fetch all four, load all four) -")
+	b10t7FetchPushLoad(h, b, ctx)
+
+	fmt.Println("\n- A1b: camera-ALONE sanity (the FPC differential - screen modules loaded but idle, no draw, no analyze) -")
+	if !b10t7CamOn(h, b, ctx, "A1b cam-on") {
+		fmt.Printf("AIM_ROUND %d VERDICT: BLOCKED-FPC | camera dead with no screen work done - owner must re-check the FPC/connector\n", round)
+		b10t7AwaitBoard(h, b, ctx, "after the stalled camera-on")
+		b10t7Teardown(h, b, ctx, true)
+		return finish()
+	}
 	okShot := b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("2026-11-08-b10-t7-aim-%d-camonly.jpg", round)))
-	h.check(okShot, fmt.Sprintf("A1 camera alone: QVGA shot ok (round %d) - a failure here is sensor/FPC hardware, NOT coexistence", round))
+	h.check(okShot, fmt.Sprintf("A1b camera alone: QVGA module shot ok (round %d) - a failure here is sensor/FPC hardware, NOT coexistence", round))
 	if !okShot {
-		fmt.Printf("AIM_ROUND %d VERDICT: BLOCKED-FPC | camera dead with NO module loaded - owner must re-check the FPC/connector\n", round)
-		b10t7AwaitBoard(h, b, ctx, "after the stalled capture (fb_get unwind)")
-		b10t7Teardown(h, b, ctx, false)
+		fmt.Printf("AIM_ROUND %d VERDICT: BLOCKED-FPC | camera dead with no screen work done - owner must re-check the FPC/connector\n", round)
+		b10t7AwaitBoard(h, b, ctx, "after the stalled shot")
+		b10t7Teardown(h, b, ctx, true)
 		return finish()
 	}
 	// park the camera: large spi_xfer (4KB DMA) hits the engine's
 	// "DMA buffer OOM" refusal while the DVP path is live (round 1's
 	// honest finding) - the panel holds its own RAM, so the loop draws
 	// with the camera OFF and watches the PERSISTED pattern (see A6).
-	_, text, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_board_op",
-		map[string]any{"board": b10t7Board, "op": "camera.off"})
-	h.check(!isErr, fmt.Sprintf("A1b camera parked (off) before any draw - draw-then-watch discipline (text=%.50s)", text))
-
-	fmt.Println("\n- A2: the real pipeline - fetch both modules from the live index -> push x2 -> load x2 -")
-	b10t7FetchPushLoad(h, b, ctx)
+	b10t7CamOff(b, ctx)
+	h.note("A1c camera parked (gc2145.off) before any draw - draw-then-watch discipline")
 
 	fmt.Println("\n- A3: st7789 init + border pattern drawn with the camera OFF (the panel persists it) -")
 	v, text, okLua := b10t7Lua(b, ctx, "return bench.wasm.call('st7789','init',{x_offset=0})")
@@ -580,6 +603,11 @@ func runB10T7Aim(round int, daemonBin, runDir, outDir string) int {
 	var done [2]bool
 	for p := 1; p <= 2; p++ {
 		fmt.Printf("\n- A%d: capture pass %d on the persisted border + ledwatch analyze -\n", 3+p, p)
+		time.Sleep(3 * time.Second) // sensor settle between cycles (F-4)
+		if !b10t7CamOn(h, b, ctx, fmt.Sprintf("aim pass %d cam-on", p)) {
+			h.check(false, fmt.Sprintf("A%d camera-on pass %d failed", 3+p, p))
+			continue
+		}
 		if !b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("2026-11-08-b10-t7-aim-%d-border%d.jpg", round, p))) {
 			b10t7AwaitBoard(h, b, ctx, fmt.Sprintf("after aim pass %d stalled shot", p))
 			continue
@@ -669,11 +697,14 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	_, text, okLua = b10t7Lua(b, ctx, "return bench.wasm.call('st7789','clear',0xF800)")
 	h.check(okLua, fmt.Sprintf("S2 clear(RED) 0xF800 full screen drawn (camera off; text=%.60s)", text))
 
-	fmt.Printf("\n- S3: geometry pairing + R/B signal #1 - camera on (power shot) -> ledwatch region on the persisted RED screen vs the reference screen bbox (tol %dpx) + the full-red r/b ratio -\n", tolPx)
+	fmt.Printf("\n- S3: geometry pairing + R/B signal #1 - camera on (module init + settle) -> shot -> ledwatch region on the persisted RED screen vs the reference screen bbox (tol %dpx) + the full-red r/b ratio -\n", tolPx)
 	stalled := false
 	sigRed := -1 // -1 unknown, 1 red-dominant, 0 blue-dominant
-	if !b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-clearred.jpg", attempt))) {
-		b10t7AwaitBoard(h, b, ctx, "after the S3 power shot stall")
+	if !b10t7CamOn(h, b, ctx, "S3 cam-on") {
+		h.check(false, "S3 camera-on failed (retry armor exhausted)")
+		stalled = true
+	} else if !b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-clearred.jpg", attempt))) {
+		b10t7AwaitBoard(h, b, ctx, "after the S3 shot stall")
 		stalled = true
 	}
 	regs, text, okA := b10t7Analyze(b, ctx, "min_area=800")
@@ -745,29 +776,24 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	// awaits the conn-task unwind and reports the phase failed WITHOUT
 	// poisoning the phases after it. Returns the screen region.
 	phase := func(label, drawCode string, shotName string, thrs []int, baseCfg string) (b10t7Reg, int, bool) {
-		if _, text, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_board_op",
-			map[string]any{"board": b10t7Board, "op": "camera.off"}); isErr {
-			h.note("%s: camera.off pre-draw: %.70s", label, text)
-		}
+		b10t7CamOff(b, ctx)
 		time.Sleep(3 * time.Second) // sensor settle before the re-power (attempt 1's honest finding)
-		_, t, okD := b10t7Lua(b, ctx, drawCode)
+		_, t, okD := b10t7Lua2(b, ctx, drawCode, 8000, 40)
 		if !okD {
 			h.check(false, fmt.Sprintf("%s draw (text=%.90s)", label, t))
 			b10t7AwaitBoard(h, b, ctx, "after "+label)
 			return b10t7Reg{}, 0, false
 		}
+		if !b10t7CamOn(h, b, ctx, label+" cam-on") {
+			// the documented transient class: i2c-stuck / boot-churn
+			// margins - the retry armor inside CamOn already cycled
+			// off+cooldown; record and phase-fail without poisoning
+			b10t7AwaitBoard(h, b, ctx, "after "+label+" stalled camera-on")
+			return b10t7Reg{}, 0, false
+		}
 		if !b10t7Shot(h, b, ctx, filepath.Join(outDir, shotName)) {
-			// the documented transient class: esp_camera_init rc=-1 at
-			// boot-churn margins retries clean (diag round: B9+B10 both,
-			// ~1-2 per 15 cold inits) - one retry, honestly noted
-			b10t7AwaitBoard(h, b, ctx, "after "+label+" stalled capture")
-			h.note("%s: transient init-fail retry (documented class)", label)
-			b.call(ctx, 30*time.Second, "xuansi_board_op", map[string]any{"board": b10t7Board, "op": "camera.off"})
-			time.Sleep(2 * time.Second)
-			if !b10t7Shot(h, b, ctx, filepath.Join(outDir, shotName)) {
-				b10t7AwaitBoard(h, b, ctx, "after "+label+" retry also stalled")
-				return b10t7Reg{}, 0, false
-			}
+			b10t7AwaitBoard(h, b, ctx, "after "+label+" stalled shot")
+			return b10t7Reg{}, 0, false
 		}
 		pickScr := func(rs []b10t7Reg) b10t7Reg { // best overlap with the ref screen bbox
 			if len(rs) == 0 {

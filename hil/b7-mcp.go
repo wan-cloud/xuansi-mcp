@@ -86,7 +86,7 @@ import (
 
 const (
 	b7Board    = "d75884"  // the bench board (echo fixture I2C0 8/9 <-> I2C1 10/11 @0x28; SPI self-loop 12<->13, sclk 14)
-	b7FwBuild  = "0b6cc4e" // B10-T8c canonical (fw_version semver + CI build proof; supersedes the T8b canonical)
+	b7FwBuild  = "dcaa9ae" // B12-P2 fullclean canonical (protocol_ver 6); HOUSE RULE: same commit as the other hil constants
 	b7Holder   = "b7-hil"  // custom lease holder for this run
 	b7TCPEndp  = "xuansi-d75884.local:7777"
 	b7Resource = "xuansi://boards/" + b7Board + "/events"

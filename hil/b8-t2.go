@@ -68,7 +68,7 @@ import (
 
 const (
 	b8t2Board   = "d75884"  // the bench board
-	b8t2FwBuild = "0b6cc4e" // B10-T8c canonical (fw_version semver + CI build proof; supersedes the T8b canonical)
+	b8t2FwBuild = "dcaa9ae" // B12-P2 fullclean canonical (protocol_ver 6); HOUSE RULE: same commit as the other hil constants
 	b8t2Holder  = "b8-t2"   // custom lease holder for this run
 	b8t2TCPEndp = "xuansi-d75884.local:7777"
 	b8t2Script  = "b8t2res" // the S3 resident script's name
