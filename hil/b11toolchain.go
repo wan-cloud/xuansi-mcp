@@ -73,7 +73,7 @@ import (
 
 const (
 	b11Board   = "d75884"
-	b11FwBuild = "0b6cc4e" // B10-T8c canonical (fw_version semver); HOUSE RULE: same commit as the other hil constants
+	b11FwBuild = "dcaa9ae" // B12-P2 fullclean canonical (protocol_ver 6); HOUSE RULE: same commit as the other hil constants
 	b11Holder  = "b11tc-hil"
 	b11TCPEndp = "xuansi-d75884.local:7777"
 
