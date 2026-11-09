@@ -59,36 +59,15 @@ type fakeCtl struct {
 
 	opErr map[string]error
 
-	// 0x02 camera scripting (camera_test.go): the camera.capture op
-	// streams camFrames as ch=1 chunks (frame i = seq 10+i, split into
-	// camChunk-byte pieces; 0 = one chunk) through the connection's
-	// registered sink BEFORE replying — the fw's frames-then-reply
-	// order. camSkip drops one chunk (gap injection); camTail emits
-	// extra chunks after the frames (stragglers/re-deliveries).
-	// sinkAtOp records whether a sink was registered when the op ran.
-	sink      replclient.StreamSink
-	sinkAtOp  bool
-	camFrames [][]byte
-	camChunk  int
-	camSkip   map[uint32]int
-	camTail   []camChunkT
-	camW      int
-	camH      int
-	camSensor string
+	// sink is the connection's current 0x02 stream sink (the frames
+	// tests script ch=2 module streams through it, the fw's
+	// frames-then-reply order).
+	sink replclient.StreamSink
 }
 
 type recOp struct {
 	op   string
 	args map[string]any
-}
-
-// camChunkT is one scripted stream chunk (camera_test.go's straggler
-// and re-delivery scripting).
-type camChunkT struct {
-	seq   uint32
-	idx   uint16
-	total uint16
-	data  []byte
 }
 
 func newFakeCtl() *fakeCtl {
@@ -136,9 +115,6 @@ func (f *fakeCtl) Op(ctx context.Context, op string, args map[string]any) (map[s
 	f.record(op, args)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if op == "camera.capture" {
-		f.sinkAtOp = f.sink != nil // recorded on every path, refusals included
-	}
 	if err, ok := f.opErr[op]; ok {
 		return nil, err
 	}
@@ -159,54 +135,6 @@ func (f *fakeCtl) Op(ctx context.Context, op string, args map[string]any) (map[s
 			}
 		}()
 		return map[string]any{}, nil
-	case "camera.capture":
-		// frames-then-reply: every chunk crosses the registered sink
-		// BEFORE the reply map returns (the fw's order — CameraShot
-		// reads the collector only after Op comes back). sinkAtOp
-		// itself is recorded at Op entry, refusals included.
-		sink := f.sink
-		for i, frame := range f.camFrames {
-			seq := uint32(10 + i)
-			var chunks [][]byte
-			if f.camChunk <= 0 {
-				chunks = [][]byte{frame}
-			} else {
-				for off := 0; off < len(frame); off += f.camChunk {
-					end := off + f.camChunk
-					if end > len(frame) {
-						end = len(frame)
-					}
-					chunks = append(chunks, frame[off:end])
-				}
-			}
-			for idx, c := range chunks {
-				if skip, ok := f.camSkip[seq]; ok && skip == idx {
-					continue // the injected gap
-				}
-				if sink != nil {
-					sink(1, seq, uint16(idx), uint16(len(chunks)), c)
-				}
-			}
-		}
-		for _, t := range f.camTail {
-			if sink != nil {
-				sink(1, t.seq, t.idx, t.total, t.data)
-			}
-		}
-		w, h, sensor := f.camW, f.camH, f.camSensor
-		if w == 0 {
-			w = 640
-		}
-		if h == 0 {
-			h = 480
-		}
-		if sensor == "" {
-			sensor = "GC2145"
-		}
-		return map[string]any{
-			"frames": int64(len(f.camFrames)), "w": int64(w), "h": int64(h),
-			"format": "JPEG", "sensor": sensor, "seq0": int64(10),
-		}, nil
 	case "session.reset":
 		s, _ := args["session"].(int64)
 		if f.resetErr != nil {
@@ -268,7 +196,7 @@ func (f *fakeCtl) OnEvent(prefix string, fn func(replclient.Event)) (cancel func
 }
 
 // OnStream stores the connection's 0x02 sink (nil clears; the fake has
-// no router, camera.capture's scripting drives it synchronously).
+// no router, the frames tests' op scripting drives it synchronously).
 func (f *fakeCtl) OnStream(sink replclient.StreamSink) {
 	f.mu.Lock()
 	f.sink = sink

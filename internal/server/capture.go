@@ -13,7 +13,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +26,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"xuansi/internal/board"
 	"xuansi/internal/paths"
 	"xuansi/internal/replclient"
 )
@@ -278,124 +276,6 @@ func (s *Server) hCaptureStart(ctx context.Context, cc *clientConn, req *Request
 	go s.spoolCapture(cs)
 	s.logf("server: capture %s started (%s %s → %s, max %dMiB/%ds)", id, b.MAC6, req.Source, path, maxBytes>>20, maxSeconds)
 	return map[string]any{"capture_id": id, "path": path}, nil
-}
-
-// ---------------------------------------------------------------------------
-// the camera face (b9 task 5) — the 0x02 stream's first consumer
-// ---------------------------------------------------------------------------
-
-// hCameraShot serves camera_shot: one synchronous camera.capture under
-// the lease, whose 0x02 ch=1 chunks precede the op reply on the warm
-// controller. board.CameraShot registers the stream sink per attempt,
-// so a dead link's one redial re-registers on the fresh connection
-// (T2's per-connection ruling). Captures of one board serialize
-// (daemonBoard.cameraMu): concurrent calls would interleave their
-// ch=1 chunks into each other's collectors on the shared warm link.
-func (s *Server) hCameraShot(ctx context.Context, cc *clientConn, req *Request) (any, error) {
-	if req.Frames < 0 || req.Frames > 4 {
-		return nil, &RPCError{Class: "api",
-			Msg: fmt.Sprintf("camera_shot: frames must be 1..4 (got %d; omit for the board default 1)", req.Frames)}
-	}
-	switch req.Framesize {
-	case "", "QVGA", "VGA":
-	default:
-		return nil, &RPCError{Class: "api",
-			Msg: fmt.Sprintf("camera_shot: framesize must be \"QVGA\" or \"VGA\" (got %q; omit for the default VGA)", req.Framesize)}
-	}
-	b, rerr := s.resolve(req.Board)
-	if rerr != nil {
-		return nil, rerr
-	}
-	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
-		return nil, err
-	}
-	db := s.supervisor(b)
-	db.cameraMu.Lock()
-	defer db.cameraMu.Unlock()
-
-	opts := board.CameraOpts{Frames: req.Frames, Framesize: req.Framesize}
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		ctl, err := s.warmController(ctx, b)
-		if err != nil {
-			return nil, err
-		}
-		res, err := board.CameraShot(ctx, ctl, opts)
-		if err == nil {
-			return s.landCamera(b.MAC6, res)
-		}
-		lastErr = err
-		if !errors.Is(err, replclient.ErrDead) {
-			return nil, err // board refusal (OpError) or caller ctx — no retry
-		}
-		s.logf("server: board %s: camera_shot hit a dead link (%v) — redialing once", b.MAC6, err)
-		db.connectMu.Lock()
-		db.sup.Close() // drop the corpse so the next Connect redials
-		db.connectMu.Unlock()
-	}
-	return nil, fmt.Errorf("board %s: camera_shot after redial: %w", b.MAC6, lastErr)
-}
-
-// cameraShotFile is one landed JPEG's record (proto.go's camera
-// contract).
-type cameraShotFile struct {
-	Path   string `json:"path"`
-	Bytes  int64  `json:"bytes"`
-	SHA256 string `json:"sha256"`
-	W      int    `json:"w,omitempty"`
-	H      int    `json:"h,omitempty"`
-}
-
-// landCamera writes each assembled JPEG under the captures root with
-// the capture face's discipline (O_EXCL, never truncates): one file
-// per frame — <epoch>-<mac6>-camera.jpg for a single frame,
-// <epoch>-<mac6>-camera-N.jpg for a burst's Nth frame. A same-second
-// collision bumps the epoch until the exclusive open succeeds.
-func (s *Server) landCamera(mac6 string, res board.CameraResult) (map[string]any, error) {
-	files := make([]cameraShotFile, 0, len(res.JPEGs))
-	if len(res.JPEGs) > 0 {
-		s.mu.Lock()
-		root := s.captureRoot
-		open := s.captureOpen
-		s.mu.Unlock()
-		if err := os.MkdirAll(root, 0o700); err != nil {
-			return nil, &RPCError{Class: "server", Msg: fmt.Sprintf("camera_shot: mkdir %s: %v", root, err)}
-		}
-		epoch := time.Now().Unix()
-		for i, jpeg := range res.JPEGs {
-			var file io.WriteCloser
-			var path string
-			for try := int64(0); ; try++ {
-				name := fmt.Sprintf("%d-%s-camera", epoch+try, mac6)
-				if len(res.JPEGs) > 1 {
-					name = fmt.Sprintf("%s-%d", name, i+1)
-				}
-				path = filepath.Join(root, name+".jpg")
-				f, oerr := open(path)
-				if oerr == nil {
-					file = f
-					break
-				}
-				if !errors.Is(oerr, os.ErrExist) || try > 8 {
-					return nil, &RPCError{Class: "server", Msg: fmt.Sprintf("camera_shot: open %s: %v", path, oerr)}
-				}
-			}
-			sum := sha256.Sum256(jpeg)
-			_, werr := file.Write(jpeg)
-			if cerr := file.Close(); werr == nil {
-				werr = cerr
-			}
-			if werr != nil {
-				return nil, &RPCError{Class: "server", Msg: fmt.Sprintf("camera_shot: write %s: %v", path, werr)}
-			}
-			files = append(files, cameraShotFile{
-				Path: path, Bytes: int64(len(jpeg)),
-				SHA256: fmt.Sprintf("%x", sum), W: res.W, H: res.H,
-			})
-		}
-	}
-	s.logf("server: camera_shot %s: %d file(s) landed, gaps=%d sensor=%s", mac6, len(files), res.Gaps, res.Sensor)
-	return map[string]any{"files": files, "gaps": res.Gaps, "sensor": res.Sensor}, nil
 }
 
 // hCaptureStop serves capture_stop: signal the session, wait bounded

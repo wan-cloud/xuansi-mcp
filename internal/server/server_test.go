@@ -11,7 +11,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -47,7 +46,7 @@ type fakeCtl struct {
 	handlers map[int]evHandler
 	nextHID  int
 	hellos   int
-	sink     replclient.StreamSink // the connection's current 0x02 sink (camera scripting drives it synchronously)
+	sink     replclient.StreamSink // the connection's current 0x02 sink (frames-face scripting drives it synchronously)
 }
 
 type mockCall struct {
@@ -214,6 +213,16 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	}
 	if v, ok := res["boot_epoch"].(int64); ok && v >= 0 && v <= math.MaxUint32 {
 		h.BootEpoch = uint32(v)
+	}
+	// v6 ring (B12-P2 T6): strings in wire order; absent key leaves the
+	// non-nil empty slice (T4's normalization)
+	h.ResetHistory = []string{}
+	if rh, ok := res["reset_history"].([]any); ok {
+		for _, v := range rh {
+			if s, ok := v.(string); ok {
+				h.ResetHistory = append(h.ResetHistory, s)
+			}
+		}
 	}
 	if h.ResetReason == "" {
 		h.ResetReason = h.Reset
@@ -2021,13 +2030,12 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // single-source test below fails when the table, the hOp refusal's
 // rendered list, or either MCP description (pinned separately in
 // internal/mcp) drifts from it. diag.i2cslave joined with b7 — the
-// driver-pipeline loopback's on-board fixture toggle; camera.capture/
-// status/off joined with b9 (the camera face — capture's 0x02 stream
-// is consumed by the dedicated camera_shot request; through op it
-// returns the metadata reply and the stream is dropped daemon-side).
+// driver-pipeline loopback's on-board fixture toggle; the camera trio
+// left with the camera face's retirement (B12-P2 T6: the fw keeps its
+// camera ops, the daemon no longer forwards them).
 var opsFaceAllowlistV1 = []string{
-	"budget.get", "budget.set", "camera.capture", "camera.off",
-	"camera.status", "caps", "diag.heapinfo", "diag.i2cslave",
+	"budget.get", "budget.set",
+	"caps", "diag.heapinfo", "diag.i2cslave",
 	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup",
 	"wifi.status",
 }
@@ -2110,250 +2118,258 @@ func TestOpDiagI2CSlaveForwarded(t *testing.T) {
 	}
 }
 
-// scriptCamera wires the fake's camera.capture: two SOI/EOI frames
-// streamed as ch=1 two-chunk sequences through the connection's
-// registered sink BEFORE the reply (the fw's frames-then-reply order).
-// gap drops frame 0's second chunk — a daemon-side reassembly loss the
-// board's reply cannot know about (it still reports frames=2).
-func scriptCamera(f *fakeCtl, gap bool) {
-	frames := [][]byte{
-		{0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9},
-		{0xFF, 0xD8, 4, 5, 6, 7, 0xFF, 0xD9},
+// rebootEventOf reads the watcher's next push as a board.reboot event
+// and returns its data map (the synthesis tests' shared reader).
+func rebootEventOf(t *testing.T, w *sockClient) map[string]any {
+	t.Helper()
+	ev := w.recv()
+	if asStr(ev["type"]) != "event" || asStr(ev["board"]) != "d75884" {
+		t.Fatalf("event push = %#v, want a d75884 event", ev)
 	}
-	f.on("camera.capture", func(args map[string]any) (map[string]any, *replclient.OpError) {
-		sink := f.sinkSnapshot()
-		total := int64(0)
-		for i, fr := range frames {
-			half := len(fr) / 2
-			sink(1, uint32(7+i), 0, 2, fr[:half])
-			if !(gap && i == 0) {
-				sink(1, uint32(7+i), 1, 2, fr[half:])
-			}
-			total += int64(len(fr))
+	inner := asMap(ev["event"])
+	if asStr(inner["source"]) != "board" {
+		t.Fatalf("event source = %#v, want board", inner)
+	}
+	data := asMap(inner["data"])
+	if asStr(data["kind"]) != "board.reboot" {
+		t.Fatalf("event kind = %#v, want board.reboot", data)
+	}
+	return data
+}
+
+// reasonsOf reads data["reasons"] as a string slice, failing when the
+// key is absent (callers that want absence check the key themselves).
+func reasonsOf(t *testing.T, data map[string]any) []string {
+	t.Helper()
+	raw, ok := data["reasons"].([]any)
+	if !ok {
+		t.Fatalf("reasons = %#v, want an array", data["reasons"])
+	}
+	out := make([]string, len(raw))
+	for i, v := range raw {
+		out[i] = asStr(v)
+	}
+	return out
+}
+
+// usbOnlyBoard keeps the startup audit away: the audit only touches
+// mDNS boards WITH a host, and the env's fake discovery sources merge
+// mdns+host back onto every entry — so the lever that actually holds
+// is the empty Host. The boot-identity tests need a clean daemon-side
+// bootSeen, and the audit's own tap would silently baseline epoch 0
+// under them the moment Start races ahead.
+func usbOnlyBoard(mac6, host string) discover.Board {
+	b := mkBoard(mac6, host)
+	b.Host = ""
+	return b
+}
+
+// TestBoardRebootReasonsSynthesis (B12-P2 T6): an epoch delta > 1
+// loses the intermediate boots' causes unless the event carries them —
+// the board.reboot synthesis reads the fw's v6 reset_history ring
+// (HelloInfo.ResetHistory, wire order oldest→newest, its final entry
+// this boot's reason): delta > 1 → reasons = the history's tail delta
+// entries (oldest→newest, the last == reset_reason), capped at the
+// ring's 8 with reasons_partial flagging the cut; delta ≤ 1 or an
+// empty history (pre-v6 fw, T4's non-nil-empty normalization) → the
+// reasons key is absent, honestly. Each changed-epoch sighting pair
+// fires exactly ONE board.reboot. The sightings are driven straight
+// into noteBootSighting (the tap hello's landing point — the test
+// env's dial seam hands every dial the same fake pointer, so a second
+// tap never re-hellos; the synthesis under test is this function's).
+func TestBoardRebootReasonsSynthesis(t *testing.T) {
+	sight := func(e *env, b discover.Board, epoch uint32, reason string, history []string) {
+		t.Helper()
+		db := e.srv.supervisor(b)
+		e.srv.noteBootSighting(b.MAC6, db, &replclient.HelloInfo{
+			ProtocolVer: 6, FwBuild: "dcaa9ae", FwVersion: "0.2.0",
+			BootEpoch: epoch, ResetReason: reason, ResetHistory: history,
+		})
+	}
+	// hWatchEvents itself warms the controller and taps it — the
+	// watch's reply landing means the tap hello (the fake's default:
+	// no boot_epoch → baseline epoch 0) has already sighted. Each
+	// subtest's single sight() then fires 0→N, delta = N, with the
+	// watcher guaranteed subscribed before the event.
+	watch := func(t *testing.T, e *env) *sockClient {
+		t.Helper()
+		w := dialSock(t, e.sock)
+		rep, _ := w.call(1, map[string]any{"type": "watch_events", "board": "d75884"})
+		if asMap(rep["error"]) != nil {
+			t.Fatalf("watch: %#v", rep)
 		}
-		return map[string]any{
-			"frames": int64(2), "bytes": total, "w": int64(640), "h": int64(480),
-			"format": "JPEG", "sensor": "GC2145", "seq0": int64(7),
-		}, nil
+		return w
+	}
+
+	t.Run("delta 3 tail", func(t *testing.T) {
+		b := usbOnlyBoard("d75884", "xuansi-d75884.local")
+		e := newEnv(t, nil, b)
+		w := watch(t, e)
+		sight(e, b, 3, "usb", []string{"power-on", "usb", "software", "panic", "usb"})
+		data := rebootEventOf(t, w)
+		if asInt(data["prev_epoch"]) != 0 || asInt(data["new_epoch"]) != 3 {
+			t.Fatalf("epoch pair = %v→%v, want 0→3", data["prev_epoch"], data["new_epoch"])
+		}
+		if asStr(data["reset_reason"]) != "usb" {
+			t.Fatalf("reset_reason = %q, want usb (the last boot's cause)", data["reset_reason"])
+		}
+		got := reasonsOf(t, data)
+		want := []string{"software", "panic", "usb"} // the tail 3, oldest→newest
+		if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+			t.Fatalf("reasons = %v, want %v (tail delta entries, oldest→newest)", got, want)
+		}
+		if _, ok := data["reasons_partial"]; ok {
+			t.Fatalf("reasons_partial = %#v, want absent (delta 3 ≤ the ring's 8)", data["reasons_partial"])
+		}
+		if _, ok := data["gap_ms"]; !ok {
+			t.Fatal("gap_ms missing from the reboot event")
+		}
+		w.recvNone() // one reboot, one event — nothing else fired
+	})
+
+	t.Run("delta 1 no reasons", func(t *testing.T) {
+		b := usbOnlyBoard("d75884", "xuansi-d75884.local")
+		e := newEnv(t, nil, b)
+		w := watch(t, e)
+		sight(e, b, 1, "power-on", []string{"usb", "power-on"})
+		data := rebootEventOf(t, w)
+		if asInt(data["new_epoch"]) != 1 {
+			t.Fatalf("new_epoch = %v, want 1", data["new_epoch"])
+		}
+		if _, ok := data["reasons"]; ok {
+			t.Fatalf("reasons = %v, want the key absent (delta 1: no lost intermediate to recover)", data["reasons"])
+		}
+		if _, ok := data["reasons_partial"]; ok {
+			t.Fatalf("reasons_partial = %#v, want absent with reasons", data["reasons_partial"])
+		}
+	})
+
+	t.Run("delta 10 partial eight", func(t *testing.T) {
+		b := usbOnlyBoard("d75884", "xuansi-d75884.local")
+		e := newEnv(t, nil, b)
+		w := watch(t, e)
+		hist := []string{"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"} // the fw ring is last-8
+		sight(e, b, 10, "r8", hist)
+		data := rebootEventOf(t, w)
+		got := reasonsOf(t, data)
+		if len(got) != 8 {
+			t.Fatalf("reasons = %d entries, want the ring's full 8", len(got))
+		}
+		for i, r := range hist {
+			if got[i] != r {
+				t.Fatalf("reasons = %v, want %v (all 8, oldest→newest)", got, hist)
+			}
+		}
+		if partial, ok := data["reasons_partial"].(bool); !ok || !partial {
+			t.Fatalf("reasons_partial = %#v, want true (delta 10 > the 8 the ring kept)", data["reasons_partial"])
+		}
+	})
+
+	t.Run("old fw empty history", func(t *testing.T) {
+		b := usbOnlyBoard("d75884", "xuansi-d75884.local")
+		e := newEnv(t, nil, b)
+		w := watch(t, e)
+		sight(e, b, 3, "usb", []string{}) // pre-v6 fw: T4 normalizes the absent key to non-nil empty
+		data := rebootEventOf(t, w)
+		if _, ok := data["reasons"]; ok {
+			t.Fatalf("reasons = %v, want the key absent (no history to read)", data["reasons"])
+		}
+		if _, ok := data["reasons_partial"]; ok {
+			t.Fatalf("reasons_partial = %#v, want absent with reasons", data["reasons_partial"])
+		}
+		if asStr(data["reset_reason"]) != "usb" {
+			t.Fatalf("reset_reason = %q, want usb (the last boot's cause still crosses)", data["reset_reason"])
+		}
 	})
 }
 
-// TestCameraShotLandsFiles: the dedicated camera_shot request — lease
-// gate, args shaping, per-frame JPEG landing under the captures root
-// (O_EXCL-unique <epoch>-<mac6>-camera[-N].jpg, one file per frame,
-// sha256/bytes/w/h per file), and the gap path: a lost chunk drops its
-// frame from files and counts in gaps while the call still succeeds.
-func TestCameraShotLandsFiles(t *testing.T) {
+// TestCameraShotRequestRetired (B12-P2 T6): the camera_shot request
+// type is gone from the internal API — a client sending one gets the
+// generic unknown-type refusal (server class) and the board is never
+// contacted.
+func TestCameraShotRequestRetired(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
-	e.srv.mu.Lock()
-	e.srv.captureRoot = t.TempDir()
-	e.srv.mu.Unlock()
 	c := dialSock(t, e.sock)
 
-	// the lease gate applies — camera.capture is not ro
 	rep, _ := c.call(1, map[string]any{"type": "camera_shot", "board": "d75884"})
 	er := errOf(t, rep)
-	if asStr(er["class"]) != "not_held" {
-		t.Fatalf("no-lease class = %q, want not_held (%#v)", er["class"], er)
-	}
-
-	// daemon-side validation, before any board contact
-	rep, _ = c.call(2, map[string]any{"type": "camera_shot", "board": "d75884", "framesize": "SVGA"})
-	er = errOf(t, rep)
-	if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "QVGA") || !strings.Contains(asStr(er["msg"]), "VGA") {
-		t.Fatalf("bad framesize = %s: %q, want api naming QVGA and VGA", er["class"], asStr(er["msg"]))
-	}
-	rep, _ = c.call(3, map[string]any{"type": "camera_shot", "board": "d75884", "frames": float64(5)})
-	er = errOf(t, rep)
-	if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "1..4") {
-		t.Fatalf("bad frames = %s: %q, want api naming the 1..4 range", er["class"], asStr(er["msg"]))
+	if asStr(er["class"]) != "server" || !strings.Contains(asStr(er["msg"]), "unknown request type") {
+		t.Fatalf("retired camera_shot = %s: %q, want the server unknown-type refusal", asStr(er["class"]), asStr(er["msg"]))
 	}
 	for _, call := range e.fakes["d75884"].got() {
 		if call.op == "camera.capture" {
-			t.Fatal("a refused camera_shot reached the board")
+			t.Fatal("a retired camera_shot reached the board")
 		}
-	}
-
-	rep, _ = c.call(4, map[string]any{"type": "lease", "board": "d75884", "holder": "camshot"})
-	if asMap(rep["error"]) != nil {
-		t.Fatalf("lease: %#v", rep)
-	}
-
-	scriptCamera(e.fakes["d75884"], false)
-	rep, _ = c.call(5, map[string]any{"type": "camera_shot", "board": "d75884", "frames": float64(2), "framesize": "VGA"})
-	res := asMap(rep["result"])
-	if res == nil {
-		t.Fatalf("camera_shot: %#v", rep)
-	}
-	files, _ := res["files"].([]any)
-	if len(files) != 2 {
-		t.Fatalf("files = %d entries, want 2 (%#v)", len(files), res)
-	}
-	if g := asInt(res["gaps"]); g != 0 {
-		t.Fatalf("gaps = %d, want 0", g)
-	}
-	if s := asStr(res["sensor"]); s != "GC2145" {
-		t.Fatalf("sensor = %q, want GC2145", s)
-	}
-	wantBody := [][]byte{
-		{0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9},
-		{0xFF, 0xD8, 4, 5, 6, 7, 0xFF, 0xD9},
-	}
-	root := ""
-	e.srv.mu.Lock()
-	root = e.srv.captureRoot
-	e.srv.mu.Unlock()
-	for i, fe := range files {
-		fm, _ := fe.(map[string]any)
-		path := asStr(fm["path"])
-		wantName := fmt.Sprintf("%d-d75884-camera-%d.jpg", time.Now().Unix(), i+1)
-		if filepath.Base(path) != wantName {
-			t.Fatalf("file[%d] name = %q, want %q", i, filepath.Base(path), wantName)
-		}
-		if !strings.HasPrefix(path, root) {
-			t.Fatalf("file[%d] outside the captures root: %q (root %q)", i, path, root)
-		}
-		body, rerr := os.ReadFile(path)
-		if rerr != nil {
-			t.Fatalf("file[%d] read: %v", i, rerr)
-		}
-		if !bytes.Equal(body, wantBody[i]) {
-			t.Fatalf("file[%d] body = %v, want %v", i, body, wantBody[i])
-		}
-		sum := sha256.Sum256(wantBody[i])
-		if asStr(fm["sha256"]) != fmt.Sprintf("%x", sum) {
-			t.Fatalf("file[%d] sha256 = %q, want %x", i, asStr(fm["sha256"]), sum)
-		}
-		if asInt(fm["bytes"]) != int64(len(wantBody[i])) || asInt(fm["w"]) != 640 || asInt(fm["h"]) != 480 {
-			t.Fatalf("file[%d] bytes/w/h = %d/%d/%d", i, asInt(fm["bytes"]), asInt(fm["w"]), asInt(fm["h"]))
-		}
-	}
-
-	// args crossed as msgpack ints / verbatim strings
-	var camArgs map[string]any
-	for _, call := range e.fakes["d75884"].got() {
-		if call.op == "camera.capture" {
-			camArgs = call.args
-		}
-	}
-	if camArgs == nil {
-		t.Fatal("camera.capture never reached the board")
-	}
-	if v, ok := camArgs["frames"].(int64); !ok || v != 2 {
-		t.Fatalf("args[frames] = %#v, want int64 2", camArgs["frames"])
-	}
-	if v, _ := camArgs["framesize"].(string); v != "VGA" {
-		t.Fatalf("args[framesize] = %#v, want VGA", camArgs["framesize"])
-	}
-
-	// the gap path: frame 0's chunk loss drops that file, counts once,
-	// and the call still succeeds with what landed
-	scriptCamera(e.fakes["d75884"], true)
-	rep, _ = c.call(6, map[string]any{"type": "camera_shot", "board": "d75884"})
-	res = asMap(rep["result"])
-	if res == nil {
-		t.Fatalf("gap camera_shot: %#v", rep)
-	}
-	files, _ = res["files"].([]any)
-	if len(files) != 1 || asInt(res["gaps"]) != 1 {
-		t.Fatalf("gap path: %d files, gaps=%d, want 1 and 1", len(files), asInt(res["gaps"]))
-	}
-	fm, _ := files[0].(map[string]any)
-	body, _ := os.ReadFile(asStr(fm["path"]))
-	if !bytes.Equal(body, wantBody[1]) {
-		t.Fatalf("gap path landed frame = %v, want the intact frame 1", body)
 	}
 }
 
-// TestCameraShotRedialsDeadLink: a dead link under the warm controller
-// costs nothing — the next camera_shot redials (fresh TCP, no reboot),
-// and the retried call's stream sink lands on the FRESH connection
-// before its op (the per-connection sink ruling; a redial's fresh link
-// starts with no sink).
-func TestCameraShotRedialsDeadLink(t *testing.T) {
-	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
-	e.srv.mu.Lock()
-	e.srv.captureRoot = t.TempDir()
-	e.srv.mu.Unlock()
+// TestBoardViewBootIdentity (B12-P2 T6): list_boards/board_status
+// carry the board's boot identity — boot_epoch/reset_reason from the
+// daemon's last hello sighting (the registry's enriched view, where
+// fw/fw_version already live) and last_seen, the daemon's most recent
+// protocol crossing (the tap hello, then every op reply). Before any
+// crossing all three are absent — honest, there is nothing to report.
+func TestBoardViewBootIdentity(t *testing.T) {
+	b := usbOnlyBoard("d75884", "xuansi-d75884.local")
+	e := newEnv(t, nil, b)
 	c := dialSock(t, e.sock)
 
-	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "camredial"})
+	// pre-crossing: no boot fields on an untouched board
+	rep, _ := c.call(1, map[string]any{"type": "list_boards"})
+	boards, _ := asMap(rep["result"])["boards"].([]any)
+	if len(boards) != 1 {
+		t.Fatalf("boards = %#v, want the one board", rep["result"])
+	}
+	b0, _ := boards[0].(map[string]any)
+	for _, k := range []string{"boot_epoch", "reset_reason", "last_seen"} {
+		if _, ok := b0[k]; ok {
+			t.Fatalf("pre-crossing board view carries %q = %#v, want honest absence", k, b0[k])
+		}
+	}
+
+	// a v6 hello crossing lands the identity: the tap hello enriches
+	// the registry AND sights the boot
+	e.fakes["d75884"].on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{
+			"protocol_ver": int64(6), "role": "controller", "fw": "xuansi-fw v0.2.0",
+			"fw_build": "dcaa9ae", "fw_version": "0.2.0", "fs": true,
+			"boot_epoch": int64(8), "reset_reason": "usb",
+			"reset_history": []any{"power-on", "usb"},
+		}, nil
+	})
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "bootid"})
 	if asMap(rep["error"]) != nil {
 		t.Fatalf("lease: %#v", rep)
 	}
-	scriptCamera(e.fakes["d75884"], false)
-	rep, _ = c.call(2, map[string]any{"type": "camera_shot", "board": "d75884"})
-	if asMap(rep["result"]) == nil {
-		t.Fatalf("warm-up camera_shot: %#v", rep)
-	}
-	if e.dialed["d75884"] != 1 {
-		t.Fatalf("dials = %d, want 1 before the death", e.dialed["d75884"])
-	}
-
-	// the link dies; a FRESH fake answers the redial with a working
-	// camera (the sink must register on IT, not the corpse)
-	fresh := newFakeCtl()
-	scriptCamera(fresh, false)
-	e.fakes["d75884"].markDead()
-	e.dmu.Lock()
-	e.fakes["d75884"] = fresh
-	e.dmu.Unlock()
-
-	rep, _ = c.call(3, map[string]any{"type": "camera_shot", "board": "d75884"})
-	res := asMap(rep["result"])
-	if res == nil {
-		t.Fatalf("post-death camera_shot: %#v", rep)
-	}
-	files, _ := res["files"].([]any)
-	if len(files) != 2 || asInt(res["gaps"]) != 0 {
-		t.Fatalf("post-death files=%d gaps=%d, want 2 and 0 (the fresh link's stream consumed)", len(files), asInt(res["gaps"]))
-	}
-	if e.dialed["d75884"] != 2 {
-		t.Fatalf("dials = %d, want exactly one redial", e.dialed["d75884"])
-	}
-}
-
-// TestOpCameraCaptureForwarded: camera.capture crosses the ops face
-// like every allowlisted op — uniform lease gate, args through the
-// shared walk — under the camera mutex hold (its 0x02 chunks ride the
-// warm connection with no sink registered on this path, so nothing
-// lands and nothing interleaves; the board's metadata reply is the
-// result). The mutex is the b9-review minor-4 hardening: a concurrent
-// camera_shot must never share its connection with op-path chunks.
-func TestOpCameraCaptureForwarded(t *testing.T) {
-	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
-	c := dialSock(t, e.sock)
-
-	rep, _ := c.call(1, map[string]any{"type": "op", "board": "d75884", "op": "camera.capture"})
-	er := errOf(t, rep)
-	if asStr(er["class"]) != "not_held" {
-		t.Fatalf("no-lease class = %q, want not_held (%#v)", er["class"], er)
-	}
-
-	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "camop"})
+	crossed := time.Now()
+	rep, _ = c.call(3, map[string]any{"type": "op", "board": "d75884", "op": "wifi.status"})
 	if asMap(rep["error"]) != nil {
-		t.Fatalf("lease: %#v", rep)
+		t.Fatalf("op wifi.status: %#v", rep)
 	}
 
-	var gotFrames any
-	e.fakes["d75884"].on("camera.capture", func(args map[string]any) (map[string]any, *replclient.OpError) {
-		gotFrames = args["frames"]
-		return map[string]any{"frames": args["frames"], "bytes": int64(1234), "w": int64(640), "h": int64(480), "sensor": "GC2145"}, nil
-	})
-	rep, _ = c.call(3, map[string]any{
-		"type": "op", "board": "d75884", "op": "camera.capture",
-		"args": map[string]any{"frames": float64(2)},
-	})
-	if asMap(rep["error"]) != nil {
-		t.Fatalf("op camera.capture: %#v", rep)
+	checkView := func(view map[string]any, label string) {
+		t.Helper()
+		if asInt(view["boot_epoch"]) != 8 {
+			t.Fatalf("%s boot_epoch = %#v, want 8 (the sighting's epoch)", label, view["boot_epoch"])
+		}
+		if asStr(view["reset_reason"]) != "usb" {
+			t.Fatalf("%s reset_reason = %q, want usb", label, view["reset_reason"])
+		}
+		seen, perr := time.Parse(time.RFC3339, asStr(view["last_seen"]))
+		if perr != nil {
+			t.Fatalf("%s last_seen = %q, not RFC3339: %v", label, view["last_seen"], perr)
+		}
+		if seen.Before(crossed.Add(-2*time.Second)) || time.Now().Before(seen) {
+			t.Fatalf("%s last_seen = %v, want a timestamp at the crossing (±clock skew)", label, seen)
+		}
 	}
-	if v, ok := gotFrames.(int64); !ok || v != 2 {
-		t.Fatalf("args[frames] crossed as %#v, want int64 2", gotFrames)
-	}
-	res := asMap(rep["result"])
-	if asStr(res["sensor"]) != "GC2145" || asInt(res["frames"]) != 2 {
-		t.Fatalf("camera.capture result = %#v, want the board's metadata reply", rep["result"])
-	}
+	rep, _ = c.call(4, map[string]any{"type": "list_boards"})
+	boards, _ = asMap(rep["result"])["boards"].([]any)
+	b0, _ = boards[0].(map[string]any)
+	checkView(b0, "list_boards")
+
+	rep, _ = c.call(5, map[string]any{"type": "board_status", "board": "d75884"})
+	checkView(asMap(asMap(rep["result"])["board"]), "board_status")
 }
 
 // TestOutboundQueueEvictionPolicy pins the delivery policy on one

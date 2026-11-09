@@ -38,14 +38,6 @@ var OpTimeouts = map[string]time.Duration{
 	"submit": 5 * time.Second, // ack only; the result comes as a job event
 
 	"script.*": 5 * time.Second,
-
-	// camera.capture (B10-T8 fix round): the in-op framesize switch now
-	// carries the full off→settle(1s)→prewarm(2s)→init cycle + up to
-	// frames=4 software-JPEG encodes (~0.75s each at VGA) — the measured
-	// switch-burst worst case is ~5.3s (b9 attempt log: QVGA→VGA switch
-	// + 2×VGA encode), over the old default 5s. 12s bounds it with the
-	// 4-frame margin. First-shot latency unchanged (~3.2s, well under).
-	"camera.capture": 12 * time.Second,
 }
 
 // defaultOpTimeout bounds any op not named in OpTimeouts (diag.* and

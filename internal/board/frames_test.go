@@ -198,6 +198,25 @@ func TestFrameCollectorTotalDisagreementAbandons(t *testing.T) {
 	}
 }
 
+// TestFrameCollectorOutOfRangeIdxAbandons (T5 review minor ①): the one
+// emitter-contract defense the completion path lacked — a chunk whose
+// idx is at or beyond the sequence's total can never be part of the
+// frame (its bucket would otherwise satisfy the have==total completion
+// check with an in-range chunk still missing, assembling a holey
+// frame). Both arrival shapes abandon exactly once: out-of-range on a
+// FRESH bucket and on an in-flight one (ch=1: unstamped, so the
+// idx/total contract is the only thing under test).
+func TestFrameCollectorOutOfRangeIdxAbandons(t *testing.T) {
+	c := NewFrameCollector()
+	c.Sink(1, 1, 1, 1, []byte("x")) // fresh bucket: first chunk already idx ≥ total
+	c.Sink(1, 2, 0, 2, []byte("a")) // in-flight bucket: idx 0 of 2 buffers fine
+	c.Sink(1, 2, 2, 2, []byte("c")) // then idx 2 arrives — beyond total 2
+	snap := c.Drain()
+	if len(snap.Frames) != 0 || snap.Dropped != 2 {
+		t.Fatalf("snap = %+v, want no frames and two drops (each out-of-range sequence abandoned exactly once)", snap)
+	}
+}
+
 // TestFrameCollectorSnapshotCountsOpenTails: a still-open sequence at
 // snapshot time can no longer complete (on the ordered stream its
 // remaining chunks would have preceded the reply) — counted lost.

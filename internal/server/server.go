@@ -200,10 +200,6 @@ type daemonBoard struct {
 	// identity — production dynamic types are pointers, comparable). A
 	// redial swaps the controller; the next server-side touch re-taps.
 	tapped board.Controller
-	// cameraMu serializes camera_shot calls per board (capture.go):
-	// two concurrent captures would interleave their ch=1 stream
-	// chunks into each other's collectors on the shared warm link.
-	cameraMu sync.Mutex
 	// frames is the board's 0x02 consumer fan-out (B12-P2 T5): the
 	// connection's sink slot is single, so the per-call collectors of
 	// overlapping eval windows and the pending-job buffer below all
@@ -221,10 +217,14 @@ type daemonBoard struct {
 	// a CHANGED boot_epoch on the next sighting means the board
 	// rebooted while we were not connected (panic auto-reboot included
 	// — epoch change is epoch change regardless of cause) → the
-	// board.reboot event. Guarded by the Server mu (like tapped).
-	// In-memory only (v1 ruling): a daemon restart re-baselines
-	// silently — first sighting after restart never fires.
+	// board.reboot event. lastSeen (B12-P2 T6) is the daemon's most
+	// recent protocol crossing with the board (hello sighting or op
+	// reply) — list_boards/board_status's last_seen. Both guarded by
+	// the Server mu (like tapped), in-memory only (v1 ruling): a
+	// daemon restart re-baselines silently — first sighting after
+	// restart never fires.
 	bootSeen *bootSight
+	lastSeen time.Time
 }
 
 // bootSight is one hello sighting's boot identity (B10-T8b): the fw's
@@ -1033,8 +1033,6 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hCaptureStart(ctx, cc, req)
 	case "capture_stop":
 		result, err = s.hCaptureStop(req)
-	case "camera_shot":
-		result, err = s.hCameraShot(ctx, cc, req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1090,8 +1088,14 @@ func (s *Server) resolve(selector string) (discover.Board, *RPCError) {
 	return b, nil
 }
 
-// boardView renders one registry entry for list/status replies.
-func boardView(b discover.Board) map[string]any {
+// boardView renders one registry entry for list/status replies. The
+// boot-identity fields (B12-P2 T6) ride the same enriched hello the
+// fw/fw_version pair does — boot_epoch/reset_reason appear once the
+// daemon has sighted the board, absent before (honest: nothing to
+// report), epoch 0 = pre-b9 fw without the counter. last_seen is the
+// daemon's most recent protocol crossing (tap hello or op reply),
+// from the daemon-side board state.
+func (s *Server) boardView(b discover.Board) map[string]any {
 	v := map[string]any{
 		"mac6":     b.MAC6,
 		"alias":    b.Alias,
@@ -1105,9 +1109,21 @@ func boardView(b discover.Board) map[string]any {
 	if b.Hello != nil {
 		fw = b.Hello.FwBuild
 		fwVer = b.Hello.FwVersion // B10-T8c: semver beside the build id (esp_app_desc face)
+		v["boot_epoch"] = int64(b.Hello.BootEpoch)
+		v["reset_reason"] = b.Hello.ResetReason
 	}
 	v["fw"] = fw
 	v["fw_version"] = fwVer
+	s.mu.Lock()
+	db := s.sups[b.MAC6]
+	var last time.Time
+	if db != nil {
+		last = db.lastSeen
+	}
+	s.mu.Unlock()
+	if !last.IsZero() {
+		v["last_seen"] = last.UTC().Format(time.RFC3339)
+	}
 	return v
 }
 
@@ -1115,7 +1131,7 @@ func (s *Server) hListBoards() (any, error) {
 	boards := s.reg.Snapshot()
 	out := make([]any, 0, len(boards))
 	for _, b := range boards {
-		out = append(out, boardView(b))
+		out = append(out, s.boardView(b))
 	}
 	return map[string]any{"boards": out, "mdns_error": s.reg.MDNSError()}, nil
 }
@@ -1125,7 +1141,7 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	res := map[string]any{"board": boardView(b), "connected": false, "lease": nil}
+	res := map[string]any{"board": s.boardView(b), "connected": false, "lease": nil}
 
 	var db *daemonBoard
 	s.mu.Lock()
@@ -1414,15 +1430,13 @@ func validateArgsPath(prefix string, v any, path string) (any, *RPCError) {
 // narrow — the bench surface batch 6's MCP agents need (budget, wifi,
 // log, caps, diagnostics) plus diag.i2cslave, the board's internal
 // I2C echo-slave loopback fixture toggle ({mode:-1..1} = status/off/
-// on) the b7 driver-pipeline loopback rides, plus the camera face's
-// camera.capture/status/off (b9 — capture via op returns the board's
-// metadata reply while its 0x02 stream is dropped daemon-side;
-// camera_shot is the stream-consuming path). eval/submit/fs.*/
-// script.*/session.* have their own request types and are NOT
-// reachable through op; every other diag.* stays internal.
+// on) the b7 driver-pipeline loopback rides. The fw's stills trio
+// left with the stills face's retirement (B12-P2 T6): still on the
+// board, no longer forwarded. eval/submit/fs.*/script.*/session.*
+// have their own request types and are NOT reachable through op;
+// every other diag.* stays internal.
 var opAllowlist = map[string]bool{
 	"budget.get": true, "budget.set": true,
-	"camera.capture": true, "camera.status": true, "camera.off": true,
 	"wifi.status": true, "wifi.setup": true, "wifi.off": true,
 	"log.read":  true,
 	"caps":      true,
@@ -1513,17 +1527,6 @@ func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, er
 			out["event_ms"] = v
 		}
 		return out, nil
-	}
-	// camera.capture via op drops its 0x02 stream daemon-side (no sink
-	// on this path) — but its chunks still ride the SAME warm connection
-	// a concurrent camera_shot is reassembling from. Hold the board's
-	// camera mutex so the documented "frames are DROPPED" claim holds
-	// unconditionally, never just when no capture happens to be in
-	// flight (b9 review minor 4).
-	if req.Op == "camera.capture" {
-		db := s.supervisor(b)
-		db.cameraMu.Lock()
-		defer db.cameraMu.Unlock()
 	}
 	return s.boardOp(ctx, b, req.Op, args)
 }
@@ -1691,11 +1694,11 @@ func (s *Server) hFsRm(ctx context.Context, cc *clientConn, req *Request) (any, 
 // The lease itself is untouched (its teardown keeps its own sweep).
 // Negative sessions are refused daemon-side (whole-branch final
 // review, Critical): -1 is the board's INTERNAL op-face pin sentinel
-// (XS_PIN_SESSION_OPFACE — the camera's 14 slots), never a user
-// namespace; crossing it would sweep those slots while the camera
-// stays logically active, reopening dual-drive. The fw refuses it too
-// (belt on both sides); refusing here keeps the daemon from ever
-// putting the request on the wire.
+// (XS_PIN_SESSION_OPFACE — the on-board device face's 14 slots), never
+// a user namespace; crossing it would sweep those slots while the
+// device stays logically active, reopening dual-drive. The fw refuses
+// it too (belt on both sides); refusing here keeps the daemon from
+// ever putting the request on the wire.
 func (s *Server) hSessionReset(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -1938,6 +1941,7 @@ func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.He
 	s.mu.Lock()
 	prev := db.bootSeen
 	db.bootSeen = &bootSight{epoch: h.BootEpoch, fwBuild: h.FwBuild, fwVersion: h.FwVersion, at: now}
+	db.lastSeen = now
 	s.mu.Unlock()
 	if prev == nil || prev.epoch == h.BootEpoch {
 		return
@@ -1958,9 +1962,45 @@ func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.He
 		data["fw_version_prev"] = prev.fwVersion
 		data["fw_version"] = h.FwVersion
 	}
+	// reasons (B12-P2 T6): an epoch delta > 1 means boots whose causes
+	// the single reset_reason cannot carry — the v6 fw's NVS last-8
+	// ring (hello reset_history, oldest→newest, its final entry this
+	// boot's reason) fills them in: the history's TAIL delta entries,
+	// oldest→newest, so reasons[last] == reset_reason always. Capped
+	// at 8 (the ring's depth; a shorter-than-delta ring means the same
+	// thing) with reasons_partial flagging the cut. delta ≤ 1 or an
+	// empty ring (pre-v6 fw): the key stays absent, honestly.
+	if delta := int64(h.BootEpoch) - int64(prev.epoch); delta > 1 && len(h.ResetHistory) > 0 {
+		n := delta
+		if n > int64(len(h.ResetHistory)) {
+			n = int64(len(h.ResetHistory))
+		}
+		if n > 8 {
+			n = 8
+		}
+		reasons := make([]string, n)
+		copy(reasons, h.ResetHistory[int64(len(h.ResetHistory))-n:])
+		data["reasons"] = reasons
+		if n < delta {
+			data["reasons_partial"] = true
+		}
+	}
 	s.logf("server: board %s rebooted (boot_epoch %d → %d, reset=%s, gap=%dms) — board.reboot event",
 		mac6, prev.epoch, h.BootEpoch, h.ResetReason, now.Sub(prev.at).Milliseconds())
 	s.broadcast(mac6, replclient.Event{Source: "board", Data: data})
+}
+
+// noteBoardContact records the daemon's most recent protocol crossing
+// (a successful op reply) on the board's daemon-side state — the
+// last_seen field's op leg (noteBootSighting carries the hello leg).
+// Read-only lookup: a board with no supervisor entry has never been
+// crossed, so there is nothing to record.
+func (s *Server) noteBoardContact(mac6 string) {
+	s.mu.Lock()
+	if db, ok := s.sups[mac6]; ok {
+		db.lastSeen = time.Now()
+	}
+	s.mu.Unlock()
 }
 
 // broadcast fans one board event out to the board's watchers.
@@ -1994,12 +2034,9 @@ func (s *Server) boardOp(ctx context.Context, b discover.Board, op string, args 
 // non-nil collector rides the hub for exactly the call, RESET between
 // attempts: the redial retry re-executes the op board-side, and the
 // dead attempt's partial sequences must not graft onto the retry's
-// frames (a nondeterministic payload — a camera shot — would
-// reassemble corrupt otherwise). Pre-v6 transitional note: the camera
-// path (capture.go) still installs its own per-call sink the old way;
-// an eval issued while a capture is mid-flight displaces its
-// collector (the capture honestly counts the loss as gaps). The camera
-// face retires in T6, taking the last non-hub consumer with it.
+// frames (a nondeterministic payload would reassemble corrupt
+// otherwise). A successful reply is a protocol crossing — the board's
+// last_seen advances (B12-P2 T6).
 func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string, args map[string]any, db *daemonBoard, col *board.FrameCollector) (map[string]any, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -2015,6 +2052,7 @@ func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string,
 		}
 		res, err := ctl.Op(ctx, op, args)
 		if err == nil {
+			s.noteBoardContact(b.MAC6)
 			return res, nil
 		}
 		lastErr = err
@@ -2045,6 +2083,7 @@ func (s *Server) withController(ctx context.Context, b discover.Board, fn func(c
 		}
 		err = fn(ctl)
 		if err == nil {
+			s.noteBoardContact(b.MAC6)
 			return nil
 		}
 		lastErr = err

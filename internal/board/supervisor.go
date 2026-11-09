@@ -75,8 +75,9 @@ type Controller interface {
 	// OnStream installs this connection's 0x02 data-frame sink (nil
 	// drops them). Set-only and PER-CONNECTION: a redial's fresh
 	// connection starts with no sink — every consumer registers its
-	// own on the connection it is about to use (camera.go does, once
-	// per call, so a redial retry re-registers on the new link).
+	// own on the connection it is about to use (the board's frame hub
+	// is asserted around each streaming op, so a redial retry
+	// re-asserts it on the new link).
 	OnStream(sink replclient.StreamSink)
 }
 
