@@ -9,7 +9,9 @@ package mcp
 // server.Request each tool actually sends.
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -676,4 +678,115 @@ func TestFsWriteInvalidBase64RefusedLocally(t *testing.T) {
 		}
 	}
 	noContact(t, reqs)
+}
+
+// ---------------------------------------------------------------------------
+// budget_ms domain validation + frames decode on the static eval face
+// (B12-P2 T5): out-of-domain budgets are refused client-side with zero
+// daemon contact; valid budgets forward on server.Request.BudgetMs;
+// eval replies' frames/frames_dropped decode into the typed out.
+// ---------------------------------------------------------------------------
+
+// TestRunLuaBudgetMsDomainAndForward: budget_ms is validated on the MCP
+// face (1..30000, the board's own wire domain; anything else —
+// negative, over-domain — is refused BEFORE any daemon contact, so the
+// int-wrap corner T4's review flagged can never reach the wire); valid
+// budgets forward on the request; omitted/0 rides as 0 (the session
+// budget, key absent).
+func TestRunLuaBudgetMsDomainAndForward(t *testing.T) {
+	e, reqs := newEnv(t, []step{
+		{result: map[string]any{"out": "ok"}}, // budget_ms 8000
+		{result: map[string]any{"out": "ok"}}, // budget_ms 30000 (domain edge)
+		{result: map[string]any{"out": "ok"}}, // omitted
+		{result: map[string]any{"out": "ok"}}, // budget_ms 0 (rides omitted)
+	}, Options{})
+
+	for _, bad := range []float64{-1, 30001, 1 << 40} {
+		res := e.call("xuansi_run_lua", map[string]any{"board": "d75884", "code": "return 1", "budget_ms": bad})
+		if !res.IsError {
+			t.Fatalf("budget_ms %v: accepted, want a refusal", bad)
+		}
+		if txt := resultText(t, res); !strings.Contains(txt, "budget_ms") || !strings.Contains(txt, "1..30000") {
+			t.Fatalf("budget_ms %v refusal = %q, want it naming budget_ms and the 1..30000 domain", bad, txt)
+		}
+	}
+	select {
+	case r := <-reqs:
+		t.Fatalf("an out-of-domain budget reached the daemon: %+v", r)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	for _, ms := range []int64{8000, 30000, 0, 0} {
+		args := map[string]any{"board": "d75884", "code": "return 1"}
+		if ms != 0 {
+			args["budget_ms"] = float64(ms)
+		}
+		res := e.call("xuansi_run_lua", args)
+		if res.IsError {
+			t.Fatalf("budget_ms %d: %s", ms, resultText(t, res))
+		}
+		req := wantReq(t, reqs)
+		if req.Type != "eval" || req.BudgetMs != ms {
+			t.Fatalf("daemon request = %s budget %d, want eval budget %d", req.Type, req.BudgetMs, ms)
+		}
+	}
+}
+
+// TestSubmitBudgetMsDomainAndForward: the same MCP-face domain gate and
+// forwarding on the async half.
+func TestSubmitBudgetMsDomainAndForward(t *testing.T) {
+	e, reqs := newEnv(t, []step{
+		{result: map[string]any{"tag": "j1", "queued": true}},
+	}, Options{})
+
+	res := e.call("xuansi_submit", map[string]any{"board": "d75884", "code": "shot()", "tag": "j1", "budget_ms": float64(-5)})
+	if !res.IsError || !strings.Contains(resultText(t, res), "budget_ms") {
+		t.Fatalf("negative budget on submit = %+v, want a refusal naming budget_ms", res)
+	}
+	select {
+	case r := <-reqs:
+		t.Fatalf("out-of-domain submit budget reached the daemon: %+v", r)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	res = e.call("xuansi_submit", map[string]any{"board": "d75884", "code": "shot()", "tag": "j1", "budget_ms": float64(12000)})
+	if res.IsError {
+		t.Fatalf("valid submit budget: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Type != "submit" || req.BudgetMs != 12000 {
+		t.Fatalf("daemon request = %s budget %d, want submit budget 12000", req.Type, req.BudgetMs)
+	}
+}
+
+// TestRunLuaDecodesFrames: the eval reply's frames array and drop count
+// decode into the typed out (ch/name/data_b64 per frame).
+func TestRunLuaDecodesFrames(t *testing.T) {
+	jpeg := []byte{0xFF, 0xD8, 7, 7, 0xFF, 0xD9}
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"out":            "ok",
+		"frames":         []any{map[string]any{"ch": float64(2), "name": "jpge", "data_b64": base64.StdEncoding.EncodeToString(jpeg)}},
+		"frames_dropped": float64(3),
+	}}}, Options{})
+
+	res := e.call("xuansi_run_lua", map[string]any{"board": "d75884", "code": "shot()"})
+	if res.IsError {
+		t.Fatalf("run_lua: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	frames, ok := m["frames"].([]any)
+	if !ok || len(frames) != 1 {
+		t.Fatalf("frames = %#v, want one entry", m["frames"])
+	}
+	fm, _ := frames[0].(map[string]any)
+	if fm["ch"] != float64(2) || fm["name"] != "jpge" {
+		t.Fatalf("frame meta = %#v, want ch=2 name=jpge", fm)
+	}
+	got, err := base64.StdEncoding.DecodeString(fmt.Sprint(fm["data_b64"]))
+	if err != nil || !bytes.Equal(got, jpeg) {
+		t.Fatalf("data_b64 decode = %x (err %v), want %x", got, err, jpeg)
+	}
+	if m["frames_dropped"] != float64(3) {
+		t.Fatalf("frames_dropped = %#v, want 3", m["frames_dropped"])
+	}
 }

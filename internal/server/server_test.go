@@ -3513,3 +3513,313 @@ func TestBindSockSweepsDeadClaimScratch(t *testing.T) {
 	}
 	c.Close()
 }
+
+// ---------------------------------------------------------------------------
+// run_lua/submit frames primitive (B12-P2 T5, spec §5.6): eval-window
+// stream frames ride the reply; pending-job frames ride the job event.
+// ---------------------------------------------------------------------------
+
+// stampStreamChunk builds one ch=2 module chunk exactly the way the
+// fw's stream_send host-stamp writes it (xs_wasm.c): every chunk of a
+// sequence carries [u8 name_len][name][data part].
+func stampStreamChunk(name string, part []byte) []byte {
+	out := make([]byte, 0, 1+len(name)+len(part))
+	out = append(out, byte(len(name)))
+	out = append(out, name...)
+	return append(out, part...)
+}
+
+// scriptEvalStream wires the fake's eval op: it drives the
+// connection's current sink with one COMPLETE single-chunk ch=2 frame
+// per payload (frames-then-reply, the fw's wire order) before
+// answering — the module-streaming eval shape.
+func scriptEvalStream(f *fakeCtl, name string, payloads ...[]byte) {
+	f.on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		sink := f.sinkSnapshot()
+		for i, p := range payloads {
+			sink(2, uint32(i+1), 0, 1, stampStreamChunk(name, p))
+		}
+		return map[string]any{"out": "ok"}, nil
+	})
+}
+
+// TestEvalReplyCarriesStreamFrames (case ①): a ch=2 frame that
+// completes inside the eval window rides the reply as
+// frames[0]{ch,name,data_b64} with the host-stamped module name parsed
+// off and the payload byte-exact; nothing dropped, no frames_dropped
+// key.
+func TestEvalReplyCarriesStreamFrames(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "fr1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	jpeg := []byte{0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9}
+	scriptEvalStream(e.fakes["d75884"], "jpge", jpeg)
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "jpge.shot()"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	if asStr(res["out"]) != "ok" {
+		t.Fatalf("out = %#v", res["out"])
+	}
+	frames, ok := res["frames"].([]any)
+	if !ok || len(frames) != 1 {
+		t.Fatalf("frames = %#v, want one entry", res["frames"])
+	}
+	fm := asMap(frames[0])
+	if asInt(fm["ch"]) != 2 || asStr(fm["name"]) != "jpge" {
+		t.Fatalf("frame meta = %#v, want ch=2 name=jpge", fm)
+	}
+	got, err := base64.StdEncoding.DecodeString(asStr(fm["data_b64"]))
+	if err != nil || !bytes.Equal(got, jpeg) {
+		t.Fatalf("data_b64 decodes to %x (err %v), want %x", got, err, jpeg)
+	}
+	if _, ok := res["frames_dropped"]; ok {
+		t.Fatalf("frames_dropped present with nothing dropped: %#v", res)
+	}
+}
+
+// TestEvalFramesSixteenBound (case ②): the 16-frame bound truncates the
+// reply's frames and counts the remainder in frames_dropped.
+func TestEvalFramesSixteenBound(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "fr2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	payloads := make([][]byte, 20)
+	for i := range payloads {
+		payloads[i] = []byte{byte('a' + i)}
+	}
+	scriptEvalStream(e.fakes["d75884"], "jpge", payloads...)
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "burst()"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	frames, _ := res["frames"].([]any)
+	if len(frames) != board.FramesMax {
+		t.Fatalf("frames = %d, want %d", len(frames), board.FramesMax)
+	}
+	if asInt(res["frames_dropped"]) != 4 {
+		t.Fatalf("frames_dropped = %#v, want 4", res["frames_dropped"])
+	}
+	last := asMap(frames[len(frames)-1])
+	got, _ := base64.StdEncoding.DecodeString(asStr(last["data_b64"]))
+	if !bytes.Equal(got, []byte{'a' + 15}) {
+		t.Fatalf("last kept frame = %q, want the 16th (p)", got)
+	}
+}
+
+// TestEvalFramesByteBound (case ③): crossing the 1 MiB cumulative
+// payload bound truncates — the fitting frame rides the reply, the
+// overflow counts in frames_dropped.
+func TestEvalFramesByteBound(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "fr3"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	first := bytes.Repeat([]byte{1}, 560*1024)
+	second := bytes.Repeat([]byte{2}, 560*1024)
+	scriptEvalStream(e.fakes["d75884"], "jpge", first, second)
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "fat()"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	frames, _ := res["frames"].([]any)
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want 1 (the fitting one)", len(frames))
+	}
+	got, _ := base64.StdEncoding.DecodeString(asStr(asMap(frames[0])["data_b64"]))
+	if !bytes.Equal(got, first) {
+		t.Fatalf("kept frame is not the first payload (len %d)", len(got))
+	}
+	if asInt(res["frames_dropped"]) != 1 {
+		t.Fatalf("frames_dropped = %#v, want 1", res["frames_dropped"])
+	}
+}
+
+// TestEvalFramesChunkedOutOfOrder (case ④): one frame split across
+// chunks whose idx order scrambles reassembles as ONE reply frame with
+// the parts concatenated in idx order — the T2 reassembler semantics
+// riding the eval window.
+func TestEvalFramesChunkedOutOfOrder(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "fr4"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		sink := e.fakes["d75884"].sinkSnapshot()
+		sink(2, 5, 1, 3, stampStreamChunk("jpge", []byte("B")))
+		sink(2, 5, 0, 3, stampStreamChunk("jpge", []byte("A")))
+		sink(2, 5, 2, 3, stampStreamChunk("jpge", []byte("C")))
+		return map[string]any{"out": "ok"}, nil
+	})
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "split()"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	frames, _ := res["frames"].([]any)
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want exactly 1", len(frames))
+	}
+	fm := asMap(frames[0])
+	if asStr(fm["name"]) != "jpge" {
+		t.Fatalf("name = %q, want jpge", fm["name"])
+	}
+	got, _ := base64.StdEncoding.DecodeString(asStr(fm["data_b64"]))
+	if !bytes.Equal(got, []byte("ABC")) {
+		t.Fatalf("reassembled = %q, want ABC", got)
+	}
+	if _, ok := res["frames_dropped"]; ok {
+		t.Fatalf("frames_dropped present with nothing dropped: %#v", res)
+	}
+}
+
+// TestEvalNoFramesReplyShapeUnchanged (case ⑤ — the highest bar): an
+// eval whose window saw no stream frames answers with a reply
+// byte-equivalent to the pre-frames shape — no frames key, no
+// frames_dropped key (existing callers see zero difference).
+func TestEvalNoFramesReplyShapeUnchanged(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "fr5"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	b, err := json.Marshal(asMap(rep["result"]))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != `{"out":"ok"}` {
+		t.Fatalf("no-frames eval reply = %s, want the exact pre-frames shape {\"out\":\"ok\"}", b)
+	}
+
+	// the value face stays byte-stable too
+	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"out": "hello\n", "value": map[string]any{"ok": int64(1)}}, nil
+	})
+	rep, _ = c.call(3, map[string]any{"type": "eval", "board": "d75884", "code": "return {ok=1}"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("value eval: %#v", rep)
+	}
+	b, err = json.Marshal(asMap(rep["result"]))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != `{"out":"hello\n","value":{"ok":1}}` {
+		t.Fatalf("no-frames value eval reply = %s, want the exact pre-frames shape", b)
+	}
+}
+
+// TestEvalErrorReplyCarriesNoFrames: a board error mid-stream still
+// answers as the plain error reply — frames never ride error replies.
+func TestEvalErrorReplyCarriesNoFrames(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "fr6"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	e.fakes["d75884"].on("eval", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		sink := e.fakes["d75884"].sinkSnapshot()
+		sink(2, 1, 0, 1, stampStreamChunk("jpge", []byte("x")))
+		return nil, &replclient.OpError{Op: "eval", Class: "rt", Msg: "boom"}
+	})
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "err()"})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "rt" || asStr(er["msg"]) != "boom" {
+		t.Fatalf("error = %#v, want the board's rt/boom verbatim", er)
+	}
+}
+
+// TestSubmitJobEventCarriesFrames: submit acks immediately with the
+// board's {tag, queued} byte-unchanged; the job's stream frames buffer
+// while it is pending and ride its job event's data (frames +
+// frames_dropped); a job that streams nothing leaves the event data
+// byte-unchanged.
+func TestSubmitJobEventCarriesFrames(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	w := dialSock(t, e.sock)
+	rep, _ := w.call(1, map[string]any{"type": "watch_events", "board": "d75884"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("watch: %#v", rep)
+	}
+	rep, _ = w.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "fr7"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	rep, _ = w.call(3, map[string]any{"type": "submit", "board": "d75884", "code": "shot()", "tag": "j1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("submit: %#v", rep)
+	}
+	b, err := json.Marshal(asMap(rep["result"]))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != `{"queued":true,"tag":"j1"}` {
+		t.Fatalf("submit ack = %s, want the exact pre-frames ack shape", b)
+	}
+
+	// the job streams on the warm connection, then its event lands
+	f := e.fakes["d75884"]
+	jpeg := []byte{0xFF, 0xD8, 9, 9, 0xFF, 0xD9}
+	sink := f.sinkSnapshot()
+	sink(2, 1, 0, 1, stampStreamChunk("jpge", jpeg))
+	sink(2, 2, 0, 1, stampStreamChunk("jpge", jpeg))
+	f.push("job", map[string]any{"tag": "j1", "ok": true, "out": "done"})
+
+	ev := w.recv()
+	if asStr(ev["type"]) != "event" || asStr(ev["board"]) != "d75884" {
+		t.Fatalf("event push = %#v", ev)
+	}
+	inner := asMap(ev["event"])
+	if asStr(inner["source"]) != "job" {
+		t.Fatalf("source = %q, want job", inner["source"])
+	}
+	data := asMap(inner["data"])
+	frames, ok := data["frames"].([]any)
+	if !ok || len(frames) != 2 {
+		t.Fatalf("job event frames = %#v, want two entries", data["frames"])
+	}
+	fm := asMap(frames[0])
+	if asInt(fm["ch"]) != 2 || asStr(fm["name"]) != "jpge" {
+		t.Fatalf("frame meta = %#v, want ch=2 name=jpge", fm)
+	}
+	got, derr := base64.StdEncoding.DecodeString(asStr(fm["data_b64"]))
+	if derr != nil || !bytes.Equal(got, jpeg) {
+		t.Fatalf("data_b64 = %x (err %v), want %x", got, derr, jpeg)
+	}
+
+	// a job that streams nothing leaves its event data byte-unchanged
+	f.push("job", map[string]any{"tag": "j2", "ok": true, "out": "quiet"})
+	ev = w.recv()
+	data = asMap(asMap(ev["event"])["data"])
+	b, err = json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != `{"ok":true,"out":"quiet","tag":"j2"}` {
+		t.Fatalf("no-stream job event data = %s, want the exact pre-frames shape", b)
+	}
+}

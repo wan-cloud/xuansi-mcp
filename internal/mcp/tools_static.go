@@ -116,18 +116,26 @@ type releaseIn struct {
 }
 
 type runLuaIn struct {
-	Board  string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Code   string `json:"code" jsonschema:"Lua chunk to evaluate synchronously on the board under the lease; return a value to read it back from the value field"`
-	Args   any    `json:"args,omitempty" jsonschema:"arguments for the Lua chunk: a JSON array or object crossing to Lua's read-only ARGS. Numbers must be integers with absolute value below 2^53 (the firmware args bridge is int-only); violations are refused daemon-side with an \"api\" error naming the offending path"`
-	Holder string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
+	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
+	Code  string `json:"code" jsonschema:"Lua chunk to evaluate synchronously on the board under the lease; return a value to read it back from the value field"`
+	Args  any    `json:"args,omitempty" jsonschema:"arguments for the Lua chunk: a JSON array or object crossing to Lua's read-only ARGS. Numbers must be integers with absolute value below 2^53 (the firmware args bridge is int-only); violations are refused daemon-side with an \"api\" error naming the offending path"`
+	// BudgetMs is the per-call eval budget (§9.6, protocol v6):
+	// 1..30000 ms for THIS call only; omit (or 0) to ride the session
+	// budget. Validated on this face — out-of-domain values are
+	// refused HERE, never forwarded.
+	BudgetMs int    `json:"budget_ms,omitempty" jsonschema:"per-call eval budget in milliseconds, 1..30000 — this call only; omit to ride the session budget. Lengthens the daemon's reply wait to budget+2s (its 60s per-request ceiling still applies on top)"`
+	Holder   string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
 type submitIn struct {
-	Board  string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Code   string `json:"code" jsonschema:"Lua chunk to queue as a background job on the board under the lease; the job's result arrives later as a job event"`
-	Tag    string `json:"tag" jsonschema:"caller-chosen job tag echoed in the ack and on the job event"`
-	Args   any    `json:"args,omitempty" jsonschema:"arguments for the Lua chunk: a JSON array or object crossing to Lua's read-only ARGS. Numbers must be integers with absolute value below 2^53 (the firmware args bridge is int-only); violations are refused daemon-side with an \"api\" error naming the offending path"`
-	Holder string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
+	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
+	Code  string `json:"code" jsonschema:"Lua chunk to queue as a background job on the board under the lease; the job's result arrives later as a job event"`
+	Tag   string `json:"tag" jsonschema:"caller-chosen job tag echoed in the ack and on the job event"`
+	Args  any    `json:"args,omitempty" jsonschema:"arguments for the Lua chunk: a JSON array or object crossing to Lua's read-only ARGS. Numbers must be integers with absolute value below 2^53 (the firmware args bridge is int-only); violations are refused daemon-side with an \"api\" error naming the offending path"`
+	// BudgetMs — the same per-call budget as run_lua's: the board runs
+	// the JOB under it (the ack itself is immediate).
+	BudgetMs int    `json:"budget_ms,omitempty" jsonschema:"per-call budget in milliseconds for the JOB this call queues, 1..30000 — this job only; omit to ride the session budget. Validated here: out-of-domain values are refused before any daemon contact"`
+	Holder   string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
 type scriptStartIn struct {
@@ -239,9 +247,24 @@ type releaseOut struct {
 	Holder string `json:"holder"`
 }
 
+// frameOut is one collected stream frame in an eval reply / job event
+// (spec §5.6): the channel, the sending module's name (the fw's
+// stream_send host-stamp, parsed), and the assembled payload.
+type frameOut struct {
+	Ch      int    `json:"ch" jsonschema:"the 0x02 stream channel the frame rode (2 = a wasm module's stream_send)"`
+	Name    string `json:"name" jsonschema:"the sending module's name (the fw host-stamps it onto every chunk; parsed off here)"`
+	DataB64 string `json:"data_b64" jsonschema:"the assembled frame payload, standard base64"`
+}
+
 type runLuaOut struct {
 	Out   string `json:"out" jsonschema:"the chunk's captured stdout"`
 	Value any    `json:"value,omitempty" jsonschema:"the chunk's bridged return value, present when it returned one"`
+	// Frames (B12-P2 T5): the 0x02 stream frames that completed on the
+	// connection during the call — e.g. a wasm module's stream_send
+	// output (a JPEG). Absent when none did (the no-frames reply is
+	// byte-identical to the pre-frames shape).
+	Frames        []frameOut `json:"frames,omitempty" jsonschema:"stream frames that arrived on the connection during this call (any module stream_send output) — absent when none did. Bounded: at most 16 frames / 1 MiB cumulative; frames_dropped counts the honest losses"`
+	FramesDropped int        `json:"frames_dropped,omitempty" jsonschema:"frames lost to the collection bounds (16 frames / 1 MiB) or to incomplete chunk sequences — present only when something was dropped"`
 }
 
 type submitOut struct {
@@ -342,12 +365,12 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_run_lua",
-		Description: "Evaluate a Lua chunk synchronously on the board under the lease: captured stdout in out, a bridged return value (when the chunk returns one) in value. " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
+		Description: "Evaluate a Lua chunk synchronously on the board under the lease: captured stdout in out, a bridged return value (when the chunk returns one) in value, and frames — the 0x02 stream frames that arrived on the connection during the call, e.g. a wasm module's stream_send output (a JPEG shot lands here as base64; decode and save it yourself). Frames are bounded (at most 16 frames / 1 MiB cumulative, frames_dropped counts honest losses — chunk-gap losses included) and the whole field is absent when nothing streamed. budget_ms (1..30000) sets this call's eval budget — the daemon's reply wait derives from it (budget+2s) under its 60s per-request ceiling. " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
 	}, ts.runLua)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_submit",
-		Description: "Queue a Lua chunk as a background job on the board under the lease; the ack carries {tag, queued} and the job's result arrives later as a job event (events face). " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
+		Description: "Queue a Lua chunk as a background job on the board under the lease; the ack carries {tag, queued} and the job's result arrives later as a job event (events face) — with frames riding the event's data when the job streamed on the connection while it ran (the same bounded {ch,name,data_b64} shape run_lua replies carry; absent when it streamed nothing). budget_ms (1..30000) is the JOB's budget — the board runs the queued job under it while the ack stays immediate. " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
 	}, ts.submit)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -533,7 +556,10 @@ func (ts *toolset) release(ctx context.Context, _ *mcpsdk.CallToolRequest, in re
 }
 
 func (ts *toolset) runLua(ctx context.Context, _ *mcpsdk.CallToolRequest, in runLuaIn) (*mcpsdk.CallToolResult, runLuaOut, error) {
-	res, err := ts.callHeld(ctx, server.Request{Type: "eval", Board: in.Board, Holder: in.Holder, Code: in.Code, Args: in.Args})
+	if err := budgetDomain(in.BudgetMs); err != nil {
+		return nil, runLuaOut{}, err
+	}
+	res, err := ts.callHeld(ctx, server.Request{Type: "eval", Board: in.Board, Holder: in.Holder, Code: in.Code, Args: in.Args, BudgetMs: int64(in.BudgetMs)})
 	if err != nil {
 		return nil, runLuaOut{}, err
 	}
@@ -541,15 +567,54 @@ func (ts *toolset) runLua(ctx context.Context, _ *mcpsdk.CallToolRequest, in run
 	if v, ok := res["value"]; ok {
 		out.Value = v // any: the bridged value crosses as-is
 	}
+	out.Frames = decodeFrames(res)
+	out.FramesDropped = num(res, "frames_dropped")
 	return nil, out, nil
 }
 
 func (ts *toolset) submit(ctx context.Context, _ *mcpsdk.CallToolRequest, in submitIn) (*mcpsdk.CallToolResult, submitOut, error) {
-	res, err := ts.callHeld(ctx, server.Request{Type: "submit", Board: in.Board, Holder: in.Holder, Code: in.Code, Tag: in.Tag, Args: in.Args})
+	if err := budgetDomain(in.BudgetMs); err != nil {
+		return nil, submitOut{}, err
+	}
+	res, err := ts.callHeld(ctx, server.Request{Type: "submit", Board: in.Board, Holder: in.Holder, Code: in.Code, Tag: in.Tag, Args: in.Args, BudgetMs: int64(in.BudgetMs)})
 	if err != nil {
 		return nil, submitOut{}, err
 	}
 	return nil, submitOut{Tag: str(res, "tag"), Queued: bol(res, "queued")}, nil
+}
+
+// budgetDomain validates the per-call budget on this face (B12-P2 T5,
+// absorbing T4's review minors): 0 rides omitted (the session budget,
+// wire key absent); anything else must be 1..30000 — the board's own
+// wire domain (§9.6). Out-of-domain values are refused HERE with zero
+// daemon contact, so no wrap-corner value ever reaches the wire.
+func budgetDomain(ms int) error {
+	if ms != 0 && (ms < 1 || ms > 30000) {
+		return &server.RPCError{
+			Class: "api",
+			Msg:   fmt.Sprintf("budget_ms %d out of domain 1..30000 (omit it to ride the session budget), refused client-side", ms),
+		}
+	}
+	return nil
+}
+
+// decodeFrames pulls the eval reply's frames array (the daemon's §5.6
+// shape) into the typed out; nil when the key is absent (no frames
+// crossed — the common case keeps the reply shape unchanged).
+func decodeFrames(res map[string]any) []frameOut {
+	arr := arr(res["frames"])
+	if len(arr) == 0 {
+		return nil
+	}
+	out := make([]frameOut, 0, len(arr))
+	for _, f := range arr {
+		fm, ok := f.(map[string]any)
+		if !ok {
+			continue // a non-object entry is daemon drift; keep the rest
+		}
+		out = append(out, frameOut{Ch: num(fm, "ch"), Name: str(fm, "name"), DataB64: str(fm, "data_b64")})
+	}
+	return out
 }
 
 func (ts *toolset) scriptStart(ctx context.Context, _ *mcpsdk.CallToolRequest, in scriptStartIn) (*mcpsdk.CallToolResult, boardAckOut, error) {

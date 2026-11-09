@@ -11,6 +11,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -203,6 +204,19 @@ type daemonBoard struct {
 	// two concurrent captures would interleave their ch=1 stream
 	// chunks into each other's collectors on the shared warm link.
 	cameraMu sync.Mutex
+	// frames is the board's 0x02 consumer fan-out (B12-P2 T5): the
+	// connection's sink slot is single, so the per-call collectors of
+	// overlapping eval windows and the pending-job buffer below all
+	// ride this one hub, asserted on the link around every streaming
+	// op. jobBuf buffers stream frames while submitted jobs are
+	// pending (jobsPending > 0); each job event drains it onto the
+	// event's data (spec §5.6 — submit is the same primitive, its
+	// window ends at the event, not the ack). jobsMu guards
+	// jobsPending; the buffer's own lock guards its state.
+	frames      *board.FrameHub
+	jobBuf      *board.FrameCollector
+	jobsMu      sync.Mutex
+	jobsPending int
 	// bootSeen is the last hello sighting's boot identity (B10-T8b):
 	// a CHANGED boot_epoch on the next sighting means the board
 	// rebooted while we were not connected (panic auto-reboot included
@@ -1292,16 +1306,42 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 		op = "submit"
 		args["tag"] = req.Tag
 	}
-	res, err := s.boardOp(ctx, b, op, args)
+	db := s.supervisor(b)
+	if async {
+		// The pending-job frame window opens BEFORE the op: the board
+		// may start the job the moment it writes the ack, and the
+		// router dispatches stream chunks in arrival order — opening
+		// after the ack reply would race the job's first chunks. The
+		// window ends at the job event (tap drains jobBuf onto it).
+		db.jobSubmit()
+		res, err := s.boardOpStream(ctx, b, op, args, db, nil)
+		if err != nil {
+			db.jobRollback() // never queued: close the window
+			return nil, err
+		}
+		return res, nil // board ack {tag, queued} — byte-unchanged
+	}
+	// The eval window: a per-call collector rides the board's frame
+	// hub for exactly this op; whatever 0x02 frames complete inside
+	// the window ride the reply (spec §5.6) — absent when none did.
+	col := board.NewFrameCollector()
+	remove := db.frames.Add(col.Sink)
+	defer remove()
+	res, err := s.boardOpStream(ctx, b, op, args, db, col)
 	if err != nil {
 		return nil, err
-	}
-	if async {
-		return res, nil // board ack {tag, queued}
 	}
 	out := map[string]any{"out": res["out"]}
 	if v, ok := res["value"]; ok && v != nil {
 		out["value"] = v
+	}
+	if snap := col.Snapshot(); len(snap.Frames) > 0 || snap.Dropped > 0 {
+		if frames := wireFrames(snap); len(frames) > 0 {
+			out["frames"] = frames
+		}
+		if snap.Dropped > 0 {
+			out["frames_dropped"] = int64(snap.Dropped)
+		}
 	}
 	return out, nil
 }
@@ -1726,8 +1766,103 @@ func (s *Server) supervisor(b discover.Board) *daemonBoard {
 		Port:    b.Port,
 		USBPath: b.USBPath,
 	})
+	// The frames face (B12-P2 T5): the hub's own sink is what gets
+	// asserted on a controller (boardOpStream); the pending-job buffer
+	// is its one long-lived consumer, gated by jobsPending — chunks
+	// outside a submitted-job window pass uncollected and uncounted
+	// (they are not ours to report). Board-side every ch=2 emitter
+	// runs in the one serial VM task, so a pending window's chunks are
+	// exactly that job's.
+	db.frames = board.NewFrameHub()
+	db.jobBuf = board.NewFrameCollector()
+	db.frames.Add(db.jobSink)
 	s.sups[b.MAC6] = db
 	return db
+}
+
+// jobSink is the pending-job buffer's hub consumer: chunks count only
+// while a submitted job is outstanding. Runs on the router goroutine
+// (quick, no client callbacks — the collector is mutex-only).
+func (db *daemonBoard) jobSink(ch byte, seq uint32, idx, total uint16, payload []byte) {
+	if !db.jobActive() {
+		return
+	}
+	db.jobBuf.Sink(ch, seq, idx, total, payload)
+}
+
+// jobActive reports whether any submitted job is outstanding.
+func (db *daemonBoard) jobActive() bool {
+	db.jobsMu.Lock()
+	defer db.jobsMu.Unlock()
+	return db.jobsPending > 0
+}
+
+// jobSubmit opens the pending-job frame window BEFORE the submit op is
+// issued (the board may start the job — and streaming — the moment the
+// ack is written; opening after the ack would race the first chunks).
+func (db *daemonBoard) jobSubmit() {
+	db.jobsMu.Lock()
+	db.jobsPending++
+	db.jobsMu.Unlock()
+}
+
+// jobRollback closes a window whose submit never queued (op error).
+func (db *daemonBoard) jobRollback() {
+	db.jobsMu.Lock()
+	if db.jobsPending > 0 {
+		db.jobsPending--
+	}
+	db.jobsMu.Unlock()
+}
+
+// jobReset drops every pending window and the buffer (a controller
+// identity change: the board direct-delivers job events to the
+// SUBMITTING connection — xs_repl.c — so a redial orphans the old
+// connection's pending jobs board-side; their events never arrive).
+func (db *daemonBoard) jobReset() {
+	db.jobsMu.Lock()
+	db.jobsPending = 0
+	db.jobsMu.Unlock()
+	db.jobBuf.Reset()
+}
+
+// drainJobFrames ends one pending window at a job event: the buffered
+// frames ride the event's data (frames/frames_dropped, the same shape
+// the eval reply carries — absent when nothing was buffered). Called
+// from the tap on the router goroutine.
+func (db *daemonBoard) drainJobFrames(ev *replclient.Event) {
+	db.jobsMu.Lock()
+	if db.jobsPending > 0 {
+		db.jobsPending--
+	}
+	db.jobsMu.Unlock()
+	snap := db.jobBuf.Drain()
+	if len(snap.Frames) == 0 && snap.Dropped == 0 {
+		return
+	}
+	if ev.Data == nil {
+		ev.Data = map[string]any{}
+	}
+	if frames := wireFrames(snap); len(frames) > 0 {
+		ev.Data["frames"] = frames
+	}
+	if snap.Dropped > 0 {
+		ev.Data["frames_dropped"] = int64(snap.Dropped)
+	}
+}
+
+// wireFrames renders one snapshot as the wire shape both the eval
+// reply and the job event carry (spec §5.6): [{ch, name, data_b64}].
+func wireFrames(snap board.FrameSnapshot) []any {
+	out := make([]any, 0, len(snap.Frames))
+	for _, f := range snap.Frames {
+		out = append(out, map[string]any{
+			"ch":       int64(f.Ch),
+			"name":     f.Name,
+			"data_b64": base64.StdEncoding.EncodeToString(f.Data),
+		})
+	}
+	return out
 }
 
 // warmController connects (or reuses) the board's warm TCP controller
@@ -1763,7 +1898,14 @@ func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 	if already {
 		return
 	}
+	// A controller identity change orphans the old link's pending jobs
+	// board-side (job events are direct-delivered to the SUBMITTING
+	// connection — xs_repl.c): drop their windows and the buffer.
+	db.jobReset()
 	ctl.OnEvent("", func(ev replclient.Event) {
+		if ev.Source == "job" {
+			db.drainJobFrames(&ev) // the pending window's frames ride the event (§5.6)
+		}
 		s.broadcast(mac6, ev)
 	})
 	if h, err := ctl.Hello(false, "xuansi-daemon"); err == nil {
@@ -1840,11 +1982,36 @@ func (s *Server) broadcast(mac6 string, ev replclient.Event) {
 // boardOp runs one op over the warm controller connection, redialing
 // once when the link died under it (§13: redial ≠ reboot).
 func (s *Server) boardOp(ctx context.Context, b discover.Board, op string, args map[string]any) (map[string]any, error) {
+	return s.boardOpStream(ctx, b, op, args, nil, nil)
+}
+
+// boardOpStream is boardOp with an optional stream-frames window
+// (B12-P2 T5): a non-nil db gets the board's frame hub asserted on the
+// connection for the op — the connection's sink slot is single
+// (router swap semantics, set-only), and the hub is what that slot
+// should carry while an eval/submit window is open, so overlapping
+// windows share one fan-out instead of clobbering each other — and a
+// non-nil collector rides the hub for exactly the call, RESET between
+// attempts: the redial retry re-executes the op board-side, and the
+// dead attempt's partial sequences must not graft onto the retry's
+// frames (a nondeterministic payload — a camera shot — would
+// reassemble corrupt otherwise). Pre-v6 transitional note: the camera
+// path (capture.go) still installs its own per-call sink the old way;
+// an eval issued while a capture is mid-flight displaces its
+// collector (the capture honestly counts the loss as gaps). The camera
+// face retires in T6, taking the last non-hub consumer with it.
+func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string, args map[string]any, db *daemonBoard, col *board.FrameCollector) (map[string]any, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 && col != nil {
+			col.Reset()
+		}
 		ctl, err := s.warmController(ctx, b)
 		if err != nil {
 			return nil, err
+		}
+		if db != nil {
+			ctl.OnStream(db.frames.Sink) // assert the hub for this window
 		}
 		res, err := ctl.Op(ctx, op, args)
 		if err == nil {
@@ -1855,10 +2022,10 @@ func (s *Server) boardOp(ctx context.Context, b discover.Board, op string, args 
 			return nil, err // board error (OpError) or caller ctx — no retry
 		}
 		s.logf("server: board %s: op %s hit a dead link (%v) — redialing once", b.MAC6, op, err)
-		db := s.supervisor(b)
-		db.connectMu.Lock()
-		db.sup.Close() // drop the corpse so the next Connect redials
-		db.connectMu.Unlock()
+		dead := s.supervisor(b) // same per-board state as db when db != nil
+		dead.connectMu.Lock()
+		dead.sup.Close() // drop the corpse so the next Connect redials
+		dead.connectMu.Unlock()
 	}
 	return nil, fmt.Errorf("board %s: %s after redial: %w", b.MAC6, op, lastErr)
 }
