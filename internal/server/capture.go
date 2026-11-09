@@ -271,6 +271,7 @@ func (s *Server) hCaptureStart(ctx context.Context, cc *clientConn, req *Request
 		}
 		return nil, err
 	}
+	s.noteBoardContact(b.MAC6) // the subscribe's reply is a protocol crossing (last_seen)
 
 	s.wg.Add(1)
 	go s.spoolCapture(cs)
