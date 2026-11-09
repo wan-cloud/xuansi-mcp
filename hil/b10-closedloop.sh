@@ -45,8 +45,8 @@ round="${ROUND:-1}"
 ref="${REF:-}"
 tol="${TOL:-20}"
 case "$mode" in
-  aim)  log="$eviddir/2026-11-08-b10-t7-aim-round${round}.log" ;;
-  loop) log="$eviddir/2026-11-08-b10-t7-closedloop-attempt${attempt}.log" ;;
+  aim)  log="$eviddir/$(date +%F)-b10-t7-aim-round${round}.log" ;;
+  loop) log="$eviddir/$(date +%F)-b10-t7-closedloop-attempt${attempt}.log" ;;
   *)    echo "MODE must be aim or loop" >&2; exit 2 ;;
 esac
 exec > >(tee "$log") 2>&1
@@ -124,7 +124,7 @@ set -e
 echo "driver exit: ${rc}"
 
 if [ "$rc" -eq 0 ] && [ "$mode" = "loop" ]; then
-  cp "$log" "$eviddir/2026-11-08-b10-t7-closedloop.log"
+  cp "$log" "$eviddir/$(date +%F)-b10-t7-closedloop.log"
   echo "ALL PASS: canonical evidence copied alongside the attempt log (private evidence dir; this public repo keeps nothing)"
 fi
 echo "sandbox workspace (fetched artifacts stay for inspection): $run/xdg/xuansi/workspace/"

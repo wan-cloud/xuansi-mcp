@@ -566,7 +566,7 @@ func runB10T7Aim(round int, daemonBin, runDir, outDir string) int {
 		b10t7Teardown(h, b, ctx, true)
 		return finish()
 	}
-	okShot := b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("2026-11-08-b10-t7-aim-%d-camonly.jpg", round)))
+	okShot := b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("b10-t7-allmodule-v6-aim-%d-camonly.jpg", round)))
 	h.check(okShot, fmt.Sprintf("A1b camera alone: QVGA module shot ok (round %d) - a failure here is sensor/FPC hardware, NOT coexistence", round))
 	if !okShot {
 		fmt.Printf("AIM_ROUND %d VERDICT: BLOCKED-FPC | camera dead with no screen work done - owner must re-check the FPC/connector\n", round)
@@ -608,7 +608,7 @@ func runB10T7Aim(round int, daemonBin, runDir, outDir string) int {
 			h.check(false, fmt.Sprintf("A%d camera-on pass %d failed", 3+p, p))
 			continue
 		}
-		if !b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("2026-11-08-b10-t7-aim-%d-border%d.jpg", round, p))) {
+		if !b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("b10-t7-allmodule-v6-aim-%d-border%d.jpg", round, p))) {
 			b10t7AwaitBoard(h, b, ctx, fmt.Sprintf("after aim pass %d stalled shot", p))
 			continue
 		}
@@ -703,7 +703,7 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	if !b10t7CamOn(h, b, ctx, "S3 cam-on") {
 		h.check(false, "S3 camera-on failed (retry armor exhausted)")
 		stalled = true
-	} else if !b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-clearred.jpg", attempt))) {
+	} else if !b10t7Shot(h, b, ctx, filepath.Join(outDir, fmt.Sprintf("b10-t7-allmodule-v6-attempt%d-clearred.jpg", attempt))) {
 		b10t7AwaitBoard(h, b, ctx, "after the S3 shot stall")
 		stalled = true
 	}
@@ -877,7 +877,7 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	// blue-mirror polarity inversion - both fixed, honest history kept).
 	if !stalled {
 		if r, thr, okP := phase("S4a red_rect", "return bench.wasm.call('st7789','pattern','red_rect')",
-			fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-redrect.jpg", attempt),
+			fmt.Sprintf("b10-t7-allmodule-v6-attempt%d-redrect.jpg", attempt),
 			[]int{128, 60, 40, 25, 15}, "min_area=500"); okP {
 			if r.r > 0 || r.b > 0 {
 				rbRatio = r.r / maxF(r.b, 1)
@@ -907,7 +907,7 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	// machine-SWAPPED was the !blueDom polarity inversion - fixed).
 	if !stalled {
 		if r, thr, okP := phase("S4b clear-BLUE", "return bench.wasm.call('st7789','clear',0x001F)",
-			fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-clear-blue.jpg", attempt),
+			fmt.Sprintf("b10-t7-allmodule-v6-attempt%d-clear-blue.jpg", attempt),
 			[]int{60, 25, 15, 10}, "min_area=2000"); okP {
 			evBlue = r.r / maxF(r.b, 1)
 			blueDom := r.b >= 2*r.r
@@ -927,7 +927,7 @@ func runB10T7Loop(attempt int, daemonBin, runDir, outDir, refGeom string, tolPx 
 	// S4c: quad luma-ordering pass (swap-invariant by construction) + JPEG
 	if !stalled {
 		if r, _, okP := phase("S4c quad@100", "return bench.wasm.call('st7789','pattern','quad')",
-			fmt.Sprintf("2026-11-08-b10-t7-closedloop-attempt%d-quad.jpg", attempt),
+			fmt.Sprintf("b10-t7-allmodule-v6-attempt%d-quad.jpg", attempt),
 			[]int{100}, "min_area=2000"); okP {
 			h.note("S4c quad@100: the lit adjacent quadrants MERGE in ledwatch's CCL (seam-adjacent), so per-quadrant r/b is unreachable through ledwatch - evidence by ordering + the red_rect/clear passes above")
 			h.check(r.area >= 2000, fmt.Sprintf("S4c quad pass: a dominant lit region resolves on the multi-color panel (%s)", r.String()))
