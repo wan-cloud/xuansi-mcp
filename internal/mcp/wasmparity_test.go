@@ -82,6 +82,24 @@ func driversParity(repoDir, sdkRoot string) (problems, okLines []string) {
 		return []string{"drivers parity: no modules discovered under src/ — checkout shape drift?"}, nil
 	}
 
+	// sibling headers: the drivers repo's modules include headers that
+	// live beside their .c (gc2145_regs.h). The parity rebuild compiles
+	// the SAME translation unit build.sh does, so every src/<name>/*.h
+	// rides the include dir (the ExtraIncludes seam).
+	siblingHeaders := func(name string) (map[string]string, error) {
+		pat := filepath.Join(repoDir, "src", name, "*.h")
+		matches, _ := filepath.Glob(pat)
+		out := map[string]string{}
+		for _, m := range matches {
+			b, err := os.ReadFile(m)
+			if err != nil {
+				return nil, err
+			}
+			out[filepath.Base(m)] = string(b)
+		}
+		return out, nil
+	}
+
 	// index.json: absent = the two-way compare stands alone (noted per
 	// module); present but unparseable = a broken deliverable, red.
 	idx := map[string]*parityIndexMod{}
@@ -101,6 +119,17 @@ func driversParity(repoDir, sdkRoot string) (problems, okLines []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	for _, name := range names {
+		// multi-TU modules (src/<name>/<name>.cpp beside the .c — the
+		// vendored-core shape, currently jpge): the daemon's build face
+		// is single-source BY DESIGN (a module past the 1 MiB source
+		// cap belongs in the drivers repo, the cap's refusal says so);
+		// the parity leg cannot drive the two-TU compile through
+		// wasmBuildInner, so these modules are an honest skip-note, not
+		// a red — the drivers repo's own CI hard-gates their artifacts.
+		if _, err := os.Stat(filepath.Join(repoDir, "src", name, name+".cpp")); err == nil {
+			okLines = append(okLines, fmt.Sprintf("drivers parity: %s: multi-TU module (carries %s.cpp) — the daemon face is single-source; the drivers CI is its parity authority", name, name))
+			continue
+		}
 		verB, verr := os.ReadFile(filepath.Join(repoDir, "src", name, "VERSION"))
 		if verr != nil {
 			problems = append(problems, fmt.Sprintf("drivers parity: %s: read VERSION: %v", name, verr))
@@ -120,7 +149,12 @@ func driversParity(repoDir, sdkRoot string) (problems, okLines []string) {
 		if m, ok := parityInitialMemory[name]; ok {
 			mem = m
 		}
-		wasm, warnings, berr := ts.wasmBuildInner(ctx, buildReq{Name: name, Source: string(src), InitialMemory: mem, WasiSDKPath: sdkRoot})
+		hdrs, herr := siblingHeaders(name)
+		if herr != nil {
+			problems = append(problems, fmt.Sprintf("drivers parity: %s: read sibling headers: %v", name, herr))
+			continue
+		}
+		wasm, warnings, berr := ts.wasmBuildInner(ctx, buildReq{Name: name, Source: string(src), InitialMemory: mem, WasiSDKPath: sdkRoot, ExtraIncludes: hdrs})
 		if berr != nil {
 			problems = append(problems, fmt.Sprintf("drivers parity: %s@%s: rebuild failed: %v (warnings tail: %s)", name, ver, berr, tcWarnTail(warnings)))
 			continue

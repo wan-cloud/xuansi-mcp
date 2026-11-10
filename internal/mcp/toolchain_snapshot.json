@@ -1,10 +1,13 @@
 {
   "index_ver": 1,
-  "latest": "toolchain-v2",
+  "latest": "toolchain-v3",
   "generations": {
     "toolchain-v2": {
       "kind": "stock-wamrc",
-      "fw_compat": { "wasm": ">=0.2.0", "aot": ">=0.3.0" },
+      "fw_compat": {
+        "wasm": ">=0.2.0",
+        "aot": ">=0.3.0"
+      },
       "wasi_sdk": "24.0",
       "platforms": {
         "linux-x64": {
@@ -49,6 +52,70 @@
             "url": "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/wamrc-2.4.0-xtensa-18.1.2-macos-arm64.tar.gz",
             "sha256": "e73c84a24abbc50e5122a5dc8221aa2c579594ea1559224d156f8bb1778fca30",
             "bytes": 22421504
+          }
+        },
+        "win-x64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-windows.tar.gz",
+            "sha256": "0f934c6e7e171b5627c81b697a9e57e96d65cd889f56ce6077350de48978afd3",
+            "bytes": 495098073
+          },
+          "wamrc": null
+        }
+      },
+      "note": "kept generation: the stock wamrc (upstream WAMR-2.4.0 + espressif llvm xtensa_release_18.1.2). Its .aot is the fw-INTERNAL SRAM lane only (the IRAM reserved region, within caps aot_exec_budget_bytes; stock placement is phase-limited relative to v3's PSRAM lane) — for new .aot prefer toolchain-v3."
+    },
+    "toolchain-v3": {
+      "kind": "xuansi-surgery-wamrc",
+      "fw_compat": {
+        "wasm": ">=0.2.0",
+        "aot": ">=0.3.0"
+      },
+      "wasi_sdk": "24.0",
+      "note": "the surgery wamrc: WAMR fork wan-cloud/wasm-micro-runtime xuansi/base-2.4.0 @17036fa0 built against wan-cloud/llvm-project xuansi/a3-surgery @cf84bd31 (built in-workflow by toolchain-v3.yml, which attaches the llvm-dev package of the same lineage). Its .aot carries the split literal pool (xuansi.literal CUSTOM section, literal_size=0): fw 0.3.0+ classifies SURGERY and places the code in PSRAM exec. default-ON pairing: v3 wamrc <-> fork LLVM <-> fw >=0.3.0.",
+      "platforms": {
+        "linux-x64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz",
+            "sha256": "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5",
+            "bytes": 118879731
+          },
+          "wamrc": {
+            "url": "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v3/wamrc-2.4.0-xuansi-surgery-cf84bd31-linux-x64.tar.gz",
+            "sha256": "a69642458b4f78427d9bd2759b76aad6405fb609d7b8cb49ed384c890e3aad73",
+            "bytes": 33059704
+          }
+        },
+        "linux-arm64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-linux.tar.gz",
+            "sha256": "ae6c1417ea161e54bc54c0a168976af57a0c6e53078857886057a71a0d928646",
+            "bytes": 119660865
+          },
+          "wamrc": null
+        },
+        "macos-x64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-macos.tar.gz",
+            "sha256": "4bfc274ae8b68c771dd93e32ad4bd695336ca46b585beb3b1260e5602dbc11a2",
+            "bytes": 109975956
+          },
+          "wamrc": {
+            "url": "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v3/wamrc-2.4.0-xuansi-surgery-cf84bd31-macos-x64.tar.gz",
+            "sha256": "a2e8ee4ea6ee31f3130f49e837fb92d1bd39f9e8383f727d4112f4c61eca18bf",
+            "bytes": 23788868
+          }
+        },
+        "macos-arm64": {
+          "wasi_sdk": {
+            "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-macos.tar.gz",
+            "sha256": "aeae999396d5f5caa5ce419f52e83c35869d5fd21d40af80acba2c80f51b0b3a",
+            "bytes": 108199177
+          },
+          "wamrc": {
+            "url": "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v3/wamrc-2.4.0-xuansi-surgery-cf84bd31-macos-arm64.tar.gz",
+            "sha256": "8c5c7f097aed438e496ceeff28f12c20466afc088b9a01c1c027fd87b2ecf9b8",
+            "bytes": 22425173
           }
         },
         "win-x64": {
