@@ -24,6 +24,15 @@ package mcp
 // the wasi-sdk values; task 8 synced the snapshot to the published
 // index verbatim (all five wasi_sdk entries real; wamrc real on
 // linux-x64 + both mac legs — snapshot == index, byte-identical).
+//
+// P3-T12: the snapshot carries TWO generations — toolchain-v3 (the
+// latest: kind xuansi-surgery-wamrc, the fork surgery wamrc whose
+// .aot rides PSRAM exec on fw 0.3.0+; the default generation the
+// wasm build's aot lane resolves via resolveAOTWamrc) alongside the
+// kept toolchain-v2 (stock wamrc, the fw-internal-SRAM lane). The
+// drift-lock (TestEmbeddedSnapshotDriftLock) cross-asserts every
+// served pin verbatim AND the hardcoded build-face constants
+// (aotFWFloor, aotDefaultGen) against the snapshot mechanically.
 
 import (
 	"archive/tar"
@@ -68,13 +77,16 @@ type toolchainIndex struct {
 // compatibility domains per artifact track, the wasi-sdk version it
 // pins, and the per-platform asset matrix. FwCompat is SPLIT-TRACK
 // (design §6.2): "wasm" carries a wide semver domain (bytecode is
-// version-less); since P3-T7 "aot" carries toolchain-v2's OPEN
-// domain (">=0.3.0" — the stock wamrc against the fw line with the
-// internal-SRAM aot loader + budget gate). "" (or a missing key)
-// still reads as an empty domain — the honest shape for any future
+// version-less); "aot" has been OPEN (">=0.3.0") since P3-T7 — and
+// since P3-T12 the index carries TWO generations over that domain
+// with different PLACEMENT lanes: toolchain-v3 (the latest, kind
+// xuansi-surgery-wamrc — the fork surgery wamrc; .aot into PSRAM
+// exec) and toolchain-v2 (stock-wamrc — .aot into fw-internal SRAM
+// within caps aot_exec_budget_bytes). "" (or a missing key) still
+// reads as an empty domain — the honest shape for any future
 // generation whose aot lane is genuinely closed.
 type tcGen struct {
-	Kind      string            `json:"kind"`      // "stock-wamrc" (v2) / "fork-surgery" (v3, P2)
+	Kind      string            `json:"kind"`      // "stock-wamrc" (v2) / "xuansi-surgery-wamrc" (v3, P3-T12)
 	FwCompat  map[string]string `json:"fw_compat"` // per-track domains; "" (or a missing key) = empty domain
 	WasiSDK   string            `json:"wasi_sdk"`  // pinned wasi-sdk version ("24.0")
 	Platforms map[string]tcPlat `json:"platforms"` // linux-x64 / linux-arm64 / macos-x64 / macos-arm64 / win-x64
@@ -470,7 +482,7 @@ func tcClampTimeoutSec(sec int) int {
 }
 
 type tcFetchIn struct {
-	Generation string `json:"generation,omitempty" jsonschema:"the toolchain generation to install (e.g. \"toolchain-v2\"); omit for the index's latest"`
+	Generation string `json:"generation,omitempty" jsonschema:"the toolchain generation to install (e.g. \"toolchain-v3\", the latest — the surgery wamrc; \"toolchain-v2\" stays installable as the stock lane); omit for the index's latest"`
 	IndexURL   string `json:"index_url,omitempty" jsonschema:"the toolchain-index.json URL; omit for the default https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json (http(s) only - file:// and other schemes are refused client-side, and every ASSET url the index hands out re-passes the same gate)"`
 	TimeoutSec int    `json:"timeout_sec,omitempty" jsonschema:"bounds the WHOLE fetch (index + every asset download), seconds; default 600, clamped to at most 3600; 0 or negative reads as the default"`
 }

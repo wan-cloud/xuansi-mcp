@@ -88,37 +88,92 @@ func TestParseToolchainIndexVerGate(t *testing.T) {
 	}
 }
 
-// TestEmbeddedSnapshotParses pins the embedded snapshot's shape AND,
-// since the T8 sync, every real pin verbatim: all five wasi_sdk
-// entries and the three built wamrc assets (linux-x64 + both mac
-// legs) against hardcoded truth — the drift lock. A snapshot that no
-// longer mirrors the drivers repo's published toolchain-index.json
-// (stale copy, bad manual transcription) fails HERE, in every test
-// run, instead of at a user's fetch. linux-arm64/win-x64 wamrc stay
-// honest nulls (no leg built; the win best-effort leg failed its
+// TestEmbeddedSnapshotDriftLock (B11 task 1's TestEmbeddedSnapshotParses,
+// grown the T8 pin verbatim lock and the P3-T12 dual-generation +
+// mechanical cross-assertion legs): pins the embedded snapshot's shape,
+// every real pin verbatim — all five wasi_sdk entries and the built
+// wamrc assets of BOTH generations (v2: linux-x64 + both mac legs;
+// v3: the same three legs) against hardcoded truth — and, the T7-③
+// debt closed, MECHANICALLY cross-asserts the build face's hardcoded
+// constants against the snapshot itself: every generation that opens
+// an aot lane pins exactly ">=" + aotFWFloor (a future floor move
+// turns this red in every test run, moving all the legs in one
+// sweep), and the snapshot's latest IS aotDefaultGen (the default
+// aot lane resolves a generation the shipped snapshot actually
+// names). A snapshot that no longer mirrors the drivers repo's
+// published toolchain-index.json (stale copy, bad manual
+// transcription) fails HERE, in every test run, instead of at a
+// user's fetch. linux-arm64/win-x64 wamrc stay honest nulls in both
+// generations (no leg built; the win best-effort leg failed its
 // MSVC probe — tracked P2).
-func TestEmbeddedSnapshotParses(t *testing.T) {
+func TestEmbeddedSnapshotDriftLock(t *testing.T) {
 	ix := embeddedToolchainIndex()
 	if ix.IndexVer != 1 { // trivially true past the gate; pins that the gate ran
 		t.Fatalf("embedded index_ver: want 1, got %d", ix.IndexVer)
 	}
-	if ix.Latest != "toolchain-v2" {
-		t.Fatalf("embedded latest: want toolchain-v2, got %q", ix.Latest)
+	if ix.Latest != "toolchain-v3" {
+		t.Fatalf("embedded latest: want toolchain-v3 (the P3-T12 surgery generation), got %q", ix.Latest)
 	}
-	gen, ok := ix.Generations["toolchain-v2"]
+
+	// ---- v2 (kept): head + pins unchanged since the T8 sync ----
+	v2, ok := ix.Generations["toolchain-v2"]
 	if !ok {
 		t.Fatal("embedded generations: toolchain-v2 missing")
 	}
-	if gen.Kind != "stock-wamrc" || gen.WasiSDK != "24.0" {
-		t.Fatalf("embedded gen head: want stock-wamrc/24.0, got %q/%q", gen.Kind, gen.WasiSDK)
+	if v2.Kind != "stock-wamrc" || v2.WasiSDK != "24.0" {
+		t.Fatalf("embedded v2 head: want stock-wamrc/24.0, got %q/%q", v2.Kind, v2.WasiSDK)
 	}
-	if gen.FwCompat["aot"] != ">=0.3.0" || gen.FwCompat["wasm"] != ">=0.2.0" {
-		t.Fatalf("embedded fw_compat: want wasm >=0.2.0 + aot >=0.3.0 (the P3-T7 open domain), got %v", gen.FwCompat)
+	wamrcAssetURL := func(gen, file string) string {
+		return "https://github.com/wan-cloud/xuansi-drivers/releases/download/" + gen + "/" + file
+	}
+	wantV2Wamrc := map[string]struct {
+		url, sha string
+		bytes    int64
+	}{
+		"linux-x64":   {wamrcAssetURL("toolchain-v2", "wamrc-2.4.0-xtensa-18.1.2-linux-x64.tar.gz"), "209a6a51b6066f05e91060d95c2506ec0bad97cb898fec1fe634cd68865b9c42", 33053698},
+		"macos-x64":   {wamrcAssetURL("toolchain-v2", "wamrc-2.4.0-xtensa-18.1.2-macos-x64.tar.gz"), "b87c91e5b6bd907937f8b5f79053212abfc297ee810d2dc348488d8c0089bdc1", 23784250},
+		"macos-arm64": {wamrcAssetURL("toolchain-v2", "wamrc-2.4.0-xtensa-18.1.2-macos-arm64.tar.gz"), "e73c84a24abbc50e5122a5dc8221aa2c579594ea1559224d156f8bb1778fca30", 22421504},
+	}
+	for plat, want := range wantV2Wamrc {
+		w := v2.Platforms[plat].Wamrc
+		if w == nil {
+			t.Errorf("embedded v2 %s wamrc: want asset, got null", plat)
+			continue
+		}
+		if w.URL != want.url || w.SHA256 != want.sha || w.Bytes != want.bytes {
+			t.Errorf("embedded v2 %s wamrc: got url=%s sha=%s bytes=%d, want url=%s sha=%s bytes=%d", plat, w.URL, w.SHA256, w.Bytes, want.url, want.sha, want.bytes)
+		}
 	}
 
-	// Five platform keys, each with a wasi-sdk asset at its official
-	// URL (arm64 — NOT aarch64 — is the linux asset name; the exact
-	// spot a wrong guess would plant a dead URL only T6 would catch).
+	// ---- v3 (the latest): the surgery generation ----
+	v3, ok := ix.Generations["toolchain-v3"]
+	if !ok {
+		t.Fatal("embedded generations: toolchain-v3 missing")
+	}
+	if v3.Kind != "xuansi-surgery-wamrc" || v3.WasiSDK != "24.0" {
+		t.Fatalf("embedded v3 head: want xuansi-surgery-wamrc/24.0, got %q/%q", v3.Kind, v3.WasiSDK)
+	}
+	wantV3Wamrc := map[string]struct {
+		url, sha string
+		bytes    int64
+	}{
+		"linux-x64":   {wamrcAssetURL("toolchain-v3", "wamrc-2.4.0-xuansi-surgery-cf84bd31-linux-x64.tar.gz"), "a69642458b4f78427d9bd2759b76aad6405fb609d7b8cb49ed384c890e3aad73", 33059704},
+		"macos-x64":   {wamrcAssetURL("toolchain-v3", "wamrc-2.4.0-xuansi-surgery-cf84bd31-macos-x64.tar.gz"), "a2e8ee4ea6ee31f3130f49e837fb92d1bd39f9e8383f727d4112f4c61eca18bf", 23788868},
+		"macos-arm64": {wamrcAssetURL("toolchain-v3", "wamrc-2.4.0-xuansi-surgery-cf84bd31-macos-arm64.tar.gz"), "8c5c7f097aed438e496ceeff28f12c20466afc088b9a01c1c027fd87b2ecf9b8", 22425173},
+	}
+	for plat, want := range wantV3Wamrc {
+		w := v3.Platforms[plat].Wamrc
+		if w == nil {
+			t.Errorf("embedded v3 %s wamrc: want asset, got null", plat)
+			continue
+		}
+		if w.URL != want.url || w.SHA256 != want.sha || w.Bytes != want.bytes {
+			t.Errorf("embedded v3 %s wamrc: got url=%s sha=%s bytes=%d, want url=%s sha=%s bytes=%d", plat, w.URL, w.SHA256, w.Bytes, want.url, want.sha, want.bytes)
+		}
+	}
+
+	// ---- shared: five platform keys, wasi_sdk pins verbatim (both
+	// generations pin the SAME five official sdk entries) ----
 	wantURLs := map[string]string{
 		"linux-x64":   "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz",
 		"linux-arm64": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-linux.tar.gz",
@@ -126,21 +181,6 @@ func TestEmbeddedSnapshotParses(t *testing.T) {
 		"macos-arm64": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-macos.tar.gz",
 		"win-x64":     "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-windows.tar.gz",
 	}
-	if len(gen.Platforms) != len(wantURLs) {
-		t.Fatalf("embedded platforms: want %d keys, got %d (%v)", len(wantURLs), len(gen.Platforms), gen.Platforms)
-	}
-	for plat, url := range wantURLs {
-		p, ok := gen.Platforms[plat]
-		if !ok {
-			t.Fatalf("embedded platforms: %s missing", plat)
-		}
-		if p.WasiSDK == nil || p.WasiSDK.URL != url {
-			t.Fatalf("embedded %s wasi_sdk: want URL %s, got %+v", plat, url, p.WasiSDK)
-		}
-	}
-
-	// T8 drift lock: every wasi_sdk entry pinned real (sha256 + bytes
-	// hardcoded from the drivers repo's toolchain-index.json main).
 	wantSDK := map[string]struct {
 		sha   string
 		bytes int64
@@ -151,57 +191,65 @@ func TestEmbeddedSnapshotParses(t *testing.T) {
 		"macos-arm64": {"aeae999396d5f5caa5ce419f52e83c35869d5fd21d40af80acba2c80f51b0b3a", 108199177},
 		"win-x64":     {"0f934c6e7e171b5627c81b697a9e57e96d65cd889f56ce6077350de48978afd3", 495098073},
 	}
-	for plat, want := range wantSDK {
-		ws := gen.Platforms[plat].WasiSDK
-		if ws.SHA256 != want.sha || ws.Bytes != want.bytes {
-			t.Errorf("embedded %s wasi_sdk pins: got sha=%s bytes=%d, want sha=%s bytes=%d", plat, ws.SHA256, ws.Bytes, want.sha, want.bytes)
+	for genName, gen := range map[string]tcGen{"toolchain-v2": v2, "toolchain-v3": v3} {
+		if len(gen.Platforms) != len(wantURLs) {
+			t.Fatalf("embedded %s platforms: want %d keys, got %d (%v)", genName, len(wantURLs), len(gen.Platforms), gen.Platforms)
+		}
+		for plat, url := range wantURLs {
+			p, ok := gen.Platforms[plat]
+			if !ok {
+				t.Fatalf("embedded %s platforms: %s missing", genName, plat)
+			}
+			if p.WasiSDK == nil || p.WasiSDK.URL != url || p.WasiSDK.SHA256 != wantSDK[plat].sha || p.WasiSDK.Bytes != wantSDK[plat].bytes {
+				t.Errorf("embedded %s %s wasi_sdk: got %+v, want url=%s sha=%s bytes=%d", genName, plat, p.WasiSDK, url, wantSDK[plat].sha, wantSDK[plat].bytes)
+			}
+		}
+		for _, plat := range []string{"linux-arm64", "win-x64"} {
+			if gen.Platforms[plat].Wamrc != nil {
+				t.Fatalf("embedded %s %s wamrc: want null (no leg built; win best-effort leg failed — tracked P2), got %+v", genName, plat, gen.Platforms[plat].Wamrc)
+			}
 		}
 	}
 
-	// wamrc matrix after T8: linux-x64 + both mac legs carry real
-	// assets (URL/sha256/bytes verbatim — a guessed URL would plant a
-	// dead release link; a stale sha would fail every fetch);
-	// linux-arm64 and win-x64 are honest nulls.
-	wamrcAssetURL := func(file string) string {
-		return "https://github.com/wan-cloud/xuansi-drivers/releases/download/toolchain-v2/" + file
-	}
-	wantWamrc := map[string]struct {
-		url, sha string
-		bytes    int64
-	}{
-		"linux-x64":   {wamrcAssetURL("wamrc-2.4.0-xtensa-18.1.2-linux-x64.tar.gz"), "209a6a51b6066f05e91060d95c2506ec0bad97cb898fec1fe634cd68865b9c42", 33053698},
-		"macos-x64":   {wamrcAssetURL("wamrc-2.4.0-xtensa-18.1.2-macos-x64.tar.gz"), "b87c91e5b6bd907937f8b5f79053212abfc297ee810d2dc348488d8c0089bdc1", 23784250},
-		"macos-arm64": {wamrcAssetURL("wamrc-2.4.0-xtensa-18.1.2-macos-arm64.tar.gz"), "e73c84a24abbc50e5122a5dc8221aa2c579594ea1559224d156f8bb1778fca30", 22421504},
-	}
-	for plat, want := range wantWamrc {
-		w := gen.Platforms[plat].Wamrc
-		if w == nil {
-			t.Errorf("embedded %s wamrc: want asset, got null", plat)
-			continue
+	// ---- the mechanical cross-assertions (T7-③'s debt closed: the
+	// build face's hardcoded constants are locked to the SNAPSHOT, in
+	// both directions) ----
+	for genName, gen := range map[string]tcGen{"toolchain-v2": v2, "toolchain-v3": v3} {
+		if aot, ok := gen.FwCompat["aot"]; ok && aot != "" {
+			// an OPEN aot domain must be exactly the hardcoded floor
+			if want := ">=" + aotFWFloor; aot != want {
+				t.Errorf("%s fw_compat.aot = %q, want exactly %q (aotFWFloor=%s — a floor move must land here red)", genName, aot, want, aotFWFloor)
+			}
 		}
-		if w.URL != want.url || w.SHA256 != want.sha || w.Bytes != want.bytes {
-			t.Errorf("embedded %s wamrc: got url=%s sha=%s bytes=%d, want url=%s sha=%s bytes=%d", plat, w.URL, w.SHA256, w.Bytes, want.url, want.sha, want.bytes)
+		if gen.FwCompat["wasm"] != ">=0.2.0" {
+			t.Errorf("%s fw_compat.wasm = %q, want the wide \">=0.2.0\" domain", genName, gen.FwCompat["wasm"])
 		}
 	}
-	for _, plat := range []string{"linux-arm64", "win-x64"} {
-		if gen.Platforms[plat].Wamrc != nil {
-			t.Fatalf("embedded %s wamrc: want null (no leg built; win best-effort leg failed — tracked P2), got %+v", plat, gen.Platforms[plat].Wamrc)
-		}
+	// the default aot lane's generation is the snapshot's latest — the
+	// resolver's hardcoded label can never drift from what this daemon
+	// serves as current
+	if ix.Latest != aotDefaultGen {
+		t.Errorf("snapshot latest %q != aotDefaultGen %q (resolveAOTWamrc's default generation drifted from the served index)", ix.Latest, aotDefaultGen)
+	}
+	// and the latest generation really is the surgery kind the default
+	// lane assumes
+	if k := ix.Generations[aotDefaultGen].Kind; k != "xuansi-surgery-wamrc" {
+		t.Errorf("aotDefaultGen %s kind = %q, want xuansi-surgery-wamrc", aotDefaultGen, k)
 	}
 }
 
-// TestToolchainDescAOTDomain (P3-T7, the MCP-seat discipline's
-// executable half): the toolchain/build Descriptions are the face's
-// fw-compat pairing surface, and with toolchain-v2's aot domain OPEN
-// they must speak the present tense — the open domain + its floor, the
-// fw-internal-SRAM placement semantics with the caps
-// aot_exec_budget_bytes ceiling, the honest over-budget refusal, and
-// PSRAM (toolchain-v3) as the later chapter — while every retired
-// future-tense marker ("aot = null", "arrives with the A1 runtime",
-// "refused until A1") must be GONE from all three Descs. The drift
-// this pins is exactly the T8-minor⑤ staleness class: a Desc that
-// describes a mechanism the product no longer has (or does not yet
-// have) is a documentation defect the seat carries to every agent.
+// TestToolchainDescAOTDomain (P3-T7, extended P3-T12): the
+// toolchain/build Descriptions are the face's fw-compat pairing
+// surface, and they must speak the DUAL-GENERATION read — aot >=0.3.0
+// with toolchain-v3 (the latest/default: the surgery wamrc, PSRAM
+// exec) and toolchain-v2 (the stock wamrc, fw-internal SRAM within
+// aot_exec_budget_bytes) — while every retired future-tense marker
+// ("aot = null", "arrives with the A1 runtime", "refused until A1",
+// "arrives later with toolchain-v3") must be GONE: v3 is the present,
+// not a horizon. The drift this pins is the T8-minor⑤ staleness
+// class: a Desc that describes a mechanism the product no longer has
+// (or does not yet have) is a documentation defect the seat carries
+// to every agent.
 func TestToolchainDescAOTDomain(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -215,50 +263,59 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 		desc[tool.Name] = tool.Description
 	}
 
-	// status: the pairing matrix sentence, present tense, all four
-	// ruling-mandated elements + the toolchain-v3 horizon.
+	// status: the pairing matrix sentence, present tense, the four
+	// ruling-mandated elements + BOTH generations of the dual-gen read.
 	st := desc["xuansi_toolchain_status"]
 	for _, want := range []string{
 		"aot >=0.3.0",           // the open domain + its floor
-		"aot_exec_budget_bytes", // the ceiling's caps key (T6 caps face)
-		"INTERNAL SRAM",         // placement: fw-internal, not PSRAM
+		"aot_exec_budget_bytes", // v2's ceiling's caps key (T6 caps face)
+		"INTERNAL SRAM",         // v2 placement: fw-internal, not PSRAM
 		"honestly refused",      // over-budget semantics: no silent swap
-		"toolchain-v3",          // PSRAM exec is the later chapter
+		"toolchain-v3",          // the latest generation
+		"toolchain-v2",          // the kept stock generation
+		"xuansi-surgery-wamrc",  // v3's kind
+		"PSRAM exec",            // v3's placement lane
 	} {
 		if !strings.Contains(st, want) {
-			t.Errorf("toolchain_status Desc: want %q (the open aot domain, present tense), missing from:\n%s", want, st)
+			t.Errorf("toolchain_status Desc: want %q (the dual-generation aot read), missing from:\n%s", want, st)
 		}
 	}
 
-	// the retired future-tense markers must be gone from ALL three.
+	// the retired future-tense markers must be gone from ALL three —
+	// including T12's own retiree: "arrives later with toolchain-v3"
+	// (v3 IS the present now).
 	for name, d := range desc {
 		switch name {
 		case "xuansi_toolchain_status", "xuansi_toolchain_fetch", "xuansi_wasm_build":
 		default:
 			continue
 		}
-		for _, stale := range []string{"aot = null", "aot empty", "refused until A1", "arrives with the A1 runtime", "empty domain"} {
+		for _, stale := range []string{"aot = null", "aot empty", "refused until A1", "arrives with the A1 runtime", "empty domain", "arrives later with toolchain-v3", "arrives with toolchain-v3"} {
 			if strings.Contains(d, stale) {
 				t.Errorf("%s Desc: retired future-tense marker %q still present:\n%s", name, stale, d)
 			}
 		}
 	}
 
-	// fetch: the PAIRING sentence states the open domain.
-	if fx := desc["xuansi_toolchain_fetch"]; !strings.Contains(fx, "aot >=0.3.0") {
-		t.Errorf("toolchain_fetch Desc: want the pairing sentence to state \"aot >=0.3.0\", missing from:\n%s", fx)
-	}
-
-	// build: wamrc_path is the aot lane, the frozen recipe named.
-	bd := desc["xuansi_wasm_build"]
-	for _, want := range []string{"--target=xtensa", "--cpu=esp32s3", "drivers/<name>@<version>.aot", "wasm-dev"} {
-		if !strings.Contains(bd, want) {
-			t.Errorf("wasm_build Desc: want %q (the wamrc_path aot lane), missing from:\n%s", want, bd)
+	// fetch: the PAIRING sentence states the dual generations.
+	fx := desc["xuansi_toolchain_fetch"]
+	for _, want := range []string{"aot >=0.3.0", "toolchain-v3", "PSRAM exec"} {
+		if !strings.Contains(fx, want) {
+			t.Errorf("toolchain_fetch Desc: want %q in the dual-generation pairing sentence, missing from:\n%s", want, fx)
 		}
 	}
 
-	// build input schema: the wamrc_path field Desc carries the lane
-	// semantics too (the seat a client actually reads first).
+	// build: the aot lane's TWO knobs + the frozen recipe named.
+	bd := desc["xuansi_wasm_build"]
+	for _, want := range []string{"--target=xtensa", "--cpu=esp32s3", "drivers/<name>@<version>.aot", "wasm-dev", "aot=true"} {
+		if !strings.Contains(bd, want) {
+			t.Errorf("wasm_build Desc: want %q (the dual-knob aot lane), missing from:\n%s", want, bd)
+		}
+	}
+
+	// build input schema: the aot knob's Desc carries the lane
+	// semantics; the wamrc_path field Desc keeps the dev-override
+	// semantics (the seat a client actually reads first).
 	for _, tool := range lr.Tools {
 		if tool.Name != "xuansi_wasm_build" {
 			continue
@@ -268,14 +325,33 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 			t.Fatalf("wasm_build input schema = %#v, want a JSON object", tool.InputSchema)
 		}
 		props, _ := m["properties"].(map[string]any)
-		f, ok := props["wamrc_path"].(map[string]any)
-		if !ok {
-			t.Fatal("wasm_build input schema: no wamrc_path property")
-		}
-		fd, _ := f["description"].(string)
-		for _, want := range []string{".aot", "wasm-dev"} {
-			if !strings.Contains(fd, want) {
-				t.Errorf("wamrc_path schema Desc: want %q, missing from:\n%s", want, fd)
+		for _, field := range [...]string{"aot", "wamrc_path", "fw"} {
+			f, ok := props[field].(map[string]any)
+			if !ok {
+				t.Fatalf("wasm_build input schema: no %s property", field)
+			}
+			fd, _ := f["description"].(string)
+			switch field {
+			case "aot":
+				for _, want := range []string{".aot", "toolchain-v3"} {
+					if !strings.Contains(fd, want) {
+						t.Errorf("aot schema Desc: want %q, missing from:\n%s", want, fd)
+					}
+				}
+			case "wamrc_path":
+				for _, want := range []string{".aot", "wasm-dev"} {
+					if !strings.Contains(fd, want) {
+						t.Errorf("wamrc_path schema Desc: want %q, missing from:\n%s", want, fd)
+					}
+				}
+			case "fw":
+				// T7-①'s debt: the fw Desc must state BOTH floors —
+				// 0.2.0 (wasm track) and 0.3.0 (aot lane).
+				for _, want := range []string{"0.2.0", "0.3.0", "aot"} {
+					if !strings.Contains(fd, want) {
+						t.Errorf("fw schema Desc: want the dual-floor wording (%s), missing from:\n%s", want, fd)
+					}
+				}
 			}
 		}
 	}
@@ -385,7 +461,7 @@ func TestTCStatusAllPresentRemoteIndex(t *testing.T) {
 	sdkPin := tcInstalled{SHA256: "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5", Bytes: 118879731, Dir: "wasi-sdk-24.0-" + plat}
 	wamrcPin := tcInstalled{SHA256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", Bytes: 4096, Dir: "wamrc/wamrc"}
 	if err := saveTCState(filepath.Join(cache, toolchainStateFile), &tcState{
-		Generation: "toolchain-v2",
+		Generation: "toolchain-v3",
 		Installed:  map[string]tcInstalled{"wasi_sdk": sdkPin, "wamrc": wamrcPin},
 	}); err != nil {
 		t.Fatalf("plant state: %v", err)
@@ -401,11 +477,11 @@ func TestTCStatusAllPresentRemoteIndex(t *testing.T) {
 	}
 
 	out := tcStatusOK(t, srv.URL)
-	if out.Index.Source != "remote" || out.Index.Latest != "toolchain-v2" || out.Index.Note != "" {
-		t.Fatalf("index = %+v, want remote / toolchain-v2 / no note", out.Index)
+	if out.Index.Source != "remote" || out.Index.Latest != "toolchain-v3" || out.Index.Note != "" {
+		t.Fatalf("index = %+v, want remote / toolchain-v3 (the P3-T12 latest) / no note", out.Index)
 	}
-	if out.Generation != "toolchain-v2" {
-		t.Fatalf("generation = %q, want the state's toolchain-v2", out.Generation)
+	if out.Generation != "toolchain-v3" {
+		t.Fatalf("generation = %q, want the state's toolchain-v3", out.Generation)
 	}
 	if out.CacheRoot != cache {
 		t.Fatalf("cache_root = %q, want the XUANSI_WASM_CACHE override %q", out.CacheRoot, cache)
@@ -436,6 +512,21 @@ func TestTCStatusAllPresentRemoteIndex(t *testing.T) {
 	if n := hits.Load(); n != 1 {
 		t.Errorf("HTTP hits = %d, want exactly 1 (the index; status downloads no assets)", n)
 	}
+
+	// the dual-generation upgrade line (P3-T12): the SAME complete
+	// cache re-labeled toolchain-v2 against the v3-latest index gains
+	// exactly the upgrade guidance — both pieces still present, the
+	// pairing question answered honestly.
+	if err := saveTCState(filepath.Join(cache, toolchainStateFile), &tcState{
+		Generation: "toolchain-v2",
+		Installed:  map[string]tcInstalled{"wasi_sdk": sdkPin, "wamrc": wamrcPin},
+	}); err != nil {
+		t.Fatalf("re-plant v2 state: %v", err)
+	}
+	out = tcStatusOK(t, srv.URL)
+	if !strings.Contains(out.Guidance, "toolchain-v2") || !strings.Contains(out.Guidance, "toolchain-v3") || !strings.Contains(out.Guidance, "xuansi_toolchain_fetch") {
+		t.Errorf("v2-cache guidance = %q: want the upgrade line naming both generations and fetch", out.Guidance)
+	}
 }
 
 // TestTCStatusRemoteUnreachableDegradesToEmbedded: a dead index URL
@@ -448,8 +539,8 @@ func TestTCStatusRemoteUnreachableDegradesToEmbedded(t *testing.T) {
 
 	t.Setenv("XUANSI_WASM_CACHE", t.TempDir())
 	out := tcStatusOK(t, srv.URL)
-	if out.Index.Source != "embedded" || out.Index.Latest != "toolchain-v2" {
-		t.Fatalf("index = %+v, want embedded / toolchain-v2 (the snapshot's values)", out.Index)
+	if out.Index.Source != "embedded" || out.Index.Latest != "toolchain-v3" {
+		t.Fatalf("index = %+v, want embedded / toolchain-v3 (the snapshot's values)", out.Index)
 	}
 	if out.Index.Note == "" {
 		t.Fatal("note: want non-empty (why the remote index did not answer)")
