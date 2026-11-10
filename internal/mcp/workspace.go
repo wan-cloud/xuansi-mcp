@@ -605,9 +605,10 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	if paired {
 		// ruling 2's order: the .aot leg FIRST (the smaller failure
 		// face) — its failure leaves no residue and never touches the
-		// .wasm slot; then the .wasm, whose failure rolls the .aot
-		// back out. The board ends all-old or all-new, never half a
-		// pair (Review Focus #4).
+		// .wasm slot; then the .wasm, whose failure rolls the WHOLE
+		// pair back out (the .aot always, the .wasm when its write
+		// crossed — pre-push slots, never half a pair; Review Focus
+		// #4's 誠實錯: the error states the exact residual state).
 		if wrote, err := ts.pushArtifact(ctx, board, aotPath, aotContent, in.Holder); err != nil {
 			// no-residue cleanup: a refused fs_write changed nothing
 			// (the daemon's atomic-write contract — wrote=false, no rm
@@ -621,14 +622,30 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 			}
 			return nil, driverPushOut{}, err
 		}
-		if _, err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
-			// rollback: the just-pushed .aot must not stay — the
-			// loader PREFERS it, so a half-new pair would silently run
-			// the new compiled code against the old deliverable.
+		if wrote, err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
+			// rollback (ruling 2: pre-push slot state, honestly): BOTH
+			// halves go. The .aot always (it landed verified moments
+			// ago); the .wasm when its write crossed — a refused
+			// fs_write left nothing (the daemon's atomic-write
+			// contract), but a failed read-back left THIS push's
+			// UNVERIFIED bytes in the loader's fallback path, and
+			// "neither half" is only true once they are gone.
+			var stuck []string
 			if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: aotPath, Holder: in.Holder}); rerr != nil && !notFoundIsh(rerr) {
-				return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) AND rolling back the .aot failed (%v) — the board may hold the half-new pair (.aot at %s without its .wasm); xuansi_driver_pull the driver before retrying; manifest untouched", err, rerr, aotPath)
+				stuck = append(stuck, fmt.Sprintf("the .aot at %s (%v)", aotPath, rerr))
 			}
-			return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) — the .aot leg was rolled back (fs_rm %s); the board holds neither half of the new pair, manifest untouched", err, aotPath)
+			cleared := aotPath
+			if wrote {
+				if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: path, Holder: in.Holder}); rerr != nil && !notFoundIsh(rerr) {
+					stuck = append(stuck, fmt.Sprintf("the unverified .wasm at %s (%v)", path, rerr))
+				} else {
+					cleared = aotPath + " + the unverified " + path
+				}
+			}
+			if len(stuck) > 0 {
+				return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) AND the rollback could not clear %s — the board may hold UNVERIFIED bytes of this push; xuansi_driver_pull the driver before retrying; manifest untouched", err, strings.Join(stuck, "; "))
+			}
+			return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) — the pair was rolled back to the pre-push slots (fs_rm %s); the board holds neither half of the new pair, manifest untouched", err, cleared)
 		}
 	} else if _, err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
 		return nil, driverPushOut{}, err
