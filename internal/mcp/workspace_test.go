@@ -1384,11 +1384,16 @@ func TestDriverPushPairedWasmAotHappyPath(t *testing.T) {
 }
 
 // TestDriverPushPairedWasmLegFailRollsBackAot: the pair's .wasm leg
-// failing (a tampered read-back) rolls the just-pushed .aot back out —
-// the board is left with NEITHER half of the new pair, the manifest is
-// untouched, and the error says all of that (Review Focus #4: no half
-// pair survives).
+// failing rolls the WHOLE pair back out — the .aot always, and the
+// .wasm too when its write crossed (a tampered read-back left this
+// push's unverified bytes in the loader's fallback path; fix round 1:
+// "neither half" is only true once they are gone). A REFUSED .wasm
+// write crosses no .wasm rm (nothing of ours landed there), and a
+// rollback rm that itself fails errors naming the exact residual
+// state. The manifest is untouched on every leg.
 func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
+	// leg 1: the .wasm write lands, the read-back is tampered — both
+	// halves roll back, the board's slot table ends empty
 	e, pd, root := newPairEnv(t)
 	seedChipBoard(t, e, "d75884", "ESP32-S3")
 	storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
@@ -1401,7 +1406,7 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 		t.Fatalf("paired push with a failing .wasm leg succeeded: %+v", res)
 	}
 	// wire order: .aot write + clean read-back, .wasm write + tampered
-	// read-back, then the ROLLBACK fs_rm of the .aot
+	// read-back, then the ROLLBACK fs_rm of BOTH halves (.aot, .wasm)
 	for i, want := range []struct {
 		typ  string
 		path string
@@ -1411,6 +1416,7 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 		{"fs_write", "/drv/pairmod.wasm"},
 		{"fs_read", "/drv/pairmod.wasm"},
 		{"fs_rm", "/drv/pairmod.aot"},
+		{"fs_rm", "/drv/pairmod.wasm"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -1418,12 +1424,14 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 		}
 	}
 	noContact(t, pd.reqs)
-	if _, still := pd.files["d75884\x00/drv/pairmod.aot"]; still {
-		t.Errorf("board still holds the rolled-back .aot — the half-pair foot-gun")
+	for _, slot := range []string{"/drv/pairmod.aot", "/drv/pairmod.wasm"} {
+		if _, still := pd.files["d75884\x00"+slot]; still {
+			t.Errorf("board still holds %s after the rollback — neither half may survive", slot)
+		}
 	}
 
 	got := resultText(t, res)
-	for _, want := range []string{"read-back sha256", "rolled back", "/drv/pairmod.aot", "manifest untouched"} {
+	for _, want := range []string{"read-back sha256", "rolled back", "/drv/pairmod.aot", "/drv/pairmod.wasm", "neither half", "manifest untouched"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("error text = %q, want it to contain %q", got, want)
 		}
@@ -1435,6 +1443,66 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 	}
 	if fm := ent.Files["1.0.0"]; len(fm.Boards) != 0 || !fm.PushedAt.IsZero() {
 		t.Errorf("Files[1.0.0] = %+v, want zero push footprints (pre-push manifest state)", fm)
+	}
+
+	// leg 2: the board REFUSES the .wasm fs_write — nothing of ours in
+	// that slot, so the rollback rms the .aot only (no .wasm rm)
+	e2, pd2, root2 := newPairEnv(t)
+	seedChipBoard(t, e2, "d75884", "ESP32-S3")
+	storePairVersion(t, root2, "pairmod", "1.0.0", "esp32s3")
+	pd2.failWrite["/drv/pairmod.wasm"] = "flash write refused: no space left on device"
+	res2 := e2.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if !res2.IsError {
+		t.Fatalf("paired push with a refused .wasm write succeeded: %+v", res2)
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.aot"},
+		{"fs_read", "/drv/pairmod.aot"},
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_rm", "/drv/pairmod.aot"},
+	} {
+		req := wantReq(t, pd2.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("leg2 crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd2.reqs)
+	if got := resultText(t, res2); !strings.Contains(got, "neither half") {
+		t.Errorf("leg2 error text = %q, want the neither-half claim (true here: the write never landed)", got)
+	}
+
+	// leg 3: the .wasm rollback rm itself fails — the error names the
+	// UNVERIFIED residual bytes honestly instead of claiming neither
+	e3, pd3, root3 := newPairEnv(t)
+	seedChipBoard(t, e3, "d75884", "ESP32-S3")
+	storePairVersion(t, root3, "pairmod", "1.0.0", "esp32s3")
+	pd3.tamperRead["/drv/pairmod.wasm"] = true
+	pd3.failRm["/drv/pairmod.wasm"] = "lease vanished mid-rollback"
+	res3 := e3.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if !res3.IsError {
+		t.Fatalf("paired push with a failing .wasm rollback succeeded: %+v", res3)
+	}
+	got3 := resultText(t, res3)
+	for _, want := range []string{"could not clear", "unverified .wasm at /drv/pairmod.wasm", "lease vanished mid-rollback", "xuansi_driver_pull", "manifest untouched"} {
+		if !strings.Contains(got3, want) {
+			t.Errorf("leg3 error text = %q, want it to contain %q", got3, want)
+		}
+	}
+	if _, still := pd3.files["d75884\x00/drv/pairmod.wasm"]; !still {
+		t.Errorf("leg3 board lost the .wasm the daemon refused to rm — the fixture disagrees with the script")
+	}
+	if _, still := pd3.files["d75884\x00/drv/pairmod.aot"]; still {
+		t.Errorf("leg3 board still holds the .aot — its rollback rm was not in failRm and must have cleared")
+	}
+	if m3 := wsManifest(t, root3); m3.Drivers["pairmod"].Active != "" {
+		t.Errorf("leg3 Active = %q after the failed rollback, want none (manifest untouched)", m3.Drivers["pairmod"].Active)
 	}
 }
 
