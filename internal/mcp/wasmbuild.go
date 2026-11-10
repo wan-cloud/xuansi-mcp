@@ -685,6 +685,18 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	// that timestamp — the disk values win on a re-build, the same
 	// single-source discipline driverPush applies to sha/size.
 	fm.PushedAt = time.Now().UTC()
+	// P3-T13: the aot lane records its target — the frozen recipe's
+	// --cpu=esp32s3 IS the manifest's aot.esp32s3 claim (the pairing
+	// source a bare push acts on when the same version later also
+	// holds a .wasm; the record refreshes on every re-build, and a
+	// .wasm-lane re-build of the version leaves it untouched — the
+	// artifact on disk is what it describes).
+	if ext == "aot" {
+		if fm.Aot == nil {
+			fm.Aot = map[string]AotSlot{}
+		}
+		fm.Aot["esp32s3"] = AotSlot{Sha256: sha, Size: len(wasm)}
+	}
 	e.Files[ver] = fm // Active deliberately untouched
 	m.Drivers[in.Name] = e
 	if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
