@@ -68,9 +68,11 @@ type toolchainIndex struct {
 // compatibility domains per artifact track, the wasi-sdk version it
 // pins, and the per-platform asset matrix. FwCompat is SPLIT-TRACK
 // (design §6.2): "wasm" carries a wide semver domain (bytecode is
-// version-less), "aot" an empty string "" = EMPTY domain — the P1 v2
-// honest refusal (the current fw stack cannot load .aot; the domain
-// opens with the A1 runtime).
+// version-less); since P3-T7 "aot" carries toolchain-v2's OPEN
+// domain (">=0.3.0" — the stock wamrc against the fw line with the
+// internal-SRAM aot loader + budget gate). "" (or a missing key)
+// still reads as an empty domain — the honest shape for any future
+// generation whose aot lane is genuinely closed.
 type tcGen struct {
 	Kind      string            `json:"kind"`      // "stock-wamrc" (v2) / "fork-surgery" (v3, P2)
 	FwCompat  map[string]string `json:"fw_compat"` // per-track domains; "" (or a missing key) = empty domain

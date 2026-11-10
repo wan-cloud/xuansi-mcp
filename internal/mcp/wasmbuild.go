@@ -11,22 +11,29 @@ package mcp
 //     cross-leg rebuilds the drivers modules through this function
 //     and hash-compares, so a drift on either side is a red build).
 //   - aotGate / fwGateWasm: the split-track pairing gates (§6.2).
-//     The aot domain is EMPTY in P1's toolchain-v2 — .aot is refused
-//     for every fw, the honest S3 ruling, with wamrc_path as the
-//     §6.4 developer escape; the wasm track's domain is the WIDE one
-//     (bytecode is version-less), floored at the first fw with a
-//     wasm loader (0.2.0).
+//     Since P3-T7 toolchain-v2's aot domain is OPEN
+//     (fw_compat.aot >=0.3.0): .aot is a real artifact lane — the
+//     wamrc_path §6.4 override compiles the freshly-built .wasm one
+//     step further with wamrc — and the aot gate's job is the EARLY
+//     fw pairing refusal below the 0.3.0 floor (the 分發 spec's
+//     配對紀律: refuse at BUILD time, not at board load). The wasm
+//     track's domain stays the WIDE one (bytecode is version-less),
+//     floored at the first fw with a wasm loader (0.2.0).
 //   - wasmBuildInner: resolve the wasi-sdk (wasi_sdk_path override >
 //     the cache state's landed record > the self-guiding fetch
 //     refusal), expand the embedded xuansi_host.h into a temp include
 //     dir, exec <sdk>/bin/clang, and return the .wasm bytes with
 //     clang's stdout/stderr verbatim as warnings.
-//   - wamrcExec: a stub — wamrc execution lands with A1/A3 runtime
-//     work; the aot lane's override half dies there, explicitly.
+//   - wamrcExec: the aot lane's exec half (P3-T7: the not-yet stub
+//     retired with the domain opening) — stage the .wasm, exec the
+//     §6.4 wamrc with build.sh's frozen recipe, gate the output's
+//     \0aot container magic, return the .aot bytes with wamrc's
+//     transcript verbatim.
 //   - wasmBuild (T5): the tool face — input gates, the gates above,
-//     the compile, then drivers/<name>@<ver>.wasm + one manifest
-//     cycle (kind "wasm", or "wasm-dev" when ANY §6.4 override —
-//     wamrc_path or wasi_sdk_path — is in play).
+//     the compile, then drivers/<name>@<ver>.wasm (or .aot on the
+//     wamrc_path lane) + one manifest cycle (kind "wasm", or
+//     "wasm-dev" when ANY §6.4 override — wamrc_path or
+//     wasi_sdk_path — is in play).
 
 import (
 	"bytes"
@@ -140,17 +147,35 @@ func tcClangName(goos string) string {
 	return "clang"
 }
 
-// aotGate is the split-track pairing gate's aot half (§6.2, spec
-// wording verbatim): P1's toolchain-v2 carries an EMPTY aot domain —
-// the current fw stack cannot load .aot at all (the S3 deficiency) —
-// so the build gate refuses .aot for every fw, always, with the
-// honest why and the one escape: wamrc_path, the §6.4 developer
-// experimental lane (the gate then passes, and wamrcExec's stub
-// answers the rest). A1 opens the index's aot domain; A3 the v3
-// generation — neither is this daemon's today.
+// aotFWFloor is the aot track's fw floor — 0.3.0, the first fw with
+// an aot loader (internal-SRAM placement + the caps
+// aot_exec_budget_bytes budget gate, T6). Hardcoded here exactly as
+// fwGateWasm hardcodes its own floor: the build face never reads an
+// index (the cache state IS the pairing evidence), and the value is
+// locked to the index's fw_compat.aot by TestEmbeddedSnapshotParses
+// (">=0.3.0") — the drift-lock's third leg. A future generation
+// moving the floor moves all three in one red sweep.
+const aotFWFloor = "0.3.0"
+
+// aotGate is the split-track pairing gate's aot half (§6.2). Since
+// P3-T7 toolchain-v2's aot domain is OPEN — the stock wamrc compiles
+// .aot for fw 0.3.0+ — the gate's job is the EARLY pairing refusal
+// the 分發 spec's 配對紀律 demands: an explicit fw below the 0.3.0
+// floor refuses at BUILD time with the honest why (that firmware has
+// no aot loader), never left to blow at board load. The lane itself
+// needs a wamrc: the §6.4 wamrc_path override today (dev lane, kind
+// wasm-dev); the cache-paired DEFAULT wamrc arrives with
+// toolchain-v3 (P3-T12) — an internal WantAOT with no wamrc is
+// refused here honestly, naming both.
 func aotGate(r buildReq) error {
-	if r.WantAOT && r.WamrcPath == "" {
-		return errWs("xuansi_wasm_build: toolchain-v2 aot domain empty (fw_compat.aot=null) — .aot needs the A1/A3 runtime; experimental: pass wamrc_path")
+	if !r.WantAOT {
+		return nil
+	}
+	if r.FW != "" && cmpVer(r.FW, aotFWFloor) < 0 {
+		return errWs("xuansi_wasm_build: fw %q is below the aot track's fw floor 0.3.0 (fw_compat.aot=\">=0.3.0\") — this firmware has no aot loader; upgrade the board, or omit fw to build without the compat check", r.FW)
+	}
+	if r.WamrcPath == "" {
+		return errWs("xuansi_wasm_build: the aot lane needs a wamrc — pass wamrc_path (the §6.4 dev override; the toolchain-v2 stock wamrc xuansi_toolchain_fetch installs compiles the .aot fw 0.3.0+ loads); the cache-paired default wamrc arrives with toolchain-v3")
 	}
 	return nil
 }
@@ -174,15 +199,73 @@ func fwGateWasm(fw string) error {
 	return nil
 }
 
-// wamrcExec is the .aot compile's exec seam. NOT in P1: wamrc
-// execution lands with the A1/A3 runtime work (§6.2/§6.4). The stub
-// keeps the override lane honest — aotGate PASSES an explicit
-// wamrc_path (the §6.4 experimental override), and the first .aot
-// build then dies HERE with the explicit not-yet refusal instead of
-// silently shipping a .wasm where .aot was asked.
-// TODO(T5+): the real wamrc exec + the aot artifact's own shape gate.
-func wamrcExec(_ context.Context, _ buildReq, _ string) (aotBytes []byte, warnings string, err error) {
-	return nil, "", errWs("xuansi_wasm_build: wamrc exec lands with A1 — .aot compilation is not in this daemon yet (the gate passed because wamrc_path was given; the runtime that would load .aot arrives with A1/A3)")
+// wamrcExec is the aot lane's exec half — P3-T7 retired the not-yet
+// stub when toolchain-v2's aot domain opened. Stages the freshly
+// built .wasm bytes into one temp dir, execs the §6.4 wamrc with
+// build.sh's frozen recipe VERBATIM (--target=xtensa --cpu=esp32s3
+// --size-level=3 — the drivers repo's own invocation, so a
+// daemon-built .aot is recipe-comparable with the repo's auxiliary
+// artifacts), and returns the .aot bytes with wamrc's stdout/stderr
+// verbatim as warnings. The probe gives a missing binary the
+// broken-tree refusal (the clang twin's shape); a failing wamrc
+// refuses carrying the transcript tail (wamrc prints its errors on
+// STDOUT, so the tail rides the combined transcript); a "successful"
+// run whose output lacks the \0aot container magic (aotMagic — the
+// SAME byte-for-byte
+// fw-loader gate driver_push enforces, workspace.go's B10 table) is
+// refused too — wamrc exiting 0 with garbage must never land as an
+// artifact. The compile cap rides tcRunCompile (tcCompileTimeout
+// bounds ONE compiler run — clang's and wamrc's each get their own).
+func wamrcExec(ctx context.Context, r buildReq, wasm []byte) (aotBytes []byte, warnings string, err error) {
+	if _, serr := os.Stat(r.WamrcPath); serr != nil {
+		return nil, "", errWs("xuansi_wasm_build: no wamrc at %s — the aot lane needs the toolchain-v2 stock wamrc (xuansi_toolchain_fetch installs it) or an explicit local build; manual steps: see the xuansi-drivers README's User-compiled modules section", r.WamrcPath)
+	}
+	base := "module"
+	if r.Name != "" {
+		if !wsNameRe.MatchString(r.Name) {
+			return nil, "", errWs("xuansi_wasm_build: name must match [a-z0-9_-]+, got %q", r.Name)
+		}
+		base = r.Name
+	}
+	tmp, terr := os.MkdirTemp("", "xuansi-wamrc-*")
+	if terr != nil {
+		return nil, "", errWs("xuansi_wasm_build: wamrc staging dir: %v", terr)
+	}
+	defer os.RemoveAll(tmp)
+	wasmPath := filepath.Join(tmp, base+".wasm")
+	if err := os.WriteFile(wasmPath, wasm, 0o644); err != nil {
+		return nil, "", errWs("xuansi_wasm_build: stage .wasm for wamrc: %v", err)
+	}
+	aotPath := filepath.Join(tmp, base+".aot")
+
+	stdoutS, stderrS, runErr, timedOut := tcRunCompile(ctx, r.WamrcPath, []string{
+		"--target=xtensa", "--cpu=esp32s3", "--size-level=3",
+		"-o", aotPath, wasmPath,
+	})
+	warnings = stdoutS + stderrS
+	if timedOut {
+		return nil, warnings, runErr
+	}
+	if runErr != nil {
+		// the TAIL rides the combined transcript (the seat check's
+		// finding: wamrc prints ITS errors on STDOUT — "llvm get
+		// target from triple ... failed" — unlike clang's stderr, so
+		// an stderr-only tail like clang's refusal would arrive empty
+		// exactly when it matters).
+		return nil, warnings, errWs("xuansi_wasm_build: wamrc failed (%v): %s", runErr, tcWarnTail(warnings))
+	}
+	aot, rerr := os.ReadFile(aotPath)
+	if rerr != nil {
+		return nil, warnings, errWs("xuansi_wasm_build: wamrc reported success but no .aot landed: %v (transcript: %s)", rerr, tcWarnTail(warnings))
+	}
+	if len(aot) < len(aotMagic) || !bytes.HasPrefix(aot, aotMagic[:]) {
+		got := aot
+		if len(got) > 8 {
+			got = got[:8]
+		}
+		return nil, warnings, errWs("xuansi_wasm_build: wamrc output is not an .aot container (magic % x, want \\0aot) — not a stock-wamrc xtensa build; the artifact is refused", got)
+	}
+	return aot, warnings, nil
 }
 
 // tcCompileTimeout bounds ONE clang compile (final-review M4: the
@@ -379,11 +462,12 @@ type wasmBuildIn struct {
 	// explicit, deliberately outside the toolchain cache's pairing
 	// evidence — and EITHER one marks the manifest entry kind
 	// "wasm-dev" (the artifact is visibly not an index-paired build,
-	// however the unpaired compile was requested). WamrcPath is the
-	// aot lane's knob (the .aot compile itself arrives with the A1
-	// runtime); WasiSDKPath compiles with a local wasi-sdk tree
-	// (bin/clang inside it) instead of the cache's landed record.
-	WamrcPath   string `json:"wamrc_path,omitempty" jsonschema:"the §6.4 developer override: an explicit wamrc marks this a dev build — the manifest entry records kind \"wasm-dev\" instead of \"wasm\" (the .aot lane itself arrives with the A1 runtime)"`
+	// however the unpaired compile was requested). WamrcPath IS the
+	// aot lane (since P3-T7 the lane really execs wamrc — the frozen
+	// recipe from build.sh — and lands a .aot for fw 0.3.0+);
+	// WasiSDKPath compiles with a local wasi-sdk tree (bin/clang
+	// inside it) instead of the cache's landed record.
+	WamrcPath   string `json:"wamrc_path,omitempty" jsonschema:"the §6.4 developer override and the aot lane's knob: given, the freshly-built .wasm compiles one step further with this wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3) and the artifact lands as drivers/<name>@<version>.aot, manifest kind \"wasm-dev\" — the toolchain-v2 stock wamrc (xuansi_toolchain_fetch) produces the .aot fw 0.3.0+ loads from internal SRAM (caps aot_exec_budget_bytes ceiling)"`
 	WasiSDKPath string `json:"wasi_sdk_path,omitempty" jsonschema:"the §6.4 developer override: compile with this local wasi-sdk tree (its bin/clang, never a PATH lookup) instead of the toolchain cache's landed record — explicitly bypassing the index pairing evidence, and marks the manifest entry kind \"wasm-dev\""`
 }
 
@@ -392,25 +476,28 @@ type wasmBuildIn struct {
 type wasmBuildOut struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
-	File    string `json:"file" jsonschema:"the landed artifact's workspace-relative path (drivers/<name>@<version>.wasm) — same presentation xuansi_ws_list/xuansi_driver_fetch use"`
-	Sha256  string `json:"sha256" jsonschema:"sha256 of the compiled .wasm — the value the manifest's Files entry records"`
-	Bytes   int    `json:"bytes" jsonschema:"compiled .wasm bytes"`
-	// Warnings is clang's stdout+stderr verbatim (empty transcript =
+	File    string `json:"file" jsonschema:"the landed artifact's workspace-relative path (drivers/<name>@<version>.wasm, or .aot on the wamrc_path aot lane) — same presentation xuansi_ws_list/xuansi_driver_fetch use"`
+	Sha256  string `json:"sha256" jsonschema:"sha256 of the compiled artifact (.wasm, or the .aot the wamrc lane produced) — the value the manifest's Files entry records"`
+	Bytes   int    `json:"bytes" jsonschema:"compiled artifact bytes (.wasm, or .aot on the wamrc lane)"`
+	// Warnings is the compiler transcripts verbatim — clang's
+	// stdout+stderr, plus wamrc's on the aot lane (empty transcript =
 	// absent). On a failed compile it is LOST — the refusal carries
 	// the stderr tail instead, and nothing lands.
-	Warnings string `json:"warnings,omitempty" jsonschema:"clang's stdout+stderr verbatim; absent when the compile was silent"`
+	Warnings string `json:"warnings,omitempty" jsonschema:"compiler stdout+stderr verbatim — clang's, plus wamrc's on the wamrc_path aot lane; absent when every compile was silent"`
 	Next     string `json:"next" jsonschema:"the fixed next step: deploy the artifact, then exercise it"`
 }
 
 // wasmBuild is the xuansi_wasm_build handler — the toolchain face's
 // build verb and the workspace's third storing path (ws_put stores
 // Lua text, driver_fetch a prebuilt index artifact, this compiles C
-// source into a fresh .wasm on this host). Pipeline: input gates
-// (name/version/source size/the one ABI knob, both its rules) → the
-// split-track gates (§6.2) → wasmBuildInner (sdk resolution + the
-// compile) → the landing (writeDurableFile + one manifest cycle,
-// driverFetch's commit pattern under wsMu). No board, no lease — the
-// compile is host-side, storing is not activating.
+// source into a fresh .wasm on this host — or, on the wamrc_path aot
+// lane since P3-T7, the .aot the §6.4 wamrc compiles that .wasm
+// into). Pipeline: input gates (name/version/source size/the one ABI
+// knob, both its rules) → the split-track gates (§6.2) →
+// wasmBuildInner (sdk resolution + the compile) → the landing
+// (writeDurableFile + one manifest cycle, driverFetch's commit
+// pattern under wsMu). No board, no lease — the compile is
+// host-side, storing is not activating.
 func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in wasmBuildIn) (*mcpsdk.CallToolResult, wasmBuildOut, error) {
 	// input shape: the same name/version whitelist every workspace
 	// path rides (ws_put's gates verbatim), the version default first
@@ -441,11 +528,14 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: initial_memory %d is over the frozen 1 MiB ceiling (the module-ABI freeze caps it at 1048576, the -Wl,--max-memory every build rides) — ask for at most 1048576", in.InitialMemory)
 	}
 
-	// the split-track gates (§6.2): the aot half can only fire the
-	// day this face grows an aot knob (WantAOT is never set from tool
-	// input today — the call keeps the pipeline whole for that day);
-	// the wasm half judges an EXPLICIT fw only.
-	r := buildReq{Name: in.Name, Source: in.Source, Version: ver, InitialMemory: in.InitialMemory, FW: in.FW, WamrcPath: in.WamrcPath, WasiSDKPath: in.WasiSDKPath}
+	// the split-track gates (§6.2): the aot half rides the wamrc_path
+	// lane (P3-T7: WantAOT = the §6.4 override in play; the aot
+	// track's EARLY fw floor is 0.3.0 and the lane execs wamrc after
+	// the compile); the wasm half judges an EXPLICIT fw only — its
+	// 0.2.0 floor is dominated by the aot floor on the aot lane, so
+	// the gate order is safe.
+	wantAOT := in.WamrcPath != ""
+	r := buildReq{Name: in.Name, Source: in.Source, Version: ver, InitialMemory: in.InitialMemory, FW: in.FW, WamrcPath: in.WamrcPath, WasiSDKPath: in.WasiSDKPath, WantAOT: wantAOT}
 	if err := aotGate(r); err != nil {
 		return nil, wasmBuildOut{}, err
 	}
@@ -455,6 +545,23 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	wasm, warnings, err := ts.wasmBuildInner(ctx, r)
 	if err != nil {
 		return nil, wasmBuildOut{}, err
+	}
+
+	// the aot lane (P3-T7): the freshly-built .wasm compiles one step
+	// further with the §6.4 wamrc — the artifact that LANDS is the
+	// .aot, wamrc's transcript joining clang's in warnings (a wamrc
+	// failure refuses carrying its stderr tail, and nothing lands).
+	ext := "wasm"
+	if wantAOT {
+		var aot []byte
+		var wwarn string
+		aot, wwarn, err = wamrcExec(ctx, r, wasm)
+		if err != nil {
+			return nil, wasmBuildOut{}, err
+		}
+		warnings += wwarn
+		wasm = aot
+		ext = "aot"
 	}
 
 	// the landing: drivers/<name>@<ver>.wasm + one manifest cycle, the
@@ -473,7 +580,7 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	sha := sha256hex(wasm)
 	wsMu.Lock()
 	defer wsMu.Unlock()
-	path := ts.ws.driverPath(in.Name, ver, "wasm")
+	path := ts.ws.driverPath(in.Name, ver, ext)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: %v", err)
 	}
@@ -501,7 +608,7 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	return nil, wasmBuildOut{
 		Name:     in.Name,
 		Version:  ver,
-		File:     "drivers/" + in.Name + "@" + ver + ".wasm",
+		File:     "drivers/" + in.Name + "@" + ver + "." + ext,
 		Sha256:   sha,
 		Bytes:    len(wasm),
 		Warnings: warnings,

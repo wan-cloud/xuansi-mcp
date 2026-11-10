@@ -4,7 +4,7 @@
   "generations": {
     "toolchain-v2": {
       "kind": "stock-wamrc",
-      "fw_compat": { "wasm": ">=0.2.0", "aot": "" },
+      "fw_compat": { "wasm": ">=0.2.0", "aot": ">=0.3.0" },
       "wasi_sdk": "24.0",
       "platforms": {
         "linux-x64": {
