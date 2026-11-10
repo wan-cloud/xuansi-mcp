@@ -107,12 +107,31 @@ func (w *wsState) driverPath(name, ver, ext string) string {
 func drvBoardPath(name, ext string) string { return "/drv/" + name + "." + ext }
 
 // name/version sanitization (the path-traversal guard): name
-// [a-z0-9_-]+, version [a-z0-9.]+; anything else is a local api-class
-// refusal.
+// [a-z0-9_-]+, version [a-z0-9.]+, aot target [a-z0-9-]+ (the §8-6
+// namespace's own vocabulary — esp32s3 style; a target is a manifest
+// key, not a path, but the gate keeps hostile indexes from planting
+// arbitrary keys); anything else is a local api-class refusal.
 var (
-	wsNameRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
-	wsVerRe  = regexp.MustCompile(`^[a-z0-9.]+$`)
+	wsNameRe   = regexp.MustCompile(`^[a-z0-9_-]+$`)
+	wsVerRe    = regexp.MustCompile(`^[a-z0-9.]+$`)
+	wsTargetRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 )
+
+// chipTargets maps the fw hello's chip string (surfaced as the board
+// list's chip column — daemon-cached hello) to the aot target
+// namespace's key (§8-6: "esp32s3" today; classic/C6 keys arrive later
+// without migration). An unmapped chip pairs NOTHING — the conservative
+// .wasm single (ruling 1: never guess an arch, never claim a pair that
+// did not happen).
+var chipTargets = map[string]string{
+	"ESP32-S3": "esp32s3",
+}
+
+// boardTarget answers the board's aot target key from its hello chip.
+func boardTarget(chip string) (string, bool) {
+	t, ok := chipTargets[chip]
+	return t, ok
+}
 
 func sha256hex(b []byte) string {
 	sum := sha256.Sum256(b)
@@ -245,6 +264,10 @@ type wsVersionInfo struct {
 	Version string `json:"version"`
 	Size    int    `json:"size"`
 	Sha256  string `json:"sha256"`
+	// Aot (P3-T13) surfaces the version's per-target .aot records —
+	// the pairing claims a bare push acts on. Absent = a bare push
+	// deploys the single resolved artifact on every board.
+	Aot map[string]AotSlot `json:"aot,omitempty" jsonschema:"per-target .aot records the version's manifest carries (key = aot target, e.g. \"esp32s3\"; value = sha256+size of the .aot): present = a bare xuansi_driver_push to a board whose chip maps to that key (ESP32-S3 → esp32s3) deploys the .wasm + .aot PAIR; absent = the single resolved artifact"`
 }
 
 type wsGetIn struct {
@@ -261,16 +284,30 @@ type wsGetOut struct {
 
 type driverPushIn struct {
 	Board   string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Name    string `json:"name" jsonschema:"driver name, lowercase [a-z0-9_-]+ — the board's effective file /drv/<name>.<ext> is overwritten (ext = the stored artifact's: .lua, or .wasm/.aot from a fetch)"`
+	Name    string `json:"name" jsonschema:"driver name, lowercase [a-z0-9_-]+ — the board's effective file /drv/<name>.<ext> is overwritten (a paired push overwrites BOTH .wasm and .aot; an explicit single-artifact push overwrites its own ext and EMPTIES the sibling slots)"`
 	Version string `json:"version,omitempty" jsonschema:"omit to re-deploy the manifest's ACTIVE version (error when none is active). Rollback = push the older version explicitly; fleet = push each board"`
+	// Artifact (P3-T13, the F-5 kill): push EXACTLY one binary
+	// artifact and sweep every other extension slot empty — a stale
+	// .aot can never shadow a fresh .wasm (the loader prefers .aot).
+	// Omitted = the manifest-driven default (pairing, see the tool
+	// Desc).
+	Artifact string `json:"artifact,omitempty" jsonschema:"\"wasm\" or \"aot\": push exactly that artifact AND fs_rm every sibling slot (/drv/<name>.<lua|wasm|aot> minus the pushed one — the F-5 sweep, driver_pull's mirror; an already-empty sibling is expected not-found noise). The kill for the stale-shield foot-gun: the loader PREFERS .aot, so redeploying a .wasm while an old .aot sits in its slot would silently keep running the old compiled code — artifact \"wasm\" removes it. Omit for the manifest-driven default: .wasm + .aot PAIR when the version's manifest record aot.<target> matches the board's chip (see the tool Desc), else the single resolved artifact (.lua → .wasm → .aot priority). NOT \"lua\": a Lua driver just pushes bare (it has no binary sibling to shield)"`
 	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
 type driverPushOut struct {
 	Board  string `json:"board" jsonschema:"the board the push landed on: resolved mac6 when the local board list knows it, else the raw selector"`
-	Path   string `json:"path" jsonschema:"the board's effective driver file that was overwritten"`
-	Sha256 string `json:"sha256" jsonschema:"sha256 of the pushed bytes, verified by fs_read-back"`
-	Bytes  int    `json:"bytes" jsonschema:"bytes written"`
+	Path   string `json:"path" jsonschema:"the board's effective driver file that was overwritten (the .wasm deliverable's path on a paired push; the pushed artifact's on a single push)"`
+	Sha256 string `json:"sha256" jsonschema:"sha256 of the pushed bytes at path, verified by fs_read-back"`
+	Bytes  int    `json:"bytes" jsonschema:"bytes written at path"`
+	// Paired (P3-T13): the honest pair claim. True only when BOTH legs
+	// of a .wasm + .aot pair landed read-back-verified; false on every
+	// single-artifact push — the reply never claims a pair that did
+	// not happen (unknown chip, no manifest record, degraded file).
+	Paired    bool     `json:"paired" jsonschema:"true when the .wasm + .aot PAIR landed (the version's manifest aot.<target> matched the board's chip; the .aot leg verified FIRST, then the .wasm) — false on every single-artifact push: never a pairing claim that did not happen"`
+	AotPath   string   `json:"aot_path,omitempty" jsonschema:"the paired push's .aot board path (present only when paired)"`
+	AotSha256 string   `json:"aot_sha256,omitempty" jsonschema:"sha256 of the paired .aot leg, verified by its own fs_read-back (present only when paired)"`
+	Swept     []string `json:"swept,omitempty" jsonschema:"sibling board paths an explicit artifact push EMPTIED (fs_rm; the F-5 sweep) — absent on paired and bare pushes (they overwrite every slot they touch), and lists nothing when the siblings were already empty"`
 }
 
 type driverPullIn struct {
@@ -351,7 +388,7 @@ func (ts *toolset) wsList(_ context.Context, _ *mcpsdk.CallToolRequest, _ wsList
 		s := wsDriverSummary{Name: n, Active: e.Active, Versions: make([]wsVersionInfo, 0, len(vers))}
 		for _, v := range vers {
 			fm := e.Files[v]
-			s.Versions = append(s.Versions, wsVersionInfo{Version: v, Size: fm.Size, Sha256: fm.Sha256})
+			s.Versions = append(s.Versions, wsVersionInfo{Version: v, Size: fm.Size, Sha256: fm.Sha256, Aot: fm.Aot})
 		}
 		out.Drivers = append(out.Drivers, s)
 	}
@@ -407,6 +444,13 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	if in.Version != "" && !wsVerRe.MatchString(in.Version) {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: version must match [a-z0-9.]+, got %q", in.Version)
 	}
+	// the artifact key's enum (P3-T13): a garbage value must refuse as
+	// a BAD KEY, not fall through to the missing-artifact error (the
+	// seat check's S6 catch — a typo'd "AOT" read as a missing file
+	// sends the agent looking for a fetch instead of fixing the key).
+	if in.Artifact != "" && in.Artifact != "wasm" && in.Artifact != "aot" {
+		return nil, driverPushOut{}, errWs(`xuansi_driver_push: artifact must be "wasm" or "aot", got %q — omit it for the manifest-driven default (the .wasm + .aot pair on a matching board)`, in.Artifact)
+	}
 
 	// best-known board identity: the refresh-fed board list resolves
 	// the selector to mac6 (the manifest keys footprints by it); a
@@ -438,20 +482,33 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: version must match [a-z0-9.]+, got %q", ver)
 	}
 
-	// artifact resolution (B10 task 5): the first extension with a
-	// stored file wins (.lua → .wasm → .aot, pushExts) — a fetched
+	// artifact resolution (B10 task 5): an EXPLICIT artifact key (P3's
+	// F-5) pins exactly one extension; else the first extension with
+	// a stored file wins (.lua → .wasm → .aot, pushExts) — a fetched
 	// binary module pushes exactly like a stored Lua one, to the
 	// extension-matching board path.
 	var ext string
 	var content []byte
-	for _, cand := range pushExts {
-		b, rerr := readFileShared(ts.ws.driverPath(in.Name, ver, cand)) // share-delete read (windows replace contract)
-		if rerr == nil {
-			ext, content = cand, b
-			break
+	if in.Artifact != "" {
+		ext = in.Artifact
+		b, rerr := readFileShared(ts.ws.driverPath(in.Name, ver, ext)) // share-delete read (windows replace contract)
+		if os.IsNotExist(rerr) {
+			return nil, driverPushOut{}, errWs("xuansi_driver_push: %s.%s is not in the workspace — the explicit artifact push deploys exactly that file (xuansi_driver_fetch / xuansi_wasm_build land .wasm/.aot)", in.Name+"@"+ver, ext)
 		}
-		if !os.IsNotExist(rerr) {
+		if rerr != nil {
 			return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", rerr)
+		}
+		content = b
+	} else {
+		for _, cand := range pushExts {
+			b, rerr := readFileShared(ts.ws.driverPath(in.Name, ver, cand)) // share-delete read (windows replace contract)
+			if rerr == nil {
+				ext, content = cand, b
+				break
+			}
+			if !os.IsNotExist(rerr) {
+				return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", rerr)
+			}
 		}
 	}
 	file := in.Name + "@" + ver
@@ -459,6 +516,40 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s.lua is not in the workspace — xuansi_ws_put it first (no .wasm/.aot artifact either; xuansi_driver_fetch stores those)", file)
 	}
 	file += "." + ext
+
+	// the pairing decision (P3-T13, F-5): a BARE .wasm push whose
+	// version carries an aot.<target> record for the BOARD's mapped
+	// chip deploys the .wasm + .aot PAIR. The architecture source is
+	// the hello-cached chip on the refresh-fed board list — no fresh
+	// crossing (ruling 3): a board the list does not carry, or a chip
+	// the map does not know, or a version without the record pairs
+	// NOTHING — the conservative .wasm single, exactly the pre-T13
+	// behavior, and the reply's paired=false never claims otherwise.
+	// A record whose sha disagrees with the artifact on disk is a
+	// REFUSAL (the corrupt-manifest discipline), not a guess.
+	var aotContent []byte
+	paired := false
+	if in.Artifact == "" && ext == "wasm" && resolved {
+		if target, ok := boardTarget(ts.ev.chip(board)); ok {
+			if slot, ok := m.entry(in.Name).Files[ver].Aot[target]; ok {
+				b, rerr := readFileShared(ts.ws.driverPath(in.Name, ver, "aot"))
+				switch {
+				case os.IsNotExist(rerr):
+					// the record's file is gone: nothing to pair — the
+					// .wasm single, honestly (ws_get/ws_list would not
+					// see the file either)
+				case rerr != nil:
+					return nil, driverPushOut{}, errWs("xuansi_driver_push: %s.aot: %v", in.Name+"@"+ver, rerr)
+				default:
+					if got := sha256hex(b); got != slot.Sha256 {
+						return nil, driverPushOut{}, errWs("xuansi_driver_push: manifest aot.%s says sha256 %s but %s.aot on disk hashes %s — the record and the artifact disagree (hand-edited file or manifest?); re-fetch the version (xuansi_driver_fetch) to resync; refusing to push an unverified pair", target, slot.Sha256, in.Name+"@"+ver, got)
+					}
+					aotContent = b
+					paired = true
+				}
+			}
+		}
+	}
 
 	// the load gate, enforced BEFORE the flash write, branched by
 	// artifact (task 5): the Lua track keeps its §7 gate — first line
@@ -489,26 +580,83 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		path = drvBoardPath(in.Name, ext)
 	}
 
+	// the paired .aot gates on its own magic too — both legs are
+	// refused BEFORE the first flash write (the whole pair or nothing).
+	if paired {
+		if gerr := gateModuleMagic("aot", aotContent, in.Name+"@"+ver+".aot"); gerr != nil {
+			return nil, driverPushOut{}, gerr
+		}
+	}
+
 	// write, read back, verify — then (and only then) the manifest.
 	// The WHOLE cycle rides wsMu (not just the manifest half): a
 	// concurrent driver_pull's fs_rm of the same path must not land
 	// between this fs_write and its fs_read-back (the read-back would
 	// see the removal and fail the sha check) — pull/push serialize as
 	// one unit per board file, the contract the B8 race test pins.
+	// P3-T13: a paired push rides the SAME serialization for BOTH legs
+	// plus its rollback rm — the pair lands or reverts as one unit
+	// against a pull too.
 	sum := sha256hex(content)
+	aotPath := drvBoardPath(in.Name, "aot")
 	wsMu.Lock()
 	defer wsMu.Unlock()
-	if _, err := ts.callHeld(ctx, server.Request{Type: "fs_write", Board: board, Path: path, Data: content, Holder: in.Holder}); err != nil {
+
+	if paired {
+		// ruling 2's order: the .aot leg FIRST (the smaller failure
+		// face) — its failure leaves no residue and never touches the
+		// .wasm slot; then the .wasm, whose failure rolls the .aot
+		// back out. The board ends all-old or all-new, never half a
+		// pair (Review Focus #4).
+		if wrote, err := ts.pushArtifact(ctx, board, aotPath, aotContent, in.Holder); err != nil {
+			// no-residue cleanup: a refused fs_write changed nothing
+			// (the daemon's atomic-write contract — wrote=false, no rm
+			// crosses); a failed read-back left THIS push's bytes
+			// (wrote=true) — remove them so the failing leg truly
+			// leaves nothing behind.
+			if wrote {
+				if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: aotPath, Holder: in.Holder}); rerr != nil && !notFoundIsh(rerr) {
+					return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .aot leg failed (%v) AND its cleanup fs_rm failed (%v) — the board may hold an unverified %s; xuansi_driver_pull the driver before retrying; manifest untouched", err, rerr, aotPath)
+				}
+			}
+			return nil, driverPushOut{}, err
+		}
+		if _, err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
+			// rollback: the just-pushed .aot must not stay — the
+			// loader PREFERS it, so a half-new pair would silently run
+			// the new compiled code against the old deliverable.
+			if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: aotPath, Holder: in.Holder}); rerr != nil && !notFoundIsh(rerr) {
+				return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) AND rolling back the .aot failed (%v) — the board may hold the half-new pair (.aot at %s without its .wasm); xuansi_driver_pull the driver before retrying; manifest untouched", err, rerr, aotPath)
+			}
+			return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) — the .aot leg was rolled back (fs_rm %s); the board holds neither half of the new pair, manifest untouched", err, aotPath)
+		}
+	} else if _, err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
 		return nil, driverPushOut{}, err
 	}
-	readRes, rerr := ts.call(ctx, server.Request{Type: "fs_read", Board: board, Path: path})
-	if rerr != nil {
-		return nil, driverPushOut{}, rerr
-	}
-	back, derr := base64.StdEncoding.DecodeString(str(readRes, "data"))
-	got := sha256hex(back)
-	if derr != nil || got != sum {
-		return nil, driverPushOut{}, errWs("xuansi_driver_push: %s on board %s: read-back sha256 %s != pushed %s — the board's file differs; manifest untouched", path, board, got, sum)
+
+	// the F-5 sweep (an explicit single-artifact push): empty every
+	// sibling slot a push could have written — driver_pull's mirror.
+	// A stale .aot would SHADOW the fresh .wasm (the loader prefers
+	// .aot), the foot-gun this kills; an already-empty sibling answers
+	// the fw's api not-found and is expected noise, not a failure. A
+	// REAL sweep failure refuses honestly with the manifest untouched
+	// (error ⇒ manifest untouched, the read-back contract's shape) —
+	// the error says the shield may still be armed.
+	var swept []string
+	if in.Artifact != "" {
+		for _, sib := range pushExts {
+			if sib == ext {
+				continue
+			}
+			sp := drvBoardPath(in.Name, sib)
+			if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: sp, Holder: in.Holder}); rerr != nil {
+				if notFoundIsh(rerr) {
+					continue // already empty: the desired end state
+				}
+				return nil, driverPushOut{}, errWs("xuansi_driver_push: %s landed and verified, but the sibling sweep failed at %s (%v) — a stale artifact there may still shadow the pushed one (the loader prefers .aot); re-run the push or xuansi_driver_pull the driver; manifest untouched", path, sp, rerr)
+			}
+			swept = append(swept, sp)
+		}
 	}
 
 	now := time.Now().UTC()
@@ -517,25 +665,62 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", err)
 	}
 	e := m.entry(in.Name)
-	fm := e.Files[ver]
+	fmPush := e.Files[ver]
 	// ALWAYS the disk-at-push-time values (single source): a file
 	// modified after its put must not leave a stale put-time checksum —
 	// the push just verified THESE bytes on the board, so these are the
 	// bytes the history records (B7 minors item 1; the old fill-only-
-	// when-empty guard desynced manifest vs disk).
-	fm.Sha256, fm.Size = sum, len(content)
-	fm.PushedAt = now
-	if fm.Boards == nil {
-		fm.Boards = map[string]time.Time{}
+	// when-empty guard desynced manifest vs disk). The version's own
+	// aot.<target> record rides through untouched (it describes the
+	// workspace artifact, not the board legs).
+	fmPush.Sha256, fmPush.Size = sum, len(content)
+	fmPush.PushedAt = now
+	if fmPush.Boards == nil {
+		fmPush.Boards = map[string]time.Time{}
 	}
-	fm.Boards[board] = now
-	e.Files[ver] = fm
+	fmPush.Boards[board] = now
+	e.Files[ver] = fmPush
 	e.Active = ver
 	m.Drivers[in.Name] = e
 	if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", err)
 	}
-	return nil, driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content)}, nil
+	out := driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content), Swept: swept}
+	if paired {
+		out.Paired, out.AotPath, out.AotSha256 = true, aotPath, sha256hex(aotContent)
+	}
+	return nil, out, nil
+}
+
+// pushArtifact is one board leg of a push: the held fs_write plus the
+// holder-less byte-exact fs_read-back (the B8 verify cycle). wrote
+// reports whether the fs_write CROSSED successfully (the caller's
+// rollback signal: a refused write left nothing by the daemon's
+// atomic-write contract, a failed read-back left this push's bytes).
+// The CALLER owns serialization (wsMu) and any rollback or sweep
+// around the leg.
+func (ts *toolset) pushArtifact(ctx context.Context, board, path string, content []byte, holder string) (bool, error) {
+	if _, err := ts.callHeld(ctx, server.Request{Type: "fs_write", Board: board, Path: path, Data: content, Holder: holder}); err != nil {
+		return false, err
+	}
+	readRes, rerr := ts.call(ctx, server.Request{Type: "fs_read", Board: board, Path: path})
+	if rerr != nil {
+		return true, rerr
+	}
+	back, derr := base64.StdEncoding.DecodeString(str(readRes, "data"))
+	got := sha256hex(back)
+	if derr != nil || got != sha256hex(content) {
+		return true, errWs("xuansi_driver_push: %s on board %s: read-back sha256 %s != pushed %s — the board's file differs; manifest untouched", path, board, got, sha256hex(content))
+	}
+	return true, nil
+}
+
+// notFoundIsh recognizes the fw's absent-file vocabulary ("'path' not
+// found (ENOENT)" — xs_fs.c's error) in an fs_rm refusal: a slot that
+// never held the artifact is already the sweep's desired end state,
+// the same expected noise driverPull tolerates on its un-held slots.
+func notFoundIsh(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "not found")
 }
 
 // boardAPIVersion answers the board's bench.api_version for the push

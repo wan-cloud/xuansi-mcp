@@ -420,6 +420,39 @@ func TestListBoardsBootIdentity(t *testing.T) {
 	}
 }
 
+// TestListBoardsChipColumn (P3-T13): the daemon board list's chip
+// column (hello-cached) crosses the mapping — the pairing decision's
+// architecture source must be VISIBLE at the seat, honestly absent
+// before the first hello crossing.
+func TestListBoardsChipColumn(t *testing.T) {
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"boards": []any{
+			map[string]any{
+				"mac6": "d75884", "alias": "bench1",
+				"sources": []any{"usb"}, "chip": "ESP32-S3", "fw": "dcaa9ae",
+			},
+			map[string]any{"mac6": "aabbcc", "sources": []any{"mdns"}},
+		},
+	}}}, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_list_boards", nil)
+	if res.IsError {
+		t.Fatalf("list_boards failed: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	boards, _ := m["boards"].([]any)
+	if len(boards) != 2 {
+		t.Fatalf("boards = %#v, want the two-board list", m["boards"])
+	}
+	b0, _ := boards[0].(map[string]any)
+	if b0["chip"] != "ESP32-S3" {
+		t.Errorf("board[0].chip = %#v, want ESP32-S3 (the hello-cached chip)", b0["chip"])
+	}
+	b1, _ := boards[1].(map[string]any)
+	if _, ok := b1["chip"]; ok {
+		t.Errorf("board[1].chip = %#v, want honest absence (no hello crossing yet)", b1["chip"])
+	}
+}
+
 // TestDefaultHolderFormat: a zero Options generates a per-process
 // holder "mcp-<8 hex>" — short, unique per process.
 func TestDefaultHolderFormat(t *testing.T) {

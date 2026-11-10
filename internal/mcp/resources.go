@@ -321,6 +321,22 @@ func candidateName(b dynBoard) string {
 	return b.mac6
 }
 
+// chip answers the board's hello chip string from the last refresh's
+// board list — the push pairing's architecture source (the
+// daemon-cached hello chip; NO fresh crossing, ruling 3). A board the
+// list does not carry, or one whose hello predates the chip column,
+// answers "" — the caller's conservative single-artifact push.
+func (es *eventState) chip(mac6 string) string {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	for _, b := range es.boards {
+		if b.mac6 == mac6 {
+			return b.chip
+		}
+	}
+	return ""
+}
+
 func joinCandidates(boards []dynBoard) string {
 	names := make([]string, 0, len(boards))
 	for _, b := range boards {

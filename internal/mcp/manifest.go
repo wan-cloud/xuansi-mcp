@@ -64,6 +64,22 @@ type FileMeta struct {
 	Size     int                  `json:"size"`
 	PushedAt time.Time            `json:"pushed_at,omitempty"`
 	Boards   map[string]time.Time `json:"boards,omitempty"`
+
+	// Aot (P3-T13) is the version's per-target .aot record — the
+	// pairing CLAIM a bare driver_push acts on: target key → the .aot
+	// artifact's sha/size (the §8-6 namespace, "esp32s3" today,
+	// classic/C6 keys later without migration). Populated by the fetch
+	// (the index files[] target field) and the build aot lane (the
+	// frozen --cpu=esp32s3 recipe); additive — pre-T13 manifests load
+	// unchanged and simply never pair. A record whose sha disagrees
+	// with drivers/<name>@<ver>.aot on disk is a refusal, not a guess.
+	Aot map[string]AotSlot `json:"aot,omitempty"`
+}
+
+// AotSlot is one target's .aot record inside FileMeta.Aot.
+type AotSlot struct {
+	Sha256 string `json:"sha256"`
+	Size   int    `json:"size"`
 }
 
 // entry returns the driver's entry with Files non-nil — manifests

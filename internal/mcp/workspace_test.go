@@ -918,6 +918,7 @@ type fetchFileSpec struct {
 	bytes  int
 	body   []byte
 	status int
+	target string // the aot target key riding files[] (P3-T12's index face)
 }
 
 // fetchModSpec is one fake-index module entry.
@@ -946,6 +947,7 @@ func newFetchIndex(t *testing.T, mods []fetchModSpec) (idxURL string, hits *atom
 		Path   string `json:"path"`
 		Sha256 string `json:"sha256"`
 		Bytes  int    `json:"bytes"`
+		Target string `json:"target,omitempty"`
 	}
 	type modEnt struct {
 		Name    string    `json:"name"`
@@ -958,7 +960,7 @@ func newFetchIndex(t *testing.T, mods []fetchModSpec) (idxURL string, hits *atom
 	for _, m := range mods {
 		me := modEnt{Name: m.name, Kind: m.kind, Version: m.version, ABI: 1}
 		for _, f := range m.files {
-			me.Files = append(me.Files, fileEnt{Path: f.path, Sha256: f.sha256, Bytes: f.bytes})
+			me.Files = append(me.Files, fileEnt{Path: f.path, Sha256: f.sha256, Bytes: f.bytes, Target: f.target})
 		}
 		modsJ = append(modsJ, me)
 	}
@@ -1020,11 +1022,13 @@ func fetchAotBody(n int) []byte {
 func TestDriverFetchTwoFilesKindAndManifest(t *testing.T) {
 	e, reqs, root := newWsEnv(t, nil)
 	wbody, abody := fetchWasmBody(64), fetchAotBody(48)
+	aotSpec := fetchSpec(t, "modules/fakemod/1.0.0/fakemod.aot", abody, "")
+	aotSpec.target = "esp32s3" // P3-T12's index face: files[] carries the aot target
 	url, _ := newFetchIndex(t, []fetchModSpec{{
 		name: "fakemod", kind: "driver", version: "1.0.0",
 		files: []fetchFileSpec{
 			fetchSpec(t, "modules/fakemod/1.0.0/fakemod.wasm", wbody, ""),
-			fetchSpec(t, "modules/fakemod/1.0.0/fakemod.aot", abody, ""),
+			aotSpec,
 		},
 	}})
 
@@ -1083,8 +1087,801 @@ func TestDriverFetchTwoFilesKindAndManifest(t *testing.T) {
 	if fm.Sha256 != sha256hex(wbody) || fm.Size != len(wbody) {
 		t.Errorf("Files[1.0.0] = %+v, want the .wasm's sha/size (the bare-push artifact)", fm)
 	}
+	// P3-T13: the .aot's index target lands as the version's aot record
+	// — the push pairing's claim source
+	if slot, ok := fm.Aot["esp32s3"]; !ok || slot.Sha256 != sha256hex(abody) || slot.Size != len(abody) {
+		t.Errorf("Files[1.0.0].Aot[esp32s3] = %+v (ok=%v), want the .aot's sha/size", slot, ok)
+	}
 	if ent.Active != "" {
 		t.Errorf("Active = %q after a fetch, want none (a push activates)", ent.Active)
+	}
+}
+
+// TestDriverFetchAotTargetHandling (P3-T13): the .aot target field's
+// edge cases — a target-less .aot stores UNPAIRED (no record, no
+// claim: a bare push deploys the resolved single), and a hostile
+// target string is refused before anything lands (a target is a
+// manifest key, but the workspace still refuses keys outside the
+// namespace's [a-z0-9-] vocabulary).
+func TestDriverFetchAotTargetHandling(t *testing.T) {
+	// leg 1: target-less .aot — honest non-record
+	e, _, root := newWsEnv(t, nil)
+	abody := fetchAotBody(48)
+	url, hits := newFetchIndex(t, []fetchModSpec{{
+		name: "notarget", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{fetchSpec(t, "modules/notarget/1.0.0/notarget.aot", abody, "")},
+	}})
+	res := e.call("xuansi_driver_fetch", map[string]any{
+		"name": "notarget", "version": "1.0.0", "index_url": url,
+	})
+	if res.IsError {
+		t.Fatalf("target-less fetch failed: %s", resultText(t, res))
+	}
+	if fm := wsManifest(t, root).Drivers["notarget"].Files["1.0.0"]; fm.Aot != nil {
+		t.Errorf("Files[1.0.0].Aot = %+v, want nil (no target, no pairing claim)", fm.Aot)
+	}
+
+	// leg 2: hostile target — refused, zero writes
+	e2, _, root2 := newWsEnv(t, nil)
+	bad := fetchSpec(t, "modules/bad/1.0.0/bad.aot", abody, "")
+	bad.target = "ESP32-S3/../../x"
+	url2, hits2 := newFetchIndex(t, []fetchModSpec{{
+		name: "bad", kind: "driver", version: "1.0.0",
+		files: []fetchFileSpec{bad},
+	}})
+	res2 := e2.call("xuansi_driver_fetch", map[string]any{
+		"name": "bad", "version": "1.0.0", "index_url": url2,
+	})
+	if !res2.IsError {
+		t.Fatalf("hostile target accepted: %+v", res2)
+	}
+	if got := resultText(t, res2); !strings.Contains(got, "target") {
+		t.Errorf("refusal = %q, want the target gate named", got)
+	}
+	if _, err := os.Stat(filepath.Join(root2, "drivers")); !os.IsNotExist(err) {
+		t.Errorf("drivers/ exists after the refusal, want zero writes")
+	}
+	_ = hits
+	_ = hits2
+}
+
+// ---------------------------------------------------------------------------
+// P3-T13: F-5 paired push — the chip source, the pair legs, rollback,
+// and the explicit single-artifact sibling sweep
+
+// pairD is servePushDaemon's T13 twin: the same fs store plus per-path
+// failure injection (a refused fs_write, a tampered fs_read read-back,
+// a REAL fs_rm refusal) and the file table exposed for final-state
+// assertions. fs_rm of an ABSENT file refuses with the fw's own
+// "'path' not found" vocabulary (the sweep tolerance's contract).
+type pairD struct {
+	fd         *fakeDaemon
+	reqs       chan server.Request
+	files      map[string][]byte   // board\x00path → payload
+	failWrite  map[string]string   // path → api error msg on fs_write
+	tamperRead map[string]bool     // path → flip the last bit on fs_read
+	failRm     map[string]string   // path → api error msg on fs_rm (a REAL refusal)
+}
+
+func newPairEnv(t *testing.T) (*env, *pairD, string) {
+	t.Helper()
+	pd := &pairD{
+		reqs:       make(chan server.Request, 32),
+		files:      map[string][]byte{},
+		failWrite:  map[string]string{},
+		tamperRead: map[string]bool{},
+		failRm:     map[string]string{},
+	}
+	pd.fd = newFakeDaemon(t)
+	pd.fd.serve(t, func(conn net.Conn) {
+		for {
+			var req server.Request
+			if err := server.ReadMsg(conn, &req); err != nil {
+				return // client close: expected shutdown path
+			}
+			select {
+			case pd.reqs <- req:
+			default:
+				t.Errorf("pair daemon: unexpected extra request %+v", req)
+			}
+			var rep *server.Reply
+			switch req.Type {
+			case "fs_write":
+				if msg, ok := pd.failWrite[req.Path]; ok {
+					rep = &server.Reply{Type: "reply", ID: req.ID,
+						Error: &server.RPCError{Class: "api", Msg: msg}}
+					break
+				}
+				pd.files[req.Board+"\x00"+req.Path] = req.Data
+				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{"ok": true}}
+			case "fs_read":
+				data := append([]byte(nil), pd.files[req.Board+"\x00"+req.Path]...)
+				if pd.tamperRead[req.Path] && len(data) > 0 {
+					data[len(data)-1] ^= 1
+				}
+				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{
+					"data": base64.StdEncoding.EncodeToString(data)}}
+			case "fs_rm":
+				if msg, ok := pd.failRm[req.Path]; ok {
+					rep = &server.Reply{Type: "reply", ID: req.ID,
+						Error: &server.RPCError{Class: "api", Msg: msg}}
+					break
+				}
+				if _, ok := pd.files[req.Board+"\x00"+req.Path]; !ok {
+					rep = &server.Reply{Type: "reply", ID: req.ID,
+						Error: &server.RPCError{Class: "api", Msg: fmt.Sprintf("'%s' not found (ENOENT)", req.Path)}}
+					break
+				}
+				delete(pd.files, req.Board+"\x00"+req.Path)
+				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{}}
+			default:
+				t.Errorf("pair daemon: unexpected request type %s", req.Type)
+				rep = &server.Reply{Type: "reply", ID: req.ID,
+					Error: &server.RPCError{Class: "server", Msg: "unexpected " + req.Type}}
+			}
+			if err := server.WriteMsg(conn, rep); err != nil {
+				t.Errorf("pair daemon reply: %v", err)
+				return
+			}
+		}
+	})
+	root := t.TempDir()
+	e := wireMCP(t, pd.fd, Options{Holder: "mcp-fixed01", WorkspaceRoot: root})
+	return e, pd, root
+}
+
+// seedChipBoard plants the event face's board list with one board whose
+// hello chip is chip — the pairing decision's architecture source (the
+// daemon-cached hello chip; no fresh crossing).
+func seedChipBoard(t *testing.T, e *env, mac6, chip string) {
+	t.Helper()
+	es := e.ts.ev
+	if es == nil {
+		t.Fatal("event face not wired")
+	}
+	es.mu.Lock()
+	es.boards = []dynBoard{{mac6: mac6, chip: chip}}
+	es.mu.Unlock()
+}
+
+// storeArtifact plants one artifact file under drivers/ (no manifest
+// touch — the pairing record is the caller's business).
+func storeArtifact(t *testing.T, root, name, ver, ext string, body []byte) string {
+	t.Helper()
+	p := filepath.Join(root, "drivers", name+"@"+ver+"."+ext)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// storePairVersion plants the T12 dual-product shape: .wasm + .aot on
+// disk plus the manifest's aot.<target> record (what a dual-product
+// fetch or a paired build lands). Returns the two bodies.
+func storePairVersion(t *testing.T, root, name, ver, target string) (wasm, aot []byte) {
+	t.Helper()
+	wasm, aot = fetchWasmBody(64), fetchAotBody(48)
+	storeArtifact(t, root, name, ver, "wasm", wasm)
+	storeArtifact(t, root, name, ver, "aot", aot)
+	m, err := loadManifest(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatalf("loadManifest: %v", err)
+	}
+	e := m.entry(name)
+	fm := e.Files[ver]
+	fm.Sha256, fm.Size = sha256hex(wasm), len(wasm)
+	fm.Aot = map[string]AotSlot{target: {Sha256: sha256hex(aot), Size: len(aot)}}
+	e.Files[ver] = fm
+	m.Drivers[name] = e
+	if err := writeManifestAtomic(filepath.Join(root, "manifest.json"), m); err != nil {
+		t.Fatalf("writeManifestAtomic: %v", err)
+	}
+	return wasm, aot
+}
+
+// TestChipTargetMapping (ruling 1): the fw hello chip string maps to
+// the aot target namespace's key — ESP32-S3 → esp32s3, everything else
+// (unknown chip, empty) maps nothing: the conservative .wasm single.
+func TestChipTargetMapping(t *testing.T) {
+	if tgt, ok := boardTarget("ESP32-S3"); !ok || tgt != "esp32s3" {
+		t.Errorf(`boardTarget("ESP32-S3") = %q, %v; want "esp32s3", true`, tgt, ok)
+	}
+	for _, chip := range []string{"ESP32-C6", "ESP32-S2", "esp32-s3", "", "ESP32-S3 "} {
+		if _, ok := boardTarget(chip); ok {
+			t.Errorf("boardTarget(%q) = ok, want unmapped (the conservative single)", chip)
+		}
+	}
+}
+
+// TestDriverPushPairedWasmAotHappyPath: a bare push whose version
+// carries aot.<target> AND whose board's chip maps to that target
+// deploys the PAIR — the .aot leg FIRST (ruling 2), then the .wasm —
+// both read-back verified, no sweep, Active moves, and the reply
+// claims the pair honestly (paired/aot_path/aot_sha256).
+func TestDriverPushPairedWasmAotHappyPath(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-S3")
+	wasm, aot := storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("paired push failed: %s", resultText(t, res))
+	}
+	// wire order: the .aot leg first (write + read-back), then .wasm
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.aot"},
+		{"fs_read", "/drv/pairmod.aot"},
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_read", "/drv/pairmod.wasm"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs) // a paired push sweeps NOTHING — both slots are fresh
+	if !bytes.Equal(pd.files["d75884\x00/drv/pairmod.aot"], aot) {
+		t.Errorf("board .aot slot = %d bytes, want the artifact verbatim", len(pd.files["d75884\x00/drv/pairmod.aot"]))
+	}
+
+	out := structured(t, res)
+	if out["paired"] != true {
+		t.Errorf("paired = %#v, want true (the pair landed — never a false claim)", out["paired"])
+	}
+	if out["path"] != "/drv/pairmod.wasm" || out["sha256"] != sha256hex(wasm) {
+		t.Errorf("out path/sha = %v, want the .wasm deliverable leg's", out)
+	}
+	if out["aot_path"] != "/drv/pairmod.aot" || out["aot_sha256"] != sha256hex(aot) {
+		t.Errorf("out aot leg = %v, want the .aot path + verified sha", out)
+	}
+	if _, swept := out["swept"]; swept {
+		t.Errorf("out swept = %v, want absent (no sweep on the paired push)", out["swept"])
+	}
+
+	// manifest: Active moves, the board footprint lands, and the
+	// version's own aot record SURVIVES the push cycle.
+	m := wsManifest(t, root)
+	ent := m.Drivers["pairmod"]
+	if ent.Active != "1.0.0" {
+		t.Errorf("Active = %q, want 1.0.0", ent.Active)
+	}
+	fm := ent.Files["1.0.0"]
+	if slot, ok := fm.Aot["esp32s3"]; !ok || slot.Sha256 != sha256hex(aot) {
+		t.Errorf("Files[1.0.0].Aot[esp32s3] = %+v (ok=%v), want the record intact", slot, ok)
+	}
+	if _, ok := fm.Boards["d75884"]; !ok {
+		t.Errorf("Files[1.0.0].Boards = %v, want the d75884 footprint", fm.Boards)
+	}
+
+	// ws_list surfaces the aot record — the seat can SEE pairing coming
+	lres := e.call("xuansi_ws_list", map[string]any{})
+	if lres.IsError {
+		t.Fatalf("ws_list failed: %s", resultText(t, lres))
+	}
+	lm := structured(t, lres)
+	drivers, _ := lm["drivers"].([]any)
+	if len(drivers) != 1 {
+		t.Fatalf("ws_list drivers = %v, want the one", lm["drivers"])
+	}
+	d0, _ := drivers[0].(map[string]any)
+	vers, _ := d0["versions"].([]any)
+	if len(vers) != 1 {
+		t.Fatalf("ws_list versions = %v, want the one", d0["versions"])
+	}
+	v0, _ := vers[0].(map[string]any)
+	aotm, _ := v0["aot"].(map[string]any)
+	if aotm == nil || aotm["esp32s3"] == nil {
+		t.Errorf("ws_list versions[0].aot = %v, want the esp32s3 record visible", v0["aot"])
+	}
+}
+
+// TestDriverPushPairedWasmLegFailRollsBackAot: the pair's .wasm leg
+// failing (a tampered read-back) rolls the just-pushed .aot back out —
+// the board is left with NEITHER half of the new pair, the manifest is
+// untouched, and the error says all of that (Review Focus #4: no half
+// pair survives).
+func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-S3")
+	storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+	pd.tamperRead["/drv/pairmod.wasm"] = true
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if !res.IsError {
+		t.Fatalf("paired push with a failing .wasm leg succeeded: %+v", res)
+	}
+	// wire order: .aot write + clean read-back, .wasm write + tampered
+	// read-back, then the ROLLBACK fs_rm of the .aot
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.aot"},
+		{"fs_read", "/drv/pairmod.aot"},
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_read", "/drv/pairmod.wasm"},
+		{"fs_rm", "/drv/pairmod.aot"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	if _, still := pd.files["d75884\x00/drv/pairmod.aot"]; still {
+		t.Errorf("board still holds the rolled-back .aot — the half-pair foot-gun")
+	}
+
+	got := resultText(t, res)
+	for _, want := range []string{"read-back sha256", "rolled back", "/drv/pairmod.aot", "manifest untouched"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	m := wsManifest(t, root)
+	ent := m.Drivers["pairmod"]
+	if ent.Active != "" {
+		t.Errorf("Active = %q after a rolled-back pair, want none", ent.Active)
+	}
+	if fm := ent.Files["1.0.0"]; len(fm.Boards) != 0 || !fm.PushedAt.IsZero() {
+		t.Errorf("Files[1.0.0] = %+v, want zero push footprints (pre-push manifest state)", fm)
+	}
+}
+
+// TestDriverPushPairedAotLegFailNoResidue: the .aot leg failing leaves
+// NO residue — a refused fs_write changed nothing (daemon contract), a
+// tampered .aot read-back removes the bytes this push wrote. Either
+// way the .wasm leg never crosses and the manifest stays untouched.
+func TestDriverPushPairedAotLegFailNoResidue(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-S3")
+
+	// leg 1: the board refuses the .aot fs_write
+	storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+	pd.failWrite["/drv/pairmod.aot"] = "flash write refused: no space left on device"
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if !res.IsError {
+		t.Fatalf("paired push with a refused .aot write succeeded: %+v", res)
+	}
+	if got := resultText(t, res); !strings.Contains(got, "no space left on device") {
+		t.Errorf("error text = %q, want the board's refusal verbatim", got)
+	}
+	req := wantReq(t, pd.reqs)
+	if req.Type != "fs_write" || req.Path != "/drv/pairmod.aot" {
+		t.Errorf("crossing = %s %s, want the .aot fs_write", req.Type, req.Path)
+	}
+	noContact(t, pd.reqs) // no .wasm leg, no rollback rm (nothing of ours landed)
+	if _, ok := pd.files["d75884\x00/drv/pairmod.aot"]; ok {
+		t.Errorf("board holds an .aot after a refused .aot write")
+	}
+
+	// leg 2: the .aot write lands but the read-back is corrupt — the
+	// push removes its OWN bytes on the way out ("aot 失敗→無殘留")
+	e2, pd2, root2 := newPairEnv(t)
+	seedChipBoard(t, e2, "d75884", "ESP32-S3")
+	storePairVersion(t, root2, "pairmod", "1.0.0", "esp32s3")
+	pd2.tamperRead["/drv/pairmod.aot"] = true
+	res2 := e2.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if !res2.IsError {
+		t.Fatalf("paired push with a corrupt .aot read-back succeeded: %+v", res2)
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.aot"},
+		{"fs_read", "/drv/pairmod.aot"},
+		{"fs_rm", "/drv/pairmod.aot"},
+	} {
+		req := wantReq(t, pd2.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd2.reqs)
+	if _, ok := pd2.files["d75884\x00/drv/pairmod.aot"]; ok {
+		t.Errorf("board holds the corrupt .aot this push wrote — residue")
+	}
+	if m := wsManifest(t, root2); m.Drivers["pairmod"].Active != "" {
+		t.Errorf("Active = %q after the failed .aot leg, want none", m.Drivers["pairmod"].Active)
+	}
+}
+
+// TestDriverPushPairUnknownChipConservativeSingle: a chip the target
+// map does not carry (ESP32-C6 today) pairs NOTHING — the bare push is
+// the current .wasm single, the reply says paired=false and carries no
+// aot leg (never a false pairing claim).
+func TestDriverPushPairUnknownChipConservativeSingle(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-C6")
+	wasm, _ := storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("push failed: %s", resultText(t, res))
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_read", "/drv/pairmod.wasm"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s (the .wasm single only)", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	out := structured(t, res)
+	if out["paired"] != false {
+		t.Errorf("paired = %#v, want false (unknown chip: no pairing claimed)", out["paired"])
+	}
+	if _, ok := out["aot_path"]; ok {
+		t.Errorf("out carries aot_path = %v on an unpaired push", out["aot_path"])
+	}
+	if out["sha256"] != sha256hex(wasm) {
+		t.Errorf("sha256 = %v, want the .wasm's", out["sha256"])
+	}
+}
+
+// TestDriverPushPairNoAotRecordSingle: a manifest WITHOUT the version's
+// aot.<target> record pairs nothing even with both files on disk — the
+// record is the claim, the file alone is not (pre-T13 workspaces and
+// target-less fetch indexes keep the current single-artifact behavior).
+func TestDriverPushPairNoAotRecordSingle(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-S3")
+	storeArtifact(t, root, "pairmod", "1.0.0", "wasm", fetchWasmBody(64))
+	storeArtifact(t, root, "pairmod", "1.0.0", "aot", fetchAotBody(48))
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("push failed: %s", resultText(t, res))
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_read", "/drv/pairmod.wasm"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	if out := structured(t, res); out["paired"] != false {
+		t.Errorf("paired = %#v, want false (no manifest record, no pair)", out["paired"])
+	}
+}
+
+// TestDriverPushPairAotShaDriftRefused: a manifest aot record whose
+// sha disagrees with the artifact on disk is a workspace inconsistency
+// — refusing beats pushing an unverified pair (the corrupt-manifest
+// discipline). Zero crossings.
+func TestDriverPushPairAotShaDriftRefused(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-S3")
+	wasm, _ := storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+	// the .aot file replaced behind the manifest's back
+	storeArtifact(t, root, "pairmod", "1.0.0", "aot", fetchAotBody(96))
+	_ = wasm
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if !res.IsError {
+		t.Fatalf("push with a drifted .aot record succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"aot.esp32s3", "disagree", "driver_fetch"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	noContact(t, pd.reqs)
+	if m := wsManifest(t, root); m.Drivers["pairmod"].Active != "" {
+		t.Errorf("Active = %q after the refusal, want none", m.Drivers["pairmod"].Active)
+	}
+}
+
+// TestDriverPushPairAotFileAbsentDegradesSingle: a record whose file is
+// gone simply cannot pair — the bare push degrades to the .wasm single
+// (honest, not an error: ws_get/list would not see the file either).
+func TestDriverPushPairAotFileAbsentDegradesSingle(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-S3")
+	storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+	if err := os.Remove(filepath.Join(root, "drivers", "pairmod@1.0.0.aot")); err != nil {
+		t.Fatal(err)
+	}
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("push failed: %s", resultText(t, res))
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_read", "/drv/pairmod.wasm"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	if out := structured(t, res); out["paired"] != false {
+		t.Errorf("paired = %#v, want false (no artifact, no pair)", out["paired"])
+	}
+}
+
+// TestDriverPushPairUnresolvedBoardSingle: a board the local list does
+// not carry has no chip to map — the conservative .wasm single (ruling
+// 3: no new assumptions, no fresh crossing to fetch one).
+func TestDriverPushPairUnresolvedBoardSingle(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	// no seedChipBoard: the event face's list is empty
+	storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("push failed: %s", resultText(t, res))
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_read", "/drv/pairmod.wasm"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	if out := structured(t, res); out["paired"] != false {
+		t.Errorf("paired = %#v, want false (no chip source, no pair)", out["paired"])
+	}
+}
+
+// TestDriverPushExplicitWasmSweepsSiblings: artifact "wasm" pushes
+// exactly the .wasm and EMPTIES every other slot a push could have
+// written (.lua, .aot — the F-5 sweep, pull's mirror) — a stale .aot
+// can never shadow the fresh .wasm. The reply lists what it swept.
+func TestDriverPushExplicitWasmSweepsSiblings(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	wasm, _ := storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+	// the board already holds a STALE .aot and a stray .lua
+	stale := fetchAotBody(128)
+	pd.files["d75884\x00/drv/pairmod.aot"] = stale
+	pd.files["d75884\x00/drv/pairmod.lua"] = []byte("--@api 1\nold\n")
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0", "artifact": "wasm",
+	})
+	if res.IsError {
+		t.Fatalf("explicit wasm push failed: %s", resultText(t, res))
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.wasm"},
+		{"fs_read", "/drv/pairmod.wasm"},
+		{"fs_rm", "/drv/pairmod.lua"},
+		{"fs_rm", "/drv/pairmod.aot"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	if _, ok := pd.files["d75884\x00/drv/pairmod.aot"]; ok {
+		t.Errorf("the stale .aot survived the sweep — the F-5 foot-gun stays armed")
+	}
+	if _, ok := pd.files["d75884\x00/drv/pairmod.lua"]; ok {
+		t.Errorf("the stray .lua survived the sweep")
+	}
+	if got := pd.files["d75884\x00/drv/pairmod.wasm"]; !bytes.Equal(got, wasm) {
+		t.Errorf("board .wasm = %d bytes, want the fresh artifact verbatim", len(got))
+	}
+
+	out := structured(t, res)
+	if out["paired"] != false {
+		t.Errorf("paired = %#v, want false (an explicit single is never a pair claim)", out["paired"])
+	}
+	swept, _ := out["swept"].([]any)
+	if len(swept) != 2 || swept[0] != "/drv/pairmod.lua" || swept[1] != "/drv/pairmod.aot" {
+		t.Errorf("swept = %v, want both sibling paths in pushExts order", out["swept"])
+	}
+	if m := wsManifest(t, root); m.Drivers["pairmod"].Active != "1.0.0" {
+		t.Errorf("Active = %q, want 1.0.0 (the sweep completed)", m.Drivers["pairmod"].Active)
+	}
+}
+
+// TestDriverPushExplicitAotSweepsWasmSibling: artifact "aot" mirrors —
+// the .aot lands alone and the .wasm/.lua slots empty.
+func TestDriverPushExplicitAotSweepsWasmSibling(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	_, aot := storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+	pd.files["d75884\x00/drv/pairmod.wasm"] = fetchWasmBody(999)
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0", "artifact": "aot",
+	})
+	if res.IsError {
+		t.Fatalf("explicit aot push failed: %s", resultText(t, res))
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/pairmod.aot"},
+		{"fs_read", "/drv/pairmod.aot"},
+		{"fs_rm", "/drv/pairmod.lua"},
+		{"fs_rm", "/drv/pairmod.wasm"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	if _, ok := pd.files["d75884\x00/drv/pairmod.wasm"]; ok {
+		t.Errorf("the .wasm survived the .aot push's sweep")
+	}
+	if got := pd.files["d75884\x00/drv/pairmod.aot"]; !bytes.Equal(got, aot) {
+		t.Errorf("board .aot = %d bytes, want the artifact verbatim", len(got))
+	}
+	out := structured(t, res)
+	if out["path"] != "/drv/pairmod.aot" {
+		t.Errorf("path = %v, want the .aot slot", out["path"])
+	}
+}
+
+// TestDriverPushExplicitSweepFailureHandling: a sweep fs_rm failing
+// with a REAL error (not the fw's not-found) refuses honestly — the
+// push landed but the manifest stays untouched and the error names the
+// armed foot-gun; a not-found refusal is the absent-slot noise the
+// sweep tolerates (already empty = the desired end state).
+func TestDriverPushExplicitSweepFailureHandling(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
+	pd.files["d75884\x00/drv/pairmod.aot"] = fetchAotBody(128) // the stale shield
+	pd.failRm["/drv/pairmod.aot"] = "lease vanished mid-sweep"
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0", "artifact": "wasm",
+	})
+	if !res.IsError {
+		t.Fatalf("push with a failing sweep succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"sweep", "/drv/pairmod.aot", "lease vanished mid-sweep", "manifest untouched"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	if m := wsManifest(t, root); m.Drivers["pairmod"].Active != "" {
+		t.Errorf("Active = %q after the failed sweep, want none (error ⇒ manifest untouched)", m.Drivers["pairmod"].Active)
+	}
+
+	// the tolerated shape: the fw's not-found vocabulary on an absent slot
+	e2, pd2, root2 := newPairEnv(t)
+	storePairVersion(t, root2, "pairmod", "1.0.0", "esp32s3")
+	pd2.failRm["/drv/pairmod.aot"] = "'/drv/pairmod.aot' not found (ENOENT)"
+	res2 := e2.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0", "artifact": "wasm",
+	})
+	if res2.IsError {
+		t.Fatalf("push with an absent sibling slot failed: %s", resultText(t, res2))
+	}
+	if out := structured(t, res2); out["swept"] != nil {
+		t.Errorf("swept = %v, want absent (the .aot slot was already empty)", out["swept"])
+	}
+}
+
+// TestDriverPushExplicitArtifactRefusals: the artifact key's enum and
+// the missing-artifact refusal — "lua" is refused (the key is the
+// binary single-artifact override; a .lua deploys bare like always), a
+// garbage value is refused, and artifact "aot" with no stored .aot is
+// a zero-crossing local refusal naming the candidates.
+func TestDriverPushExplicitArtifactRefusals(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	storeArtifact(t, root, "pairmod", "1.0.0", "wasm", fetchWasmBody(64))
+
+	for _, artifact := range []string{"lua", "AOT", "wasm2"} {
+		res := e.call("xuansi_driver_push", map[string]any{
+			"board": "d75884", "name": "pairmod", "version": "1.0.0", "artifact": artifact,
+		})
+		if !res.IsError {
+			t.Fatalf("artifact %q accepted: %+v", artifact, res)
+		}
+		// the ENUM refusal, not the missing-artifact fall-through (the
+		// seat check's S6 catch: a typo'd key must name the enum, not
+		// send the agent looking for a fetch)
+		if got := resultText(t, res); !strings.Contains(got, `"wasm" or "aot"`) || !strings.Contains(got, artifact) {
+			t.Errorf("artifact %q refusal = %q, want the enum gate naming the bad value", artifact, got)
+		}
+	}
+	noContact(t, pd.reqs)
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "pairmod", "version": "1.0.0", "artifact": "aot",
+	})
+	if !res.IsError {
+		t.Fatalf("artifact aot with no stored .aot succeeded: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"pairmod@1.0.0.aot", "not in the workspace"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text = %q, want it to contain %q", got, want)
+		}
+	}
+	noContact(t, pd.reqs)
+}
+
+// TestDriverPushBareAotOnlyStillSingle: a version holding ONLY an .aot
+// (the build lane's shape) keeps the current bare behavior — one .aot
+// leg, paired=false, no sweep. Loader preference is fw semantics; the
+// daemon does not re-judge it.
+func TestDriverPushBareAotOnlyStillSingle(t *testing.T) {
+	e, pd, root := newPairEnv(t)
+	seedChipBoard(t, e, "d75884", "ESP32-S3")
+	abody := fetchAotBody(48)
+	storeArtifact(t, root, "onlyaot", "1.0.0", "aot", abody)
+
+	res := e.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "onlyaot", "version": "1.0.0",
+	})
+	if res.IsError {
+		t.Fatalf("aot-only push failed: %s", resultText(t, res))
+	}
+	for i, want := range []struct {
+		typ  string
+		path string
+	}{
+		{"fs_write", "/drv/onlyaot.aot"},
+		{"fs_read", "/drv/onlyaot.aot"},
+	} {
+		req := wantReq(t, pd.reqs)
+		if req.Type != want.typ || req.Path != want.path {
+			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
+		}
+	}
+	noContact(t, pd.reqs)
+	out := structured(t, res)
+	if out["paired"] != false || out["path"] != "/drv/onlyaot.aot" || out["sha256"] != sha256hex(abody) {
+		t.Errorf("out = %v, want the single .aot leg with paired=false", out)
 	}
 }
 

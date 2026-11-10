@@ -144,10 +144,13 @@ func (ts *toolset) startDynamic(srv *mcpsdk.Server, d time.Duration) (stop func(
 	}
 }
 
-// dynBoard is one board from list_boards, reduced to what naming needs.
+// dynBoard is one board from list_boards, reduced to what naming needs
+// (plus chip — P3-T13: the hello-cached chip is driver_push's aot
+// pairing source, empty when the daemon has not crossed the board).
 type dynBoard struct {
 	mac6  string
 	alias string
+	chip  string
 }
 
 // refreshDynamic reconciles the dynamic toolset with the daemon's
@@ -649,10 +652,11 @@ func parseDynBoards(res map[string]any) []dynBoard {
 		}
 		mac6, _ := m["mac6"].(string)
 		alias, _ := m["alias"].(string)
+		chip, _ := m["chip"].(string)
 		if mac6 == "" {
 			continue
 		}
-		boards = append(boards, dynBoard{mac6: mac6, alias: alias})
+		boards = append(boards, dynBoard{mac6: mac6, alias: alias, chip: chip})
 	}
 	return boards
 }

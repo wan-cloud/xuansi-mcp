@@ -844,3 +844,23 @@ func TestDynamicRefreshLoopStops(t *testing.T) {
 		t.Errorf("list_boards continued after stop: %d → %d (loop leaked)", settled, now)
 	}
 }
+
+// TestParseDynBoardsChip (P3-T13): the board list decode carries the
+// hello-cached chip — the push pairing's architecture source rides the
+// same dynBoard the refresh feeds every face, honestly empty when the
+// daemon has not crossed the board.
+func TestParseDynBoardsChip(t *testing.T) {
+	boards := parseDynBoards(map[string]any{"boards": []any{
+		map[string]any{"mac6": "d75884", "alias": "bench1", "chip": "ESP32-S3"},
+		map[string]any{"mac6": "aabbcc"},
+	}})
+	if len(boards) != 2 {
+		t.Fatalf("boards = %+v, want the two entries", boards)
+	}
+	if boards[0].chip != "ESP32-S3" || boards[0].mac6 != "d75884" || boards[0].alias != "bench1" {
+		t.Errorf("boards[0] = %+v, want the chip carried beside mac6/alias", boards[0])
+	}
+	if boards[1].chip != "" {
+		t.Errorf("boards[1].chip = %q, want empty (no hello crossing)", boards[1].chip)
+	}
+}

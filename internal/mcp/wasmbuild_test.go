@@ -715,6 +715,12 @@ func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 	if !ok || fm.Sha256 != out.Sha256 || fm.Size != out.Bytes {
 		t.Fatalf("files[%s] = %+v (ok=%v): want the built artifact's meta matching out", wasmBuildFirstVersion, fm, ok)
 	}
+	// P3-T13: the aot lane records its target — the frozen recipe's
+	// --cpu=esp32s3 is the manifest's aot.esp32s3 claim (a later .wasm
+	// build of the same version pairs with it on a matching board)
+	if slot, aok := fm.Aot["esp32s3"]; !aok || slot.Sha256 != out.Sha256 || slot.Size != out.Bytes {
+		t.Fatalf("files[%s].Aot[esp32s3] = %+v (ok=%v): want the built .aot's own sha/size", wasmBuildFirstVersion, slot, aok)
+	}
 
 	// half 2: wasi_sdk_path ALONE (probe-22's symmetric pair) — a
 	// local tree compiles with no cache record at all, and the

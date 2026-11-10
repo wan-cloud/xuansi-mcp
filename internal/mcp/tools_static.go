@@ -210,6 +210,10 @@ type boardInfo struct {
 	BootEpoch   int64  `json:"boot_epoch,omitempty" jsonschema:"the firmware's NVS per-boot counter at the daemon's last hello sighting — present once the daemon has touched the board; 0/absent = firmware without the counter. A CHANGE between reads (or a board.reboot event) means the board rebooted"`
 	ResetReason string `json:"reset_reason,omitempty" jsonschema:"this boot's reset cause at the last sighting (esp_reset_reason name: power-on / usb / software / panic / task-wdt / ...); the reboot-judgment table rides the events face's description"`
 	LastSeen    string `json:"last_seen,omitempty" jsonschema:"RFC3339 UTC of the daemon's most recent protocol crossing with the board (hello or op reply) — the freshness of the identity above; absent before the first crossing"`
+	// Chip (P3-T13) is the push pairing's architecture source: the
+	// chip the board's hello reported (e.g. ESP32-S3). omitempty keeps
+	// it honestly absent before the first crossing.
+	Chip string `json:"chip,omitempty" jsonschema:"the chip the board's hello reported (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source: a version whose manifest carries aot.<target> for THIS chip (ESP32-S3 → esp32s3) deploys as the .wasm + .aot PAIR; absent before the daemon's first hello crossing (then a bare push is the conservative single artifact)"`
 }
 
 type listBoardsOut struct {
@@ -328,7 +332,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table). Read-only, no lease.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source. Read-only, no lease.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -407,8 +411,8 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 	}, ts.wsGet)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "xuansi_driver_push",
-		Description: "Deploy one workspace driver version onto a board: overwrite its EFFECTIVE file /drv/<name>.<ext> (ext = the stored artifact's: .lua for ws_put drivers, .wasm/.aot for fetched modules — first stored extension wins; the board knows nothing of versions). Gated BEFORE the flash write: a Lua file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one); a binary module gates on the module magic the fw's wasm loader itself validates. The write rides the chunked transport for any size (B10-T1) and is then verified by fs_read-back sha256, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
+		Name: "xuansi_driver_push",
+		Description: "Deploy one workspace driver version onto a board. BARE (no artifact key) = the manifest-driven default: when the version's manifest carries an aot.<target> record AND the board's chip maps to that target (chip comes from the daemon's hello cache, surfaced in xuansi_list_boards — ESP32-S3 → esp32s3), the .wasm + .aot PAIR deploys: the .aot leg lands FIRST, then the .wasm, both read-back-verified, and ANY leg failing rolls the just-pushed .aot back out (fs_rm) — the board is never left half a pair (all-old or all-new), the error says the rollback happened, and the manifest stays untouched. No matching chip (e.g. ESP32-C6 today), no aot record, or a version without one = the conservative single artifact — exactly the classic behavior, and the reply's paired=false says so honestly. The board's loader PREFERRING .aot is fw semantics — this face does not re-judge it. ARTIFACT \"wasm\"/\"aot\" = push exactly that one artifact AND fs_rm every sibling slot /drv/<name>.<lua|wasm|aot> (the F-5 sweep, driver_pull's mirror; already-empty siblings are expected not-found noise, swept lists what it emptied) — the kill for the stale-shield foot-gun: the loader prefers .aot, so an old .aot left in its slot would silently shadow a freshly pushed .wasm. Gated BEFORE the first flash write: a Lua file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one; a paired push also gates the .aot on the \\0aot container magic); a binary module gates on the module magic the fw's wasm loader itself validates. The write rides the chunked transport for any size (B10-T1) and is verified by fs_read-back sha256 per leg, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
 	}, ts.driverPush)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -423,7 +427,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_driver_fetch",
-		Description: "Fetch one driver-module version from a public module index (task 3's layout: index.json + modules/<name>/<ver>/ artifacts; default " + defaultIndexURL + ") into the daemon-side driver workspace — the fetch half of the module pipeline, xuansi_driver_push deploys what this stores. Every file is downloaded and verified (sha256 + byte count against the index) BEFORE anything is written: a mid-download failure leaves the workspace untouched. Stores drivers/<name>@<version>.<ext> plus one manifest entry (kind from the index; NOT activating — a fresh fetch has no active version, so state version explicitly on its first push). Binary-safe — this is the storing path for .wasm/.aot artifacts (xuansi_ws_put's content field is a JSON string, fit for Lua text only). version omitted = the index's highest for the name.",
+		Description: "Fetch one driver-module version from a public module index (task 3's layout: index.json + modules/<name>/<ver>/ artifacts; default " + defaultIndexURL + ") into the daemon-side driver workspace — the fetch half of the module pipeline, xuansi_driver_push deploys what this stores. Every file is downloaded and verified (sha256 + byte count against the index) BEFORE anything is written: a mid-download failure leaves the workspace untouched. Stores drivers/<name>@<version>.<ext> plus one manifest entry (kind from the index; NOT activating — a fresh fetch has no active version, so state version explicitly on its first push). An .aot entry's target field lands as the version's aot.<target> manifest record — the pairing claim a bare push to a matching board acts on; a .aot without a target stores honestly unpaired. Binary-safe — this is the storing path for .wasm/.aot artifacts (xuansi_ws_put's content field is a JSON string, fit for Lua text only). version omitted = the index's highest for the name.",
 	}, ts.driverFetch)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -482,6 +486,7 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			BootEpoch:   int64(num(m, "boot_epoch")),
 			ResetReason: str(m, "reset_reason"),
 			LastSeen:    str(m, "last_seen"),
+			Chip:        str(m, "chip"),
 		})
 	}
 	return nil, out, nil
@@ -792,13 +797,19 @@ type fetchFileRef struct {
 	Path   string `json:"path"`
 	Sha256 string `json:"sha256"`
 	Bytes  int64  `json:"bytes"`
+	// Target (P3-T12's index face, consumed P3-T13): the aot target a
+	// .aot entry was compiled for (e.g. esp32s3). The .wasm deliverable
+	// carries none (arch-neutral); a .aot without a target stores
+	// honestly UNPAIRED (no manifest aot record, no push pairing).
+	Target string `json:"target,omitempty"`
 }
 
 // stagedFile is one fully-verified artifact awaiting the commit phase.
 type stagedFile struct {
-	ext  string
-	body []byte
-	sha  string
+	ext    string
+	body   []byte
+	sha    string
+	target string // the .aot's index target ("" = none declared)
 }
 
 // fetchGet GETs url with the fetch client, refusing bodies above max
@@ -972,6 +983,15 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: files %q and %q share the .%s slot — the workspace stores one artifact per extension", in.Name, chosen.Version, prev, f.Path, ext)
 		}
 		seen[ext] = f.Path
+		if f.Target != "" && ext != "aot" {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %q declares target %q but is not an .aot — only an .aot artifact carries an aot target", in.Name, chosen.Version, f.Path, f.Target)
+		}
+		// the target is a manifest KEY (aot.<target>), never a path —
+		// still, a hostile index must not plant arbitrary keys: the
+		// namespace's vocabulary is [a-z0-9-]+ (esp32s3 style).
+		if f.Target != "" && !wsTargetRe.MatchString(f.Target) {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares aot target %q failing the [a-z0-9-]+ gate — refusing (a hostile index must not steer the manifest's aot namespace)", in.Name, chosen.Version, f.Path, f.Target)
+		}
 		if f.Bytes <= 0 || f.Bytes > fetchFileMax {
 			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares %d bytes (outside 1..%d)", in.Name, chosen.Version, f.Path, f.Bytes, fetchFileMax)
 		}
@@ -994,7 +1014,7 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: sha256 %s != index %s", in.Name, chosen.Version, f.Path, sha, f.Sha256)
 		}
 		total += f.Bytes
-		staged = append(staged, stagedFile{ext: ext, body: fbody, sha: sha})
+		staged = append(staged, stagedFile{ext: ext, body: fbody, sha: sha, target: f.Target})
 	}
 
 	// 4) commit — everything verified; now the durable writes and ONE
@@ -1027,6 +1047,18 @@ priority:
 				fm.Sha256, fm.Size = s.sha, len(s.body)
 				break priority
 			}
+		}
+	}
+	// P3-T13: an .aot with a declared target lands as the version's
+	// aot.<target> record — the pairing CLAIM a bare push acts on. A
+	// target-less .aot records nothing (honestly unpaired); a re-fetch
+	// refreshes the record like every other disk-derived value.
+	for _, s := range staged {
+		if s.ext == "aot" && s.target != "" {
+			if fm.Aot == nil {
+				fm.Aot = map[string]AotSlot{}
+			}
+			fm.Aot[s.target] = AotSlot{Sha256: s.sha, Size: len(s.body)}
 		}
 	}
 	e.Files[chosen.Version] = fm // Active deliberately untouched

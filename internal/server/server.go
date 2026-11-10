@@ -1118,6 +1118,9 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 		fwVer = b.Hello.FwVersion // B10-T8c: semver beside the build id (esp_app_desc face)
 		v["boot_epoch"] = int64(b.Hello.BootEpoch)
 		v["reset_reason"] = b.Hello.ResetReason
+		if b.Hello.Chip != "" { // P3-T13: the pairing source rides the same sighting
+			v["chip"] = b.Hello.Chip
+		}
 	}
 	v["fw"] = fw
 	v["fw_version"] = fwVer

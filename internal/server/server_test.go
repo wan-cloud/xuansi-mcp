@@ -234,6 +234,9 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	if v, ok := res["reset_reason"].(string); ok {
 		h.ResetReason = v
 	}
+	if v, ok := res["chip"].(string); ok { // P3-T13: chip rides the sighting (parseHello's twin)
+		h.Chip = v
+	}
 	if v, ok := res["boot_epoch"].(int64); ok && v >= 0 && v <= math.MaxUint32 {
 		h.BootEpoch = uint32(v)
 	}
@@ -2344,19 +2347,22 @@ func TestBoardViewBootIdentity(t *testing.T) {
 		t.Fatalf("boards = %#v, want the one board", rep["result"])
 	}
 	b0, _ := boards[0].(map[string]any)
-	for _, k := range []string{"boot_epoch", "reset_reason", "last_seen"} {
+	for _, k := range []string{"boot_epoch", "reset_reason", "last_seen", "chip"} {
 		if _, ok := b0[k]; ok {
 			t.Fatalf("pre-crossing board view carries %q = %#v, want honest absence", k, b0[k])
 		}
 	}
 
 	// a v6 hello crossing lands the identity: the tap hello enriches
-	// the registry AND sights the boot
+	// the registry AND sights the boot (P3-T13: chip rides the same
+	// sighting — the push pairing's architecture source)
 	e.fakes["d75884"].on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		return map[string]any{
 			"protocol_ver": int64(6), "role": "controller", "fw": "xuansi-fw v0.2.0",
 			"fw_build": "dcaa9ae", "fw_version": "0.2.0", "fs": true,
-			"boot_epoch": int64(8), "reset_reason": "usb",
+			"chip":         "ESP32-S3",
+			"boot_epoch":   int64(8),
+			"reset_reason": "usb",
 			"reset_history": []any{"power-on", "usb"},
 		}, nil
 	})
@@ -2372,6 +2378,9 @@ func TestBoardViewBootIdentity(t *testing.T) {
 
 	checkView := func(view map[string]any, label string) {
 		t.Helper()
+		if asStr(view["chip"]) != "ESP32-S3" {
+			t.Fatalf("%s chip = %#v, want ESP32-S3 (the sighting's chip)", label, view["chip"])
+		}
 		if asInt(view["boot_epoch"]) != 8 {
 			t.Fatalf("%s boot_epoch = %#v, want 8 (the sighting's epoch)", label, view["boot_epoch"])
 		}
