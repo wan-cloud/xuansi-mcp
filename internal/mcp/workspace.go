@@ -732,12 +732,26 @@ func (ts *toolset) pushArtifact(ctx context.Context, board, path string, content
 	return true, nil
 }
 
-// notFoundIsh recognizes the fw's absent-file vocabulary ("'path' not
-// found (ENOENT)" — xs_fs.c's error) in an fs_rm refusal: a slot that
-// never held the artifact is already the sweep's desired end state,
-// the same expected noise driverPull tolerates on its un-held slots.
+// notFoundIsh recognizes the fw's absent-file vocabularies in an fs_rm
+// refusal: a slot that never held the artifact is already the sweep's
+// desired end state, the same expected noise driverPull tolerates on its
+// un-held slots. Two spellings are real on the wire: the READ path says
+// "'path' not found (No such file or directory)" (xs_fs.c's stat branch)
+// while the REMOVE path — the one fs_rm actually rides — says
+// "rm 'path' failed (No such file or directory)" (xs_fs_remove's unlink
+// branch, POSIX strerror). The remove spelling carries no "not found"
+// substring at all; the P3-T15 real-board seat check caught the first
+// version of this helper matching only the read-path text (the unit-test
+// fake board had embedded that spelling), which made every explicit-
+// artifact push on a clean board fail its sweep AFTER landing the
+// artifact. Both spellings are tolerated; anything else is a true error.
 func notFoundIsh(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "not found") ||
+		strings.Contains(s, "No such file or directory")
 }
 
 // boardAPIVersion answers the board's bench.api_version for the push
