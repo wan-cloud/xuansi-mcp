@@ -80,30 +80,138 @@ func TestTCBuildFlagsFrozen(t *testing.T) {
 	tcAPIErr(t, err, "65536") // asserts api class + the page size named
 }
 
-// TestAOTGateRejectsV2 pins the P1 v2 ruling (design §6.2): the aot
-// domain is EMPTY — .aot is refused for EVERY fw (the current stack
-// cannot load it; the domain opens with A1/A3), the message says the
-// honest why, and the ONLY pass is the §6.4 developer override
-// (wamrc_path) — which the gate passes to wamrcExec's not-yet stub.
-func TestAOTGateRejectsV2(t *testing.T) {
-	for _, fw := range []string{"", "0.1.0", "0.2.0", "9.9.9"} {
-		err := aotGate(buildReq{WantAOT: true, FW: fw})
-		tcAPIErr(t, err, "aot domain empty")
-		if !strings.Contains(err.Error(), "wamrc_path") {
-			t.Errorf("refusal %v: want the wamrc_path experimental escape named", err)
+// TestAOTGateAOTFloor (P3-T7: the domain-open rewrite of the gate the
+// T7 wave replaced): toolchain-v2's aot domain is OPEN — the gate's
+// job is the EARLY fw pairing refusal the 分發 spec's 配對紀律 demands.
+// An explicit fw below 0.3.0 (the aot track's floor, fw_compat.aot's
+// twin in the index) refuses at BUILD time naming the floor; the
+// wamrc_path lane passes; an internal WantAOT with NO wamrc refuses
+// honestly (the cache-paired default wamrc arrives with toolchain-v3
+// — T12), and wasm-only builds never see the gate.
+func TestAOTGateAOTFloor(t *testing.T) {
+	// explicit fw below the aot floor: refused EARLY, api-class, the
+	// floor and the escape named — for every below-floor spelling.
+	for _, fw := range []string{"0.1.0", "0.2.0", "0.2.9", "0.2"} {
+		err := aotGate(buildReq{WantAOT: true, WamrcPath: "/opt/wamrc", FW: fw})
+		tcAPIErr(t, err, "0.3.0")
+	}
+	// at/above the floor, and an omitted fw (this gate only judges
+	// what it is given — fwGateWasm's aot-lane twin), the lane passes.
+	for _, fw := range []string{"", "0.3.0", "0.3.1", "0.3.0-rc1", "9.9.9"} {
+		if err := aotGate(buildReq{WantAOT: true, WamrcPath: "/opt/wamrc", FW: fw}); err != nil {
+			t.Errorf("aotGate(fw %q): want the lane open, got %v", fw, err)
 		}
 	}
-	// the override passes the gate (aot dies later, in wamrcExec's stub)
-	if err := aotGate(buildReq{WantAOT: true, WamrcPath: "/opt/wamrc"}); err != nil {
-		t.Fatalf("wamrc_path override: want the gate to pass, got %v", err)
+	// the aot lane with no wamrc: the honest default-lane gap — the
+	// refusal names wamrc_path now and toolchain-v3 as the default.
+	err := aotGate(buildReq{WantAOT: true})
+	tcAPIErr(t, err, "wamrc_path")
+	if !strings.Contains(err.Error(), "toolchain-v3") {
+		t.Errorf("refusal %v: want the default-wamrc lane named as toolchain-v3's", err)
 	}
 	// wasm-only builds never see the aot gate
-	if err := aotGate(buildReq{}); err != nil {
+	if err := aotGate(buildReq{FW: "0.1.0"}); err != nil {
 		t.Fatalf("wasm-only: want nil, got %v", err)
 	}
-	// and the stub the override lane lands in says not-yet, explicitly
-	_, _, err := wamrcExec(context.Background(), buildReq{WantAOT: true, WamrcPath: "/opt/wamrc"}, "/opt/wamrc")
-	tcAPIErr(t, err, "wamrc exec lands with A1")
+}
+
+// fakeWamrc plants a shell-script wamrc and returns its path: it
+// asserts the frozen recipe's argv shape (--target=xtensa
+// --cpu=esp32s3 --size-level=3 — build.sh's invocation verbatim) and
+// writes an \0aot-magic fake .aot to the -o target, one line on
+// stderr — the aot lane's fake-clang twin (the argv pins live HERE;
+// the tool tests only exercise the landing).
+func fakeWamrc(t *testing.T) string {
+	t.Helper()
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh absent: the fake wamrc is a shell script")
+	}
+	dir := t.TempDir()
+	script := `#!/bin/sh
+out=""
+prev=""
+seen=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  case "$a" in
+    --target=xtensa|--cpu=esp32s3|--size-level=3) seen="$seen $a" ;;
+    -o|*.wasm|*.aot) ;;
+    *) echo "unexpected wamrc argv: $a" >&2; exit 2 ;;
+  esac
+  prev="$a"
+done
+if [ "$seen" != " --target=xtensa --cpu=esp32s3 --size-level=3" ]; then
+  echo "frozen recipe flags missing, got:$seen" >&2; exit 2
+fi
+printf '\000aot\004\000\000\000fake-aot-body' > "$out"
+echo "fake wamrc: compile ok" >&2
+`
+	p := filepath.Join(dir, "wamrc")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatalf("plant fake wamrc: %v", err)
+	}
+	return p
+}
+
+// fakeAotBody is the fake wamrc's exact output: the \0aot magic, the
+// v4 container version (u32 LE — the version AOT carries since
+// forever, deliberately NOT bumped for P3), then the marker body.
+func fakeAotBody() []byte {
+	return append([]byte{0x00, 'a', 'o', 't', 0x04, 0x00, 0x00, 0x00}, []byte("fake-aot-body")...)
+}
+
+// TestWamrcExecFake (P3-T7): the real wamrc exec seam against the
+// fake wamrc — the happy lane returns the .aot bytes with the
+// transcript verbatim; a failing wamrc refuses carrying the stderr
+// tail; a missing binary refuses naming the path; and a "successful"
+// run whose output is not an \0aot container is refused by the shape
+// gate (wasmMagic's aot twin — wamrc exit 0 with garbage must never
+// land as an artifact).
+func TestWamrcExecFake(t *testing.T) {
+	wamrc := fakeWamrc(t)
+	r := buildReq{Name: "hello", WamrcPath: wamrc}
+	wasm := fakeWasmBody()
+
+	aot, warnings, err := wamrcExec(context.Background(), r, wasm)
+	if err != nil {
+		t.Fatalf("wamrcExec: %v", err)
+	}
+	if want := fakeAotBody(); !bytes.Equal(aot, want) {
+		t.Fatalf("aot bytes % x: want the fake's \\0aot output % x", aot, want)
+	}
+	if warnings != "fake wamrc: compile ok\n" {
+		t.Fatalf("warnings = %q: want the fake's stderr verbatim", warnings)
+	}
+
+	// failing wamrc: non-zero exit → api refusal carrying the
+	// transcript tail (wamrc prints its errors on STDOUT — the tail
+	// rides the combined transcript); the transcript itself still
+	// rides warnings verbatim.
+	if err := os.WriteFile(wamrc, []byte("#!/bin/sh\necho 'wamrc: error: bad module' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("plant failing wamrc: %v", err)
+	}
+	_, warnings, err = wamrcExec(context.Background(), r, wasm)
+	tcAPIErr(t, err, "wamrc failed")
+	if !strings.Contains(err.Error(), "bad module") {
+		t.Errorf("refusal %v: want wamrc's own transcript carried verbatim", err)
+	}
+	if warnings != "wamrc: error: bad module\n" {
+		t.Fatalf("failing warnings = %q: want the stderr verbatim", warnings)
+	}
+
+	// missing binary: the probe refusal names the path (the clang
+	// twin's broken-tree shape).
+	_, _, err = wamrcExec(context.Background(), buildReq{Name: "hello", WamrcPath: filepath.Join(t.TempDir(), "no-wamrc")}, wasm)
+	tcAPIErr(t, err, "no wamrc at")
+
+	// shape gate: exit 0 but the output is not an \0aot container —
+	// refused (a .wasm-magic file would be wamrc refusing to convert
+	// while still exiting 0, or a wrong binary entirely).
+	if err := os.WriteFile(wamrc, []byte("#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then out=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '\\000asm-not-aot' > \"$out\"\n"), 0o755); err != nil {
+		t.Fatalf("plant wrong-magic wamrc: %v", err)
+	}
+	_, _, err = wamrcExec(context.Background(), r, wasm)
+	tcAPIErr(t, err, "not an .aot container")
 }
 
 // TestFWGateWasm pins the wasm track's fw floor (design §6.2): the
@@ -477,18 +585,21 @@ func TestWasmBuildToolVersionGate(t *testing.T) {
 // "wasm-dev" — the artifact is visibly not an index-paired build,
 // however the unpaired compile was requested. Both halves: wamrc_path
 // (fired over the cache state's OWN landed record — the mark rides
-// the request's override, not the sdk the build resolved), and
-// wasi_sdk_path alone (a local tree compiling with no cache in
-// play). The omitted version lands the first-build default 0.0.1.
+// the request's override, not the sdk the build resolved; since P3-T7
+// this lane REALLY execs wamrc, so the landed artifact is the fake
+// wamrc's .aot at drivers/<name>@<ver>.aot), and wasi_sdk_path alone
+// (a local tree compiling with no cache in play). The omitted version
+// lands the first-build default 0.0.1.
 func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 	// half 1: wamrc_path over the PAIRED cache lane — the request's
 	// override marks, even though the sdk resolved through the
-	// pairing evidence.
+	// pairing evidence. The aot lane: clang builds the .wasm, the
+	// fake wamrc compiles it one step further, the .aot lands.
 	plantFakeSDKCache(t)
 	ts := &toolset{ws: newWSState(t.TempDir())}
 	out, err := wasmBuildRun(t, ts, wasmBuildIn{
 		Name: "hello", Source: "int x;\n",
-		WamrcPath: "/opt/wamrc", // no Version: the 0.0.1 default
+		WamrcPath: fakeWamrc(t), // no Version: the 0.0.1 default
 	})
 	if err != nil {
 		t.Fatalf("wasmBuild (wamrc dev): %v", err)
@@ -496,8 +607,12 @@ func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 	if out.Version != wasmBuildFirstVersion {
 		t.Fatalf("out.Version = %q: want the %s first-build default", out.Version, wasmBuildFirstVersion)
 	}
-	if out.File != "drivers/hello@"+wasmBuildFirstVersion+".wasm" {
-		t.Errorf("out.File = %q: want the default version's path", out.File)
+	if out.File != "drivers/hello@"+wasmBuildFirstVersion+".aot" {
+		t.Errorf("out.File = %q: want the aot lane's .aot path", out.File)
+	}
+	aotBody := fakeAotBody()
+	if out.Sha256 != sha256hex(aotBody) || out.Bytes != len(aotBody) {
+		t.Errorf("out sha/bytes = %s/%d: want the compiled .aot's own %s/%d", out.Sha256, out.Bytes, sha256hex(aotBody), len(aotBody))
 	}
 	m, merr := loadManifest(ts.ws.manifestPath())
 	if merr != nil {
@@ -529,6 +644,48 @@ func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 	}
 	if e2 := m2.Drivers["hello"]; e2.Kind != "wasm-dev" {
 		t.Fatalf("kind = %q: want wasm-dev (wasi_sdk_path alone marks the override lane too)", e2.Kind)
+	}
+}
+
+// TestWasmBuildToolAOTLaneFloor (P3-T7): the aot lane's EARLY fw
+// pairing refusal through the tool handler — an explicit fw below the
+// 0.3.0 floor refuses before any exec (a 0.2.x board has no aot
+// loader; the build must not discover that at push time), while the
+// same call at the floor proceeds into the lane.
+func TestWasmBuildToolAOTLaneFloor(t *testing.T) {
+	plantFakeSDKCache(t)
+	ts := &toolset{ws: newWSState(t.TempDir())}
+	wamrc := fakeWamrc(t)
+
+	_, err := wasmBuildRun(t, ts, wasmBuildIn{
+		Name: "hello", Source: "int x;\n", FW: "0.2.0", WamrcPath: wamrc,
+	})
+	tcAPIErr(t, err, "0.3.0")
+	if !strings.Contains(err.Error(), "aot") {
+		t.Errorf("refusal %v: want the aot track named", err)
+	}
+	// nothing landed (the manifest may exist from the plant, but no
+	// hello entry — the refusal fired before any compile or landing).
+	m, merr := loadManifest(ts.ws.manifestPath())
+	if merr == nil {
+		if _, ok := m.Drivers["hello"]; ok {
+			t.Fatal("aot floor refusal: a hello entry landed anyway")
+		}
+	}
+
+	// at the floor the lane proceeds: the .aot lands.
+	out, err := wasmBuildRun(t, ts, wasmBuildIn{
+		Name: "hello", Version: "1.0.0", Source: "int x;\n", FW: "0.3.0", WamrcPath: wamrc,
+	})
+	if err != nil {
+		t.Fatalf("wasmBuild (aot lane at floor): %v", err)
+	}
+	if out.File != "drivers/hello@1.0.0.aot" {
+		t.Errorf("out.File = %q: want the .aot landing", out.File)
+	}
+	// both transcripts ride: clang's then wamrc's, in lane order.
+	if !strings.Contains(out.Warnings, "fake clang: ok") || !strings.Contains(out.Warnings, "fake wamrc: compile ok") {
+		t.Errorf("out.Warnings = %q: want BOTH transcripts (clang then wamrc)", out.Warnings)
 	}
 }
 

@@ -35,14 +35,18 @@ import (
 	"testing"
 	"time"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"xuansi/internal/server"
 )
 
 // TestParseToolchainIndexVerGate pins the version gate: index_ver 2 is
 // refused as an api-class error (the whole toolchain face refuses with
 // errWs, never a bare fmt error), and index_ver 1 parses with the
-// fw_compat SPLIT TRACKS intact — "aot" as the EMPTY domain ("") is
-// the P1 v2 honest-refusal semantic every downstream gate reads.
+// fw_compat SPLIT TRACKS intact — since P3-T7 the aot track's domain
+// is OPEN (">=0.3.0": toolchain-v2's stock wamrc against the fw line
+// with an aot loader); "" or a missing key still reads as an empty
+// domain for any generation that honestly carries one.
 func TestParseToolchainIndexVerGate(t *testing.T) {
 	if _, err := parseToolchainIndex([]byte(`{"index_ver":2,"latest":"toolchain-v3"}`)); err == nil {
 		t.Fatal("index_ver 2: want refusal, got nil")
@@ -66,7 +70,7 @@ func TestParseToolchainIndexVerGate(t *testing.T) {
 		"generations": {
 			"toolchain-v2": {
 				"kind": "stock-wamrc",
-				"fw_compat": {"wasm": ">=0.2.0", "aot": ""},
+				"fw_compat": {"wasm": ">=0.2.0", "aot": ">=0.3.0"},
 				"wasi_sdk": "24.0",
 				"platforms": {}
 			}
@@ -76,8 +80,8 @@ func TestParseToolchainIndexVerGate(t *testing.T) {
 		t.Fatalf("index_ver 1: want pass, got %v", err)
 	}
 	gen := ix.Generations["toolchain-v2"]
-	if gen.FwCompat["aot"] != "" {
-		t.Fatalf("fw_compat aot: want empty-domain \"\", got %q", gen.FwCompat["aot"])
+	if gen.FwCompat["aot"] != ">=0.3.0" {
+		t.Fatalf("fw_compat aot: want the P3-T7 open domain \">=0.3.0\", got %q", gen.FwCompat["aot"])
 	}
 	if gen.FwCompat["wasm"] != ">=0.2.0" {
 		t.Fatalf("fw_compat wasm: want \">=0.2.0\", got %q", gen.FwCompat["wasm"])
@@ -108,8 +112,8 @@ func TestEmbeddedSnapshotParses(t *testing.T) {
 	if gen.Kind != "stock-wamrc" || gen.WasiSDK != "24.0" {
 		t.Fatalf("embedded gen head: want stock-wamrc/24.0, got %q/%q", gen.Kind, gen.WasiSDK)
 	}
-	if gen.FwCompat["aot"] != "" || gen.FwCompat["wasm"] != ">=0.2.0" {
-		t.Fatalf("embedded fw_compat: want wasm >=0.2.0 + empty aot, got %v", gen.FwCompat)
+	if gen.FwCompat["aot"] != ">=0.3.0" || gen.FwCompat["wasm"] != ">=0.2.0" {
+		t.Fatalf("embedded fw_compat: want wasm >=0.2.0 + aot >=0.3.0 (the P3-T7 open domain), got %v", gen.FwCompat)
 	}
 
 	// Five platform keys, each with a wasi-sdk asset at its official
@@ -182,6 +186,97 @@ func TestEmbeddedSnapshotParses(t *testing.T) {
 	for _, plat := range []string{"linux-arm64", "win-x64"} {
 		if gen.Platforms[plat].Wamrc != nil {
 			t.Fatalf("embedded %s wamrc: want null (no leg built; win best-effort leg failed — tracked P2), got %+v", plat, gen.Platforms[plat].Wamrc)
+		}
+	}
+}
+
+// TestToolchainDescAOTDomain (P3-T7, the MCP-seat discipline's
+// executable half): the toolchain/build Descriptions are the face's
+// fw-compat pairing surface, and with toolchain-v2's aot domain OPEN
+// they must speak the present tense — the open domain + its floor, the
+// fw-internal-SRAM placement semantics with the caps
+// aot_exec_budget_bytes ceiling, the honest over-budget refusal, and
+// PSRAM (toolchain-v3) as the later chapter — while every retired
+// future-tense marker ("aot = null", "arrives with the A1 runtime",
+// "refused until A1") must be GONE from all three Descs. The drift
+// this pins is exactly the T8-minor⑤ staleness class: a Desc that
+// describes a mechanism the product no longer has (or does not yet
+// have) is a documentation defect the seat carries to every agent.
+func TestToolchainDescAOTDomain(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc := map[string]string{}
+	for _, tool := range lr.Tools {
+		desc[tool.Name] = tool.Description
+	}
+
+	// status: the pairing matrix sentence, present tense, all four
+	// ruling-mandated elements + the toolchain-v3 horizon.
+	st := desc["xuansi_toolchain_status"]
+	for _, want := range []string{
+		"aot >=0.3.0",           // the open domain + its floor
+		"aot_exec_budget_bytes", // the ceiling's caps key (T6 caps face)
+		"INTERNAL SRAM",         // placement: fw-internal, not PSRAM
+		"honestly refused",      // over-budget semantics: no silent swap
+		"toolchain-v3",          // PSRAM exec is the later chapter
+	} {
+		if !strings.Contains(st, want) {
+			t.Errorf("toolchain_status Desc: want %q (the open aot domain, present tense), missing from:\n%s", want, st)
+		}
+	}
+
+	// the retired future-tense markers must be gone from ALL three.
+	for name, d := range desc {
+		switch name {
+		case "xuansi_toolchain_status", "xuansi_toolchain_fetch", "xuansi_wasm_build":
+		default:
+			continue
+		}
+		for _, stale := range []string{"aot = null", "aot empty", "refused until A1", "arrives with the A1 runtime", "empty domain"} {
+			if strings.Contains(d, stale) {
+				t.Errorf("%s Desc: retired future-tense marker %q still present:\n%s", name, stale, d)
+			}
+		}
+	}
+
+	// fetch: the PAIRING sentence states the open domain.
+	if fx := desc["xuansi_toolchain_fetch"]; !strings.Contains(fx, "aot >=0.3.0") {
+		t.Errorf("toolchain_fetch Desc: want the pairing sentence to state \"aot >=0.3.0\", missing from:\n%s", fx)
+	}
+
+	// build: wamrc_path is the aot lane, the frozen recipe named.
+	bd := desc["xuansi_wasm_build"]
+	for _, want := range []string{"--target=xtensa", "--cpu=esp32s3", "drivers/<name>@<version>.aot", "wasm-dev"} {
+		if !strings.Contains(bd, want) {
+			t.Errorf("wasm_build Desc: want %q (the wamrc_path aot lane), missing from:\n%s", want, bd)
+		}
+	}
+
+	// build input schema: the wamrc_path field Desc carries the lane
+	// semantics too (the seat a client actually reads first).
+	for _, tool := range lr.Tools {
+		if tool.Name != "xuansi_wasm_build" {
+			continue
+		}
+		m, ok := tool.InputSchema.(map[string]any)
+		if !ok {
+			t.Fatalf("wasm_build input schema = %#v, want a JSON object", tool.InputSchema)
+		}
+		props, _ := m["properties"].(map[string]any)
+		f, ok := props["wamrc_path"].(map[string]any)
+		if !ok {
+			t.Fatal("wasm_build input schema: no wamrc_path property")
+		}
+		fd, _ := f["description"].(string)
+		for _, want := range []string{".aot", "wasm-dev"} {
+			if !strings.Contains(fd, want) {
+				t.Errorf("wamrc_path schema Desc: want %q, missing from:\n%s", want, fd)
+			}
 		}
 	}
 }
@@ -602,7 +697,7 @@ func tcTestIndex(t *testing.T, plat string, sdk, wamrc *tcAsset) []byte {
 		Latest:   "toolchain-v2",
 		Generations: map[string]tcGen{
 			"toolchain-v2": {
-				Kind: "stock-wamrc", FwCompat: map[string]string{"wasm": ">=0.2.0", "aot": ""},
+				Kind: "stock-wamrc", FwCompat: map[string]string{"wasm": ">=0.2.0", "aot": ">=0.3.0"},
 				WasiSDK:   "24.0",
 				Platforms: map[string]tcPlat{plat: {WasiSDK: sdk, Wamrc: wamrc}},
 			},
