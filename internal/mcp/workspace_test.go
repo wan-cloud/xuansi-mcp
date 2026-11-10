@@ -1208,8 +1208,12 @@ func newPairEnv(t *testing.T) (*env, *pairD, string) {
 					break
 				}
 				if _, ok := pd.files[req.Board+"\x00"+req.Path]; !ok {
+					// the fw's REAL remove-path vocabulary (xs_fs_remove's
+					// unlink branch, POSIX strerror — pinned by the P3-T15
+					// seat check; the read path's "'%s' not found (...)"
+					// spelling is a different branch and never rides fs_rm)
 					rep = &server.Reply{Type: "reply", ID: req.ID,
-						Error: &server.RPCError{Class: "api", Msg: fmt.Sprintf("'%s' not found (ENOENT)", req.Path)}}
+						Error: &server.RPCError{Class: "api", Msg: fmt.Sprintf("rm '%s' failed (No such file or directory)", req.Path)}}
 					break
 				}
 				delete(pd.files, req.Board+"\x00"+req.Path)
@@ -1863,10 +1867,16 @@ func TestDriverPushExplicitSweepFailureHandling(t *testing.T) {
 		t.Errorf("Active = %q after the failed sweep, want none (error ⇒ manifest untouched)", m.Drivers["pairmod"].Active)
 	}
 
-	// the tolerated shape: the fw's not-found vocabulary on an absent slot
+	// the tolerated shape: BOTH of the fw's absent-file spellings are
+	// sweep noise — the failRm line below pins the read-path spelling
+	// ("'path' not found (...)"); the fake board's natural absent-slot
+	// path now returns the REMOVE-path spelling ("rm 'path' failed (No
+	// such file or directory)" — the real xs_fs_remove vocabulary the
+	// P3-T15 board seat caught), which the absent .lua slot exercises
+	// in this same push: both must be tolerated or this push fails.
 	e2, pd2, root2 := newPairEnv(t)
 	storePairVersion(t, root2, "pairmod", "1.0.0", "esp32s3")
-	pd2.failRm["/drv/pairmod.aot"] = "'/drv/pairmod.aot' not found (ENOENT)"
+	pd2.failRm["/drv/pairmod.aot"] = "'/drv/pairmod.aot' not found (No such file or directory)"
 	res2 := e2.call("xuansi_driver_push", map[string]any{
 		"board": "d75884", "name": "pairmod", "version": "1.0.0", "artifact": "wasm",
 	})
