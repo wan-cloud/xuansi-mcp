@@ -45,12 +45,16 @@ type Manifest struct {
 
 // DriverEntry is one driver's record: the active version ("" until a
 // push activates one) and the per-version file metadata. Kind (B10
-// task 5, passthrough widened B15 W1.T4) carries the fetch index's
-// module kind VERBATIM — today's vocabulary ("driver", "algorithm")
-// and the canary vocabulary the drivers-repo wave adds
-// ("production"/"test-canary") cross unchanged; the daemon never
-// judges the value. Additive: pre-B10 manifests without it load
-// unchanged, and hand-put versions simply leave it empty.
+// task 5, passthrough widened B15 W1.T4, vocabulary reconciled W2.T4)
+// carries the fetch index's `kind` VERBATIM — the post-restructure
+// index speaks the RELEASE-CLASS vocabulary there
+// ("production"/"test-canary"), and the seat's `kind` axis is exactly
+// that vocabulary, one meaning everywhere (fetch/push/ws_list/module_
+// doc): a release class, never a module type and never a build lane.
+// The per-version module-type and dev-lane facts live in FileMeta
+// (Release/Dev) where they belong — a version-scoped fact never
+// masquerades as the driver's release class. Hand-put versions and a
+// kindless index leave it empty; the daemon never judges the value.
 type DriverEntry struct {
 	Active string              `json:"active,omitempty"`
 	Kind   string              `json:"kind,omitempty"`
@@ -78,6 +82,73 @@ type FileMeta struct {
 	// unchanged and simply never pair. A record whose sha disagrees
 	// with drivers/<name>@<ver>.aot on disk is a refusal, not a guess.
 	Aot map[string]AotSlot `json:"aot,omitempty"`
+
+	// Release (B15 W2-T4) is the release class the version's own
+	// per-version meta declared (the drivers meta.json `release`
+	// field: production/test-canary) — the per-version twin of the
+	// index-level Kind. The seat's module_doc maps kind from the entry
+	// Kind first (the index vocabulary), falling back to this when the
+	// index carried none. Absent for versions stored before the meta
+	// leg or from kindless sources.
+	Release string `json:"release,omitempty"`
+
+	// Dev (B15 W2-T4) marks a wasm-build version whose compile rode a
+	// §6.4 override (wamrc_path / wasi_sdk_path) — visibly a dev
+	// artifact, not a cache-paired build. Formerly this rode the entry
+	// Kind as "wasm-dev", polluting the seat's kind vocabulary with a
+	// build lane; the reconciliation moved it here, a version-scoped
+	// boolean surfaced by ws_list.
+	Dev bool `json:"dev,omitempty"`
+
+	// Doc (B15 W2-T4) is the per-version module documentation the
+	// fetch records from the index artifact's meta.json `doc` field
+	// (the drivers repo's doc.md, extractor-managed): the ops table
+	// and the measured list xuansi_module_doc serves. Absent for
+	// versions fetched from pre-restructure indexes (their doc answer
+	// falls back to GitHub).
+	Doc *DocMeta `json:"doc,omitempty"`
+
+	// Footprint (B15 W2-T4) is the version's static memory footprint
+	// the meta.json `footprint` block declared — the admission
+	// preflight's candidate number (the memory account bills the
+	// linear-memory initial only; text/pool are the .aot lane's info
+	// columns). Absent for pre-restructure versions (their pushes
+	// carry no admission projection, honestly).
+	Footprint *FootprintMeta `json:"footprint,omitempty"`
+}
+
+// DocMeta is the per-version documentation payload (meta.json doc).
+type DocMeta struct {
+	Ops      []DocOp        `json:"ops,omitempty"`
+	Measured map[string]any `json:"measured,omitempty"`
+}
+
+// DocOp is one exported op's row (doc.md's Ops table, extractor-locked).
+type DocOp struct {
+	Name      string `json:"name"`
+	Args      string `json:"args,omitempty"`
+	Result    string `json:"result,omitempty"`
+	Semantics string `json:"semantics,omitempty"`
+}
+
+// FootprintMeta is the version's static footprint: the .wasm lane's
+// linear memory (initial==max under the ABI 1 freeze) and, when the
+// version carries .aot artifacts, their per-target trio (the initial
+// the account bills + text/pool as info columns).
+type FootprintMeta struct {
+	Wasm FootprintWasm           `json:"wasm"`
+	Aot  map[string]FootprintAot `json:"aot,omitempty"`
+}
+
+type FootprintWasm struct {
+	Initial int64 `json:"initial_bytes"`
+	Max     int64 `json:"max_bytes,omitempty"`
+}
+
+type FootprintAot struct {
+	Initial int64 `json:"initial_bytes"`
+	Text    int64 `json:"text_bytes,omitempty"`
+	Pool    int64 `json:"pool_bytes,omitempty"`
 }
 
 // AotSlot is one target's .aot record inside FileMeta.Aot.
