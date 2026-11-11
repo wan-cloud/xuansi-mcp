@@ -954,6 +954,11 @@ type fetchFileSpec struct {
 type fetchModSpec struct {
 	name, kind, version string
 	files               []fetchFileSpec
+	// metaBody, when non-nil, serves the version's meta.json at the
+	// conventional modules/<n>/<v>/<n>.meta.json path (B15 W2-T4);
+	// metaStatus forces the meta request's HTTP status instead.
+	metaBody   []byte
+	metaStatus int
 }
 
 // fetchSpec builds an honest file spec (declared sha/bytes match the
@@ -1014,6 +1019,16 @@ func newFetchIndex(t *testing.T, mods []fetchModSpec) (idxURL string, hits *atom
 					return
 				}
 				_, _ = w.Write(f.body)
+			})
+		}
+		if m.metaBody != nil || m.metaStatus != 0 {
+			mux.HandleFunc(fmt.Sprintf("/modules/%s/%s/%s.meta.json", m.name, m.version, m.name), func(w http.ResponseWriter, _ *http.Request) {
+				n.Add(1)
+				if m.metaStatus != 0 {
+					w.WriteHeader(m.metaStatus)
+					return
+				}
+				_, _ = w.Write(m.metaBody)
 			})
 		}
 	}
@@ -2803,5 +2818,96 @@ func TestDriverPullRemovesFetchedWasmBoardFile(t *testing.T) {
 	}
 	if fm := ent.Files["1.0.0"]; fm.Sha256 != sha256hex(body) || fm.Size != len(body) {
 		t.Errorf("Files[1.0.0] = %+v, want the wasm history kept verbatim", fm)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the fetch's per-version meta leg (B15 W2-T4): doc/footprint/release
+// from modules/<n>/<v>/<n>.meta.json into the version's FileMeta — the
+// workspace half of xuansi_module_doc and driver_push's admission
+// preflight. Presence-tolerant (a 404/pre-restructure index stores
+// without meta), integrity-hard (a present-but-garbage meta refuses
+// the fetch — the drivers CI locks meta↔index, garbage is drift).
+
+// metaFixtureJSON builds one drivers-shaped meta.json body.
+func metaFixtureJSON(t *testing.T, release string) []byte {
+	t.Helper()
+	return []byte(fmt.Sprintf(`{
+	  "name": "metamod", "kind": "driver", "release": %q, "version": "1.0.0", "abi": 1,
+	  "doc": {
+	    "ops": [
+	      {"name": "echo", "args": "args...", "result": "args...", "semantics": "round-trip"},
+	      {"name": "add", "args": "[a, b]", "result": "[a+b]", "semantics": "decode+encode proof"}
+	    ],
+	    "measured": {"wasm_bytes": 48, "initial_memory_bytes": 262144, "max_memory_bytes": 1048576}
+	  },
+	  "footprint": {
+	    "wasm": {"initial_bytes": 262144, "max_bytes": 1048576},
+	    "aot": {"esp32s3": {"initial_bytes": 262144, "text_bytes": 4096, "pool_bytes": 512}}
+	  }
+	}`, release))
+}
+
+func TestDriverFetchMetaLeg(t *testing.T) {
+	wbody := fetchWasmBody(48)
+
+	// happy: the meta's doc/footprint/release land in FileMeta
+	e, _, root := newWsEnv(t, nil)
+	url, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "metamod", kind: "production", version: "1.0.0",
+		files:    []fetchFileSpec{fetchSpec(t, "modules/metamod/1.0.0/metamod.wasm", wbody, "")},
+		metaBody: metaFixtureJSON(t, "test-canary"),
+	}})
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "metamod", "version": "1.0.0", "index_url": url})
+	if res.IsError {
+		t.Fatalf("meta fetch failed: %s", resultText(t, res))
+	}
+	m := wsManifest(t, root)
+	fm := m.Drivers["metamod"].Files["1.0.0"]
+	if fm.Release != "test-canary" {
+		t.Errorf("Files.Release = %q, want test-canary (the meta's release)", fm.Release)
+	}
+	if fm.Doc == nil || len(fm.Doc.Ops) != 2 || fm.Doc.Ops[1].Name != "add" || fm.Doc.Ops[1].Semantics != "decode+encode proof" {
+		t.Errorf("Files.Doc = %+v, want the meta's ops table", fm.Doc)
+	}
+	if fm.Doc.Measured["initial_memory_bytes"] != float64(262144) {
+		t.Errorf("Files.Doc.Measured = %v, want the measured map", fm.Doc.Measured)
+	}
+	if fm.Footprint == nil || fm.Footprint.Wasm.Initial != 262144 || fm.Footprint.Wasm.Max != 1048576 {
+		t.Errorf("Files.Footprint = %+v, want the wasm pair", fm.Footprint)
+	}
+	if fp := fm.Footprint.Aot["esp32s3"]; fp.Initial != 262144 || fp.Text != 4096 || fp.Pool != 512 {
+		t.Errorf("Files.Footprint.Aot[esp32s3] = %+v, want the full trio", fp)
+	}
+
+	// absent (a pre-restructure index): fetch succeeds, meta fields
+	// honestly absent
+	e2, _, root2 := newWsEnv(t, nil)
+	url2, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "metamod", kind: "production", version: "1.0.0",
+		files: []fetchFileSpec{fetchSpec(t, "modules/metamod/1.0.0/metamod.wasm", wbody, "")},
+	}})
+	res = e2.call("xuansi_driver_fetch", map[string]any{"name": "metamod", "version": "1.0.0", "index_url": url2})
+	if res.IsError {
+		t.Fatalf("meta-less fetch failed: %s", resultText(t, res))
+	}
+	fm = wsManifest(t, root2).Drivers["metamod"].Files["1.0.0"]
+	if fm.Doc != nil || fm.Footprint != nil || fm.Release != "" {
+		t.Errorf("meta-less FileMeta = %+v, want doc/footprint/release absent", fm)
+	}
+
+	// malformed: present-but-garbage meta refuses the fetch (integrity)
+	e3, _, _ := newWsEnv(t, nil)
+	url3, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "metamod", kind: "production", version: "1.0.0",
+		files:    []fetchFileSpec{fetchSpec(t, "modules/metamod/1.0.0/metamod.wasm", wbody, "")},
+		metaBody: []byte(`{"name": "metamod", not json`),
+	}})
+	res = e3.call("xuansi_driver_fetch", map[string]any{"name": "metamod", "version": "1.0.0", "index_url": url3})
+	if !res.IsError {
+		t.Fatal("malformed meta must refuse the fetch")
+	}
+	if txt := resultText(t, res); !strings.Contains(txt, "malformed meta") {
+		t.Errorf("refusal = %q, want the drift wording", txt)
 	}
 }

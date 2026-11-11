@@ -605,8 +605,11 @@ func TestWasmBuildToolLandsWorkspace(t *testing.T) {
 		t.Fatalf("landed bytes % x: want the fake clang's output % x", got, body)
 	}
 
-	// the manifest entry: kind wasm, FileMeta of the built bytes,
-	// built-at recorded, no activation, no push footprints
+	// the manifest entry: NO kind claim (a build makes no release-class
+	// statement — the seat's kind vocabulary is release-class only,
+	// W2-T4's reconciliation), FileMeta of the built bytes with the
+	// static footprint recorded, built-at recorded, no activation, no
+	// push footprints
 	m, merr := loadManifest(filepath.Join(root, "manifest.json"))
 	if merr != nil {
 		t.Fatalf("loadManifest: %v", merr)
@@ -615,8 +618,8 @@ func TestWasmBuildToolLandsWorkspace(t *testing.T) {
 	if !ok {
 		t.Fatal("manifest: no hello entry after the build")
 	}
-	if e.Kind != "wasm" {
-		t.Errorf("kind = %q: want wasm (the cache state's landed record compiled — no override in play)", e.Kind)
+	if e.Kind != "" {
+		t.Errorf("kind = %q: want empty (a build claims no release class; the dev-lane marker rides FileMeta)", e.Kind)
 	}
 	if e.Active != "" {
 		t.Errorf("active = %q: storing is NOT activating (a push moves it)", e.Active)
@@ -627,6 +630,12 @@ func TestWasmBuildToolLandsWorkspace(t *testing.T) {
 	}
 	if fm.Sha256 != sha256hex(body) || fm.Size != len(body) {
 		t.Errorf("files[1.2.0] = %+v: want sha %s size %d", fm, sha256hex(body), len(body))
+	}
+	if fm.Dev {
+		t.Error("files[1.2.0].dev: the cache-paired lane is not a dev artifact")
+	}
+	if fm.Footprint == nil || fm.Footprint.Wasm.Initial != 131072 || fm.Footprint.Wasm.Max != 131072 {
+		t.Errorf("files[1.2.0].footprint = %+v: want the requested initial 131072 with max==initial (the freeze)", fm.Footprint)
 	}
 	if fm.PushedAt.IsZero() {
 		t.Error("files[1.2.0].pushed_at: want the built-at timestamp recorded")
@@ -709,12 +718,18 @@ func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 		t.Fatalf("loadManifest: %v", merr)
 	}
 	e := m.Drivers["hello"]
-	if e.Kind != "wasm-dev" {
-		t.Fatalf("kind = %q: want wasm-dev (wamrc_path marks the override lane)", e.Kind)
+	if e.Kind != "" {
+		t.Fatalf("kind = %q: want empty (W2-T4: a build claims no release class; the dev marker is version-scoped)", e.Kind)
 	}
 	fm, ok := e.Files[wasmBuildFirstVersion]
 	if !ok || fm.Sha256 != out.Sha256 || fm.Size != out.Bytes {
 		t.Fatalf("files[%s] = %+v (ok=%v): want the built artifact's meta matching out", wasmBuildFirstVersion, fm, ok)
+	}
+	if !fm.Dev {
+		t.Fatalf("files[%s].dev: want true (wamrc_path marks the override lane)", wasmBuildFirstVersion)
+	}
+	if fp, fok := e.Files[wasmBuildFirstVersion].Footprint.Aot["esp32s3"]; !fok || fp.Initial != tcWasmInitialMemory {
+		t.Errorf("files[%s].footprint = %+v: want the aot target's initial at the frozen default %d (the request omitted it)", wasmBuildFirstVersion, fm.Footprint, tcWasmInitialMemory)
 	}
 	// P3-T13: the aot lane records its target — the frozen recipe's
 	// --cpu=esp32s3 is the manifest's aot.esp32s3 claim (a later .wasm
@@ -725,7 +740,7 @@ func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 
 	// half 2: wasi_sdk_path ALONE (probe-22's symmetric pair) — a
 	// local tree compiles with no cache record at all, and the
-	// manifest must not pass the artifact off as index-paired.
+	// manifest must not pass the artifact off as cache-paired.
 	tcCacheEnv(t) // fresh cache: the override is the only resolution
 	ts2 := &toolset{ws: newWSState(t.TempDir())}
 	if _, err := wasmBuildRun(t, ts2, wasmBuildIn{
@@ -738,8 +753,8 @@ func TestWasmBuildToolDevOverrideKind(t *testing.T) {
 	if merr2 != nil {
 		t.Fatalf("loadManifest (sdk dev): %v", merr2)
 	}
-	if e2 := m2.Drivers["hello"]; e2.Kind != "wasm-dev" {
-		t.Fatalf("kind = %q: want wasm-dev (wasi_sdk_path alone marks the override lane too)", e2.Kind)
+	if e2 := m2.Drivers["hello"]; e2.Kind != "" || !e2.Files["2.0.0"].Dev {
+		t.Fatalf("entry = %+v: want empty kind + files[2.0.0].dev=true (wasi_sdk_path alone marks the override lane too)", e2)
 	}
 }
 
@@ -858,8 +873,8 @@ func TestWasmBuildToolAOTDefaultLane(t *testing.T) {
 		t.Fatalf("loadManifest: %v", merr)
 	}
 	e := m.Drivers["hello"]
-	if e.Kind != "wasm" {
-		t.Fatalf("kind = %q: want wasm (aot=true alone is the cache-paired lane; only the §6.4 overrides mark wasm-dev)", e.Kind)
+	if e.Kind != "" || e.Files["1.0.0"].Dev {
+		t.Fatalf("entry = %+v: want empty kind + no dev marker (aot=true alone is the cache-paired lane; only the §6.4 overrides mark dev)", e)
 	}
 	if fm, ok := e.Files["1.0.0"]; !ok || fm.Sha256 != out.Sha256 {
 		t.Fatalf("files[1.0.0] = %+v (ok=%v): want the built .aot's meta", fm, ok)

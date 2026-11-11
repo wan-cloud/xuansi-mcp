@@ -323,9 +323,11 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 
 	// build: the aot lane's TWO knobs + the frozen recipe named, and
 	// the wamrc_path override's stock-wamrc warning speaks the
-	// 0.4.0 refusal (not the retired "narrower lane").
+	// 0.4.0 refusal (not the retired "narrower lane"). W2-T4 moved
+	// the dev-lane marker out of the kind vocabulary: the Desc says
+	// dev:true now (the "wasm-dev" kind is gone).
 	bd := desc["xuansi_wasm_build"]
-	for _, want := range []string{"--target=xtensa", "--cpu=esp32s3", "drivers/<name>@<version>.aot", "wasm-dev", "aot=true", "0.4.0", "refuses to load"} {
+	for _, want := range []string{"--target=xtensa", "--cpu=esp32s3", "drivers/<name>@<version>.aot", "dev:true", "aot=true", "0.4.0", "refuses to load"} {
 		if !strings.Contains(bd, want) {
 			t.Errorf("wasm_build Desc: want %q (the dual-knob aot lane), missing from:\n%s", want, bd)
 		}

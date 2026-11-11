@@ -370,8 +370,9 @@ func tcWarnTail(s string) string {
 // first — the developer's explicit "compile with my local tree",
 // which deliberately bypasses the cache-state pairing evidence
 // (T5's manifest marks the artifact dev — any §6.4 override, this
-// one included, lands Kind "wasm-dev") and derives the
-// sysroot from ITS root — then the cache state's landed wasi_sdk
+// one included, lands the version's Dev lane marker; since W2-T4
+// the entry Kind stays a release-class-only vocabulary) and derives
+// the sysroot from ITS root — then the cache state's landed wasi_sdk
 // record (the T3 path contract: tcCacheRoot() + the record's Dir),
 // then the self-guiding fetch refusal (§6.3 UX: the error carries
 // the next step, always).
@@ -653,16 +654,17 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	// manifest land as one unit against concurrent push/pull cycles;
 	// the compile itself stayed outside the lock — it is the slow
 	// half and touches only its temp dir).
-	kind := "wasm"
-	if in.WamrcPath != "" || in.WasiSDKPath != "" {
-		// the §6.4 override lane, EITHER override (spec's symmetric
-		// pair): the artifact was compiled outside the cache state's
-		// pairing evidence, and the manifest says so — visibly not an
-		// index-paired build. (aot=true alone stays "wasm": the
-		// cache's OWN toolchain-v3 wamrc compiled it — that IS the
-		// paired lane, the default since P3-T12.)
-		kind = "wasm-dev"
-	}
+	//
+	// The dev-lane marker (B15 W2-T4 kind reconciliation): the §6.4
+	// overrides — EITHER one (spec's symmetric pair) — compiled the
+	// artifact outside the cache state's pairing evidence, and the
+	// version's FileMeta.Dev says so. This USED to ride the entry Kind
+	// as "wasm"/"wasm-dev", which polluted the seat's single kind
+	// vocabulary (kind = the RELEASE CLASS the index carries, one
+	// meaning at every face); a version-scoped boolean is the honest
+	// shape — a build lane is a fact about one artifact, and a built
+	// version makes no release-class claim at all (Kind stays empty).
+	devLane := in.WamrcPath != "" || in.WasiSDKPath != ""
 	sha := sha256hex(wasm)
 	wsMu.Lock()
 	defer wsMu.Unlock()
@@ -677,15 +679,32 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	if err != nil {
 		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: %v", err)
 	}
-	e := m.entry(in.Name)
-	e.Kind = kind
-	fm := e.Files[ver] // push footprints (Boards) survive a re-build, like a re-put/re-fetch
+	e := m.entry(in.Name) // Kind deliberately untouched: a build makes no release-class claim
+	fm := e.Files[ver]    // push footprints (Boards) survive a re-build, like a re-put/re-fetch
 	fm.Sha256, fm.Size = sha, len(wasm)
 	// built-at: for put/fetch storing is NOT pushing and the field
 	// stays zero; a build is the artifact's birth, and this face owns
 	// that timestamp — the disk values win on a re-build, the same
 	// single-source discipline driverPush applies to sha/size.
 	fm.PushedAt = time.Now().UTC()
+	fm.Dev = devLane
+	// B15 W2-T4: the build knows its own static footprint — the
+	// -Wl,--initial-memory it just compiled under (and the freeze
+	// pins max == initial, so Wasm.Max rides the same number). The
+	// RESOLVED value (tcInitialMemory's default when omitted) is what
+	// the linker flags carried — the footprint must state the bytes
+	// that actually compiled, not the raw request. The .aot lane
+	// records the esp32s3 target's initial too (text/pool are wamrc
+	// output facts the build face does not measure — they stay
+	// absent, honestly, unlike a fetched meta's measured trio).
+	memResolved, _ := tcInitialMemory(r.InitialMemory)
+	fm.Footprint = &FootprintMeta{Wasm: FootprintWasm{Initial: memResolved, Max: memResolved}}
+	if ext == "aot" {
+		if fm.Footprint.Aot == nil {
+			fm.Footprint.Aot = map[string]FootprintAot{}
+		}
+		fm.Footprint.Aot["esp32s3"] = FootprintAot{Initial: memResolved}
+	}
 	// P3-T13: the aot lane records its target — the frozen recipe's
 	// --cpu=esp32s3 IS the manifest's aot.esp32s3 claim (the pairing
 	// source a bare push acts on when the same version later also

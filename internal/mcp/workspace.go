@@ -258,12 +258,14 @@ type wsListOut struct {
 type wsDriverSummary struct {
 	Name   string `json:"name"`
 	Active string `json:"active,omitempty" jsonschema:"the version a bare xuansi_driver_push deploys; absent when none was ever pushed"`
-	// Kind (B15 W1.T4) surfaces the drivers index's module kind the
-	// fetch persisted into the manifest — today's vocabulary
-	// (driver/algorithm) and the canary vocabulary the drivers-repo
-	// wave adds (production/test-canary) cross VERBATIM; hand-put
-	// versions and a kindless index leave it honestly absent.
-	Kind     string          `json:"kind,omitempty" jsonschema:"the module kind the fetch index carried (e.g. driver, algorithm; the drivers-repo canary wave adds production/test-canary) — verbatim from the index, persisted in the manifest; absent for hand-put versions and kindless indexes"`
+	// Kind (B15 W1.T4, vocabulary reconciled W2.T4) surfaces the
+	// RELEASE CLASS the fetch index carried in its `kind` field —
+	// the post-restructure index vocabulary (production/test-canary),
+	// one meaning at every seat face; hand-put versions and a kindless
+	// index leave it honestly absent. The per-version module facts
+	// (its own release claim, the dev-lane marker) ride each version
+	// row instead.
+	Kind     string          `json:"kind,omitempty" jsonschema:"the RELEASE CLASS the fetch index carried for this driver (production / test-canary — the index's kind field, verbatim; persisted in the manifest); absent for hand-put versions and kindless indexes. A built version makes no release-class claim — its dev-lane marker rides the version rows"`
 	Versions []wsVersionInfo `json:"versions" jsonschema:"every stored version, sorted"`
 }
 
@@ -275,6 +277,11 @@ type wsVersionInfo struct {
 	// the pairing claims a bare push acts on. Absent = a bare push
 	// deploys the single resolved artifact on every board.
 	Aot map[string]AotSlot `json:"aot,omitempty" jsonschema:"per-target .aot records the version's manifest carries (key = aot target, e.g. \"esp32s3\"; value = sha256+size of the .aot): present = a bare xuansi_driver_push to a board whose chip maps to that key (ESP32-S3 → esp32s3) deploys the .wasm + .aot PAIR; absent = the single resolved artifact"`
+	// Dev (B15 W2-T4) marks a version built through a §6.4 override
+	// lane (wasm_build's wamrc_path/wasi_sdk_path) — visibly a dev
+	// artifact, not a cache-paired build. The former "wasm-dev" entry
+	// kind, moved to where the fact lives.
+	Dev bool `json:"dev,omitempty" jsonschema:"true when this version was built through a §6.4 override lane (xuansi_wasm_build's wamrc_path or wasi_sdk_path) — a dev artifact compiled outside the toolchain cache's pairing evidence"`
 }
 
 type wsGetIn struct {
@@ -312,10 +319,12 @@ type driverPushOut struct {
 	// commit verdict (its chunk-by-chunk ledger) is what verified the
 	// landing — the post-push byte read-back is retired.
 	VerifiedBy string `json:"verified_by" jsonschema:"the verification axis: \"commit-sha256\" — the board's fs.write_commit verified the payload digest chunk-by-chunk as the file landed (the former post-push fs_read-back is retired; fs_read stays an independent tool)"`
-	// Kind (B15 W1.T4) surfaces the manifest's module kind on the
-	// deploy seat — the drivers index vocabulary the fetch persisted,
-	// verbatim; absent for hand-put versions.
-	Kind string `json:"kind,omitempty" jsonschema:"the module kind the workspace manifest carries for this driver (the fetch index's vocabulary, e.g. driver/algorithm; the canary wave adds production/test-canary) — absent for hand-put versions"`
+	// Kind (B15 W1.T4, vocabulary reconciled W2.T4) surfaces the
+	// RELEASE CLASS on the deploy seat — the index's kind field the
+	// fetch persisted (production/test-canary), else the pushed
+	// version's own meta release claim when the index carried none;
+	// absent for hand-put versions. One vocabulary at every face.
+	Kind string `json:"kind,omitempty" jsonschema:"the RELEASE CLASS for this push (production / test-canary): the fetch index's kind field, else the version's own meta release claim; absent for hand-put versions and kindless sources"`
 	// Paired (P3-T13): the honest pair claim. True only when BOTH legs
 	// of a .wasm + .aot pair landed commit-verified; false on every
 	// single-artifact push — the reply never claims a pair that did
@@ -404,7 +413,7 @@ func (ts *toolset) wsList(_ context.Context, _ *mcpsdk.CallToolRequest, _ wsList
 		s := wsDriverSummary{Name: n, Active: e.Active, Kind: e.Kind, Versions: make([]wsVersionInfo, 0, len(vers))}
 		for _, v := range vers {
 			fm := e.Files[v]
-			s.Versions = append(s.Versions, wsVersionInfo{Version: v, Size: fm.Size, Sha256: fm.Sha256, Aot: fm.Aot})
+			s.Versions = append(s.Versions, wsVersionInfo{Version: v, Size: fm.Size, Sha256: fm.Sha256, Aot: fm.Aot, Dev: fm.Dev})
 		}
 		out.Drivers = append(out.Drivers, s)
 	}
@@ -699,7 +708,15 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", err)
 	}
-	out := driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content), VerifiedBy: "commit-sha256", Kind: m.Drivers[in.Name].Kind, Swept: swept}
+	out := driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content), VerifiedBy: "commit-sha256", Swept: swept}
+	// the kind ladder (one vocabulary at the seat): the index-level
+	// Kind the fetch persisted, else the pushed version's own meta
+	// release claim; hand-put versions carry neither — honest absence.
+	if k := m.Drivers[in.Name].Kind; k != "" {
+		out.Kind = k
+	} else {
+		out.Kind = m.entry(in.Name).Files[ver].Release
+	}
 	if paired {
 		out.Paired, out.AotPath, out.AotSha256 = true, aotPath, sha256hex(aotContent)
 	}

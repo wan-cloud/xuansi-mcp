@@ -526,7 +526,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 			"INPUT: name [a-z0-9_-]+; source = the module's full C source (at most 1 MiB — over is a refusal naming the cap; #include \"xuansi_host.h\" resolves, the frozen host table every drivers-repo module compiles against); version [a-z0-9.]+, omitted = 0.0.1 (the first-build convention — the build face has no index whose highest to take, driver_fetch's omitted-version rule); initial_memory in bytes, omitted = the ABI freeze default 262144 (4 x 64 KiB pages), an explicit value must be a whole 65536-byte page multiple at most the frozen 1048576 (1 MiB) ceiling. " +
 			"FW IS AN EXPLICIT PRE-CHECK, NOT A GATE THE INTERP TRACK NEEDS: the board's interp track loads .wasm without an fw gate — the bytecode is version-less — so an omitted fw builds with no check; supply the target board's fw version only to refuse EARLY below the lane's floor — 0.2.0 on the .wasm lane (the first fw with a wasm loader), 0.3.0 on the aot lane, aot=true or wamrc_path (the first fw with an aot loader). " +
 			"TOOLCHAIN: the wasi-sdk comes from the cache xuansi_toolchain_fetch lands (a missing or broken toolchain refuses with the fetch guidance in the error itself); the frozen module-ABI flag block rides every build, so a built module is byte-comparable with the drivers repo's own; one compile is internally capped (120s — a wedged compiler cannot hold the tool hostage; the timeout refusal says so). " +
-			"AOT LANE (P3-T12, two knobs): aot=true is the DEFAULT lane — the freshly-built .wasm compiles one step further with the toolchain cache's toolchain-v3 SURGERY wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3; the cache must hold toolchain-v3 — a v2-or-empty cache refuses naming xuansi_toolchain_fetch) and lands as drivers/<name>@<version>.aot, manifest kind \"wasm\" — the cache-paired build; its .aot carries the split literal pool and fw 0.3.0+ places it in PSRAM exec. wamrc_path is the §6.4 DEVELOPER OVERRIDE of the lane's wamrc: same recipe and .aot landing, but bypassing the cache pairing evidence — a stock (toolchain-v2) wamrc there produces a v2 .aot that fw 0.4.0+ refuses to load (the internal-SRAM exec lane is retired; such an .aot loads only on fw 0.3.x boards) — and EITHER override (wamrc_path or wasi_sdk_path) marks the manifest entry kind \"wasm-dev\": visibly a dev artifact, not an index-paired build. wasi_sdk_path alone compiles with a local wasi-sdk tree (its bin/clang, never a PATH lookup). " +
+			"AOT LANE (P3-T12, two knobs): aot=true is the DEFAULT lane — the freshly-built .wasm compiles one step further with the toolchain cache's toolchain-v3 SURGERY wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3; the cache must hold toolchain-v3 — a v2-or-empty cache refuses naming xuansi_toolchain_fetch) and lands as drivers/<name>@<version>.aot — the cache-paired build; its .aot carries the split literal pool and fw 0.3.0+ places it in PSRAM exec. wamrc_path is the §6.4 DEVELOPER OVERRIDE of the lane's wamrc: same recipe and .aot landing, but bypassing the cache pairing evidence — a stock (toolchain-v2) wamrc there produces a v2 .aot that fw 0.4.0+ refuses to load (the internal-SRAM exec lane is retired; such an .aot loads only on fw 0.3.x boards) — and EITHER override (wamrc_path or wasi_sdk_path) marks the version's manifest entry dev:true (surfaced in xuansi_ws_list's version rows): visibly a dev artifact, not a cache-paired build; a built version makes no release-class claim, so the kind field stays honestly absent. wasi_sdk_path alone compiles with a local wasi-sdk tree (its bin/clang, never a PATH lookup). " +
 			"Storing is NOT activating — the manifest's Active only moves on a verified push. The compilers' stdout/stderr ride the reply's warnings verbatim (clang's, plus wamrc's on the aot lane); a failed compile refuses carrying the stderr tail and nothing lands. When this host cannot provision the toolchain through the face at all, the module can still be built by hand — see the xuansi-drivers README's \"User-compiled modules (agent path)\" section (the refusals point there too).",
 	}, ts.wasmBuild)
 
@@ -920,12 +920,14 @@ type fetchFileOut struct {
 type driverFetchOut struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
-	// Kind (B15 W1.T4) crosses VERBATIM from the index's module kind —
-	// today's vocabulary (driver/algorithm) and the canary vocabulary
-	// the drivers-repo wave adds (production/test-canary) alike — and
-	// is ABSENT when the index carried no kind (omitempty: the
-	// passthrough tolerates absence, never inventing a value).
-	Kind  string         `json:"kind,omitempty" jsonschema:"the index's module kind, verbatim (e.g. driver, algorithm; the drivers-repo canary wave adds production/test-canary) — persisted to the workspace manifest; absent when the index carried none"`
+	// Kind (B15 W1.T4, vocabulary reconciled W2.T4) crosses VERBATIM
+	// from the index entry's `kind` field — the post-restructure
+	// release-class vocabulary (production/test-canary) — and is
+	// ABSENT when the index carried no kind (omitempty: the
+	// passthrough tolerates absence, never inventing a value). The
+	// seat's kind axis is this one vocabulary everywhere; the
+	// per-version release the meta carries rides the manifest.
+	Kind  string         `json:"kind,omitempty" jsonschema:"the index entry's kind field, verbatim — the RELEASE CLASS (production / test-canary) post-restructure; persisted to the workspace manifest; absent when the index carried none"`
 	Files []fetchFileOut `json:"files" jsonschema:"one entry per landed artifact, in index order"`
 	Bytes int            `json:"bytes" jsonschema:"total stored bytes across files"`
 }
@@ -962,6 +964,62 @@ type stagedFile struct {
 	body   []byte
 	sha    string
 	target string // the .aot's index target ("" = none declared)
+}
+
+// moduleMetaDoc is the per-version meta.json the drivers index
+// artifacts carry (modules/<name>/<ver>/<name>.meta.json — the doc.md
+// extractor's output plus the release/footprint pipeline fields). The
+// fetch reads it for the seat's documentation and admission faces
+// (xuansi_module_doc, driver_push's preflight); the fields this face
+// does not serve stay untyped and ignored (additive forward shape).
+type moduleMetaDoc struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Release string `json:"release"` // the release class (production/test-canary)
+	Doc     *struct {
+		Ops []struct {
+			Name      string `json:"name"`
+			Args      string `json:"args"`
+			Result    string `json:"result"`
+			Semantics string `json:"semantics"`
+		} `json:"ops"`
+		Measured map[string]any `json:"measured"`
+	} `json:"doc"`
+	Footprint *struct {
+		Wasm *struct {
+			Initial int64 `json:"initial_bytes"`
+			Max     int64 `json:"max_bytes"`
+		} `json:"wasm"`
+		Aot map[string]struct {
+			Initial int64 `json:"initial_bytes"`
+			Text    int64 `json:"text_bytes"`
+			Pool    int64 `json:"pool_bytes"`
+		} `json:"aot"`
+	} `json:"footprint"`
+}
+
+// fetchModuleMeta pulls the version's meta.json, best-effort by
+// PRESENCE (a 404 or any transport failure from a pre-restructure
+// index is the honest no-meta shape — the version stores without
+// doc/footprint/release), hard by INTEGRITY (a body that arrives but
+// is not valid JSON refuses the fetch: the drivers CI locks meta↔
+// index↔artifacts three-way, so a present-but-garbage meta is drift,
+// not shape evolution; extra unknown keys stay ignored).
+func fetchModuleMeta(ctx context.Context, iu *url.URL, name, ver string) (*moduleMetaDoc, error) {
+	ref := fmt.Sprintf("modules/%s/%s/%s.meta.json", name, ver, name)
+	fu, ferr := iu.Parse(ref)
+	if ferr != nil || fu.Scheme != iu.Scheme || fu.Host != iu.Host {
+		return nil, nil // the conventional path does not resolve in-origin: no meta to read
+	}
+	body, derr := fetchGet(ctx, fu.String(), fetchIndexMax)
+	if derr != nil {
+		return nil, nil // absent/unreachable: tolerated, no meta recorded
+	}
+	var m moduleMetaDoc
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, errWs("xuansi_driver_fetch %s@%s: %s: not valid JSON: %v — the index serves a malformed meta (the drivers CI locks meta↔index; this is drift), refusing the fetch", name, ver, ref, err)
+	}
+	return &m, nil
 }
 
 // fetchGet GETs url with the fetch client, refusing bodies above max
@@ -1169,6 +1227,15 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 		staged = append(staged, stagedFile{ext: ext, body: fbody, sha: sha, target: f.Target})
 	}
 
+	// 3.5) the per-version meta (B15 W2-T4): doc/footprint/release for
+	// the seat's module_doc and admission faces. Presence-tolerant,
+	// integrity-hard (fetchModuleMeta's contract); a malformed body
+	// refuses the whole fetch before anything durable lands.
+	meta, merr := fetchModuleMeta(ctx, iu, in.Name, chosen.Version)
+	if merr != nil {
+		return nil, driverFetchOut{}, merr
+	}
+
 	// 4) commit — everything verified; now the durable writes and ONE
 	// manifest cycle, the whole phase under wsMu like every other
 	// workspace mutation
@@ -1211,6 +1278,33 @@ priority:
 				fm.Aot = map[string]AotSlot{}
 			}
 			fm.Aot[s.target] = AotSlot{Sha256: s.sha, Size: len(s.body)}
+		}
+	}
+	// B15 W2-T4: the meta's release/doc/footprint ride the version's
+	// FileMeta — a re-fetch refreshes them like every disk-derived
+	// value; an absent meta leaves whatever an earlier fetch recorded
+	// (the manifest is the workspace's memory, not the index's echo).
+	if meta != nil {
+		fm.Release = meta.Release
+		if meta.Doc != nil {
+			dm := &DocMeta{Measured: meta.Doc.Measured}
+			for _, op := range meta.Doc.Ops {
+				dm.Ops = append(dm.Ops, DocOp{Name: op.Name, Args: op.Args, Result: op.Result, Semantics: op.Semantics})
+			}
+			fm.Doc = dm
+		}
+		if meta.Footprint != nil {
+			fp := &FootprintMeta{}
+			if meta.Footprint.Wasm != nil {
+				fp.Wasm = FootprintWasm{Initial: meta.Footprint.Wasm.Initial, Max: meta.Footprint.Wasm.Max}
+			}
+			if len(meta.Footprint.Aot) > 0 {
+				fp.Aot = map[string]FootprintAot{}
+				for tgt, a := range meta.Footprint.Aot {
+					fp.Aot[tgt] = FootprintAot{Initial: a.Initial, Text: a.Text, Pool: a.Pool}
+				}
+			}
+			fm.Footprint = fp
 		}
 	}
 	e.Files[chosen.Version] = fm // Active deliberately untouched
