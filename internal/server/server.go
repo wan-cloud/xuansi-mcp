@@ -1268,10 +1268,13 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 	db = s.sups[b.MAC6]
 	s.mu.Unlock()
 	if db != nil {
+		// connectMu also covers the Client() read itself: a concurrent
+		// endpoint-drift rebuild swaps db.sup under this same lock, so an
+		// unlocked read would race it.
+		db.connectMu.Lock()
 		if ctl := db.sup.Client(); ctl != nil {
 			res["connected"] = true
 			sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			db.connectMu.Lock()
 			scripts, serr := db.sup.ScriptList(sctx)
 			db.connectMu.Unlock()
 			cancel()
@@ -1281,6 +1284,8 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 				res["scripts"] = scripts
 				s.noteBoardContact(b.MAC6) // script.list's reply is a protocol crossing (last_seen)
 			}
+		} else {
+			db.connectMu.Unlock()
 		}
 	}
 	for _, ls := range s.leases.Snapshot() {
@@ -2086,13 +2091,13 @@ func wireFrames(snap board.FrameSnapshot) []any {
 // pathological spin an unplugged board used to cost every op.
 func (s *Server) warmController(ctx context.Context, b discover.Board) (board.Controller, error) {
 	db := s.supervisor(b)
+	db.connectMu.Lock()
+	defer db.connectMu.Unlock()
 	if db.sup.Client() == nil {
 		if err := s.preflightSource(b.MAC6); err != nil {
 			return nil, s.boardFail(b.MAC6, err)
 		}
 	}
-	db.connectMu.Lock()
-	defer db.connectMu.Unlock()
 	ctl, err := db.sup.Connect(ctx)
 	if err != nil {
 		if errors.Is(err, board.ErrControllerSlotHeld) {
