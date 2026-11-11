@@ -1157,10 +1157,10 @@ func TestDriverFetchAotTargetHandling(t *testing.T) {
 type pairD struct {
 	fd         *fakeDaemon
 	reqs       chan server.Request
-	files      map[string][]byte   // board\x00path → payload
-	failWrite  map[string]string   // path → api error msg on fs_write
-	tamperRead map[string]bool     // path → flip the last bit on fs_read
-	failRm     map[string]string   // path → api error msg on fs_rm (a REAL refusal)
+	files      map[string][]byte // board\x00path → payload
+	failWrite  map[string]string // path → api error msg on fs_write
+	tamperRead map[string]bool   // path → flip the last bit on fs_read
+	failRm     map[string]string // path → api error msg on fs_rm (a REAL refusal)
 }
 
 func newPairEnv(t *testing.T) (*env, *pairD, string) {
@@ -2489,10 +2489,10 @@ func TestDriverPullBoardErrorVerbatimAndManifestUntouched(t *testing.T) {
 	e, reqs, root := newWsEnv(t, []step{
 		capsStep(1),                          // push: caps
 		{result: map[string]any{"ok": true}}, // push: fs_write
-		{result: map[string]any{"data": base64.StdEncoding.EncodeToString([]byte(content))}}, // push: fs_read back
-		{rerr: &server.RPCError{Class: "api", Msg: want}},                                              // pull: fs_rm .lua refused
+		{result: map[string]any{"data": base64.StdEncoding.EncodeToString([]byte(content))}},                   // push: fs_read back
+		{rerr: &server.RPCError{Class: "api", Msg: want}},                                                      // pull: fs_rm .lua refused
 		{rerr: &server.RPCError{Class: "api", Msg: "rm '/drv/ghost.wasm' failed (No such file or directory)"}}, // pull: .wasm slot equally absent
-		{rerr: &server.RPCError{Class: "api", Msg: "rm '/drv/ghost.aot' failed (No such file or directory)"}}, // pull: .aot slot equally absent
+		{rerr: &server.RPCError{Class: "api", Msg: "rm '/drv/ghost.aot' failed (No such file or directory)"}},  // pull: .aot slot equally absent
 	})
 	mustPut(t, e, "ghost", "1.0.0", content)
 	if res := e.call("xuansi_driver_push", map[string]any{
