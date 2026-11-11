@@ -1,0 +1,431 @@
+{
+  "provenance": {
+    "header": "src/xuansi_host.h",
+    "header_sha256": "3a3dc8c82f30f05cb14bd5cd96132f031ee48aa98e602ddb438af3a711731f23",
+    "sidecar": "tools/gen-abi-reference/sidecar.json",
+    "sidecar_sha256": "4e541998c2d3282a6d9aa2275b2cfafc27a6fd04822d410924912813ca82a790",
+    "generator": "tools/gen-abi-reference/gen.py",
+    "note": "regenerate with tools/gen-abi-reference/gen.py; the checked-in outputs are the single source the daemon embeds (xuansi_abi_reference) — CI byte-compares"
+  },
+  "abi": {
+    "version": 1,
+    "note": "ABI 1 is the 2026-11-11 recarve (B15 ruling): one contract axis — module ABI and bench api_version are the SAME 1. The old abi=1/abi=2 numbers are retired with fw 0.5.0 (wave-3); the recarved table is the unified host table (the i2c x4 + cam x5 families included, the retired camera_* names gone) plus the initial==max memory freeze. During wave-2 both {1,2} still load.",
+    "fw_reference": "the 0.4.x wave-2 firmware (protocol_ver 7 era) — the host table this reference was curated against",
+    "fw_header_source": "the firmware's tools/wasm/xuansi_host.h (signature source; mirrored module-side at src/xuansi_host.h in this repo — the mirror is what CI reads)",
+    "load_gate_wave2": "{1,2} (fw < 0.5.0) — the wave-3 gate is {1} with the recarved semantics",
+    "memory_freeze": "a module's linear memory must declare max == initial (the static-footprint freeze; the fw loader refuses initial != max and max-absent shapes with the bytes in the refusal)"
+  },
+  "sections": {
+    "host_table": {
+      "namespace": "xuansi",
+      "import_rule": "a module imports host functions only from the xuansi namespace; any import outside this table fails to link (loader api refusal)",
+      "error_channel": "every host function is void — results through out-parameters into linear memory; errors as wasm exceptions (prefix xuansi.<fn>), Lua face class=rt",
+      "symbols": [
+        {
+          "symbol": "millis",
+          "prototype": "void xuansi_millis(uint32_t *out)",
+          "wasm": "(out u32* out) -> void",
+          "semantics": "Boot milliseconds written to *out (u32 — wraps at 49.7 days)."
+        },
+        {
+          "symbol": "delay_ms",
+          "prototype": "void xuansi_delay_ms(uint32_t ms)",
+          "wasm": "(i32 ms) -> void",
+          "semantics": "Millisecond delay (host busy-waits in <=50ms slices feeding the watchdog; cumulative cap of 15000ms per call — over the cap raises)."
+        },
+        {
+          "symbol": "gpio_set",
+          "prototype": "void xuansi_gpio_set(uint32_t pin, uint32_t level)",
+          "wasm": "(i32 pin, i32 level) -> void",
+          "semantics": "GPIO write (first touch auto-claims the pin as output; forbidden pins are refused)."
+        },
+        {
+          "symbol": "gpio_get",
+          "prototype": "void xuansi_gpio_get(uint32_t pin, uint32_t *out)",
+          "wasm": "(i32 pin, out u32* out) -> void",
+          "semantics": "GPIO read: level written to *out (first touch auto-claims as input)."
+        },
+        {
+          "symbol": "spi_config",
+          "prototype": "void xuansi_spi_config(uint32_t *out, uint32_t slot, uint32_t sclk_pin, uint32_t sclk_hz, int32_t mosi, int32_t miso, uint32_t mode, uint32_t no_cs)",
+          "wasm": "(out u32* out, i32 slot, i32 sclk_pin, i32 sclk_hz, i32 mosi, i32 miso, i32 mode, i32 no_cs) -> void",
+          "semantics": "SPI master bus self-configuration (slot=0|1; mode 0..3; mosi/miso must be LEGAL pins 0..47 — the v1 engine's pins_valid wants that on all three bus pins, so the frozen doc's \"mosi/miso=-1 = absent\" convention is NOT actually accepted (rc=-3 \"pin banned/invalid/ duplicate\"; the on-board B10-T6 conflict vector hit it): pass a legal UNWIRED pin instead (st7789 uses 14); -1 semantics deferred to abi=2. no_cs!=0 -> CS-less, no_cs=0 is REFUSED on abi=1 — the CS bus is an abi=2 addition). Status 0 is written to *out (non-zero would have raised before returning)."
+        },
+        {
+          "symbol": "spi_xfer",
+          "prototype": "void xuansi_spi_xfer(uint32_t *out, uint32_t slot, uint32_t wbuf_off, uint32_t wlen, uint32_t rbuf_off, uint32_t rcap)",
+          "wasm": "(out u32* out, i32 slot, i32 wbuf_off, i32 wlen, i32 rbuf_off, i32 rcap) -> void",
+          "semantics": "SPI full duplex: w/r are linear-memory offsets; the transferred byte count is written to *out (rcap=0 = tx-only; wlen=0 = rx-only; both non-zero requires them equal)."
+        },
+        {
+          "symbol": "i2c_config",
+          "prototype": "void xuansi_i2c_config(uint32_t *out, uint32_t slot, uint32_t sda, uint32_t scl, uint32_t hz)",
+          "wasm": "(out u32* out, i32 slot, i32 sda, i32 scl, i32 hz) -> void",
+          "semantics": "I2C master self-configuration: slot=0|1, sda/scl claimed with prim=i2c (owner=\"wasm\", loader session), hz 10k..1M. Status 0 is written to *out (a failure raises before returning — the i2cslave fixture interlocks 10/11 still apply)."
+        },
+        {
+          "symbol": "i2c_write",
+          "prototype": "void xuansi_i2c_write(uint32_t *out, uint32_t slot, uint32_t addr, uint32_t wbuf_off, uint32_t wlen)",
+          "wasm": "(out u32* out, i32 slot, i32 addr, i32 wbuf_off, i32 wlen) -> void",
+          "semantics": "I2C pure write: 7-bit addr, a single wlen <= 4096B; the written byte count is written to *out."
+        },
+        {
+          "symbol": "i2c_read",
+          "prototype": "void xuansi_i2c_read(uint32_t *out, uint32_t slot, uint32_t addr, uint32_t rbuf_off, uint32_t rcap)",
+          "wasm": "(out u32* out, i32 slot, i32 addr, i32 rbuf_off, i32 rcap) -> void",
+          "semantics": "I2C pure read: the read byte count is written to *out."
+        },
+        {
+          "symbol": "i2c_writeread",
+          "prototype": "void xuansi_i2c_writeread(uint32_t *out, uint32_t slot, uint32_t addr, uint32_t wbuf_off, uint32_t wlen, uint32_t rbuf_off, uint32_t rcap)",
+          "wasm": "(out u32* out, i32 slot, i32 addr, i32 wbuf_off, i32 wlen, i32 rbuf_off, i32 rcap) -> void",
+          "semantics": "I2C combined transaction (repeated start): write(wbuf,wlen) -> restart -> read(rbuf,rcap) — the atomic register-addressed read form (same shape as SCCB_Read; the two-step fallback is module code). The read byte count is written to *out."
+        },
+        {
+          "symbol": "cam_xclk",
+          "prototype": "void xuansi_cam_xclk(uint32_t *out, uint32_t hz)",
+          "wasm": "(out u32* out, i32 hz) -> void",
+          "semantics": "XCLK clock out on pin 15 (LCD_CAM direct drive; hz must divide 160MHz with a divider <= 255 — 20MHz is canonical). The GC2145 SCCB side needs a 1-2s warmup after the clock starts (the module handles it with delay_ms). Status 0 is written to *out."
+        },
+        {
+          "symbol": "cam_start",
+          "prototype": "void xuansi_cam_start(uint32_t *out, uint32_t w, uint32_t h, uint32_t pixfmt)",
+          "wasm": "(out u32* out, i32 w, i32 h, i32 pixfmt) -> void",
+          "semantics": "Parallel capture stream start: claims the 11 DVP pins + LCD_CAM + GDMA + the PSRAM frame buffer (geometry decided by the module profile; if XCLK is not held it auto-starts the clock at the remembered hz). This wave's only pixfmt is 0=RGB565 (anything else raises). Below the conn floor = full rollback + raise. Status 0 is written to *out."
+        },
+        {
+          "symbol": "cam_stop",
+          "prototype": "void xuansi_cam_stop(uint32_t *out)",
+          "wasm": "(out u32* out) -> void",
+          "semantics": "Full off: stop stream -> release the 11 DVP + XCLK pins (idempotent). Status 0 is written to *out."
+        },
+        {
+          "symbol": "cam_frame_get",
+          "prototype": "void xuansi_cam_frame_get(uint32_t *len_out, uint32_t buf_off, uint32_t cap, uint32_t *w_out, uint32_t *h_out)",
+          "wasm": "(out u32* len_out, i32 buf_off, i32 cap, out u32* w_out, out u32* h_out) -> void",
+          "semantics": "Single frame copy: hold fb -> copy into buf (<=cap) -> return fb; the frame's byte count / width / height are written to the len_out, w_out and h_out outs (geometry rides the call). Frame over cap raises; serialized with cam_start/stop via the shared camera lock (an op in flight = busy, a 3s sliced wait then a retryable raise)."
+        },
+        {
+          "symbol": "cam_frame_info",
+          "prototype": "void xuansi_cam_frame_info(uint32_t *w_out, uint32_t *h_out, uint32_t *pixfmt_out, uint32_t *on_out)",
+          "wasm": "(out u32* w_out, out u32* h_out, out u32* pixfmt_out, out u32* on_out) -> void",
+          "semantics": "Read-only probe (does not touch the sensor): {w,h,pixfmt,on} written to the four outs (stream not started -> w=h=0, on=0; pixfmt 0 = RGB565)."
+        },
+        {
+          "symbol": "stream_send",
+          "prototype": "void xuansi_stream_send(uint32_t *out, uint32_t buf_off, uint32_t len)",
+          "wasm": "(out u32* out, i32 buf_off, i32 len) -> void",
+          "semantics": "Module-facing stream (host stamps the module name into the frame preamble); the accepted byte count is written to *out."
+        }
+      ],
+      "retired": [
+        {
+          "symbol": "camera_frame_get",
+          "prototype": "void xuansi_camera_frame_get(uint32_t *out, uint32_t buf_off, uint32_t cap)",
+          "wasm": "(out u32* out, i32 buf_off, i32 cap) -> void",
+          "semantics": "One camera frame (raw RGB565) copied to buf_off (<=cap); the frame's byte count is written to *out. The camera must already be on.",
+          "note": "renamed onto cam_frame_get at the camera migration (geometry now rides the frame call)"
+        },
+        {
+          "symbol": "camera_info",
+          "prototype": "void xuansi_camera_info(uint32_t *out)",
+          "wasm": "(out u32* out) -> void",
+          "semantics": "Camera read-only probe: {u32 w, u32 h, u32 fs_code} (fs_code 0=QVGA/1=VGA) written to out (>=12B); w=h=0 while the camera is off.",
+          "note": "renamed onto cam_frame_info (reshaped to w/h/pixfmt/on)"
+        }
+      ]
+    },
+    "call_convention": {
+      "module_shape": "wasm32 (wasi-sdk, no WASI imports); exports xuansi_abi() -> u32 (the loader calls it at instantiate and refuses anything the gate does not accept), xuansi_alloc(u32 n) -> u32 (linear-memory offset for the host-written args; 0 = refusal), and entry functions fn(ptr: u32, len: u32) -> u64",
+      "args": "the host serializes the caller's arguments as ONE msgpack array, calls xuansi_alloc, writes it, then calls fn(ptr, len)",
+      "result": "the entry returns a single packed u64 = (result_ptr << 32) | result_len pointing at the module's own msgpack result (C has no multi-value returns — the pair rides one i64); len=0 -> Lua nil",
+      "out_params": "every host function returns void — results are written through out-parameters into the module's linear memory (the host bounds-checks and writes directly; the module reads back as ordinary wasm memory). Buffer parameters are linear-memory offsets (u32). Module authors: land out-params in .bss/heap, not wasm stack slots (portable across the interp and AOT lanes)",
+      "errors": "the host error channel is the wasm exception (message prefix xuansi.<fn>) — surfaced at the Lua face as class=rt",
+      "alloc_convention": "the host calls xuansi_alloc on EVERY call-with-args; a bump-only allocator is a hidden per-call budget (~230 calls at small-args scale). Convention: allocations <= 128B reuse one fixed slot (safe — the fw host serializes all wasm calls); larger ones use the bump arena (see any module's ARGS_SLOT_SZ)",
+      "limits": "args/result msgpack <= 8192B each; container depth <= 8; module file <= 256KB; linear memory 256KB initial default (per-module pinnable), max == initial (the freeze)"
+    },
+    "value_domain": {
+      "note": "the msgpack<->Lua value bridge, post-float revision (B15 W2-T1): binary64 is the single float caliber",
+      "kinds": "nil, boolean, integer (int64), string, array, map, float64",
+      "float64": "msgpack f64 (0xcb) both ways — eval/submit/job values and wasm call args/results. float32 (0xca) stays OUT of domain (landing it would silently lose precision)",
+      "integers": "always int64; exact for |v| <= 2^53 (binary64)",
+      "non_finite": "NaN and +/-Inf are honestly refused at the bridge — 'float value must be finite (JSON/msgpack carry no NaN/±Inf); rescale or send as {sign,exponent,mantissa} integers'",
+      "mixed_keys": "mixed/non-string map keys are out of domain (rt); depth > 8 is out of domain (rt)"
+    },
+    "lifecycle": {
+      "load": "instantiates (after the abi gate + the initial==max memory gate + the admission pre-check: sum(loaded footprints) + candidate vs wasm_memory_budget_bytes — the refusal carries the full arithmetic); claims nothing (first host call claims)",
+      "unload": "destroys the instance, releases NOTHING else — pin/bus claims survive (owner=wasm, loader session); a DVP camera stream also survives (board-level resource, not instance state)",
+      "session_reset": "unloads every instance of the loader session AND releases its claims (incl. i2c pins and the DVP stream via the teardown chain)",
+      "vm_reopen": "instances SURVIVE (board-level resource); claims released to a safe state and re-claimed on next host call; SPI slot configs are lost — the module must re-run spi_config",
+      "script_death": "instances survive (their claims' owner is 'wasm', not the script name)",
+      "reboot": "everything zeroed",
+      "claims_discipline": "gpio/spi/i2c claims live for the module's whole loaded lifetime; cam pins (xclk + 11 DVP) are claimed owner=camera at cam_start/cam_xclk and released by cam_stop (idempotent) or the teardown chains"
+    },
+    "error_faces": {
+      "classes": "api / rt / oom / compile / budget / timeout / protocol",
+      "api": "name-domain/file/magic/export/abi/mismatch/duplicate/instance-table/file-size/not-loaded/no-such-fn refusals at the loader face; messages carry the [api] prefix",
+      "rt": "marshalling domain (over cap, depth > 8, out-of-domain values), xuansi_alloc refusal, out-of-bounds result pointer, wasm traps (message passed through), and EVERY native host refusal (prefix xuansi.<fn>)",
+      "oom": "Lua VM heap cap exceeded (class=oom, refusal carries the effective cap; see lua_heap_max)",
+      "budget": "eval/script budget exceeded — the refusal reports the numbers ('cpu budget exceeded (budget %u ms; per-call budget_ms 1..30000 or budget.set)')",
+      "admission": "the load() pre-check refusal carries the arithmetic: loaded + candidate vs budget, with the unload-or-shrink fix in the message",
+      "never_silent": "no silent fallbacks anywhere in this contract: a refused .aot never degrades to .wasm, a refused ABI never loads an older lane, OOM never truncates silently"
+    },
+    "lua_boundaries": [
+      {
+        "id": 1,
+        "rule": "budget is a wall clock, reset per tick, and blocking counts",
+        "detail": "the eval/script budget measures WALL time including time blocked inside a native call — a blocking call inside a tick eats the budget just like a spin loop. Per-call override: budget_ms 1..30000 on eval/submit; session budgets via budget.set (0..4000). The refusal reports the numbers."
+      },
+      {
+        "id": 2,
+        "rule": "return value domain (post-float)",
+        "detail": "values crossing the bridge (eval/submit/job value, wasm call args/results) are nil/bool/int64/string/array/map/float64; integers exact to |v|<=2^53; NaN/±Inf refused with the rescale hint; float32 never lands."
+      },
+      {
+        "id": 3,
+        "rule": "yield does not cross require",
+        "detail": "coroutine.yield cannot cross a require boundary (require is a C boundary). Resident-script pattern: /drv/*.lua modules do setup + timer registration and RETURN; the yield loop belongs to the launcher script."
+      },
+      {
+        "id": 4,
+        "rule": "args bumps are never returned",
+        "detail": "every wasm call-with-args consumes xuansi_alloc; the bump arena never gives memory back. Polling modules reuse a small-args slot (<= 128B) or exhaust the heap in ~230 calls. This is a module-author contract, invisible at the Lua face until it bites."
+      },
+      {
+        "id": 5,
+        "rule": "16 timers, globally shared; queue overflow drops are console-only",
+        "detail": "the 16 timer slots are shared across ALL scripts; the per-owner event queue holds 16 entries and overflow DROPS (logged to console only — the Lua face never sees the loss). Design polling cadence against shared scarcity."
+      },
+      {
+        "id": 6,
+        "rule": "script lifecycle reaches the events face",
+        "detail": "script started/finished/killed events (source=script) reach the events face; killed carries the cause (budget/error/stop). A budget-killed script's verdict rides the event, not the eval reply."
+      },
+      {
+        "id": 7,
+        "rule": "synchronous ops stand silent; slices keep the box alive",
+        "detail": "a synchronous op is silent on its connection for its whole run; internal waits are sliced <= 100ms with watchdog feeding. Hard walls: the conn-task watchdog (5s) and budget.set (0..4000). Long work belongs on submit (async, job events carry the result)."
+      },
+      {
+        "id": 8,
+        "rule": "unload does not release claims",
+        "detail": "bench.wasm.unload destroys the instance but no pin/bus claims (owner=wasm, loader session) and no DVP stream. Claims release on session_reset (which ALSO unloads the session's instances — the cleanup ritual is unload -> release pins -> session_reset)."
+      }
+    ],
+    "bench_signatures": {
+      "_note": "the Lua bench face an agent drives; the per-family op lists mirror the fw registration table (single source: the X-macro that also fills caps primitives.<prim>.ops). R4 of the host-side lua lint checks bench.* members against this table.",
+      "wasm": [
+        {
+          "sig": "bench.wasm.load(name) -> true",
+          "semantics": "instantiate /drv/<name>.aot|.wasm (the .aot preferred when both exist); gates: abi, initial==max memory, admission arithmetic"
+        },
+        {
+          "sig": "bench.wasm.call(name, fn, args...) -> any",
+          "semantics": "the marshalling convention above (msgpack array in, packed u64 out)"
+        },
+        {
+          "sig": "bench.wasm.unload(name) -> true",
+          "semantics": "destroy the instance; claims survive (boundary #8)"
+        },
+        {
+          "sig": "bench.wasm.list() -> {names}",
+          "semantics": "loaded instances"
+        },
+        {
+          "sig": "bench.wasm.info(name) -> {abi, loaded_by, session, mem_bytes[, aot='psram', text_bytes, pool_bytes]}",
+          "semantics": "identity + the static footprint trio (.aot lane carries text/pool)"
+        },
+        {
+          "sig": "bench.wasm.xfer(src_name, src_off, dst_name, dst_off, len) -> n",
+          "semantics": "cross-instance memcpy with explicit ownership (no sharing, no escape); len=0 is a legal no-op; src==dst self-move uses memmove semantics; bounds checked against each instance's CURRENT extent"
+        },
+        {
+          "sig": "bench.wasm.plan(names) -> {rows=[{name, mem_bytes, text_bytes?, pool_bytes?}], loaded_bytes, total_bytes, budget_bytes, fits}",
+          "semantics": "admission dry-run — zero side effects; compare against budget before loading. total_bytes is the union of loaded and candidate footprints — an already-loaded candidate is counted once, so planning a loaded module projects zero growth"
+        }
+      ],
+      "clock": [
+        {
+          "sig": "bench.millis() -> u32",
+          "semantics": "boot milliseconds (wraps at 49.7 days) — the Lua-face timing source (a hclock wasm module is no longer needed for this)"
+        }
+      ],
+      "meta": [
+        {
+          "sig": "bench.caps() -> caps",
+          "semantics": "the caps table: fw/api_version/batch, primitives.<prim>.ops, pins.banned, limits (the numeric full table — see caps_keys), heap"
+        },
+        {
+          "sig": "bench.gc(mode [, pause [, stepmul]])",
+          "semantics": "the collectgarbage mirror (gc mode/knobs)"
+        },
+        {
+          "sig": "bench.api_version",
+          "semantics": "the bench API version constant (= 1, the same single axis as the module ABI post-recarve)"
+        }
+      ],
+      "families": {
+        "_note": "op lists per family (the caps primitives face); full per-op semantics are each primitive's frozen page",
+        "gpio": [
+          "mode",
+          "write",
+          "read",
+          "on"
+        ],
+        "uart": [
+          "setup",
+          "write",
+          "read",
+          "on"
+        ],
+        "i2c": [
+          "setup",
+          "write",
+          "read",
+          "wreg",
+          "rreg",
+          "scan"
+        ],
+        "spi": [
+          "setup",
+          "xfer",
+          "write",
+          "read"
+        ],
+        "pwm": [
+          "setup",
+          "duty",
+          "stop"
+        ],
+        "adc": [
+          "setup",
+          "read",
+          "read_mv"
+        ],
+        "rmt": [
+          "setup",
+          "tx",
+          "rx"
+        ],
+        "events": [
+          "on",
+          "off",
+          "next"
+        ]
+      }
+    },
+    "caps_keys": {
+      "note": "18 keys in caps.limits (17 numeric + adc2_note), identical across the three exits (Lua bench.caps / msgpack caps op / console CAP: lines). Same keys, same values, same order — any drift is a bug.",
+      "keys": [
+        {
+          "key": "resident_max",
+          "value": 8,
+          "live": false,
+          "note": "resident Lua scripts cap"
+        },
+        {
+          "key": "eval_budget_ms",
+          "value": "live",
+          "live": true,
+          "note": "session eval budget (budget.set domain 0..4000)"
+        },
+        {
+          "key": "event_budget_ms",
+          "value": "live",
+          "live": true,
+          "note": "session event/callback budget (budget.set domain 0..4000)"
+        },
+        {
+          "key": "eval_budget_max_ms",
+          "value": 30000,
+          "live": false,
+          "note": "per-call budget_ms cap (the budget_ms request key 1..30000)"
+        },
+        {
+          "key": "psram_cap_kb",
+          "value": "live",
+          "live": true,
+          "note": "the Lua VM allocator cap in KB (diag.cap adjustable; 0 = unlimited; boot default 4096)"
+        },
+        {
+          "key": "aot_psram_exec_budget_bytes",
+          "value": "live",
+          "live": true,
+          "note": "the SURGERY .aot text PSRAM exec window (drops while a surgery container is loaded, recovers on unload)"
+        },
+        {
+          "key": "timers_max",
+          "value": 16,
+          "live": false,
+          "note": "timer slots shared across ALL scripts (Lua boundary #5)"
+        },
+        {
+          "key": "pending_jobs_max",
+          "value": 4,
+          "live": false,
+          "note": "pending async jobs (full = busy refusal)"
+        },
+        {
+          "key": "event_subs_max",
+          "value": 16,
+          "live": false,
+          "note": "event subscriptions per owner"
+        },
+        {
+          "key": "event_queue_depth",
+          "value": 16,
+          "live": false,
+          "note": "per-owner event queue depth — overflow DROPS, console-only (Lua boundary #5)"
+        },
+        {
+          "key": "event_next_timeout_ms",
+          "value": 5000,
+          "live": false,
+          "note": "events.next timeout ceiling"
+        },
+        {
+          "key": "name_max_bytes",
+          "value": 31,
+          "live": false,
+          "note": "script/module name cap"
+        },
+        {
+          "key": "tag_max_bytes",
+          "value": 31,
+          "live": false,
+          "note": "job tag cap"
+        },
+        {
+          "key": "lua_heap_max",
+          "value": "live",
+          "live": true,
+          "note": "the Lua heap cap in bytes (boot default 4194304; diag.cap 0..65536KB, 0 = unlimited) — the account the OOM refusal reports"
+        },
+        {
+          "key": "lua_heap",
+          "value": "live",
+          "live": true,
+          "note": "current Lua VM heap live bytes"
+        },
+        {
+          "key": "wasm_memory_budget_bytes",
+          "value": 2097152,
+          "live": false,
+          "note": "the WAMR pool total account — the admission budget sum(footprints) is checked against (the account is live: load/unload maintain it; the pool itself is fixed at boot)"
+        },
+        {
+          "key": "wasm_inst_slots",
+          "value": 16,
+          "live": false,
+          "note": "instance-table mapper slots (the memory account is the governing limit; a full table is the mapper's last-line api refusal)"
+        },
+        {
+          "key": "adc2_note",
+          "value": "live",
+          "live": true,
+          "note": "NOTE key (not a limit): the ADC2 x WiFi gate status string, one of two frozen strings"
+        }
+      ]
+    }
+  }
+}

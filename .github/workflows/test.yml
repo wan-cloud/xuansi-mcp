@@ -109,4 +109,4 @@ jobs:
       - name: go test (real wasm build + drivers parity)
         run: |
           XUANSI_DRIVERS_DIR="$PWD/drivers" \
-            go test ./internal/mcp/ -run 'TestWasmBuildReal|TestDriversParity' -v
+            go test ./internal/mcp/ -run 'TestWasmBuildReal|TestDriversParity|TestAbiReferenceDriftLock' -v

@@ -680,6 +680,10 @@ var staticToolsRequiredAudit = map[string][]string{
 	// §4.3 (B15 W1.T4): the long-poll face — the tag and the bounded
 	// timeout are both load-bearing (no defaults to ride).
 	"xuansi_job_wait": {"board", "job", "timeout_ms"},
+
+	// §4.14 (B15 W2.T4): the reference face — everything optional
+	// (the section filter defaults to the whole document).
+	"xuansi_abi_reference": {},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
