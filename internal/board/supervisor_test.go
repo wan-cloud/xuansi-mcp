@@ -59,6 +59,9 @@ type fakeCtl struct {
 
 	opErr map[string]error
 
+	// opErrOnce: a one-shot scripted error per op (failOnce).
+	opErrOnce map[string]error
+
 	// sink is the connection's current 0x02 stream sink (the frames
 	// tests script ch=2 module streams through it, the fw's
 	// frames-then-reply order).
@@ -115,6 +118,10 @@ func (f *fakeCtl) Op(ctx context.Context, op string, args map[string]any) (map[s
 	f.record(op, args)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err, ok := f.opErrOnce[op]; ok {
+		delete(f.opErrOnce, op)
+		return nil, err
+	}
 	if err, ok := f.opErr[op]; ok {
 		return nil, err
 	}
@@ -208,6 +215,18 @@ func (f *fakeCtl) markDead() {
 	f.mu.Lock()
 	f.dead = true
 	f.mu.Unlock()
+}
+
+// failOnce scripts a ONE-SHOT error for the op's NEXT call, then the
+// canned behavior resumes (the same-link retry tests' scripting knob:
+// first call times out, resend succeeds).
+func (f *fakeCtl) failOnce(op string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.opErrOnce == nil {
+		f.opErrOnce = map[string]error{}
+	}
+	f.opErrOnce[op] = err
 }
 
 // newFakeSup wires a Supervisor whose dial seams hand out the given
@@ -568,3 +587,157 @@ func TestUSBControllerYieldsSlotOnReleaseAndClose(t *testing.T) {
 // guard the interface satisfaction in one place.
 var _ Controller = (*fakeCtl)(nil)
 var _ Controller = (*replclient.Client)(nil)
+
+// ---------------------------------------------------------------------------
+// B15 W1-T1: fast-fail dial bounds + the §4.2 same-link op retry.
+// ---------------------------------------------------------------------------
+
+// TestDialLoopBoundedAttempts: the dial retry loop is bounded (B15
+// §4.1③) — at most dialAttempts tries (each bounded by the 6s
+// tcpConnectTimeout inside the real dialer, ~18s worst case) instead of
+// riding the caller's full 60s request budget. The virtual clock makes
+// the schedule instant; the counter makes the bound exact.
+func TestDialLoopBoundedAttempts(t *testing.T) {
+	virt := &virtualClock{}
+	var mu sync.Mutex
+	calls := 0
+	s := NewSupervisor(BoardRef{MAC6: "d75884", Host: "xuansi-d75884.local", Port: 7777}, SupOpts{
+		DialTCP: func() (Controller, error) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			return nil, fmt.Errorf("dial tcp 10.1.51.205:7777: connect: network is unreachable")
+		},
+		Wait: virt.sleep,
+	})
+	_, err := s.Connect(context.Background())
+	if err == nil {
+		t.Fatal("Connect succeeded against a dead endpoint")
+	}
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != dialAttempts {
+		t.Fatalf("dial attempts = %d, want the bound %d (then the honest failure)", n, dialAttempts)
+	}
+	if !strings.Contains(err.Error(), "network is unreachable") {
+		t.Errorf("err = %v, want the last dial error carried", err)
+	}
+}
+
+// TestDialLoopNoEndpointFailsFast: a board with no TCP face at all (the
+// USB-only first appearance, Bug 1's sibling shape) fails IMMEDIATELY —
+// the no-endpoint refusal is permanent, retrying it cannot help, and
+// the old loop burned the whole request budget discovering that.
+func TestDialLoopNoEndpointFailsFast(t *testing.T) {
+	virt := &virtualClock{}
+	s := NewSupervisor(BoardRef{MAC6: "d75884"}, SupOpts{Wait: virt.sleep})
+	start := time.Now()
+	_, err := s.Connect(context.Background())
+	if err == nil {
+		t.Fatal("Connect succeeded without a TCP endpoint")
+	}
+	if !errors.Is(err, ErrNoDialEndpoint) {
+		t.Errorf("err = %v, want ErrNoDialEndpoint in the chain", err)
+	}
+	if elapsed := virt.elapsed(); elapsed > 0 {
+		t.Errorf("no-endpoint dial burned %v of retry wait, want zero", elapsed)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("no-endpoint dial took %v, want immediate", time.Since(start))
+	}
+}
+
+// TestOpTimeoutResendsSameLink: the §4.2 same-link retry — an op whose
+// reply times out while the link is still live (ErrOpTimeout, NOT
+// ErrDead) is resent ONCE on the SAME connection: no Close, no redial,
+// no teardown. The resend that answers is the caller's reply.
+func TestOpTimeoutResendsSameLink(t *testing.T) {
+	f := newFakeCtl()
+	f.failOnce("wifi.status", fmt.Errorf("replclient: timeout waiting reply for wifi.status id=1: %w", replclient.ErrOpTimeout))
+	f.wifi = map[string]any{"state": "up"}
+	s := NewSupervisor(BoardRef{MAC6: "d75884", Host: "xuansi-d75884.local", Port: 7777}, SupOpts{
+		DialTCP:   func() (Controller, error) { return f, nil },
+		RetryWait: 0,
+	})
+	if _, err := s.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	res, err := s.op(context.Background(), "wifi.status", nil)
+	if err != nil {
+		t.Fatalf("op after same-link retry: %v", err)
+	}
+	if res["state"] != "up" {
+		t.Fatalf("res = %#v, want the second attempt's reply", res)
+	}
+	if n := len(f.opsSnapshot()); n < 2 {
+		t.Fatalf("wifi.status recorded %d calls, want the resend (>=2)", n)
+	}
+	f.mu.Lock()
+	closed := f.closed
+	dead := f.dead
+	f.mu.Unlock()
+	if closed || dead {
+		t.Fatal("the warm link was torn down on a mere timeout — §4.2 forbids it (only a link-DEAD verdict tears down)")
+	}
+}
+
+// TestOpDeadLinkStillRedials: the counter-case — a read error (ErrDead)
+// under the op still tears down and redials exactly as before; the
+// same-link retry never swallows the dead-link path.
+func TestOpDeadLinkStillRedials(t *testing.T) {
+	first := newFakeCtl()
+	second := newFakeCtl()
+	second.listOut = "scripts (1): reborn"
+	first.failOnce("script.list", fmt.Errorf("%w: half-open link discovered mid-op", replclient.ErrDead))
+	dials := 0
+	var dmu sync.Mutex
+	s := NewSupervisor(BoardRef{MAC6: "d75884", Host: "xuansi-d75884.local", Port: 7777}, SupOpts{
+		DialTCP: func() (Controller, error) {
+			dmu.Lock()
+			defer dmu.Unlock()
+			dials++
+			if dials == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+		RetryWait: 0,
+	})
+	if _, err := s.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	scripts, err := s.ScriptList(context.Background())
+	if err != nil {
+		t.Fatalf("ScriptList after redial: %v", err)
+	}
+	if len(scripts) != 1 || scripts[0] != "reborn" {
+		t.Fatalf("scripts = %v, want the redialed controller's listing", scripts)
+	}
+	first.mu.Lock()
+	closed := first.closed
+	first.mu.Unlock()
+	if !closed {
+		t.Fatal("the dead link was not closed — the redial path must tear the corpse down")
+	}
+}
+
+// TestSameLinkRetryPredicate: the retry predicate itself — ErrOpTimeout
+// on a live controller is retryable; ErrDead never is (regardless of
+// the controller's state); a nil controller never is.
+func TestSameLinkRetryPredicate(t *testing.T) {
+	f := newFakeCtl()
+	if !SameLinkRetry(fmt.Errorf("replclient: timeout waiting reply for eval id=7: %w", replclient.ErrOpTimeout), f) {
+		t.Error("live-link op timeout must be same-link retryable")
+	}
+	f.markDead()
+	if SameLinkRetry(fmt.Errorf("%w: read failed", replclient.ErrDead), f) {
+		t.Error("dead link must never be same-link retryable — it redials")
+	}
+	if SameLinkRetry(fmt.Errorf("replclient: timeout waiting reply for eval id=7: %w", replclient.ErrOpTimeout), nil) {
+		t.Error("nil controller must never be retryable")
+	}
+	if SameLinkRetry(context.Canceled, f) {
+		t.Error("an unrelated error must never trigger the resend")
+	}
+}

@@ -181,7 +181,7 @@ func (c *Client) Op(ctx context.Context, op string, args map[string]any) (map[st
 			return replyResult(op, msg)
 		default:
 		}
-		return nil, fmt.Errorf("replclient: timeout waiting reply for %s id=%d: %w", op, id, context.DeadlineExceeded)
+		return nil, fmt.Errorf("replclient: timeout waiting reply for %s id=%d: %w", op, id, ErrOpTimeout)
 	case <-ctx.Done():
 		return nil, fmt.Errorf("replclient: %s: %w", op, ctx.Err())
 	case <-c.deadCh:
