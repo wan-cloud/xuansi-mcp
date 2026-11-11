@@ -6,7 +6,7 @@
       "kind": "stock-wamrc",
       "fw_compat": {
         "wasm": ">=0.2.0",
-        "aot": ">=0.3.0"
+        "aot": ">=0.3.0 <0.4.0"
       },
       "wasi_sdk": "24.0",
       "platforms": {
@@ -63,7 +63,7 @@
           "wamrc": null
         }
       },
-      "note": "kept generation: the stock wamrc (upstream WAMR-2.4.0 + espressif llvm xtensa_release_18.1.2). Its .aot is the fw-INTERNAL SRAM lane only (the IRAM reserved region, within caps aot_exec_budget_bytes; stock placement is phase-limited relative to v3's PSRAM lane) — for new .aot prefer toolchain-v3."
+      "note": "kept generation (wasm track): the stock wamrc (upstream WAMR-2.4.0 + espressif llvm xtensa_release_18.1.2). Its .aot rode the fw-internal-SRAM lane, RETIRED in fw 0.4.0 (the IRAM reserved region is gone — a stock .aot loads only on fw 0.3.x; fw 0.4.0+ honestly refuses it at load, never silently swapping for the .wasm); for new .aot use toolchain-v3. The wasm track (wasi-sdk 24.0) stays fully current."
     },
     "toolchain-v3": {
       "kind": "xuansi-surgery-wamrc",

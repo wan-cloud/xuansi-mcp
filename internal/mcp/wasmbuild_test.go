@@ -146,9 +146,10 @@ func plantFakeWamrcCache(t *testing.T, generation string) string {
 // TestResolveAOTWamrc (P3-T12): the aot lane's DEFAULT wamrc
 // resolution — the cache-paired half. The state's generation label is
 // the pairing evidence: toolchain-v3 resolves the recorded Dir; any
-// other label (v2's stock wamrc compiles the narrower internal-SRAM
-// lane — no silent substitution), a fresh cache, or a vanished wamrc
-// tree refuses api-class naming fetch and the wamrc_path override.
+// other label (v2's stock wamrc produces .aot that fw 0.4.0+ refuses
+// to load — the internal-SRAM lane is retired; no silent
+// substitution), a fresh cache, or a vanished wamrc tree refuses
+// api-class naming fetch and the wamrc_path override.
 func TestResolveAOTWamrc(t *testing.T) {
 	ts := &toolset{}
 
