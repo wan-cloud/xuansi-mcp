@@ -9,9 +9,10 @@ import (
 )
 
 // TestFsWriteSendsBinAndEnforcesCap: fs.write carries the bytes as one
-// msgpack bin with the path; data above the 16384B single-op cap is
-// refused client-side pointing at the chunked face — the board sees no
-// request at all.
+// msgpack bin with the path; data above the 65472B single-op cap (the
+// B15 §4.5 wire-realizable bound on protocol_ver=7 fw) is refused
+// client-side pointing at the chunked face — the board sees no request
+// at all.
 func TestFsWriteSendsBinAndEnforcesCap(t *testing.T) {
 	c, b := newTestClient(t)
 	var gotPath string
@@ -22,21 +23,21 @@ func TestFsWriteSendsBinAndEnforcesCap(t *testing.T) {
 		return map[string]any{"size": int64(len(gotData))}, nil
 	})
 
-	data := bytes.Repeat([]byte{0xA5}, 16384)
+	data := bytes.Repeat([]byte{0xA5}, 65472)
 	if err := c.FsWrite(context.Background(), "/lua/t.tmp", data); err != nil {
-		t.Fatalf("fs.write 16KB: %v", err)
+		t.Fatalf("fs.write 65472B: %v", err)
 	}
 	if gotPath != "/lua/t.tmp" || !bytes.Equal(gotData, data) {
-		t.Fatalf("board saw path=%q len(data)=%d, want /lua/t.tmp 16384", gotPath, len(gotData))
+		t.Fatalf("board saw path=%q len(data)=%d, want /lua/t.tmp 65472", gotPath, len(gotData))
 	}
 
 	before := len(b.got())
-	err := c.FsWrite(context.Background(), "/lua/big.tmp", make([]byte, 16385))
+	err := c.FsWrite(context.Background(), "/lua/big.tmp", make([]byte, 65473))
 	if err == nil {
-		t.Fatal("16385B single-op write accepted")
+		t.Fatal("65473B single-op write accepted")
 	}
-	if !strings.Contains(err.Error(), "16384") {
-		t.Fatalf("cap error = %v, want it to name the 16384B cap", err)
+	if !strings.Contains(err.Error(), "65472") {
+		t.Fatalf("cap error = %v, want it to name the 65472B cap", err)
 	}
 	if len(b.got()) != before {
 		t.Fatal("over-cap write must not reach the board")
