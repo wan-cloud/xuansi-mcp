@@ -2087,12 +2087,14 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // internal/mcp) drifts from it. diag.i2cslave joined with b7 — the
 // driver-pipeline loopback's on-board fixture toggle; the camera trio
 // left with the camera face's retirement (B12-P2 T6: the fw keeps its
-// camera ops, the daemon no longer forwards them).
+// camera ops, the daemon no longer forwards them); lua.check joined
+// with the W2-T4 fix1 ruling — the ro syntax ground truth the lint
+// Desc names needed a real seat path (12 ops now).
 var opsFaceAllowlistV1 = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
-	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup",
-	"wifi.status",
+	"diag.pins", "diag.stats", "log.read", "lua.check", "wifi.off",
+	"wifi.setup", "wifi.status",
 }
 
 // TestOpAllowlistSingleSource: the ops face's allowlist is single-source
@@ -2170,6 +2172,48 @@ func TestOpDiagI2CSlaveForwarded(t *testing.T) {
 	res := asMap(rep["result"])
 	if asInt(res["mode"]) != 1 || asStr(res["state"]) != "on" {
 		t.Fatalf("diag.i2cslave result = %#v, want the board's reply", rep["result"])
+	}
+}
+
+// TestOpLuaCheckForwarded (W2-T4 fix1, the controller ruling): the fw's
+// ro syntax ground truth op lua.check reaches the seat through the ops
+// face — the uniform lease gate applies like every allowlisted op (the
+// log.read/caps ro precedent), args cross verbatim, and the board's
+// {ok, line?, msg?} reply passes through unchanged.
+func TestOpLuaCheckForwarded(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+
+	// the uniform lease gate — lua.check is not special despite being ro
+	rep, _ := c.call(1, map[string]any{"type": "op", "board": "d75884", "op": "lua.check", "args": map[string]any{"code": "x = 1"}})
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "not_held" {
+		t.Fatalf("no-lease class = %q, want not_held — the ops gate is uniform, ro included (%#v)", er["class"], er)
+	}
+
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "luachk"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+
+	var gotCode string
+	e.fakes["d75884"].on("lua.check", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		gotCode, _ = args["code"].(string)
+		return map[string]any{"ok": true}, nil
+	})
+	rep, _ = c.call(3, map[string]any{
+		"type": "op", "board": "d75884", "op": "lua.check",
+		"args": map[string]any{"code": "local x = 1"},
+	})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op lua.check: %#v", rep)
+	}
+	if gotCode != "local x = 1" {
+		t.Fatalf("code crossed as %q, want verbatim", gotCode)
+	}
+	res := asMap(rep["result"])
+	if res["ok"] != true {
+		t.Fatalf("lua.check result = %#v, want the board's {ok:true} verbatim", res)
 	}
 }
 

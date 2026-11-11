@@ -114,6 +114,21 @@ func TestR1SpanEndsAtBlockKeywords(t *testing.T) {
 	}
 }
 
+// TestR1KeywordBoundaryEscapes: the return-expression scan stops at
+// any keyword, the honest boundary the Desc discloses —
+// `return flag and a/b` ESCAPES R1 (the `and` ends the scanned span).
+// Pinned here so the disclosure cannot silently rot.
+func TestR1KeywordBoundaryEscapes(t *testing.T) {
+	for _, src := range []string{
+		"return flag and a / b",
+		"return not x or y / 2",
+	} {
+		if hasRule(rules(t, src), "R1") {
+			t.Errorf("Lint(%q): R1 fired past a keyword — update the Desc's honest-boundary list (the disclosure went stale)", src)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // R2
 

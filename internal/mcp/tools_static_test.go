@@ -571,12 +571,13 @@ func TestSessionResetHolderLadder(t *testing.T) {
 // (transcribed independently of the daemon's table — server_test.go
 // holds the table-side pin; a shared typo survives only if both copies
 // are wrong the same way). The camera trio left with the camera face's
-// retirement (B12-P2 T6).
+// retirement (B12-P2 T6); lua.check joined with the W2-T4 fix1
+// ruling (the lint Desc's named ground truth needed a real seat path).
 var opsFaceAllowlistPinned = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
-	"diag.pins", "diag.stats", "log.read", "wifi.off", "wifi.setup",
-	"wifi.status",
+	"diag.pins", "diag.stats", "log.read", "lua.check", "wifi.off",
+	"wifi.setup", "wifi.status",
 }
 
 // spanList extracts the comma-separated op list between two anchors —

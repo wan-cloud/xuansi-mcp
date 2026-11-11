@@ -85,7 +85,8 @@
 // single source; every rendered listing is sorted from it):
 //
 //	budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave,
-//	diag.pins, diag.stats, log.read, wifi.off, wifi.setup, wifi.status
+//	diag.pins, diag.stats, log.read, lua.check, wifi.off, wifi.setup,
+//	wifi.status
 //
 // diag.i2cslave toggles the board's INTERNAL I2C echo-slave loopback
 // fixture ({mode:-1..1} = status/off/on) — the b7 driver-pipeline

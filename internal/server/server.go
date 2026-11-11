@@ -1752,16 +1752,20 @@ func validateArgsPath(prefix string, v any, path string) (any, *RPCError) {
 // narrow — the bench surface batch 6's MCP agents need (budget, wifi,
 // log, caps, diagnostics) plus diag.i2cslave, the board's internal
 // I2C echo-slave loopback fixture toggle ({mode:-1..1} = status/off/
-// on) the b7 driver-pipeline loopback rides. The fw's stills trio
-// left with the stills face's retirement (B12-P2 T6): still on the
-// board, no longer forwarded. eval/submit/fs.*/script.*/session.*
-// have their own request types and are NOT reachable through op;
-// every other diag.* stays internal.
+// on) the b7 driver-pipeline loopback rides. B15 W2-T4 fix1 adds
+// lua.check — the fw's ro syntax ground truth (luaL_loadbuffer +
+// discard, zero side effects), the op xuansi_lua_lint's Desc names as
+// the authority its token-level findings defer to (the log.read/caps
+// ro precedent). The fw's stills trio left with the stills face's
+// retirement (B12-P2 T6): still on the board, no longer forwarded.
+// eval/submit/fs.*/script.*/session.* have their own request types and
+// are NOT reachable through op; every other diag.* stays internal.
 var opAllowlist = map[string]bool{
 	"budget.get": true, "budget.set": true,
 	"wifi.status": true, "wifi.setup": true, "wifi.off": true,
 	"log.read":  true,
 	"caps":      true,
+	"lua.check": true,
 	"diag.pins": true, "diag.heapinfo": true, "diag.stats": true,
 	"diag.i2cslave": true,
 }
