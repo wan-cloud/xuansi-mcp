@@ -69,6 +69,36 @@ func TestListBoardsShapeAndMapping(t *testing.T) {
 	}
 }
 
+// TestListBoardsFreshnessFields (B15 §4.1⑥): the freshness face
+// crosses to the MCP seat — transport, last_seen_age_ms (-1 default
+// honest), stale — including the daemon-drift default (key absent →
+// never-crossed, not a silent 0).
+func TestListBoardsFreshnessFields(t *testing.T) {
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"boards": []any{
+			map[string]any{
+				"mac6": "d75884", "sources": []any{"mdns"},
+				"transport": "tcp", "last_seen_age_ms": 4123.0, "stale": false,
+			},
+			map[string]any{"mac6": "aabbcc"}, // key-absent drift: -1/stale-absent
+		},
+	}}}, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_list_boards", nil)
+	if res.IsError {
+		t.Fatalf("list_boards failed: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	boards, _ := m["boards"].([]any)
+	b0, _ := boards[0].(map[string]any)
+	if b0["transport"] != "tcp" || b0["last_seen_age_ms"] != float64(4123) || b0["stale"] != false {
+		t.Errorf("board[0] freshness = %v/%v/%v, want tcp/4123/false", b0["transport"], b0["last_seen_age_ms"], b0["stale"])
+	}
+	b1, _ := boards[1].(map[string]any)
+	if b1["last_seen_age_ms"] != float64(-1) {
+		t.Errorf("board[1].last_seen_age_ms = %v, want -1 (absent key = never crossed)", b1["last_seen_age_ms"])
+	}
+}
+
 // TestBoardStatusShapeAndMapping: {board} in, status+lease+scripts
 // out; the request carries no holder (proto: board_status is
 // holder-less — reads act as the connection's binding daemon-side).

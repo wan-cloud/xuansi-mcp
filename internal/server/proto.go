@@ -45,8 +45,8 @@
 //
 // # Requests
 //
-//	list_boards    {}                          → {boards:[{mac6,alias,sources,host,port,usb_path,fw}],mdns_error}
-//	board_status   {board}                      → {board:{...}, connected, lease:{holder,since,session,grace_deadline}?|null, scripts?, scripts_error?}
+//	list_boards    {}                          → {boards:[{mac6,alias,sources,host,ip,port,usb_path,fw,fw_version,boot_epoch?,reset_reason?,chip?,last_seen?,transport,last_seen_age_ms,stale}],mdns_error}
+//	board_status   {board}                      → {board:{...}, connected, transport, last_seen_age_ms, stale, lease:{holder,since,session,grace_deadline}?|null, scripts?, scripts_error?}
 //	lease          {board, holder?, transport?} → {board, holder, session, transport?, warning?}
 //	release        {board, holder?}             → {board, holder}
 //	eval           {board, code, args?, holder?} → {out, value?}   (lease required)
@@ -236,6 +236,21 @@
 // type, bad params, bad transport, off-allowlist op). The fs_write
 // 16 KiB cap refusal is gone (B10-T1): bigger writes ride the chunked
 // transport instead of being refused.
+//
+// # Board-pathology fields (B15 §4.1④, board-touching failures)
+//
+// A board-touching op that fails TRANSPORT-side (never reached the
+// board, lost the link, or could not take the controller slot) carries
+// two extra fields inside error: cause ∈ {"source gone" (no live
+// discovery source — refused with zero dial), "dial failed" (endpoint
+// did not answer within the bounded ~18s dial), "link dead" (the
+// connection died under the op, or the op could not complete over
+// it — the daemon re-establishes; resend is reasonable), "arbitration"
+// (§12 controller-slot window exhausted)} and last_seen_age_ms (int;
+// milliseconds since the daemon's last protocol crossing with the
+// board, -1 = never crossed). A board-ANSWERED error (class
+// oom/compile/rt/api/budget/timeout/protocol crossing verbatim) means
+// the board WAS reached — those carry neither field.
 package server
 
 import (

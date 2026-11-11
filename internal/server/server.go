@@ -1186,13 +1186,23 @@ func (s *Server) resolve(selector string) (discover.Board, *RPCError) {
 	return b, nil
 }
 
+// staleAfter is the staleness window (B15 §4.1⑥): a board with no live
+// discovery source whose last protocol crossing is older than this (or
+// never happened) reports stale:true — last-known only, nothing
+// dialable. A live source or a fresh crossing keeps the board current.
+const staleAfter = 30 * time.Second
+
 // boardView renders one registry entry for list/status replies. The
 // boot-identity fields (B12-P2 T6) ride the same enriched hello the
 // fw/fw_version pair does — boot_epoch/reset_reason appear once the
 // daemon has sighted the board, absent before (honest: nothing to
 // report), epoch 0 = pre-b9 fw without the counter. last_seen is the
 // daemon's most recent protocol crossing (tap hello or op reply),
-// from the daemon-side board state.
+// from the daemon-side board state. B15 §4.1⑥ adds the explicit
+// freshness face: transport (the current ACTUAL route, "" when never
+// connected), last_seen_age_ms (numeric; -1 = never crossed), and
+// stale (no live source AND no crossing within staleAfter —
+// never-crossed counts as infinitely old).
 func (s *Server) boardView(b discover.Board) map[string]any {
 	v := map[string]any{
 		"mac6":     b.MAC6,
@@ -1218,10 +1228,19 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 	s.mu.Lock()
 	db := s.sups[b.MAC6]
 	var last time.Time
+	var transport string
 	if db != nil {
 		last = db.lastSeen
+		transport = db.sup.Transport()
 	}
 	s.mu.Unlock()
+	age := int64(-1)
+	if !last.IsZero() {
+		age = time.Since(last).Milliseconds()
+	}
+	v["transport"] = transport
+	v["last_seen_age_ms"] = age
+	v["stale"] = len(b.Sources) == 0 && (last.IsZero() || time.Since(last) >= staleAfter)
 	if !last.IsZero() {
 		v["last_seen"] = last.UTC().Format(time.RFC3339)
 	}
