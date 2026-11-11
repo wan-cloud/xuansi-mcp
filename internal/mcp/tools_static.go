@@ -363,8 +363,8 @@ type opResultOut = map[string]any
 // task 2 appended toolchain_status, task 3 toolchain_fetch, task 5
 // wasm_build; B12-P2 T6 removed the stills tool (24 then); B15 W1.T2
 // appended the ⑨ pin pair, W1.T4 appended job_wait (27); W2.T4
-// appends abi_reference (28 here), then lua_lint + module_doc (30):
-// the surviving tools keep their positions (nothing renumbers).
+// appends abi_reference, then lua_lint + module_doc (30 now): the
+// surviving tools keep their positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -394,6 +394,8 @@ var staticToolNames = []string{
 	"xuansi_boards_unpin",
 	"xuansi_job_wait",
 	"xuansi_abi_reference",
+	"xuansi_lua_lint",
+	"xuansi_module_doc",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -546,6 +548,8 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 	}, ts.jobWait)
 
 	ts.registerAbiReference(srv)
+	ts.registerLuaLint(srv)
+	ts.registerModuleDoc(srv)
 
 	ts.registerCapture(srv)
 }

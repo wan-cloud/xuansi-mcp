@@ -8,6 +8,7 @@ package lualint
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -48,6 +49,14 @@ func Lint(src string, bench BenchIndex) ([]Finding, error) {
 	if bench.Members != nil {
 		out = append(out, ruleBenchMember(toks, bench)...)
 	}
+	// source order (line, then col): the rules run per-family; the
+	// seat serves one walk down the file.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].Col < out[j].Col
+	})
 	return out, nil
 }
 
