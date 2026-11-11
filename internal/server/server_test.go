@@ -1119,9 +1119,12 @@ func TestLeaseUnknownTransport(t *testing.T) {
 	}
 }
 
-// TestFailedTCPDialNeverFallsBackToUSB: the never-auto-fallback rule —
-// a board whose TCP dial fails answers unreachable and the USB seam
-// stays untouched (USB happens ONLY through lease transport:"usb").
+// TestFailedTCPDialNeverFallsBackToUSB: the never-auto-fallback rule
+// at OP time — a board whose TCP dial fails answers unreachable and
+// the USB seam stays untouched. (§4.4 moved the fallback to LEASE
+// time, decided by live sources only; this board has both sources
+// live, so its default lease stays TCP and the op's dead dial is
+// honestly unreachable — ops never silently re-route.)
 func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 	var mu sync.Mutex
 	usbDials := 0
