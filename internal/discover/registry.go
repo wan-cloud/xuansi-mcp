@@ -208,6 +208,9 @@ func (r *Registry) Refresh(ctx context.Context) error {
 		if e.IP == "" {
 			e.IP = old.IP
 		}
+		if e.Port == 0 {
+			e.Port = old.Port // partial faces (SRV-less fragments, self-reported ports) keep last-known
+		}
 		e.Hello = old.Hello // enriched identity is last-known data too
 		fresh[mac6] = e
 	}
@@ -357,6 +360,32 @@ func (r *Registry) Enrich(mac6 string, h *replclient.HelloInfo) {
 		b.Hello = h
 		r.boards[mac6] = b
 	}
+}
+
+// EnrichEndpoint records a board's self-reported endpoint (Bug 2②, B15
+// §4.9③): wifi.setup/wifi.status replies carry the board's own ip/port,
+// and that is the one address source guaranteed to be current — the
+// board cannot report a stale address for the network it is answering
+// on. Fills only what the reply carried (empty ip / port 0 leave the
+// entry's field untouched); like all last-known data the endpoint
+// survives refreshes. An unknown mac6 is a no-op.
+func (r *Registry) EnrichEndpoint(mac6, ip string, port int) {
+	if ip == "" && port == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, ok := r.boards[mac6]
+	if !ok {
+		return
+	}
+	if ip != "" {
+		b.IP = ip
+	}
+	if port != 0 {
+		b.Port = port
+	}
+	r.boards[mac6] = b
 }
 
 // LoadBoardsFile reads boards.conf: one name=mac6 line per board, '#'

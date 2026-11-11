@@ -81,6 +81,16 @@ func DiscoverMDNS(ctx context.Context) ([]Board, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Bug 2① (B15 §4.11): a sweep whose SRV hits arrived WITHOUT their
+	// A/AAAA records (the Windows responder shape) leaves IP empty — the
+	// TCP face then dials the .local hostname and SERVFAILs under the
+	// pure resolver. One bounded followup round asks the host's address
+	// directly; first answer wins, silence degrades to the hostname
+	// fallback. Never fails the sweep.
+	followupAddrs(ctx, ifaces, accum)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return accum.snapshot(), nil
 }
 
@@ -375,4 +385,183 @@ func boardFromEntry(e *zeroconf.ServiceEntry) (Board, bool) {
 		Port:    e.Port,
 		TXT:     txt,
 	}, true
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2① (B15 §4.11): the A/AAAA followup round.
+//
+// Platform posture: nothing here depends on the responder volunteering
+// address records inside browse responses — that "for free" behavior is
+// exactly what the Windows responder does not provide (B14 win-leg
+// evidence). The followup asks the question every responder must answer
+// (a direct A/AAAA query for the SRV target, unicast from a source-bound
+// socket — the same legacy-unicast road the PTR lane proved stable
+// three-for-three on the win multihomed bench), so the fix is identical
+// on linux/mac/windows; a responder that stays silent leaves IP empty
+// and the hostname fallback applies, honestly.
+// ---------------------------------------------------------------------------
+
+// mdnsFollowupBudget bounds the WHOLE followup phase (all hosts query
+// concurrently under it); mdnsFollowupPerQuery bounds one query's read
+// window so a silent A round cannot starve the AAAA round (or a silent
+// host its neighbors) out of the phase budget.
+const (
+	mdnsFollowupBudget          = 1500 * time.Millisecond
+	mdnsFollowupPerQuery        = 600 * time.Millisecond
+	dnsTypeA             uint16 = 1
+	dnsTypeAAAA          uint16 = 28
+)
+
+// followupAddrs fills Board.IP for every accumulated host that has an
+// SRV endpoint but no browse-carried address. Hosts query concurrently;
+// results merge serially (mdnsAccum is not goroutine-safe). Best effort
+// by construction — ctx expiring mid-phase leaves the rest honestly
+// address-less (the hostname remains the dial fallback).
+func followupAddrs(ctx context.Context, ifaces []net.Interface, accum mdnsAccum) {
+	var need []Board
+	for _, b := range accum.snapshot() {
+		if b.IP == "" && b.Host != "" && b.Port != 0 {
+			need = append(need, b)
+		}
+	}
+	if len(need) == 0 {
+		return
+	}
+	fctx, cancel := context.WithTimeout(ctx, mdnsFollowupBudget)
+	defer cancel()
+	ips := make([]string, len(need))
+	var wg sync.WaitGroup
+	for i := range need {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ips[i] = followupAddr(fctx, ifaces, need[i].Host)
+		}(i)
+	}
+	wg.Wait()
+	for i, b := range need {
+		if ips[i] != "" {
+			accum.add(Board{MAC6: b.MAC6, IP: ips[i]})
+		}
+	}
+}
+
+// followupAddr resolves one host: the A round first (the bench boards
+// are IPv4), the AAAA round when A came back empty. Each round queries
+// every usable interface in parallel — first answer wins — and each
+// query's read window is per-query bounded, so a fully silent round
+// costs mdnsFollowupPerQuery, not the phase budget.
+func followupAddr(ctx context.Context, ifaces []net.Interface, host string) string {
+	for _, qtype := range []uint16{dnsTypeA, dnsTypeAAAA} {
+		if ctx.Err() != nil {
+			return ""
+		}
+		ips := make([]string, len(ifaces))
+		var wg sync.WaitGroup
+		for i := range ifaces {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				src := ifaceIPv4(ifaces[i])
+				if src == nil {
+					return // drift since enumeration: soft-skip, like the lanes
+				}
+				ips[i] = followupOne(ctx, src, host, qtype)
+			}(i)
+		}
+		wg.Wait()
+		for _, ip := range ips {
+			if ip != "" {
+				return ip
+			}
+		}
+	}
+	return ""
+}
+
+// followupOne sends one unicast A/AAAA question from a source-bound
+// socket (the PTR lane's legacy-unicast shape: ephemeral source port →
+// the responder replies unicast to this socket) and reads until the
+// per-query deadline, the phase ctx, or a matching record lands. A
+// bind/send failure is this interface's degradation — "" — never the
+// phase's error.
+func followupOne(ctx context.Context, srcIP net.IP, host string, qtype uint16) string {
+	conn, err := unicastListen(srcIP)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if _, err := conn.WriteToUDP(unicastHostQuery(host, qtype), unicastGroup); err != nil {
+		return ""
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close() // wake the read at phase end; double Close is safe
+		case <-done:
+		}
+	}()
+	key := strings.ToLower(strings.TrimSuffix(host, "."))
+	buf := make([]byte, unicastReadBuf)
+	for {
+		conn.SetReadDeadline(time.Now().Add(mdnsFollowupPerQuery))
+		n, _, rerr := conn.ReadFromUDP(buf)
+		if rerr != nil {
+			return ""
+		}
+		if ip := addrFromFrame(buf[:n], key, qtype); ip != "" {
+			return ip
+		}
+	}
+}
+
+// addrFromFrame picks the first record of the wanted type whose name
+// matches the queried host (case-insensitive, trailing dot stripped) and
+// renders its address; malformed frames parse to nothing.
+func addrFromFrame(frame []byte, hostKey string, qtype uint16) string {
+	rrs, ok := frameRecords(frame)
+	if !ok {
+		return ""
+	}
+	for _, rr := range rrs {
+		if rr.typ != qtype || !strings.EqualFold(rr.name, hostKey) {
+			continue
+		}
+		switch qtype {
+		case dnsTypeA:
+			if len(rr.rd) == 4 {
+				return net.IP(rr.rd).String()
+			}
+		case dnsTypeAAAA:
+			if len(rr.rd) == 16 {
+				return net.IP(rr.rd).String()
+			}
+		}
+	}
+	return ""
+}
+
+// unicastHostQuery hand-assembles the followup question — the PTR
+// query's frozen header (id 0, RD=1, one IN question) with the host's
+// own labels as QNAME and QTYPE A or AAAA. No name compression: a
+// single name per frame. TestUnicastHostQueryByteExact pins the bytes.
+func unicastHostQuery(host string, qtype uint16) []byte {
+	var b []byte
+	b = append(b, 0, 0)       // ID 0
+	b = append(b, 0x01, 0x00) // flags: RD=1 (legacy-unicast reply mode)
+	b = append(b, 0, 1)       // QDCOUNT 1
+	b = append(b, 0, 0, 0, 0, 0, 0)
+	for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+		if label == "" {
+			continue
+		}
+		b = append(b, byte(len(label)))
+		b = append(b, label...)
+	}
+	b = append(b, 0)
+	b = append(b, byte(qtype>>8), byte(qtype&0xFF))
+	b = append(b, 0, 1) // QCLASS = IN
+	return b
 }

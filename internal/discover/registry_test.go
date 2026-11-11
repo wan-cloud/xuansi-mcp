@@ -280,6 +280,51 @@ func TestEnrichLazyHello(t *testing.T) {
 	}
 }
 
+// TestEnrichEndpointSelfReport: Bug 2② (B15 §4.9③) — a board's OWN
+// wifi.setup/wifi.status reply carries its ip/port; EnrichEndpoint
+// writes them back onto the registry entry so the daemon dials the
+// self-reported address even when discovery never resolved one. Like
+// all last-known data the endpoint survives a refresh that did not fill
+// it; unknown mac6 and empty payloads are no-ops.
+func TestEnrichEndpointSelfReport(t *testing.T) {
+	r, f := newFakeRegistry(nil)
+	f.set([]Board{usbA}, nil) // usb-only first appearance: no IP, no port
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if b := r.Snapshot()[0]; b.IP != "" || b.Port != 0 {
+		t.Fatalf("precondition: entry must start endpoint-less, got %#v", b)
+	}
+	r.EnrichEndpoint("d75884", "10.1.51.205", 7777)
+	b := r.Snapshot()[0]
+	if b.IP != "10.1.51.205" || b.Port != 7777 {
+		t.Fatalf("EnrichEndpoint not recorded: ip=%q port=%d", b.IP, b.Port)
+	}
+	// the self-reported endpoint survives a refresh that fills neither
+	// field (last-known carry — the same rule as the browse-resolved IP)
+	f.set(nil, []Board{{MAC6: "d75884", Sources: []string{SourceMDNS}, Host: "xuansi-d75884.local"}})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh 2: %v", err)
+	}
+	if b := r.Snapshot()[0]; b.IP != "10.1.51.205" || b.Port != 7777 {
+		t.Errorf("self-reported endpoint lost across refresh: ip=%q port=%d", b.IP, b.Port)
+	}
+	// partial self-reports update only what they carry
+	r.EnrichEndpoint("d75884", "10.1.51.206", 0)
+	if b := r.Snapshot()[0]; b.IP != "10.1.51.206" || b.Port != 7777 {
+		t.Errorf("partial EnrichEndpoint: ip=%q port=%d, want ip moved port kept", b.IP, b.Port)
+	}
+	// empty payload and unknown mac6 are no-ops
+	r.EnrichEndpoint("d75884", "", 0)
+	if b := r.Snapshot()[0]; b.IP != "10.1.51.206" {
+		t.Errorf("empty EnrichEndpoint mutated the entry: %#v", b)
+	}
+	r.EnrichEndpoint("ffffff", "1.2.3.4", 7777)
+	if n := len(r.Snapshot()); n != 1 {
+		t.Errorf("EnrichEndpoint for unknown mac6 created an entry (%d boards)", n)
+	}
+}
+
 func TestResolveSelectors(t *testing.T) {
 	r, f := newFakeRegistry(map[string]string{"d75884": "bench", "1a2b3c": "cam"})
 	f.set([]Board{usbA, usbB}, []Board{mdnsA, mdnsB})
