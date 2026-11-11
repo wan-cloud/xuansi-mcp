@@ -2380,16 +2380,28 @@ func (db *daemonBoard) jobWait(ctx context.Context, tag string, timeout time.Dur
 		Msg: fmt.Sprintf("job_wait: no job tagged %q is known to this daemon — jobs are tracked from their submit through this daemon (a job submitted on another connection delivers its event there, not here)", tag)}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	db.jobsMu.Lock()
-	e, known := db.jobs[tag]
-	wake := db.jobWake
-	db.jobsMu.Unlock()
-	if !known {
+	// peek reads the ledger under jobsMu and hands the DATA reference
+	// out under the same lock — a racing tag-reuse delivery (jobDeliver
+	// swaps e.data under the lock) must never be observed half-way by a
+	// reader that dropped the lock first.
+	peek := func() (data map[string]any, done, known bool) {
+		db.jobsMu.Lock()
+		defer db.jobsMu.Unlock()
+		e, ok := db.jobs[tag]
+		if !ok {
+			return nil, false, false
+		}
+		return e.data, e.done, true
+	}
+	if data, done, known := peek(); !known {
 		return nil, false, unknown
+	} else if done {
+		return data, true, nil
 	}
-	if e.done {
-		return e.data, true, nil
-	}
+	var wake chan struct{}
+	db.jobsMu.Lock()
+	wake = db.jobWake
+	db.jobsMu.Unlock()
 	for {
 		select {
 		case <-wake:
@@ -2398,16 +2410,14 @@ func (db *daemonBoard) jobWait(ctx context.Context, tag string, timeout time.Dur
 		case <-ctx.Done():
 			return nil, false, nil // the request ctx died; the reply goes nowhere anyway
 		}
+		if data, done, known := peek(); !known { // jobReset orphaned it mid-wait
+			return nil, false, unknown
+		} else if done {
+			return data, true, nil
+		}
 		db.jobsMu.Lock()
-		e, known = db.jobs[tag]
 		wake = db.jobWake
 		db.jobsMu.Unlock()
-		if !known { // jobReset orphaned it mid-wait
-			return nil, false, unknown
-		}
-		if e.done {
-			return e.data, true, nil
-		}
 	}
 }
 

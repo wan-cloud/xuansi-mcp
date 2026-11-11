@@ -265,7 +265,7 @@ func TestScriptStartStopShapes(t *testing.T) {
 
 // TestFsWriteDecodesBase64: data_b64 is decoded client-side — the
 // daemon sees raw bytes in the data field; the board ack passes
-// through. Exactly 16384B (the single-op boundary) still crosses.
+// through.
 func TestFsWriteDecodesBase64(t *testing.T) {
 	payload := []byte("hello 板上檔案") // multi-byte on purpose
 	e, reqs := newEnv(t, []step{{result: map[string]any{"ok": true}}}, Options{Holder: "mcp-fixed01"})
@@ -676,6 +676,10 @@ var staticToolsRequiredAudit = map[string][]string{
 	// unpin.
 	"xuansi_boards_pin":   {"mac6", "ip", "port"},
 	"xuansi_boards_unpin": {"mac6"},
+
+	// §4.3 (B15 W1.T4): the long-poll face — the tag and the bounded
+	// timeout are both load-bearing (no defaults to ride).
+	"xuansi_job_wait": {"board", "job", "timeout_ms"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
@@ -821,4 +825,167 @@ func TestBoardOpAllowlistSingleSource(t *testing.T) {
 		return
 	}
 	t.Fatal("xuansi_board_op not served")
+}
+
+// ---------------------------------------------------------------------------
+// xuansi_job_wait (B15 §4.3 — the daemon-side long-poll primitive)
+
+// TestJobWaitToolShapes: the tool crosses holder-less as a job_wait
+// request (board + tag + timeout_ms), and the daemon's reply maps
+// cleanly in all three shapes — delivered (done + value), timeout
+// (done:false — a RESULT, never an error), and dead job (error with
+// the board's class/msg plus the cleanup-ritual hint).
+func TestJobWaitToolShapes(t *testing.T) {
+	// delivered
+	e, reqs := newEnv(t, []step{{result: map[string]any{
+		"done": true, "value": float64(42), "elapsed_ms": float64(17),
+	}}}, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_job_wait", map[string]any{
+		"board": "d75884", "job": "j1", "timeout_ms": 5000,
+	})
+	if res.IsError {
+		t.Fatalf("job_wait failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Type != "job_wait" || req.Board != "d75884" || req.Tag != "j1" || req.TimeoutMS != 5000 || req.Holder != "" {
+		t.Errorf("job_wait request = %+v, want a holder-less job_wait board/tag/timeout", req)
+	}
+	m := structured(t, res)
+	if m["done"] != true || m["value"] != float64(42) || m["elapsed_ms"] != float64(17) {
+		t.Errorf("delivered reply = %v, want done/value/elapsed_ms mapped", m)
+	}
+
+	// timeout: done:false crosses as a result, not a tool error
+	e2, _ := newEnv(t, []step{{result: map[string]any{
+		"done": false, "elapsed_ms": float64(501),
+	}}}, Options{Holder: "mcp-fixed01"})
+	res = e2.call("xuansi_job_wait", map[string]any{
+		"board": "d75884", "job": "slow", "timeout_ms": 500,
+	})
+	if res.IsError {
+		t.Fatalf("a job_wait timeout must not be a tool error: %s", resultText(t, res))
+	}
+	if m = structured(t, res); m["done"] != false || m["elapsed_ms"] != float64(501) {
+		t.Errorf("timeout reply = %v, want done:false + the elapsed window", m)
+	}
+
+	// dead job: error {class, msg, hint} crosses whole
+	e3, _ := newEnv(t, []step{{result: map[string]any{
+		"done": true, "elapsed_ms": float64(3),
+		"error": map[string]any{"class": "budget", "msg": "cpu budget exceeded (budget 500 ms)",
+			"hint": "unload, then session_reset"},
+	}}}, Options{Holder: "mcp-fixed01"})
+	res = e3.call("xuansi_job_wait", map[string]any{
+		"board": "d75884", "job": "dead", "timeout_ms": 1000,
+	})
+	if res.IsError {
+		t.Fatalf("a dead job is a done answer: %s", resultText(t, res))
+	}
+	m = structured(t, res)
+	jer, _ := m["error"].(map[string]any)
+	if jer == nil || jer["class"] != "budget" || jer["msg"] != "cpu budget exceeded (budget 500 ms)" {
+		t.Fatalf("dead-job error = %v, want the board's class/msg verbatim", m["error"])
+	}
+	if jer["hint"] != "unload, then session_reset" {
+		t.Errorf("dead-job hint = %v, want the daemon's cleanup ritual verbatim", jer["hint"])
+	}
+}
+
+// TestJobWaitTimeoutDomainClientSide: timeout_ms outside 1..55000 is a
+// local api refusal with ZERO daemon contact (the wait must always
+// answer inside the daemon's 60s per-request ceiling).
+func TestJobWaitTimeoutDomainClientSide(t *testing.T) {
+	e, reqs := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	for _, bad := range []int{0, -1, 55001, 120000} {
+		res := e.call("xuansi_job_wait", map[string]any{
+			"board": "d75884", "job": "j1", "timeout_ms": bad,
+		})
+		if !res.IsError {
+			t.Fatalf("timeout_ms=%d crossed anyway: %+v", bad, res)
+		}
+		if got := resultText(t, res); !strings.Contains(got, "1..55000") {
+			t.Errorf("timeout_ms=%d error = %q, want the domain named", bad, got)
+		}
+	}
+	noContact(t, reqs)
+}
+
+// TestJobWaitUnknownJobIsToolError: the daemon's unknown-tag api
+// refusal crosses as the tool error (class api, the tag named).
+func TestJobWaitUnknownJobIsToolError(t *testing.T) {
+	e, _ := newEnv(t, []step{{rerr: &server.RPCError{
+		Class: "api",
+		Msg:   `job_wait: no job tagged "ghost" is known to this daemon`,
+	}}}, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_job_wait", map[string]any{
+		"board": "d75884", "job": "ghost", "timeout_ms": 100,
+	})
+	if !res.IsError {
+		t.Fatalf("unknown-tag wait succeeded: %+v", res)
+	}
+	if got := resultText(t, res); !strings.HasPrefix(got, "api: job_wait:") || !strings.Contains(got, "ghost") {
+		t.Errorf("error text = %q, want the daemon's unknown-tag refusal verbatim", got)
+	}
+}
+
+// TestCoachingDescs (B15 §5 教練 rows): the coaching wave the seat
+// actually reads — session_reset's claims≠instances contract, the
+// budget coaching on eval/submit, fs_write's 64KB chunk, driver_push's
+// commit-sha verification + kind, and job_wait's own contract.
+func TestCoachingDescs(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc := map[string]string{}
+	for _, tool := range lr.Tools {
+		desc[tool.Name] = tool.Description
+	}
+	for _, name := range []string{"xuansi_session_reset", "xuansi_run_lua", "xuansi_submit", "xuansi_fs_write", "xuansi_driver_push", "xuansi_job_wait"} {
+		if desc[name] == "" {
+			t.Fatalf("tool %s not served", name)
+		}
+	}
+	// session_reset: claims ≠ instances — the unload verb is named
+	sr := desc["xuansi_session_reset"]
+	for _, want := range []string{"bench.wasm.unload", "does NOT unload"} {
+		if !strings.Contains(sr, want) {
+			t.Errorf("session_reset Desc lacks %q — the claims≠instances coaching", want)
+		}
+	}
+	// budget coaching on both call faces: the exceeded value is named
+	// in the refusal, the per-call override and budget.set exist
+	for _, name := range []string{"xuansi_run_lua", "xuansi_submit"} {
+		d := desc[name]
+		for _, want := range []string{"budget.set", "exceeded"} {
+			if !strings.Contains(d, want) {
+				t.Errorf("%s Desc lacks %q — the budget coaching", name, want)
+			}
+		}
+	}
+	// fs_write: the 64KB chunk (not 16KB)
+	fw := desc["xuansi_fs_write"]
+	if !strings.Contains(fw, "64KB") || strings.Contains(fw, "16KB") {
+		t.Errorf("fs_write Desc = %q, want the 64KB chunk wording", fw)
+	}
+	// driver_push: the commit-sha verification axis + kind
+	dp := desc["xuansi_driver_push"]
+	for _, want := range []string{"commit-sha256", "kind"} {
+		if !strings.Contains(dp, want) {
+			t.Errorf("driver_push Desc lacks %q", want)
+		}
+	}
+	if strings.Contains(dp, "fs_read-back") {
+		t.Errorf("driver_push Desc still teaches the fs_read-back verification — the byte read-back is retired")
+	}
+	// job_wait: the contract lines an agent needs
+	jw := desc["xuansi_job_wait"]
+	for _, want := range []string{"done", "55000", "timeout"} {
+		if !strings.Contains(jw, want) {
+			t.Errorf("job_wait Desc lacks %q", want)
+		}
+	}
 }

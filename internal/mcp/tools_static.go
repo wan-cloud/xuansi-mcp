@@ -154,7 +154,7 @@ type scriptStopIn struct {
 type fsWriteIn struct {
 	Board   string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
 	Path    string `json:"path" jsonschema:"absolute file path on the board's filesystem"`
-	DataB64 string `json:"data_b64" jsonschema:"the file's full CONTENTS, standard base64 — decoded before sending; any size up to the internal wire's 1 MiB frame cap crosses (the daemon chunks >16KB payloads onto the board automatically)"`
+	DataB64 string `json:"data_b64" jsonschema:"the file's full CONTENTS, standard base64 — decoded before sending; any size up to the internal wire's 1 MiB frame cap crosses (the daemon chunks >64KB payloads onto the board automatically)"`
 	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
@@ -202,6 +202,39 @@ type boardsPinIn struct {
 
 type boardsUnpinIn struct {
 	Mac6 string `json:"mac6" jsonschema:"exact board id whose pin declaration to remove (6 lowercase hex chars)"`
+}
+
+// jobWaitIn is the §4.3 long-poll face: wait for ONE job's completion
+// on the daemon's own event tap — no lease, no board dial.
+type jobWaitIn struct {
+	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
+	// Job is the submit's tag — the caller-chosen id echoed in the
+	// submit ack and on the job event; it is how the daemon finds the
+	// job in its ledger.
+	Job string `json:"job" jsonschema:"the job's tag — the caller-chosen id you passed to xuansi_submit (echoed in its ack); the daemon tracks jobs by it from their submit"`
+	// TimeoutMS bounds the wait; the cap keeps the answer inside the
+	// daemon's 60s per-request ceiling (a timeout is a RESULT:
+	// {done:false}, never an error).
+	TimeoutMS int `json:"timeout_ms" jsonschema:"how long to park for the job's completion event, 1..55000 ms — a timeout answers {done:false, elapsed_ms} (a result, NOT an error), so loop with fresh calls for longer waits"`
+}
+
+// jobWaitOut is the §4.3 reply: done + the job's bridged value, or
+// done + error (the board's class/msg verbatim plus the cleanup-ritual
+// hint), and the measured wait window either way.
+type jobWaitOut struct {
+	Done      bool          `json:"done" jsonschema:"true when the job's completion event arrived within the timeout (value or error follows); false = the timeout burned — keep waiting with another call or move on"`
+	Value     any           `json:"value,omitempty" jsonschema:"the job's bridged return value, present when it finished ok AND returned one"`
+	Error     *jobWaitError `json:"error,omitempty" jsonschema:"the job's death, present when it finished NOT ok"`
+	ElapsedMS int64         `json:"elapsed_ms" jsonschema:"milliseconds the wait actually took (from call start to the event or the timeout)"`
+}
+
+// jobWaitError is a dead job's face: the board's own class/msg
+// (budget refusals carry the exceeded value — protocol v7) plus the
+// cleanup ritual's hint.
+type jobWaitError struct {
+	Class string `json:"class" jsonschema:"the board's error class verbatim (budget/rt/compile/oom/api)"`
+	Msg   string `json:"msg" jsonschema:"the board's error message verbatim — a budget refusal names the exceeded budget and the fix (per-call budget_ms or budget.set)"`
+	Hint  string `json:"hint" jsonschema:"the cleanup ritual: (1) wasm instances the job loaded STAY loaded — unload each with eval bench.wasm.unload(name); (2) pins it claimed stay claimed — release with xuansi_session_reset; (3) session_reset releases CLAIMS (pins/scripts/streams) but does NOT unload wasm instances"`
 }
 
 // ---------------------------------------------------------------------------
@@ -329,8 +362,8 @@ type opResultOut = map[string]any
 // session_reset after those; B10 task 5 appended driver_fetch; B11
 // task 2 appended toolchain_status, task 3 toolchain_fetch, task 5
 // wasm_build; B12-P2 T6 removed the stills tool (24 then); B15 W1.T2
-// appended the ⑨ pin pair (26 now): the surviving tools keep their
-// positions (nothing renumbers).
+// appended the ⑨ pin pair, W1.T4 appended job_wait (27 now): the
+// surviving tools keep their positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -358,6 +391,7 @@ var staticToolNames = []string{
 	"xuansi_wasm_build",
 	"xuansi_boards_pin",
 	"xuansi_boards_unpin",
+	"xuansi_job_wait",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -390,12 +424,12 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_run_lua",
-		Description: "Evaluate a Lua chunk synchronously on the board under the lease: captured stdout in out, a bridged return value (when the chunk returns one) in value, and frames — the 0x02 stream frames that arrived on the connection during the call, e.g. a wasm module's stream_send output (a JPEG shot lands here as base64; decode and save it yourself). Frames are bounded (at most 16 frames / 1 MiB cumulative, frames_dropped counts honest losses — chunk-gap losses included) and the whole field is absent when nothing streamed; the 1 MiB bound is payload bytes — base64 transport inflates a full window to ~1.37 MiB, near the reply ceiling. Frame windows are arrival-based: a background job streaming while this call runs may deliver the same frames both here and on its own job event — archive one, not both. budget_ms (1..30000) sets this call's eval budget — the daemon's reply wait derives from it (budget+2s) under its 60s per-request ceiling; it is a protocol-v6 key, so a v5 board silently ignores it and the call rides the session budget. " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
+		Description: "Evaluate a Lua chunk synchronously on the board under the lease: captured stdout in out, a bridged return value (when the chunk returns one) in value, and frames — the 0x02 stream frames that arrived on the connection during the call, e.g. a wasm module's stream_send output (a JPEG shot lands here as base64; decode and save it yourself). Frames are bounded (at most 16 frames / 1 MiB cumulative, frames_dropped counts honest losses — chunk-gap losses included) and the whole field is absent when nothing streamed; the 1 MiB bound is payload bytes — base64 transport inflates a full window to ~1.37 MiB, near the reply ceiling. Frame windows are arrival-based: a background job streaming while this call runs may deliver the same frames both here and on its own job event — archive one, not both. Budget coaching: budget_ms (1..30000) sets this call's eval budget — the daemon's reply wait derives from it (budget+2s) under its 60s per-request ceiling; it is a protocol-v6 key, so a v5 board silently ignores it and the call rides the session budget. When the board kills the call on budget, its budget error names the exceeded value (protocol v7 fw) — fix it with a higher per-call budget_ms here, or op budget.set to move the SESSION budget (read the current pair with budget.get). " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
 	}, ts.runLua)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_submit",
-		Description: "Queue a Lua chunk as a background job on the board under the lease; the ack carries {tag, queued} and the job's result arrives later as a job event (events face) — with frames riding the event's data when the job streamed on the connection while it ran (the same bounded {ch,name,data_b64} shape run_lua replies carry; absent when it streamed nothing). The window is arrival-based: a concurrent eval's reply may carry the same frames too — one chunk legitimately feeds both windows. budget_ms (1..30000) is the JOB's budget — the board runs the queued job under it while the ack stays immediate; it is a protocol-v6 key, so a v5 board silently ignores it and the job rides the session budget. " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
+		Description: "Queue a Lua chunk as a background job on the board under the lease; the ack carries {tag, queued} and the job's result arrives later as a job event (events face) — or xuansi_job_wait parks on the daemon's tap and hands you the result directly (done/value/error+cleanup hint; a timeout answers done:false, not an error) — with frames riding the event's data when the job streamed on the connection while it ran (the same bounded {ch,name,data_b64} shape run_lua replies carry; absent when it streamed nothing). The window is arrival-based: a concurrent eval's reply may carry the same frames too — one chunk legitimately feeds both windows. Budget coaching: budget_ms (1..30000) is the JOB's budget — the board runs the queued job under it while the ack stays immediate; it is a protocol-v6 key, so a v5 board silently ignores it and the job rides the session budget. When the board kills the job on budget, its job event (and job_wait's error) names the exceeded value (protocol v7 fw) — fix it with a higher per-call budget_ms on the next submit, or op budget.set to move the SESSION budget (read the current pair with budget.get); a killed job's cleanup ritual rides job_wait's error.hint. " + luaArgsDesc + ". Holder semantics: " + holderDesc + ".",
 	}, ts.submit)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -410,7 +444,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_fs_write",
-		Description: "Write a whole file to the board's filesystem under the lease. data_b64 decodes client-side; payloads above the board's 16KB single-op cap ride the chunked transport transparently (fs.write_part chunks + a sha256-verifying commit — B10-T1), bounded only by the internal wire's 1 MiB frame cap. Holder semantics: " + holderDesc + ".",
+		Description: "Write a whole file to the board's filesystem under the lease. data_b64 decodes client-side; payloads above the board's 64KB chunk cap ride the chunked transport transparently (fs.write_part chunks of 64KB + a sha256-verifying commit — B10-T1, 64KB since B15 §4.5), bounded only by the internal wire's 1 MiB frame cap. Holder semantics: " + holderDesc + ".",
 	}, ts.fsWrite)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -440,7 +474,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_ws_list",
-		Description: "List the driver workspace: per driver the ACTIVE version (what a bare xuansi_driver_push re-deploys; absent until a first push) and every stored version with size + sha256 — the deploy menu, history included.",
+		Description: "List the driver workspace: per driver the ACTIVE version (what a bare xuansi_driver_push re-deploys; absent until a first push), the module kind the fetch index carried (verbatim — driver/algorithm today, production/test-canary when the drivers-repo canary wave lands; absent for hand-put versions), and every stored version with size + sha256 — the deploy menu, history included.",
 	}, ts.wsList)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -450,7 +484,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_driver_push",
-		Description: "Deploy one workspace driver version onto a board. BARE (no artifact key) = the manifest-driven default: when the version's manifest carries an aot.<target> record AND the board's chip maps to that target (chip comes from the daemon's hello cache, surfaced in xuansi_list_boards — ESP32-S3 → esp32s3), the .wasm + .aot PAIR deploys: the .aot leg lands FIRST, then the .wasm, both read-back-verified, and ANY leg failing rolls the whole pair back out (fs_rm — the .aot always, the .wasm too when its write crossed; the board is never left half a pair, and the error names any byte that survived the rollback), the error says the rollback happened, and the manifest stays untouched. No matching chip (e.g. ESP32-C6 today), no aot record, or a version without one = the conservative single artifact — exactly the classic behavior, and the reply's paired=false says so honestly. The board's loader PREFERRING .aot is fw semantics — this face does not re-judge it. ARTIFACT \"wasm\"/\"aot\" = push exactly that one artifact AND fs_rm every sibling slot /drv/<name>.<lua|wasm|aot> (the F-5 sweep, driver_pull's mirror; already-empty siblings are expected not-found noise, swept lists what it emptied) — the kill for the stale-shield foot-gun: the loader prefers .aot, so an old .aot left in its slot would silently shadow a freshly pushed .wasm. Gated BEFORE the first flash write: a Lua file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one; a paired push also gates the .aot on the \\0aot container magic); a binary module gates on the module magic the fw's wasm loader itself validates. The write rides the chunked transport for any size (B10-T1) and is verified by fs_read-back sha256 per leg, and only a byte-exact read-back updates the manifest (Active = this version, push time, per-board footprint). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
+		Description: "Deploy one workspace driver version onto a board. BARE (no artifact key) = the manifest-driven default: when the version's manifest carries an aot.<target> record AND the board's chip maps to that target (chip comes from the daemon's hello cache, surfaced in xuansi_list_boards — ESP32-S3 → esp32s3), the .wasm + .aot PAIR deploys: the .aot leg lands FIRST, then the .wasm, both commit-verified, and the .wasm leg failing rolls the whole pair back out (fs_rm of the landed .aot; the failed leg itself lands NOTHING — an unverified commit refuses the rename, leaving only the fw's .part staging file, which the next push's off=0 reopen truncates), the error says the rollback happened, and the manifest stays untouched. No matching chip (e.g. ESP32-C6 today), no aot record, or a version without one = the conservative single artifact — exactly the classic behavior, and the reply's paired=false says so honestly. The board's loader PREFERRING .aot is fw semantics — this face does not re-judge it. ARTIFACT \"wasm\"/\"aot\" = push exactly that one artifact AND fs_rm every sibling slot /drv/<name>.<lua|wasm|aot> (the F-5 sweep, driver_pull's mirror; already-empty siblings are expected not-found noise, swept lists what it emptied) — the kill for the stale-shield foot-gun: the loader prefers .aot, so an old .aot left in its slot would silently shadow a freshly pushed .wasm. Gated BEFORE the first flash write: a Lua file's first line must be exactly \"--@api N\" with N equal to the board's bench.api_version (the fw refuses to load a mismatch — this refuses to write one; a paired push also gates the .aot on the \\0aot container magic); a binary module gates on the module magic the fw's wasm loader itself validates. VERIFICATION (B15 §4.5②): every leg's fs_write carries the payload's sha256 and the board's own fs.write_commit verdict (its chunk-by-chunk ledger, 64KB chunks) is what verifies the landing — the reply says verified_by:\"commit-sha256\" and only a verified commit updates the manifest (Active = this version, push time, per-board footprint; the former post-push byte read-back is retired — fs_read stays an independent tool). The reply's kind mirrors the workspace manifest's module kind (the fetch index's vocabulary — driver/algorithm today, production/test-canary when the drivers-repo canary wave lands; absent for hand-put versions). Rollback = push the older version explicitly (version omitted re-deploys the ACTIVE one); fleet = push each board — per-board footprints accumulate in the manifest. Take the lease first (xuansi_lease): the fs_write needs it. Holder semantics: " + holderDesc + ".",
 	}, ts.driverPush)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -460,7 +494,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_session_reset",
-		Description: "Reset one board session: stops every script running in it and releases every pin it claimed (the board's own session.reset — pins go to the safe state, high-Z). The session number is 0 or positive: negatives are refused daemon- and board-side because -1 is the board's INTERNAL op-face pin sentinel (the on-board device face's slots), never a user namespace. Omit session for namespace 0, the shared membership BARE EVALS claim pins under (owner _eval): a pin claimed by one eval persists into every later eval on the board, and THIS tool is the in-pipeline release for those claims — no more release-lease/re-lease dance (the b7 S4b detour this tool replaces; the lease itself is untouched). An explicit session number targets a script namespace: a lease's reply names the session its xuansi_script_start scripts run under, so naming that number stops those scripts mid-lease. The reply is the board's own {stopped:n} where n counts SCRIPTS stopped — a pins-only ns-0 sweep answers 0 while still releasing the pins (verify with xuansi_board_op diag.pins). The board's error class/msg crosses verbatim. Holder semantics: " + holderDesc + ".",
+		Description: "Reset one board session: stops every script running in it and releases every pin it claimed (the board's own session.reset — pins go to the safe state, high-Z). CLAIMS ≠ INSTANCES: this releases CLAIMS (scripts, pins, streams) but does NOT unload wasm instances — a loaded module stays loaded and its memory stays admitted; unload instances separately with eval bench.wasm.unload(name) (the full cleanup ritual: unload first, then reset). The session number is 0 or positive: negatives are refused daemon- and board-side because -1 is the board's INTERNAL op-face pin sentinel (the on-board device face's slots), never a user namespace. Omit session for namespace 0, the shared membership BARE EVALS claim pins under (owner _eval): a pin claimed by one eval persists into every later eval on the board, and THIS tool is the in-pipeline release for those claims — no more release-lease/re-lease dance (the b7 S4b detour this tool replaces; the lease itself is untouched). An explicit session number targets a script namespace: a lease's reply names the session its xuansi_script_start scripts run under, so naming that number stops those scripts mid-lease. The reply is the board's own {stopped:n} where n counts SCRIPTS stopped — a pins-only ns-0 sweep answers 0 while still releasing the pins (verify with xuansi_board_op diag.pins). The board's error class/msg crosses verbatim. Holder semantics: " + holderDesc + ".",
 	}, ts.sessionReset)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -503,6 +537,11 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_boards_unpin",
 		Description: "Remove a board's pinned endpoint — the registry pin source's removal half (⑨). Idempotent-shaped: unpinning a board that was never pinned still answers {unpinned}. The board keeps every other live source (usb/mdns); a pin-only board degrades to stale last-known (entries are never hard-deleted — re-pin or let discovery find it). No lease, no board contact.",
 	}, ts.boardsUnpin)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_job_wait",
+		Description: "Wait for ONE background job's completion — the daemon-side long-poll primitive (B15 §4.3): instead of polling the events face, this parks on the daemon's own event tap and returns the moment the job's event arrives. Input: the job's tag (the caller-chosen id you passed to xuansi_submit) and timeout_ms (1..55000). Reply: {done, elapsed_ms} plus value when the job finished ok and returned one, or error {class, msg, hint} when it DIED — class/msg are the board's own (a budget refusal names the exceeded budget and the fix: a per-call budget_ms 1..30000 on the next submit, or op budget.set for the session) and hint is the cleanup ritual (unload loaded wasm instances with eval bench.wasm.unload(name) FIRST, then release claimed pins with xuansi_session_reset — session_reset releases claims but does NOT unload instances). A timeout answers {done:false, elapsed_ms} — a RESULT, never an error: loop with fresh calls for longer waits. The daemon tracks jobs by tag from THEIR SUBMIT through this daemon (job events are direct-delivered to the submitting connection) — a tag it never saw is an api error, and a job submitted on another connection is invisible here, honestly. Read-only, no lease, never dials the board; a job that already finished answers immediately from the ledger.",
+	}, ts.jobWait)
 
 	ts.registerCapture(srv)
 }
@@ -610,6 +649,35 @@ func (ts *toolset) boardsUnpin(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 	return nil, boardsUnpinOut{Unpinned: str(res, "unpinned")}, nil
 }
 
+// jobWait parks on the daemon's event tap for one job's completion
+// (§4.3). Holder-less and lease-free by design: the wait reads daemon
+// state only (the ledger the daemon fills at its own submit chokepoint
+// and drains off its tap) — it never dials the board and never needs
+// the lease. timeout_ms is gated client-side (1..55000, the same
+// domain the daemon re-gates) so an out-of-domain wait is a zero-
+// contact refusal, and the wait always answers inside the daemon's
+// 60s per-request ceiling.
+func (ts *toolset) jobWait(ctx context.Context, _ *mcpsdk.CallToolRequest, in jobWaitIn) (*mcpsdk.CallToolResult, jobWaitOut, error) {
+	if in.TimeoutMS < 1 || in.TimeoutMS > 55000 {
+		return nil, jobWaitOut{}, &server.RPCError{
+			Class: "api",
+			Msg:   fmt.Sprintf("job_wait: timeout_ms %d out of domain 1..55000 (the wait must answer inside the daemon's 60s per-request ceiling), refused client-side", in.TimeoutMS),
+		}
+	}
+	res, err := ts.call(ctx, server.Request{Type: "job_wait", Board: in.Board, Tag: in.Job, TimeoutMS: int64(in.TimeoutMS)})
+	if err != nil {
+		return nil, jobWaitOut{}, err
+	}
+	out := jobWaitOut{Done: bol(res, "done"), ElapsedMS: int64(num(res, "elapsed_ms"))}
+	if v, ok := res["value"]; ok {
+		out.Value = v // any: the job's bridged value crosses as-is
+	}
+	if em, ok := res["error"].(map[string]any); ok {
+		out.Error = &jobWaitError{Class: str(em, "class"), Msg: str(em, "msg"), Hint: str(em, "hint")}
+	}
+	return nil, out, nil
+}
+
 func (ts *toolset) runLua(ctx context.Context, _ *mcpsdk.CallToolRequest, in runLuaIn) (*mcpsdk.CallToolResult, runLuaOut, error) {
 	if err := budgetDomain(in.BudgetMs); err != nil {
 		return nil, runLuaOut{}, err
@@ -693,8 +761,9 @@ func (ts *toolset) fsWrite(ctx context.Context, _ *mcpsdk.CallToolRequest, in fs
 	if derr != nil {
 		return nil, boardAckOut{}, errFsNotBase64(in.Path, derr)
 	}
-	// No client-side size cap (B10-T1): >16KB payloads ride the daemon's
-	// chunked transport; the bound is the internal wire's 1 MiB frame.
+	// No client-side size cap (B10-T1): >64KB payloads ride the daemon's
+	// chunked transport (64KB chunks since B15 §4.5); the bound is the
+	// internal wire's 1 MiB frame.
 	res, err := ts.callHeld(ctx, server.Request{Type: "fs_write", Board: in.Board, Holder: in.Holder, Path: in.Path, Data: data})
 	if err != nil {
 		return nil, boardAckOut{}, err

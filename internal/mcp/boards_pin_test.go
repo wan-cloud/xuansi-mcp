@@ -113,10 +113,11 @@ func TestBoardsPinUnpinSchema(t *testing.T) {
 	}
 }
 
-// TestStaticToolsServe26 (B15 W1.T2): tools/list serves exactly the 26
-// static tools — 24 + the ⑨ pair (boards_pin, boards_unpin; the B12-P2
-// camera retirement's count moves with them).
-func TestStaticToolsServe26(t *testing.T) {
+// TestStaticToolsServe27 (B15 W1.T2, count moved by W1.T4): tools/list
+// serves exactly the 27 static tools — 24 + the ⑨ pair (boards_pin,
+// boards_unpin) + job_wait (the B12-P2 camera retirement's count
+// moves with them).
+func TestStaticToolsServe27(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -124,13 +125,13 @@ func TestStaticToolsServe26(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lr.Tools) != 26 {
+	if len(lr.Tools) != 27 {
 		names := make([]string, len(lr.Tools))
 		for i, tool := range lr.Tools {
 			names[i] = tool.Name
 		}
 		sort.Strings(names)
-		t.Fatalf("tools/list serves %d tools, want exactly 26: %v", len(lr.Tools), names)
+		t.Fatalf("tools/list serves %d tools, want exactly 27: %v", len(lr.Tools), names)
 	}
 	got := make([]string, 0, len(lr.Tools))
 	for _, tool := range lr.Tools {

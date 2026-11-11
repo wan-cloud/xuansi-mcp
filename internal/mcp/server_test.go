@@ -358,11 +358,11 @@ func TestRegistersExactStaticToolset(t *testing.T) {
 }
 
 // TestStaticToolsDeCamerad (B12-P2 T6): the camera face is retired —
-// tools/list serves exactly 26 static tools (24 since the retirement;
-// B15 W1.T2 appended the ⑨ pin pair) and none of them is a camera
-// tool. This is the seat-facing pin (an agent reads tools/list, not Go
-// tables): a camera tool reappearing fails here even if
-// staticToolNames were internally consistent with it.
+// tools/list serves exactly 27 static tools (24 since the retirement;
+// B15 W1.T2 appended the ⑨ pin pair, W1.T4 appended job_wait) and
+// none of them is a camera tool. This is the seat-facing pin (an agent
+// reads tools/list, not Go tables): a camera tool reappearing fails
+// here even if staticToolNames were internally consistent with it.
 func TestStaticToolsDeCamerad(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -371,12 +371,12 @@ func TestStaticToolsDeCamerad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lr.Tools) != 26 {
+	if len(lr.Tools) != 27 {
 		names := make([]string, len(lr.Tools))
 		for i, tool := range lr.Tools {
 			names[i] = tool.Name
 		}
-		t.Fatalf("tools/list serves %d tools, want exactly 26: %v", len(lr.Tools), names)
+		t.Fatalf("tools/list serves %d tools, want exactly 27: %v", len(lr.Tools), names)
 	}
 	for _, tool := range lr.Tools {
 		if strings.Contains(tool.Name, "camera") {
