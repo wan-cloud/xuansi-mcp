@@ -577,13 +577,13 @@ type fakeAResponder struct {
 	v6Only bool // answers only AAAA questions (the v6 test's A-silent shape)
 }
 
-func startFakeAResponder(t *testing.T, host string) *fakeAResponder {
+func startFakeAResponder(t *testing.T, host string, v6Only bool) *fakeAResponder {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("fake A responder listen: %v", err)
 	}
-	fr := &fakeAResponder{conn: conn, queryQ: make(chan []byte, 16)}
+	fr := &fakeAResponder{conn: conn, queryQ: make(chan []byte, 16), v6Only: v6Only}
 	go func() {
 		buf := make([]byte, 1500)
 		for {
@@ -663,7 +663,7 @@ func TestDiscoverMDNSAddrFollowup(t *testing.T) {
 		newResolverFunc = func(...zeroconf.ClientOption) (mdnsBrowser, error) {
 			return &fakeBrowser{entries: []*zeroconf.ServiceEntry{srvOnly}}, nil
 		}
-		fr := startFakeAResponder(t, "xuansi-d75884.local")
+		fr := startFakeAResponder(t, "xuansi-d75884.local", false)
 		overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
 		boards, err := DiscoverMDNS(context.Background())
 		if err != nil {
@@ -708,7 +708,7 @@ func TestDiscoverMDNSAddrFollowup(t *testing.T) {
 		newResolverFunc = func(...zeroconf.ClientOption) (mdnsBrowser, error) {
 			return &fakeBrowser{entries: []*zeroconf.ServiceEntry{complete}}, nil
 		}
-		fr := startFakeAResponder(t, "xuansi-d75884.local")
+		fr := startFakeAResponder(t, "xuansi-d75884.local", false)
 		overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
 		boards, err := DiscoverMDNS(context.Background())
 		if err != nil {
@@ -741,7 +741,7 @@ func TestDiscoverMDNSAddrFollowup(t *testing.T) {
 		newResolverFunc = func(...zeroconf.ClientOption) (mdnsBrowser, error) {
 			return &fakeBrowser{entries: []*zeroconf.ServiceEntry{srvOnly}}, nil
 		}
-		fr := startFakeAResponder(t, "other-host.local") // answers only the wrong name
+		fr := startFakeAResponder(t, "other-host.local", false) // answers only the wrong name
 		overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
 		start := time.Now()
 		boards, err := DiscoverMDNS(context.Background())
@@ -764,8 +764,8 @@ func TestFollowupAddrIPv6(t *testing.T) {
 	origIfIP := ifaceIPv4
 	t.Cleanup(func() { ifaceIPv4 = origIfIP })
 	ifaceIPv4 = func(net.Interface) net.IP { return net.IPv4(127, 0, 0, 1) }
-	fr := startFakeAResponder(t, "xuansi-d75884.local")
-	fr.v6Only = true // the A round stays silent; only the AAAA round answers
+	// the A round stays silent; only the AAAA round answers
+	fr := startFakeAResponder(t, "xuansi-d75884.local", true)
 	overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
 	ifaces := []net.Interface{{Index: 95, Name: "fake0", Flags: net.FlagUp | net.FlagMulticast}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
