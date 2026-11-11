@@ -67,6 +67,71 @@ const (
 // errUnreachable wraps dial/hello failures for the error taxonomy.
 var errUnreachable = errors.New("board unreachable")
 
+// errSourceGone is the fast-fail refusal's sentinel (B15 §4.1②): the
+// registry's CURRENT snapshot carries no live source for the board —
+// every discovery face lost it (unplugged, off-WiFi; the entry is
+// last-known only). A board-touching op refused with it dialed NOTHING.
+var errSourceGone = errors.New("no live discovery source (all sources gone — last-known entry only; refresh discovery, check cable/WiFi)")
+
+// boardErr marks a board-touching failure with the board it belongs to,
+// so toRPC can attach the §4.1 pathology fields (cause +
+// last_seen_age_ms). It renders as the wrapped error and unwraps to it;
+// the wrap site is the transport chokepoints (warmController, the op
+// stream paths), never the board-answered OpErrors.
+type boardErr struct {
+	mac6 string
+	err  error
+}
+
+func (e *boardErr) Error() string { return e.err.Error() }
+func (e *boardErr) Unwrap() error { return e.err }
+
+// boardFail wraps err (nil-safe) as mac6's board-touching failure.
+func (s *Server) boardFail(mac6 string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var be *boardErr
+	if errors.As(err, &be) {
+		return err // already wrapped — never double-wrap
+	}
+	return &boardErr{mac6: mac6, err: err}
+}
+
+// lastSeenAgeMS reports milliseconds since the daemon's last protocol
+// crossing with the board (-1 when it never crossed one, honestly —
+// a board never touched has no age to report, only absence).
+func (s *Server) lastSeenAgeMS(mac6 string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	db, ok := s.sups[mac6]
+	if !ok || db.lastSeen.IsZero() {
+		return -1
+	}
+	return time.Since(db.lastSeen).Milliseconds()
+}
+
+// boardOpCause maps a board-touching failure onto the four-value cause
+// taxonomy (B15 §5): source gone / dial failed / link dead /
+// arbitration. Timeouts and other link-crossing failures that fit none
+// of the first three report "link dead" — the op could not complete
+// over the link and the daemon will re-establish it; the msg carries
+// the precise story.
+func boardOpCause(err error) string {
+	switch {
+	case errors.Is(err, errSourceGone):
+		return "source gone"
+	case errors.Is(err, board.ErrControllerSlotHeld):
+		return "arbitration"
+	case errors.Is(err, replclient.ErrDead):
+		return "link dead"
+	case errors.Is(err, errUnreachable):
+		return "dial failed"
+	default:
+		return "link dead"
+	}
+}
+
 // afterFunc is the idle-exit timer seam (production: time.AfterFunc;
 // tests swap it to capture and fire the arming deterministically).
 var afterFunc = time.AfterFunc
@@ -1051,14 +1116,16 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
 	if err != nil {
-		return &Reply{Type: "reply", ID: req.ID, Error: toRPC(err)}
+		return &Reply{Type: "reply", ID: req.ID, Error: s.toRPC(err)}
 	}
 	return &Reply{Type: "reply", ID: req.ID, Result: result}
 }
 
 // toRPC maps an error into the wire taxonomy (proto.go): board classes
-// verbatim, lease/resolve/holder/unreachable classes structured.
-func toRPC(err error) *RPCError {
+// verbatim, lease/resolve/holder/unreachable classes structured. A
+// board-touching failure (boardErr) additionally carries the §4.1
+// pathology fields: cause (four-value taxonomy) and last_seen_age_ms.
+func (s *Server) toRPC(err error) *RPCError {
 	var operr *replclient.OpError
 	if errors.As(err, &operr) {
 		return &RPCError{Class: operr.Class, Msg: operr.Msg}
@@ -1073,20 +1140,37 @@ func toRPC(err error) *RPCError {
 	}
 	var rpc *RPCError
 	if errors.As(err, &rpc) {
+		// a pre-shaped RPCError crosses as-is (its class is deliberate —
+		// the api-class daemon refusals); the pathology fields still
+		// attach when a boardErr wraps it.
+		var be *boardErr
+		if errors.As(err, &be) {
+			age := s.lastSeenAgeMS(be.mac6)
+			rpc.Cause = boardOpCause(err)
+			rpc.LastSeenAgeMS = &age
+		}
 		return rpc
 	}
+	var e *RPCError
 	switch {
 	case errors.Is(err, lease.ErrNotHeld):
-		return &RPCError{Class: "not_held", Msg: err.Error()}
+		e = &RPCError{Class: "not_held", Msg: err.Error()}
 	case errors.Is(err, lease.ErrTeardownInProgress):
-		return &RPCError{Class: "teardown", Msg: err.Error()}
+		e = &RPCError{Class: "teardown", Msg: err.Error()}
 	case errors.Is(err, board.ErrControllerSlotHeld):
-		return &RPCError{Class: "slot_held", Msg: err.Error()}
+		e = &RPCError{Class: "slot_held", Msg: err.Error()}
 	case errors.Is(err, errUnreachable):
-		return &RPCError{Class: "unreachable", Msg: err.Error()}
+		e = &RPCError{Class: "unreachable", Msg: err.Error()}
 	default:
-		return &RPCError{Class: "server", Msg: err.Error()}
+		e = &RPCError{Class: "server", Msg: err.Error()}
 	}
+	var be *boardErr
+	if errors.As(err, &be) {
+		age := s.lastSeenAgeMS(be.mac6)
+		e.Cause = boardOpCause(err)
+		e.LastSeenAgeMS = &age
+	}
+	return e
 }
 
 // resolve maps a selector to one board, classifying resolve failures.
@@ -1227,12 +1311,17 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 	sess, _ := s.leases.Session(b.MAC6)
 	res := map[string]any{"board": b.MAC6, "holder": holder, "session": sess}
 	if req.Transport == "usb" {
+		if !hasSource(b, discover.SourceUSB) {
+			// fast-fail (§4.1②): the registry's current snapshot shows no
+			// live USB source — refuse with zero dial (cause "source gone")
+			return nil, s.boardFail(b.MAC6, fmt.Errorf("board %s: usb lease: %w", b.MAC6, errSourceGone))
+		}
 		db := s.supervisor(b)
 		db.connectMu.Lock() // deliberate: held across ConnectUSB (~5s bounded — drain + hello); connects and Close serialize behind it
 		ctl, cerr := db.sup.ConnectUSB(ctx)
 		db.connectMu.Unlock()
 		if cerr != nil {
-			return nil, fmt.Errorf("%w: usb lease: %v", errUnreachable, cerr)
+			return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: usb lease: %v", errUnreachable, cerr))
 		}
 		s.tap(b.MAC6, db, ctl)
 		res["transport"] = "usb"
@@ -1632,15 +1721,15 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 			if end > len(req.Data) {
 				end = len(req.Data)
 			}
-			if _, err := ctl.Op(ctx, "fs.write_part", map[string]any{
+			if _, err := s.opSameLink(ctx, b, ctl, "fs.write_part", map[string]any{
 				"path": req.Path, "off": off, "data": req.Data[off:end],
-			}); err != nil {
+			}, true, nil); err != nil {
 				return err
 			}
 		}
-		r, err := ctl.Op(ctx, "fs.write_commit", map[string]any{
+		r, err := s.opSameLink(ctx, b, ctl, "fs.write_commit", map[string]any{
 			"path": req.Path, "expected_len": len(req.Data), "sha256": shaHex,
-		})
+		}, true, nil)
 		if err != nil {
 			return err
 		}
@@ -1673,9 +1762,9 @@ func (s *Server) hFsRead(ctx context.Context, req *Request) (any, error) {
 		// return the corruption as success)
 		var off uint32
 		for {
-			res, err := ctl.Op(ctx, "fs.read_part", map[string]any{
+			res, err := s.opSameLink(ctx, b, ctl, "fs.read_part", map[string]any{
 				"path": req.Path, "off": int(off), "len": fsFileMax,
-			})
+			}, true, nil)
 			if err != nil {
 				return err
 			}
@@ -1971,20 +2060,44 @@ func wireFrames(snap board.FrameSnapshot) []any {
 }
 
 // warmController connects (or reuses) the board's warm TCP controller
-// and installs the event tap + hello enrichment on it.
+// and installs the event tap + hello enrichment on it. B15 §4.1②: when
+// a dial would be needed (no live controller), the reachability
+// precheck runs FIRST — a board with no live discovery source is
+// refused with ZERO dial (cause "source gone"), ending the 60–120s
+// pathological spin an unplugged board used to cost every op.
 func (s *Server) warmController(ctx context.Context, b discover.Board) (board.Controller, error) {
 	db := s.supervisor(b)
+	if db.sup.Client() == nil {
+		if err := s.preflightSource(b.MAC6); err != nil {
+			return nil, s.boardFail(b.MAC6, err)
+		}
+	}
 	db.connectMu.Lock()
 	defer db.connectMu.Unlock()
 	ctl, err := db.sup.Connect(ctx)
 	if err != nil {
 		if errors.Is(err, board.ErrControllerSlotHeld) {
-			return nil, err
+			return nil, s.boardFail(b.MAC6, err)
 		}
-		return nil, fmt.Errorf("%w: %v", errUnreachable, err)
+		return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: %v", errUnreachable, err))
 	}
 	s.tap(b.MAC6, db, ctl)
 	return ctl, nil
+}
+
+// preflightSource is the board-touching ops' reachability precheck: the
+// registry's CURRENT snapshot must show at least one live source for
+// the board (usb and/or mdns). A warm controller short-circuits the
+// caller's need for this — an established link is its own evidence the
+// board is reachable. This is the fast half of fast-fail: the refusal
+// carries class unreachable + cause "source gone" and dials nothing;
+// the slow half (a live source whose endpoint does not answer) is the
+// bounded dialLoop.
+func (s *Server) preflightSource(mac6 string) error {
+	if cur, ok := s.lookupExact(mac6); ok && len(cur.Sources) > 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: board %s: %w", errUnreachable, mac6, errSourceGone)
 }
 
 // tap installs the all-sources event tap on a NEW controller (identity
@@ -2148,7 +2261,12 @@ func (s *Server) boardOp(ctx context.Context, b discover.Board, op string, args 
 // window there — a redial's reset must retire the old link's windows
 // without swallowing THIS submit's (final-review Important-1). A
 // successful reply is a protocol crossing — the board's last_seen
-// advances (B12-P2 T6).
+// advances (B12-P2 T6). §4.2 (B15): a reply timeout on a live link
+// resends the SAME op once on the SAME connection for the idempotent
+// faces (eval/fs/op-family — never submit/script.start, which must not
+// run twice board-side); only a link-DEAD verdict tears down and
+// redials, and transport failures carry the §4.1 pathology fields
+// (cause + last_seen_age_ms).
 func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string, args map[string]any, db *daemonBoard, col *board.FrameCollector, ensure func()) (map[string]any, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -2157,7 +2275,7 @@ func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string,
 		}
 		ctl, err := s.warmController(ctx, b)
 		if err != nil {
-			return nil, err
+			return nil, err // already boardFail-annotated (preflight/dial/arbitration)
 		}
 		if db != nil {
 			ctl.OnStream(db.frames.Sink) // assert the hub for this window
@@ -2165,14 +2283,23 @@ func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string,
 		if ensure != nil {
 			ensure() // re-arm a pending-job window a redial's jobReset retired
 		}
-		res, err := ctl.Op(ctx, op, args)
+		res, err := s.opSameLink(ctx, b, ctl, op, args, idempotentOpFace(op), func() {
+			if col != nil {
+				col.Reset() // the resend re-executes board-side: partial frames must not graft
+			}
+		})
 		if err == nil {
 			s.noteBoardContact(b.MAC6)
 			return res, nil
 		}
 		lastErr = err
+		var oe *replclient.OpError
+		if errors.As(err, &oe) {
+			return nil, err // the board ANSWERED with an error — verbatim, no annotation
+		}
 		if !errors.Is(err, replclient.ErrDead) {
-			return nil, err // board error (OpError) or caller ctx — no retry
+			// a timeout or ctx crossing the link — pathology fields, no redial
+			return nil, s.boardFail(b.MAC6, err)
 		}
 		s.logf("server: board %s: op %s hit a dead link (%v) — redialing once", b.MAC6, op, err)
 		dead := s.supervisor(b) // same per-board state as db when db != nil
@@ -2180,7 +2307,34 @@ func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string,
 		dead.sup.Close() // drop the corpse so the next Connect redials
 		dead.connectMu.Unlock()
 	}
-	return nil, fmt.Errorf("board %s: %s after redial: %w", b.MAC6, op, lastErr)
+	return nil, s.boardFail(b.MAC6, fmt.Errorf("board %s: %s after redial: %w", b.MAC6, op, lastErr))
+}
+
+// idempotentOpFace reports whether op is safe to RE-SEND after a
+// reply timeout on a live link (§4.2): eval/fs/op-family ops are —
+// they either answer or re-answer deterministically — while submit and
+// script.start are NOT (a resent submit could queue the job twice; a
+// resent script.start races the name registration). Those report the
+// timeout honestly instead.
+func idempotentOpFace(op string) bool {
+	return op != "submit" && op != "script.start"
+}
+
+// opSameLink runs one ctl.Op with the §4.2 same-link retry: a reply
+// timeout with the controller still live (the frame lost in transit —
+// the link itself is fine) resends the SAME op once on the SAME
+// connection. between (optional) runs between the attempts so callers
+// can reset state the resend re-executes (the eval frame collector).
+func (s *Server) opSameLink(ctx context.Context, b discover.Board, ctl board.Controller, op string, args map[string]any, retryable bool, between func()) (map[string]any, error) {
+	res, err := ctl.Op(ctx, op, args)
+	if err == nil || !retryable || !board.SameLinkRetry(err, ctl) {
+		return res, err
+	}
+	s.logf("server: board %s: op %s reply timed out with the link alive — resending once on the same link (idempotent face, §4.2)", b.MAC6, op)
+	if between != nil {
+		between()
+	}
+	return ctl.Op(ctx, op, args)
 }
 
 // withController runs fn over the board's warm controller, redialing
@@ -2202,8 +2356,13 @@ func (s *Server) withController(ctx context.Context, b discover.Board, fn func(c
 			return nil
 		}
 		lastErr = err
+		var oe *replclient.OpError
+		if errors.As(err, &oe) {
+			return err // the board ANSWERED with an error — verbatim
+		}
 		if !errors.Is(err, replclient.ErrDead) {
-			return err // board error or caller ctx — no retry
+			// a timeout or ctx crossing the link — pathology fields, no retry
+			return s.boardFail(b.MAC6, err)
 		}
 		s.logf("server: board %s: chunked stream hit a dead link (%v) — redialing once, stream restarts at off=0", b.MAC6, err)
 		db := s.supervisor(b)
@@ -2211,7 +2370,7 @@ func (s *Server) withController(ctx context.Context, b discover.Board, fn func(c
 		db.sup.Close() // drop the corpse so the next Connect redials
 		db.connectMu.Unlock()
 	}
-	return fmt.Errorf("board %s: chunked stream after redial: %w", b.MAC6, lastErr)
+	return s.boardFail(b.MAC6, fmt.Errorf("board %s: chunked stream after redial: %w", b.MAC6, lastErr))
 }
 
 // leaseTeardown is the lease manager's board-side action, bounded so a

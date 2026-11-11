@@ -50,6 +50,20 @@ type fakeCtl struct {
 	dieOnOp  string                // the half-open death script (dieOn): this op's next call fails ErrDead
 	onDie    func()                // …after running this hook
 	gen      int                   // test bookkeeping: which dial-generation this fake belongs to (supervisor rebuild tests)
+	// failOnceOp: a ONE-SHOT raw error for the op's next call (the
+	// same-link-retry tests script the §6-timeout shape here; the canned
+	// handlers resume afterwards).
+	failOnceOp map[string]error
+}
+
+// failOnce scripts a one-shot raw error for the op's NEXT call.
+func (f *fakeCtl) failOnce(op string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failOnceOp == nil {
+		f.failOnceOp = map[string]error{}
+	}
+	f.failOnceOp[op] = err
 }
 
 type mockCall struct {
@@ -191,6 +205,11 @@ func (f *fakeCtl) Op(ctx context.Context, op string, args map[string]any) (map[s
 		return nil, fmt.Errorf("%w: half-open link discovered mid-op", replclient.ErrDead)
 	}
 	f.calls = append(f.calls, mockCall{op: op, args: args})
+	if err, ok := f.failOnceOp[op]; ok {
+		delete(f.failOnceOp, op)
+		f.mu.Unlock()
+		return nil, err
+	}
 	h := f.ops[op]
 	f.mu.Unlock()
 	if h == nil {
@@ -3536,6 +3555,232 @@ func TestOpWifiSelfReportEnrichesEndpoint(t *testing.T) {
 	if asStr(asMap(boards[0])["ip"]) != "10.1.51.205" {
 		t.Errorf("list_boards ip = %q, want the self-reported address", asStr(asMap(boards[0])["ip"]))
 	}
+}
+
+// TestOpFastFailSourceGone: the reachability precheck (B15 §4.1②) — a
+// board whose discovery sources are ALL gone (unplugged, off-WiFi; the
+// registry keeps it as last-known only) refuses board-touching ops
+// IMMEDIATELY with a structured error (cause "source gone",
+// last_seen_age_ms attached) and ZERO dial attempts — the 60–120s
+// pathological spin of the pre-B15 daemon is gone. The cache-first read
+// tools (board_status) never dial regardless.
+func TestOpFastFailSourceGone(t *testing.T) {
+	var mu sync.Mutex
+	live := []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return live, nil
+		}),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return live, nil
+		}),
+	)
+	var dials int
+	getDials := func() int { mu.Lock(); defer mu.Unlock(); return dials }
+	sock := filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srv, err := New(Opts{
+		SockPath:        sock,
+		Registry:        reg,
+		GraceTTL:        10 * time.Second,
+		RefreshInterval: -1,
+		RequestTimeout:  2 * time.Second, // a dial spin would blow far past this
+		AuditTimeout:    200 * time.Millisecond,
+		Log:             newTestLogf(t, "srv: "),
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			return board.NewSupervisor(ref, board.SupOpts{
+				Log: newTestLogf(t, "sup: "),
+				DialTCP: func() (board.Controller, error) {
+					mu.Lock()
+					dials++
+					mu.Unlock()
+					return nil, fmt.Errorf("dial refused")
+				},
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	awaitSweep(t, reg, 1)
+	// let the startup audit's (failing) dial land so no warm controller
+	// exists and the dial count is settled
+	deadline := time.Now().Add(2 * time.Second)
+	for getDials() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := getDials(); n == 0 {
+		t.Fatal("the startup audit never dialed — test premise broken")
+	}
+	dialsBefore := getDials()
+
+	c := dialSock(t, sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease (host-side): %#v", rep)
+	}
+
+	// the board vanishes: every source gone, entry last-known only
+	mu.Lock()
+	live = nil
+	mu.Unlock()
+	if err := reg.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// board_status stays cache-first: an answer, never a dial
+	rep, _ = c.call(2, map[string]any{"type": "board_status", "board": "d75884"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("board_status (cache-first) errored: %#v", rep)
+	}
+
+	// the board-touching eval refuses fast with the structured shape
+	start := time.Now()
+	rep, _ = c.call(3, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "w1"})
+	elapsed := time.Since(start)
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "unreachable" {
+		t.Fatalf("class = %q, want unreachable (%#v)", er["class"], er)
+	}
+	if asStr(er["cause"]) != "source gone" {
+		t.Fatalf("cause = %q, want \"source gone\" (%#v)", er["cause"], er)
+	}
+	if _, ok := er["last_seen_age_ms"]; !ok {
+		t.Fatalf("last_seen_age_ms missing from %#v", er)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("fast-fail took %v — the dial spin is back", elapsed)
+	}
+	if n := getDials(); n != dialsBefore {
+		t.Fatalf("dials = %d after a source-gone refusal (was %d), want ZERO new dials", n, dialsBefore)
+	}
+}
+
+// TestOpErrorCauseDialFailed: a live-source board whose endpoint does
+// not answer reports cause "dial failed" (with last_seen_age_ms) — the
+// bounded dial (~3 × tcpConnectTimeout) ends in the honest structured
+// error instead of the 60s budget ride.
+func TestOpErrorCauseDialFailed(t *testing.T) {
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
+			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
+		}),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
+		}),
+	)
+	sock := filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srv, err := New(Opts{
+		SockPath:        sock,
+		Registry:        reg,
+		GraceTTL:        10 * time.Second,
+		RefreshInterval: -1,
+		AuditTimeout:    200 * time.Millisecond, // the startup audit's dead dial must not pin connectMu
+		Log:             newTestLogf(t, "srv: "),
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			s := board.NewSupervisor(ref, board.SupOpts{
+				Log: newTestLogf(t, "sup: "),
+				DialTCP: func() (board.Controller, error) {
+					return nil, fmt.Errorf("dial tcp 10.1.51.205:7777: connect: connection refused")
+				},
+				RetryWait: 20 * time.Millisecond,
+			})
+			return s
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	awaitSweep(t, reg, 1)
+
+	c := dialSock(t, sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	start := time.Now()
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "w1"})
+	elapsed := time.Since(start)
+	er := errOf(t, rep)
+	if asStr(er["class"]) != "unreachable" {
+		t.Fatalf("class = %q, want unreachable (%#v)", er["class"], er)
+	}
+	if asStr(er["cause"]) != "dial failed" {
+		t.Fatalf("cause = %q, want \"dial failed\" (%#v)", er["cause"], er)
+	}
+	if age, ok := er["last_seen_age_ms"]; !ok || asInt(age) != -1 {
+		t.Fatalf("last_seen_age_ms = %v (%t), want -1 present (never crossed the board)", age, ok)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("bounded dial took %v — the 3-attempt bound leaked", elapsed)
+	}
+}
+
+// TestEvalTimeoutSameLinkRetryAndSubmitNever: §4.2 at the ops face — an
+// eval whose reply times out with the link alive is RESENT once on the
+// same connection (the reply that lands is the caller's; no teardown,
+// no redial); submit (non-idempotent) is NEVER resent — its timeout
+// surfaces as the structured error exactly once on the wire.
+func TestEvalTimeoutSameLinkRetryAndSubmitNever(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	dialsBefore := e.dialedTCP("d75884")
+
+	// eval: first attempt times out (link alive), resend answers
+	e.fakes["d75884"].failOnce("eval", fmt.Errorf("replclient: timeout waiting reply for eval id=1: %w", replclient.ErrOpTimeout))
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "w1"})
+	if er := asMap(rep["error"]); er != nil {
+		t.Fatalf("eval after same-link resend: %#v", er)
+	}
+	if n := countOp(e.fakes["d75884"], "eval"); n != 2 {
+		t.Fatalf("eval attempts = %d, want exactly 2 (timeout + one resend)", n)
+	}
+	if n := e.dialedTCP("d75884"); n != dialsBefore {
+		t.Fatalf("tcp dials = %d (was %d) — a timeout must NOT redial", n, dialsBefore)
+	}
+	if e.fakes["d75884"].Dead() {
+		t.Fatal("the warm link was closed on a mere timeout — only a link-DEAD verdict tears down")
+	}
+
+	// submit: non-idempotent — one attempt only, honest error
+	e.fakes["d75884"].failOnce("submit", fmt.Errorf("replclient: timeout waiting reply for submit id=2: %w", replclient.ErrOpTimeout))
+	rep, _ = c.call(3, map[string]any{"type": "submit", "board": "d75884", "code": "return 2", "tag": "j1", "holder": "w1"})
+	er := errOf(t, rep)
+	if _, ok := er["last_seen_age_ms"]; !ok {
+		t.Fatalf("submit timeout error carries no last_seen_age_ms: %#v", er)
+	}
+	if asStr(er["cause"]) != "link dead" {
+		t.Fatalf("submit timeout cause = %q, want \"link dead\" (%#v)", er["cause"], er)
+	}
+	if n := countOp(e.fakes["d75884"], "submit"); n != 1 {
+		t.Fatalf("submit attempts = %d, want exactly 1 (non-idempotent faces never resend)", n)
+	}
+}
+
+// countOp counts the recorded calls of one op name.
+func countOp(f *fakeCtl, op string) int {
+	n := 0
+	for _, call := range f.got() {
+		if call.op == op {
+			n++
+		}
+	}
+	return n
 }
 
 // TestBindSockConcurrentRaceGracefulLosers: the spawn-race contract at

@@ -301,10 +301,35 @@ type RPCError struct {
 	Holder      string `json:"holder,omitempty"`
 	Since       string `json:"since,omitempty"`
 	GraceExpiry string `json:"grace_expiry,omitempty"`
+	// Board-pathology fields (B15 §4.1④, board-touching failures only):
+	// why the crossing failed and how long ago the daemon last reached
+	// the board. Cause is one of the four-value taxonomy — "source gone"
+	// (registry has no live source; refused with zero dial), "dial
+	// failed" (endpoint did not answer within the bounded attempts),
+	// "link dead" (connection died under the op, or the op could not
+	// complete over it — daemon redials), "arbitration" (the §12
+	// controller-slot window exhausted). LastSeenAgeMS is -1 when the
+	// daemon never crossed the board at all. Both absent on non-board
+	// errors (lease gating, malformed requests, board-ANSWERED errors —
+	// an OpError crossed verbatim means the board was reached fine).
+	Cause         string `json:"cause,omitempty"`
+	LastSeenAgeMS *int64 `json:"last_seen_age_ms,omitempty"`
 }
 
-// Error renders like a board error line: "<class>: <msg>".
-func (e *RPCError) Error() string { return e.Class + ": " + e.Msg }
+// Error renders like a board error line: "<class>: <msg>", plus the
+// pathology bracket when the daemon attaches it — the CLI and the MCP
+// tool-error text are this exact string, so an agent reading either
+// seat sees the cause and the last-contact age without a second call.
+func (e *RPCError) Error() string {
+	s := e.Class + ": " + e.Msg
+	if e.Cause != "" {
+		s += " [cause: " + e.Cause + "]"
+	}
+	if e.LastSeenAgeMS != nil {
+		s += fmt.Sprintf(" [last_seen_age_ms: %d]", *e.LastSeenAgeMS)
+	}
+	return s
+}
 
 // Reply is the response half of a request: exactly one per request id,
 // carrying result XOR error.

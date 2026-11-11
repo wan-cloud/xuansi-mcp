@@ -34,6 +34,21 @@ import (
 // the caller owns that trade-off.
 var ErrControllerSlotHeld = errors.New("controller slot not freed within the arbitration window (board keepalive self-release ~17s, §12) — last resort is the deliberate USB fallback, which reboots the board and kills surviving scripts")
 
+// ErrNoDialEndpoint marks a PERMANENT dial refusal: the BoardRef has no
+// TCP endpoint (or no USB path) to dial at all — retrying cannot help,
+// so dialLoop fails fast instead of burning the caller's whole request
+// budget rediscovering that (the USB-only first appearance, Bug 1's
+// sibling shape — the endpoint may appear later, and the supervisor
+// rebuild on endpoint drift is what picks it up).
+var ErrNoDialEndpoint = errors.New("no dial endpoint in the board ref")
+
+// dialAttempts bounds one dialLoop run (B15 §4.1③): three tries — with
+// the 6s tcpConnectTimeout inside the real dialer that is an ~18s worst
+// case per Connect — instead of riding the caller's full 60s request
+// budget in a synchronous spin. A refused endpoint answers instantly,
+// so the bound usually costs milliseconds.
+const dialAttempts = 3
+
 // BoardRef identifies one dialable board (from the discover registry).
 type BoardRef struct {
 	MAC6    string
@@ -155,7 +170,7 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 	if opts.DialTCP == nil {
 		if addr == "" {
 			opts.DialTCP = func() (Controller, error) {
-				return nil, fmt.Errorf("board %s: no TCP endpoint to dial", ref.MAC6)
+				return nil, fmt.Errorf("board %s: no TCP endpoint to dial: %w", ref.MAC6, ErrNoDialEndpoint)
 			}
 		} else {
 			o := replclient.DialOpts{Log: opts.Log}
@@ -167,7 +182,7 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 	if opts.DialUSB == nil {
 		if ref.USBPath == "" {
 			opts.DialUSB = func() (Controller, error) {
-				return nil, fmt.Errorf("board %s: no USB path to dial", ref.MAC6)
+				return nil, fmt.Errorf("board %s: no USB path to dial: %w", ref.MAC6, ErrNoDialEndpoint)
 			}
 		} else {
 			o := replclient.DialOpts{Log: opts.Log}
@@ -278,9 +293,13 @@ func (s *Supervisor) waitCtx(ctx context.Context, d time.Duration) error {
 	return sleepCtx(ctx, d)
 }
 
-// dialLoop retries the dial seam until success or ctx ends.
+// dialLoop retries the dial seam a bounded number of times (B15 §4.1③:
+// dialAttempts tries ≈ 3 × tcpConnectTimeout worst case, replacing the
+// full-request-budget spin). A PERMANENT refusal (ErrNoDialEndpoint)
+// fails immediately — no retry can conjure an endpoint.
 func (s *Supervisor) dialLoop(ctx context.Context, dial func() (Controller, error)) (Controller, error) {
-	for i := 0; ; i++ {
+	var lastErr error
+	for i := 0; i < dialAttempts; i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("board %s: dial abandoned: %w", s.ref.MAC6, err)
 		}
@@ -288,13 +307,31 @@ func (s *Supervisor) dialLoop(ctx context.Context, dial func() (Controller, erro
 		if err == nil {
 			return ctl, nil
 		}
+		lastErr = err
 		if i == 0 {
 			s.logf("board %s: dial failed: %v", s.ref.MAC6, err)
+		}
+		if errors.Is(err, ErrNoDialEndpoint) {
+			return nil, fmt.Errorf("board %s: %w", s.ref.MAC6, err)
+		}
+		if i == dialAttempts-1 {
+			break
 		}
 		if err := s.waitCtx(ctx, s.opts.RetryWait); err != nil {
 			return nil, fmt.Errorf("board %s: dial abandoned: %w", s.ref.MAC6, err)
 		}
 	}
+	return nil, fmt.Errorf("board %s: dial failed after %d attempts: %w", s.ref.MAC6, dialAttempts, lastErr)
+}
+
+// SameLinkRetry reports whether err is the §4.2 same-link-retry shape:
+// the op's REPLY timed out (replclient.ErrOpTimeout) while the
+// controller is still live — the frame is likely lost in transit, so
+// the idempotent faces resend the SAME op once on the SAME connection
+// instead of tearing down a healthy link. A dead-link verdict
+// (replclient.ErrDead) never qualifies — that path redials.
+func SameLinkRetry(err error, ctl Controller) bool {
+	return ctl != nil && !ctl.Dead() && errors.Is(err, replclient.ErrOpTimeout)
 }
 
 // ConnectUSB is the on-demand fallback route: opening the CDC port
@@ -390,8 +427,13 @@ func (s *Supervisor) Client() Controller {
 	return s.ctl
 }
 
-// op runs one op over the warm connection, redialing once when the link
-// died under it (dead-link op → fresh TCP dial → retry).
+// op runs one op over the warm connection. §4.2 (B15): a reply timeout
+// on a LIVE link resends the SAME op once on the SAME connection — the
+// supervisor's internal ops (script.list / diag.pins / wifi.status /
+// session sweeps) are idempotent reads or namespace resets, all safe to
+// resend; tearing down a healthy link over one lost frame was the
+// timeout→redial→25s-arbitration spiral's root. A dead-link verdict
+// (ErrDead) still tears down and redials exactly as before.
 func (s *Supervisor) op(ctx context.Context, op string, args map[string]any) (map[string]any, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -402,6 +444,13 @@ func (s *Supervisor) op(ctx context.Context, op string, args map[string]any) (ma
 		res, err := ctl.Op(ctx, op, args)
 		if err == nil {
 			return res, nil
+		}
+		if SameLinkRetry(err, ctl) {
+			s.logf("board %s: op %s reply timed out with the link alive — resending once on the same link (§4.2)", s.ref.MAC6, op)
+			res, err = ctl.Op(ctx, op, args)
+			if err == nil {
+				return res, nil
+			}
 		}
 		lastErr = err
 		if !errors.Is(err, replclient.ErrDead) {
