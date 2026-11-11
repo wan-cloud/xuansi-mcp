@@ -1,11 +1,14 @@
 package server
 
-// fs_chunked_test.go — the v5 chunked fs transport at the internal-API
-// seam (B10-T1): fs_write at/below 16384B is a single verbatim fs.write;
-// above it the daemon loops fs.write_part per 16384B chunk and lands the
-// file with one sha256-verifying fs.write_commit; fs_read assembles
-// fs.read_part windows until eof. The fake controllers pin the loop
-// boundaries: exactly 16384 / 16385 / 32768 / 40000 bytes.
+// fs_chunked_test.go — the chunked fs transport at the internal-API
+// seam (B10-T1, re-pinned to the 64KB chunk of B15 §4.5): fs_write at
+// or below the 65472B chunk with no sha256 key is a single verbatim
+// fs.write; above it (and on EVERY verified write — the sha256 key,
+// B15 §4.5②) the daemon loops fs.write_part per 65472B chunk and lands
+// the file with one sha256-verifying fs.write_commit; fs_read
+// assembles fs.read_part windows until eof. The fake controllers pin
+// the loop boundaries: exactly 65472 / 65473 / 130944 / 111KB bytes,
+// and the verified path's any-size commit.
 
 import (
 	"bytes"
@@ -13,18 +16,22 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"xuansi/internal/replclient"
 )
 
 // chunkedFake scripts the three chunked ops over an in-memory .part
-// mirror, recording every call for the boundary assertions.
+// mirror, recording every call for the boundary assertions. corrupt
+// (the tamper leg) flips a byte in each staged write_part — the
+// mid-transfer corruption whose commit verdict must refuse.
 type chunkedFake struct {
-	inner *fakeCtl
-	parts map[string][]byte // logical .part path -> staged bytes
-	files map[string][]byte // committed files
-	calls []string          // "op off/len" trace
+	inner   *fakeCtl
+	parts   map[string][]byte // logical .part path -> staged bytes
+	files   map[string][]byte // committed files
+	calls   []string          // "op off/len" trace
+	corrupt bool
 }
 
 func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
@@ -55,6 +62,10 @@ func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
 			}
 			cf.parts[key] = append(cf.parts[key], data...)
 		}
+		if cf.corrupt && len(data) > 0 {
+			staged := cf.parts[key]
+			staged[len(staged)-1] ^= 1 // the mid-transfer byte that goes wrong
+		}
 		cf.calls = append(cf.calls, "fs.write_part")
 		return map[string]any{"size": int64(len(cf.parts[key]))}, nil
 	})
@@ -73,7 +84,9 @@ func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
 		if hasSha {
 			sum := sha256.Sum256(staged)
 			if hex.EncodeToString(sum[:]) != sha {
-				return nil, &replclient.OpError{Op: "fs.write_commit", Class: "api", Msg: "sha256 mismatch"}
+				// the fw's own refusal spelling (xs_fs.c), .part kept for retry
+				return nil, &replclient.OpError{Op: "fs.write_commit", Class: "api",
+					Msg: "sha256 mismatch (.part=<got>, expected=" + sha + ")"}
 			}
 		}
 		cf.files[path] = staged
@@ -113,16 +126,26 @@ func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
 // the commit's {size} (or the single fs.write's for the small path).
 func runFsWrite(t *testing.T, e *env, path string, data []byte) int64 {
 	t.Helper()
+	return runFsWriteSha(t, e, path, data, "")
+}
+
+// runFsWriteSha is runFsWrite with the verified path's sha256 key.
+func runFsWriteSha(t *testing.T, e *env, path string, data []byte, sha string) int64 {
+	t.Helper()
 	rep, _ := dialSock(t, e.sock).call(1, map[string]any{
 		"type": "lease", "board": "d75884", "holder": "chunky",
 	})
 	if asMap(rep["error"]) != nil {
 		t.Fatalf("lease: %#v", rep)
 	}
-	rep, _ = dialSock(t, e.sock).call(2, map[string]any{
+	req := map[string]any{
 		"type": "fs_write", "board": "d75884", "path": path,
 		"data": base64.StdEncoding.EncodeToString(data), "holder": "chunky",
-	})
+	}
+	if sha != "" {
+		req["sha256"] = sha
+	}
+	rep, _ = dialSock(t, e.sock).call(2, req)
 	res := asMap(rep["result"])
 	if res == nil {
 		t.Fatalf("fs_write %d bytes: %#v", len(data), rep)
@@ -144,21 +167,22 @@ func asIntField(t *testing.T, m map[string]any, key string) int64 {
 	return 0
 }
 
-// TestFsWriteChunkBoundaries: the loop boundaries pinned — exactly
-// 16384 is ONE fs.write (the pre-B10 wire, zero parts); 16385 is two
-// parts (16384+1) + commit; 32768 is two full parts + commit; 40000 is
-// three parts (16384+16384+7232) + commit. Every commit carries the
-// sha256 of the whole payload, and the fake verifies it against the
-// staged bytes it actually received.
+// TestFsWriteChunkBoundaries: the loop boundaries pinned at the 64KB
+// chunk (B15 §4.5①) — exactly 65472 is ONE fs.write (the small path);
+// 65473 is two parts (65472+1) + commit; 130944 is two full parts +
+// commit; a 111KB payload (113664B, the module-size bench case) is two
+// parts (65472+48192) + commit. Every commit carries the sha256 of the
+// whole payload, and the fake verifies it against the staged bytes it
+// actually received.
 func TestFsWriteChunkBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		n         int
 		wantCalls []string
 	}{
-		{16384, []string{"fs.write"}},
-		{16385, []string{"fs.write_part", "fs.write_part", "fs.write_commit"}},
-		{32768, []string{"fs.write_part", "fs.write_part", "fs.write_commit"}},
-		{40000, []string{"fs.write_part", "fs.write_part", "fs.write_part", "fs.write_commit"}},
+		{65472, []string{"fs.write"}},
+		{65473, []string{"fs.write_part", "fs.write_part", "fs.write_commit"}},
+		{130944, []string{"fs.write_part", "fs.write_part", "fs.write_commit"}},
+		{113664, []string{"fs.write_part", "fs.write_part", "fs.write_commit"}},
 		{1, []string{"fs.write"}},
 	} {
 		e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
@@ -177,20 +201,21 @@ func TestFsWriteChunkBoundaries(t *testing.T) {
 			}
 		}
 		if got := cf.files["/drv/mod.aot"]; !bytes.Equal(got, data) {
-			t.Fatalf("n=%d: committed file = %d bytes, want byte-exact %d", tc.n, len(got), len(data))
+			t.Fatalf("n=%d: committed file = %d bytes, want byte-exact %d", tc.n, len(got), tc.n)
 		}
 	}
 }
 
-// TestFsWriteChunkTrace40000: full call trace for a 40000B payload —
-// three write_parts then the commit (the offsets themselves are pinned
-// by the fake's off-mismatch refusal plus the byte-exact file compare).
-func TestFsWriteChunkTrace40000(t *testing.T) {
+// TestFsWriteChunkTrace111KB: full call trace for the 111KB bench
+// payload — two write_parts (65472 + 48192) then the commit (the
+// offsets themselves are pinned by the fake's off-mismatch refusal
+// plus the byte-exact file compare).
+func TestFsWriteChunkTrace111KB(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	cf := newChunkedFake(t, e, "d75884")
-	data := makePattern(40000)
+	data := makePattern(113664) // 111KB
 	runFsWrite(t, e, "/drv/mod.aot", data)
-	want := []string{"fs.write_part", "fs.write_part", "fs.write_part", "fs.write_commit"}
+	want := []string{"fs.write_part", "fs.write_part", "fs.write_commit"}
 	if len(cf.calls) != len(want) {
 		t.Fatalf("calls = %v, want %v", cf.calls, want)
 	}
@@ -198,6 +223,101 @@ func TestFsWriteChunkTrace40000(t *testing.T) {
 		if cf.calls[i] != w {
 			t.Fatalf("call %d = %q, want %q (trace %v)", i, cf.calls[i], w, cf.calls)
 		}
+	}
+	// the two chunk boundaries, exactly
+	if got := len(cf.parts) + len(cf.files); got != 1 {
+		t.Fatalf("staged+committed = %d stores, want the one committed file (no .part left)", got)
+	}
+	if got := cf.files["/drv/mod.aot"]; !bytes.Equal(got, data) {
+		t.Fatalf("committed = %d bytes, want the whole 111KB byte-exact", len(got))
+	}
+}
+
+// TestFsWriteVerifiedPathAnySize (B15 §4.5②): a PRESENT sha256 key
+// rides the chunked transport even for a small payload — one
+// fs.write_part + one fs.write_commit whose sha256 argument is the
+// CALLER's digest (the fake verifies it; the commit verdict is the
+// push path's verification).
+func TestFsWriteVerifiedPathAnySize(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	cf := newChunkedFake(t, e, "d75884")
+	data := makePattern(1000) // far below the chunk — the verified path anyway
+	sum := sha256.Sum256(data)
+
+	if got := runFsWriteSha(t, e, "/drv/small.lua", data, hex.EncodeToString(sum[:])); got != 1000 {
+		t.Fatalf("reply size = %d, want 1000", got)
+	}
+	want := []string{"fs.write_part", "fs.write_commit"}
+	if len(cf.calls) != len(want) {
+		t.Fatalf("calls = %v, want %v (verified path: no single fs.write)", cf.calls, want)
+	}
+	for i, w := range want {
+		if cf.calls[i] != w {
+			t.Fatalf("call %d = %q, want %q", i, cf.calls[i], w)
+		}
+	}
+	if got := cf.files["/drv/small.lua"]; !bytes.Equal(got, data) {
+		t.Fatal("committed file not byte-exact (the fake's sha gate would have refused)")
+	}
+}
+
+// TestFsWriteVerifiedPathCorruptStagingRefused: a byte corrupted
+// mid-transfer (the fake flips one in staging) — the commit's sha
+// verdict REFUSES, the board's own api error crosses verbatim, and
+// nothing lands at the logical path (the fw keeps only the .part for a
+// from-off=0 retry; it never shadows the real file).
+func TestFsWriteVerifiedPathCorruptStagingRefused(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	cf := newChunkedFake(t, e, "d75884")
+	cf.corrupt = true
+	data := makePattern(70000) // two chunks — the corruption rides the second
+	sum := sha256.Sum256(data)
+
+	w := dialSock(t, e.sock)
+	rep, _ := w.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "chunky"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ = w.call(2, map[string]any{
+		"type": "fs_write", "board": "d75884", "path": "/drv/mod.aot",
+		"data":   base64.StdEncoding.EncodeToString(data),
+		"sha256": hex.EncodeToString(sum[:]), "holder": "chunky",
+	})
+	er := asMap(rep["error"])
+	if er == nil || asStr(er["class"]) != "api" {
+		t.Fatalf("corrupted staging = %#v, want the board's api refusal", rep)
+	}
+	if msg := asStr(er["msg"]); !strings.Contains(msg, "sha256 mismatch") {
+		t.Fatalf("refusal msg = %q, want the fw's commit verdict spelling", msg)
+	}
+	if _, landed := cf.files["/drv/mod.aot"]; landed {
+		t.Fatal("a mismatched commit landed the file anyway — the verdict must refuse")
+	}
+}
+
+// TestFsWriteMalformedShaZeroContact: a sha256 key that is not 64 hex
+// chars is refused daemon-side with ZERO board contact — the fw would
+// refuse it at commit, after the whole flash write had already crossed;
+// refusing early saves the cycle (the honest-refusal economics).
+func TestFsWriteMalformedShaZeroContact(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	cf := newChunkedFake(t, e, "d75884")
+	w := dialSock(t, e.sock)
+	rep, _ := w.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "chunky"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ = w.call(2, map[string]any{
+		"type": "fs_write", "board": "d75884", "path": "/drv/mod.aot",
+		"data": base64.StdEncoding.EncodeToString([]byte("x")), "sha256": "nothex",
+		"holder": "chunky",
+	})
+	er := asMap(rep["error"])
+	if er == nil || asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "64 hex") {
+		t.Fatalf("malformed sha = %#v, want the zero-contact api refusal", rep)
+	}
+	if len(cf.calls) != 0 {
+		t.Fatalf("board saw %v — a malformed sha must never cross", cf.calls)
 	}
 }
 
@@ -211,12 +331,12 @@ func makePattern(n int) []byte {
 }
 
 // TestFsReadChunkedAssembly: fs_read returns the WHOLE file assembled
-// from fs.read_part windows — a 33280B file lands as 16384+16384+512
-// with one fs_read reply, byte-exact.
+// from fs.read_part windows — a 111KB file lands as 65472+48192 with
+// one fs_read reply, byte-exact.
 func TestFsReadChunkedAssembly(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	cf := newChunkedFake(t, e, "d75884")
-	want := makePattern(33280)
+	want := makePattern(113664)
 	cf.files["/drv/mod.aot"] = want
 
 	c := dialSock(t, e.sock)
@@ -231,7 +351,7 @@ func TestFsReadChunkedAssembly(t *testing.T) {
 		t.Fatalf("decode: %v", derr)
 	}
 	if !bytes.Equal(got, want) {
-		t.Fatalf("fs_read = %d bytes, want the full 33280 byte-exact", len(got))
+		t.Fatalf("fs_read = %d bytes, want the full %d byte-exact", len(got), len(want))
 	}
 	parts := 0
 	for _, c := range cf.calls {
@@ -239,8 +359,8 @@ func TestFsReadChunkedAssembly(t *testing.T) {
 			parts++
 		}
 	}
-	if parts != 3 {
-		t.Fatalf("fs.read_part calls = %d, want 3 (16384+16384+512)", parts)
+	if parts != 2 {
+		t.Fatalf("fs.read_part calls = %d, want 2 (65472+48192)", parts)
 	}
 }
 
@@ -265,7 +385,7 @@ func TestFsReadMissingSurfacesBoardError(t *testing.T) {
 func TestFsWriteChunkShaVerifiedByFake(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	cf := newChunkedFake(t, e, "d75884")
-	data := makePattern(33280)
+	data := makePattern(113664) // 111KB across two chunks
 	runFsWrite(t, e, "/drv/mod.aot", data)
 	if got := cf.files["/drv/mod.aot"]; !bytes.Equal(got, data) {
 		t.Fatal("committed file not byte-exact (fake sha gate would have refused)")
@@ -282,7 +402,7 @@ func TestFsWriteChunkShaVerifiedByFake(t *testing.T) {
 // the fresh fake — no sleeps, no races.
 func TestFsReadRedialDoesNotDuplicate(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
-	want := makePattern(33280)
+	want := makePattern(113664)
 
 	// attempt 2 (the redial target): a FRESH fake serving the whole file.
 	fresh := newFakeCtl()

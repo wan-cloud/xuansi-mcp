@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,13 +43,20 @@ const (
 	defaultAuditTimeout    = 20 * time.Second // per-board startup orphan audit bound
 	defaultTeardownTimeout = 30 * time.Second // board-side lease teardown bound
 	defaultRequestTimeout  = 60 * time.Second // one request's total budget
-	// fsFileMax mirrors the fw per-CHUNK cap (XS_FILE_MAX = 16384B, caps
-	// limits.file_max): one fs.write / fs.write_part / fs.read_part
-	// carries at most this many bytes. fs_write payloads above it ride
-	// the v5 chunked transport (B10-T1): fs.write_part × N + one
-	// sha256-verifying fs.write_commit — transparent to internal-API
-	// clients (the request type and reply shape are unchanged).
-	fsFileMax = 16384
+	// fsFileMax is the daemon's chunk size on the board's chunked fs
+	// transport (B15 §4.5①: the 16KB→64KB wave). The fw's fs-layer cap
+	// XS_FILE_MAX is 65526B, but the WIRE-realizable single-op max —
+	// W1-T3 measured on the v7 build d42a07d — is 65482B for fs.write
+	// and ~65472B for fs.write_part (op framing overhead 43–53B), so
+	// the daemon chunks at the write_part-safe bound 65472: one size
+	// serves both the single-shot fs.write and every fs.write_part
+	// (this is the protocol-page number). One fs.write / fs.write_part
+	// / fs.read_part carries at most this many bytes; fs_write payloads
+	// above it (and every VERIFIED write, sha256 key present — B15
+	// §4.5②) ride fs.write_part × N + one sha256-verifying
+	// fs.write_commit, transparent to internal-API clients (the request
+	// type and reply shape are unchanged).
+	fsFileMax = 65472
 	// outboundQ is the per-connection event/reply buffer. A full queue
 	// drops an incoming EVENT (fire-and-forget, fw §8 style); a REPLY
 	// evicts the oldest queued event — or, in the all-replies wedge of
@@ -298,6 +306,15 @@ type daemonBoard struct {
 	// drops fix: the retry's job is acked on the NEW link, so the
 	// reset must not swallow its window).
 	jobGen uint64
+	// the job_wait ledger (B15 §4.3), all under jobsMu: every tag
+	// submitted through this daemon (pending) plus the completion
+	// events the tap delivered (done), FIFO-bounded so a long-lived
+	// daemon cannot grow it without end. jobWake is the broadcast
+	// channel job_wait parks on — closed and replaced on every
+	// delivery, so all waiters wake at once.
+	jobs    map[string]*jobEntry
+	jobFIFO []string
+	jobWake chan struct{}
 	// bootSeen is the last hello sighting's boot identity (B10-T8b):
 	// a CHANGED boot_epoch on the next sighting means the board
 	// rebooted while we were not connected (panic auto-reboot included
@@ -1114,6 +1131,8 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hOp(ctx, cc, req)
 	case "watch_events":
 		result, err = s.hWatchEvents(ctx, cc, req)
+	case "job_wait":
+		result, err = s.hJobWait(ctx, req)
 	case "capture_start":
 		result, err = s.hCaptureStart(ctx, cc, req)
 	case "capture_stop":
@@ -1615,10 +1634,15 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 		// Important-1: the retry acks on the new link, its frames are
 		// ours to report — never silently dropped).
 		gen := db.jobSubmit()
-		ensure := func() { gen = db.jobEnsure(gen) }
+		db.jobTagSubmit(req.Tag) // the job_wait ledger tracks the tag from its submit (§4.3)
+		ensure := func() {
+			gen = db.jobEnsure(gen)
+			db.jobTagSubmit(req.Tag) // a redial's jobReset dropped it; the retry re-records
+		}
 		res, err := s.boardOpStream(ctx, b, op, args, db, nil, ensure)
 		if err != nil {
 			db.jobRollback() // never queued: close the window
+			db.jobTagRollback(req.Tag)
 			return nil, err
 		}
 		return res, nil // board ack {tag, queued} — byte-unchanged
@@ -1863,16 +1887,23 @@ func (s *Server) hScriptStop(ctx context.Context, cc *clientConn, req *Request) 
 }
 
 // hFsWrite writes a whole file to the board under the lease. At or
-// below the fw's per-op cap (16384B) it is verbatim fs.write — the
-// pre-B10 wire, zero change. Above it the v5 chunked transport carries
-// the file: fs.write_part per 16384B chunk + one fs.write_commit
+// below the chunk cap (65472B) with no sha256 key it is verbatim
+// fs.write — the pre-B10 wire, zero change. Everything else rides the
+// chunked transport: fs.write_part per 65472B chunk + one fs.write_commit
 // carrying the payload's sha256 (the board hashes chunk-by-chunk as it
 // writes and verifies at commit; the rename that lands the file is
-// atomic). A dead link under the stream redials ONCE and restarts at
-// off=0 — the .part reopen truncates and the board-side hash ledger
-// restarts, so a restart is always idempotent (§13 redial ≠ reboot).
-// The reply is the commit's {size} — the same shape fs.write returns,
-// so internal-API clients see no difference (B10-T1).
+// atomic). B15 §4.5②: a PRESENT sha256 key (the push path's
+// verification — the post-push byte read-back is retired) switches the
+// write to the verified path for ANY size: even a small payload rides
+// write_part + commit, and the commit verdict IS the verification. A
+// malformed sha (not 64 hex) is refused with ZERO board contact — the
+// fw would refuse it at commit, after the whole flash write had already
+// crossed; refusing here saves the cycle. A dead link under the stream
+// redials ONCE and restarts at off=0 — the .part reopen truncates and
+// the board-side hash ledger restarts, so a restart is always
+// idempotent (§13 redial ≠ reboot). The reply is the commit's {size} —
+// the same shape fs.write returns, so internal-API clients see no
+// difference (B10-T1).
 func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -1881,11 +1912,18 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
 		return nil, err
 	}
-	if len(req.Data) <= fsFileMax {
+	if req.Sha256 != "" && !sha256HexRe.MatchString(req.Sha256) {
+		return nil, &RPCError{Class: "api",
+			Msg: fmt.Sprintf("fs_write %s: sha256 must be 64 hex chars (got %q) — refused with zero board contact; the fw's fs.write_commit would refuse it only AFTER the flash write crossed", req.Path, req.Sha256)}
+	}
+	if req.Sha256 == "" && len(req.Data) <= fsFileMax {
 		return s.boardOp(ctx, b, "fs.write", map[string]any{"path": req.Path, "data": req.Data})
 	}
-	sum := sha256.Sum256(req.Data)
-	shaHex := hex.EncodeToString(sum[:])
+	shaHex := req.Sha256
+	if shaHex == "" {
+		sum := sha256.Sum256(req.Data)
+		shaHex = hex.EncodeToString(sum[:])
+	}
 	var res map[string]any
 	err := s.withController(ctx, b, func(ctl board.Controller) error {
 		for off := 0; off < len(req.Data); off += fsFileMax {
@@ -1913,6 +1951,11 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 	}
 	return res, nil
 }
+
+// sha256HexRe gates the fs_write verified path's caller-supplied digest
+// (exactly what the fw's own commit gate demands — xs_fs.c: "sha256
+// must be 64 hex chars").
+var sha256HexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // hFsRead reads a whole board file back through the v5 chunked read
 // face: fs.read_part windows of 16384B assembled until eof (a file at
@@ -2202,14 +2245,219 @@ func (db *daemonBoard) jobRollback() {
 // connection's pending jobs board-side; their events never arrive).
 // The generation bump is what a retrying submit's jobEnsure looks for:
 // the retry rides the NEW controller, so its window re-opens while the
-// old link's other windows stay retired.
+// old link's other windows stay retired. B15 §4.3: the job_wait ledger
+// drops its PENDING entries the same way — the daemon can never hear
+// from those jobs again, so a wait on one refuses as unknown-tag
+// honestly (a retrying submit re-records its tag through the ensure
+// closure before its op re-crosses).
 func (db *daemonBoard) jobReset() {
 	db.jobsMu.Lock()
 	db.jobsPending = 0
 	db.jobGen++
+	if db.jobs != nil {
+		kept := make([]string, 0, len(db.jobFIFO))
+		for _, tag := range db.jobFIFO {
+			if e, ok := db.jobs[tag]; ok && !e.done {
+				delete(db.jobs, tag)
+				continue
+			}
+			kept = append(kept, tag)
+		}
+		db.jobFIFO = kept
+	}
+	db.wakeJobsLocked()
 	db.jobsMu.Unlock()
 	db.jobBuf.Reset()
 }
+
+// jobEntry is one tag's job_wait ledger record.
+type jobEntry struct {
+	done bool
+	data map[string]any // the job event's data (tag/ok/out/value | class/msg)
+}
+
+// jobLedgerMax bounds the ledger's DONE entries (FIFO eviction
+// oldest-first). Pending entries are never evicted — only jobReset
+// retires them, and they are bounded by real outstanding submits.
+const jobLedgerMax = 256
+
+// wakeJobsLocked closes the current wake channel (every parked waiter
+// wakes and re-checks its tag) and arms a fresh one. Caller holds jobsMu.
+func (db *daemonBoard) wakeJobsLocked() {
+	if db.jobWake != nil {
+		close(db.jobWake)
+	}
+	db.jobWake = make(chan struct{})
+}
+
+// jobTagSubmit records a tag pending at the submit chokepoint (hEval;
+// the ensure closure re-records it after a redial's jobReset). An
+// existing PENDING entry is a no-op (the re-record); an existing DONE
+// entry resets to pending — a caller REUSING a tag for a new submit
+// invalidates the old answer by their own hand (the wait must not
+// answer job #2 with job #1's result).
+func (db *daemonBoard) jobTagSubmit(tag string) {
+	if tag == "" {
+		return
+	}
+	db.jobsMu.Lock()
+	defer db.jobsMu.Unlock()
+	if db.jobs == nil {
+		db.jobs = map[string]*jobEntry{}
+	}
+	if e, ok := db.jobs[tag]; ok {
+		if !e.done {
+			return // already pending (the ensure re-record)
+		}
+		e.done, e.data = false, nil // tag reuse: a fresh submit retires the old answer
+		return
+	}
+	db.jobs[tag] = &jobEntry{}
+	db.jobFIFO = append(db.jobFIFO, tag)
+}
+
+// jobTagRollback removes a tag whose submit never queued (op error).
+func (db *daemonBoard) jobTagRollback(tag string) {
+	db.jobsMu.Lock()
+	defer db.jobsMu.Unlock()
+	if e, ok := db.jobs[tag]; ok && !e.done {
+		delete(db.jobs, tag)
+		for i, t := range db.jobFIFO {
+			if t == tag {
+				db.jobFIFO = append(db.jobFIFO[:i], db.jobFIFO[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+// jobDeliver records one job completion event off the tap (called AFTER
+// drainJobFrames enriched the data with the job's buffered frames —
+// value/out/class/msg are the keys the wait surfaces). A tag with no
+// pending record (a redial-orphaned submit that actually queued, a job
+// from an earlier daemon generation) is recorded done anyway: the event
+// is the truth, and a wait on it deserves the answer.
+func (db *daemonBoard) jobDeliver(ev *replclient.Event) {
+	tag, _ := ev.Data["tag"].(string)
+	if tag == "" {
+		return // a tagless job event is off-contract; nothing to key on
+	}
+	db.jobsMu.Lock()
+	defer db.jobsMu.Unlock()
+	if db.jobs == nil {
+		db.jobs = map[string]*jobEntry{}
+	}
+	e, ok := db.jobs[tag]
+	if !ok {
+		e = &jobEntry{}
+		db.jobs[tag] = e
+		db.jobFIFO = append(db.jobFIFO, tag)
+	}
+	e.done, e.data = true, ev.Data
+	// FIFO-bound the done entries (oldest-first; a pending head blocks
+	// eviction — pending is bounded by real outstanding submits)
+	for len(db.jobFIFO) > jobLedgerMax {
+		head := db.jobFIFO[0]
+		if he, hk := db.jobs[head]; !hk || !he.done {
+			break
+		}
+		delete(db.jobs, head)
+		db.jobFIFO = db.jobFIFO[1:]
+	}
+	db.wakeJobsLocked()
+}
+
+// jobWait parks on the ledger for one tag's completion: known-and-done
+// answers immediately (the agent that waited after the fact); pending
+// parks on the wake channel until the tap delivers, the timeout burns,
+// or the request ctx dies; unknown tag is an api refusal (jobs are
+// tracked from their submit through THIS daemon — the board
+// direct-delivers job events to the submitting connection, so a foreign
+// connection's jobs are invisible, honestly). The timeout answers
+// (nil, false, nil) — a RESULT, never an error.
+func (db *daemonBoard) jobWait(ctx context.Context, tag string, timeout time.Duration) (map[string]any, bool, error) {
+	unknown := &RPCError{Class: "api",
+		Msg: fmt.Sprintf("job_wait: no job tagged %q is known to this daemon — jobs are tracked from their submit through this daemon (a job submitted on another connection delivers its event there, not here)", tag)}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	db.jobsMu.Lock()
+	e, known := db.jobs[tag]
+	wake := db.jobWake
+	db.jobsMu.Unlock()
+	if !known {
+		return nil, false, unknown
+	}
+	if e.done {
+		return e.data, true, nil
+	}
+	for {
+		select {
+		case <-wake:
+		case <-timer.C:
+			return nil, false, nil
+		case <-ctx.Done():
+			return nil, false, nil // the request ctx died; the reply goes nowhere anyway
+		}
+		db.jobsMu.Lock()
+		e, known = db.jobs[tag]
+		wake = db.jobWake
+		db.jobsMu.Unlock()
+		if !known { // jobReset orphaned it mid-wait
+			return nil, false, unknown
+		}
+		if e.done {
+			return e.data, true, nil
+		}
+	}
+}
+
+// jobCleanupHint is the coaching every dead-job answer carries (B15
+// §5): the cleanup ritual in kill order — loaded instances stay
+// loaded, claimed pins stay claimed, and session_reset releases CLAIMS
+// but never instances.
+const jobCleanupHint = "job died mid-run — clean up before retrying: " +
+	"(1) wasm instances it loaded STAY loaded (memory stays admitted): unload each with eval bench.wasm.unload(name); " +
+	"(2) pins it claimed stay claimed (ns-0 pins survive the job): release them with xuansi_session_reset; " +
+	"(3) xuansi_session_reset releases CLAIMS (pins/scripts/streams) but does NOT unload wasm instances — unload and reset are separate steps"
+
+// hJobWait serves job_wait (B15 §4.3): park on the daemon's own event
+// tap for the job's completion event. Read-only, lease-free, and it
+// never dials the board — the ledger only ever holds jobs this daemon
+// submitted, so there is always a tapped controller behind a waitable
+// tag. timeout_ms is re-gated here (1..55000, under the 60s request
+// ceiling) because the internal API is public beyond the MCP face.
+func (s *Server) hJobWait(ctx context.Context, req *Request) (any, error) {
+	b, rerr := s.resolve(req.Board)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if req.TimeoutMS < 1 || req.TimeoutMS > 55000 {
+		return nil, &RPCError{Class: "api",
+			Msg: fmt.Sprintf("job_wait: timeout_ms %d out of domain 1..55000 (the wait must answer inside the daemon's 60s per-request ceiling)", req.TimeoutMS)}
+	}
+	start := time.Now()
+	db := s.supervisor(b)
+	data, done, err := db.jobWait(ctx, req.Tag, time.Duration(req.TimeoutMS)*time.Millisecond)
+	elapsed := time.Since(start).Milliseconds()
+	if err != nil {
+		return nil, err
+	}
+	if !done {
+		return map[string]any{"done": false, "elapsed_ms": elapsed}, nil
+	}
+	out := map[string]any{"done": true, "elapsed_ms": elapsed}
+	if ok, _ := data["ok"].(bool); ok {
+		if v, present := data["value"]; present && v != nil {
+			out["value"] = v
+		}
+	} else {
+		class, _ := data["class"].(string)
+		msg, _ := data["msg"].(string)
+		out["error"] = map[string]any{"class": class, "msg": msg, "hint": jobCleanupHint}
+	}
+	return out, nil
+}
+
 
 // drainJobFrames ends one pending window at a job event: the buffered
 // frames ride the event's data (frames/frames_dropped, the same shape
@@ -2314,6 +2562,7 @@ func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 	ctl.OnEvent("", func(ev replclient.Event) {
 		if ev.Source == "job" {
 			db.drainJobFrames(&ev) // the pending window's frames ride the event (§5.6)
+			db.jobDeliver(&ev)     // the job_wait ledger records the completion (§4.3)
 		}
 		s.broadcast(mac6, ev)
 	})
