@@ -49,6 +49,7 @@ type fakeCtl struct {
 	sink     replclient.StreamSink // the connection's current 0x02 sink (frames-face scripting drives it synchronously)
 	dieOnOp  string                // the half-open death script (dieOn): this op's next call fails ErrDead
 	onDie    func()                // …after running this hook
+	gen      int                   // test bookkeeping: which dial-generation this fake belongs to (supervisor rebuild tests)
 }
 
 type mockCall struct {
@@ -3365,6 +3366,135 @@ func TestSupervisorRefCarriesIP(t *testing.T) {
 	}
 	if addr := gotRef.TCPAddr(); addr != "10.1.51.205:7777" {
 		t.Errorf("BoardRef.TCPAddr() = %q, want 10.1.51.205:7777 (IP first)", addr)
+	}
+}
+
+// TestSupervisorRebuildsOnEndpointDrift: Bug 1 (B15 §4.10) — the
+// per-board supervisor pins its dial seams (DialTCP's endpoint,
+// DialUSB's path) at construction from a BoardRef snapshot. When the
+// registry's CURRENT snapshot drifts (the board's IP changed on
+// re-association, or a USB-only first appearance later gains its mDNS
+// endpoint), the next supervisor() acquisition must rebuild the seams
+// against the fresh ref — same daemonBoard (state: frames hub, boot
+// baseline, last_seen preserved), the stale controller corpse CLOSED,
+// and callers unchanged. No drift, no rebuild: the warm controller
+// rides on untouched.
+func TestSupervisorRebuildsOnEndpointDrift(t *testing.T) {
+	var mu sync.Mutex
+	view := discover.Board{ // the registry's canned answer, mutated below
+		MAC6: "d75884", Sources: []string{discover.SourceUSB, discover.SourceMDNS},
+		USBPath: "/dev/serial/by-id/fake-d75884", Host: "xuansi-d75884.local", Port: 7777,
+	}
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return []discover.Board{view}, nil
+		}),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return []discover.Board{view}, nil
+		}),
+	)
+	var refs []board.BoardRef
+	gen := 0
+	sock := filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srv, err := New(Opts{
+		SockPath:        sock,
+		Registry:        reg,
+		GraceTTL:        10 * time.Second,
+		RefreshInterval: -1,
+		Log:             newTestLogf(t, "srv: "),
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			mu.Lock()
+			defer mu.Unlock()
+			refs = append(refs, ref)
+			gen++
+			g := gen
+			return board.NewSupervisor(ref, board.SupOpts{
+				DialTCP: func() (board.Controller, error) {
+					f := newFakeCtl()
+					f.gen = g
+					return f, nil
+				},
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	if err := reg.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// v1: IP 10.1.51.205 — the supervisor builds once and warms its
+	// controller (generation-1 fake goes live).
+	b1, rerr := reg.Resolve("d75884")
+	if rerr != nil {
+		t.Fatalf("Resolve: %v", rerr)
+	}
+	b1.IP = "10.1.51.205"
+	db1 := srv.supervisor(b1)
+	if len(refs) != 1 || refs[0].IP != "10.1.51.205" {
+		t.Fatalf("refs = %#v, want one ref carrying IP .205", refs)
+	}
+	db1.connectMu.Lock()
+	ctl1, cerr := db1.sup.Connect(context.Background())
+	db1.connectMu.Unlock()
+	if cerr != nil {
+		t.Fatalf("Connect v1: %v", cerr)
+	}
+	gen1Fake, ok := ctl1.(*fakeCtl)
+	if !ok || gen1Fake.gen != 1 {
+		t.Fatalf("warm controller = %#v, want the generation-1 fake", ctl1)
+	}
+
+	// drift: the board re-associated — IP .206 now. The next acquisition
+	// rebuilds the dial seams on the SAME daemonBoard and closes the
+	// generation-1 corpse.
+	mu.Lock()
+	view.IP = "10.1.51.206"
+	mu.Unlock()
+	if err := reg.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh (drift): %v", err)
+	}
+	b2, rerr := reg.Resolve("d75884")
+	if rerr != nil {
+		t.Fatalf("Resolve (drift): %v", rerr)
+	}
+	db2 := srv.supervisor(b2)
+	if db2 != db1 {
+		t.Fatal("drift rebuild swapped the daemonBoard — per-board server state (frames hub, boot baseline, last_seen) must survive")
+	}
+	if len(refs) != 2 || refs[1].IP != "10.1.51.206" {
+		t.Fatalf("refs = %#v, want the rebuild against IP .206", refs)
+	}
+	if !gen1Fake.Dead() {
+		t.Fatal("the stale generation-1 controller was left open — the rebuild must close the corpse")
+	}
+	if c := db2.sup.Client(); c != nil {
+		t.Fatalf("post-rebuild controller = %#v, want nil (fresh seams, cold)", c)
+	}
+
+	// no further drift: another acquisition reuses the rebuilt seams.
+	db3 := srv.supervisor(b2)
+	if len(refs) != 2 {
+		t.Fatalf("refs = %#v, want no rebuild without drift", refs)
+	}
+	if db3 != db2 {
+		t.Fatal("no-drift acquisition must return the same daemonBoard")
+	}
+	// the rebuilt seam actually dials the new generation.
+	db3.connectMu.Lock()
+	ctl2, cerr := db3.sup.Connect(context.Background())
+	db3.connectMu.Unlock()
+	if cerr != nil {
+		t.Fatalf("Connect v2: %v", cerr)
+	}
+	if f, ok := ctl2.(*fakeCtl); !ok || f.gen != 2 {
+		t.Fatalf("post-drift controller = %#v, want the generation-2 fake", ctl2)
 	}
 }
 

@@ -194,6 +194,13 @@ type Server struct {
 // ScriptList, the lease teardown) passes through connectMu.
 type daemonBoard struct {
 	sup *board.Supervisor
+	// ref is the BoardRef snapshot sup's dial seams were pinned against.
+	// supervisor() compares it with the CURRENT registry snapshot on
+	// every acquisition: any endpoint drift (Host/IP/Port/USBPath)
+	// rebuilds the seams — Bug 1 (B15 §4.10), a USB-only first
+	// appearance used to keep a permanent "no TCP endpoint to dial"
+	// seam until daemon restart.
+	ref board.BoardRef
 
 	connectMu sync.Mutex
 	// tapped is the controller the event tap is installed on (interface
@@ -1773,21 +1780,54 @@ func (s *Server) lookupExact(mac6 string) (discover.Board, bool) {
 }
 
 // supervisor returns (creating on demand) the board's supervisor
-// wrapper.
+// wrapper. Bug 1 fix (B15 §4.10): each acquisition compares the
+// CURRENT registry snapshot's endpoint fields against the ref the
+// supervisor's dial seams were pinned to — any drift (Host/IP/Port/
+// USBPath) transparently rebuilds the seams and closes the stale
+// controller corpse. Callers are unchanged; the daemonBoard (frames
+// hub, boot baseline, last_seen) survives the rebuild, and a warm
+// connection on an UNCHANGED ref is reused as before. The swap runs
+// under connectMu so an in-flight Connect on the old seams finishes
+// first and the corpse Close is exact (no orphaned live link).
 func (s *Server) supervisor(b discover.Board) *daemonBoard {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if db, ok := s.sups[b.MAC6]; ok {
-		return db
-	}
-	db := &daemonBoard{}
-	db.sup = s.opts.NewSupervisor(board.BoardRef{
+	ref := board.BoardRef{
 		MAC6:    b.MAC6,
 		Host:    b.Host,
 		IP:      b.IP, // browse-resolved address — TCPAddr dials it first (CGO=0 cannot resolve .local)
 		Port:    b.Port,
 		USBPath: b.USBPath,
-	})
+	}
+	s.mu.Lock()
+	if db, ok := s.sups[b.MAC6]; ok {
+		if db.ref == ref {
+			s.mu.Unlock()
+			return db
+		}
+		s.mu.Unlock()
+		// Endpoint drift: rebuild under connectMu (serializes with the
+		// in-flight connects every other board path holds it for), then
+		// re-verify under s.mu — a racing rebuild may have landed while
+		// this goroutine waited. connectMu→s.mu matches the existing
+		// warmController→tap ordering, so no lock-cycle opens here.
+		db.connectMu.Lock()
+		var old *board.Supervisor
+		s.mu.Lock()
+		if db.ref != ref {
+			old = db.sup
+			db.ref = ref
+			db.sup = s.opts.NewSupervisor(ref)
+			s.logf("server: board %s endpoint drift (host=%q ip=%q port=%d usb=%q) — supervisor dial seams rebuilt, stale link closed",
+				b.MAC6, ref.Host, ref.IP, ref.Port, ref.USBPath)
+		}
+		s.mu.Unlock()
+		db.connectMu.Unlock()
+		if old != nil {
+			old.Close() // drop the corpse: TCP close releases the board's controller slot (§12)
+		}
+		return db
+	}
+	db := &daemonBoard{ref: ref}
+	db.sup = s.opts.NewSupervisor(ref)
 	// The frames face (B12-P2 T5): the hub's own sink is what gets
 	// asserted on a controller (boardOpStream); the pending-job buffer
 	// is its one long-lived consumer, gated by jobsPending — chunks
@@ -1799,6 +1839,7 @@ func (s *Server) supervisor(b discover.Board) *daemonBoard {
 	db.jobBuf = board.NewFrameCollector()
 	db.frames.Add(db.jobSink)
 	s.sups[b.MAC6] = db
+	s.mu.Unlock()
 	return db
 }
 
