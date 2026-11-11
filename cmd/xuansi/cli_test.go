@@ -90,7 +90,7 @@ func startMockDaemonUSB(t *testing.T) (string, *cmdFake) {
 		MAC6: "d75884", Sources: []string{discover.SourceUSB, discover.SourceMDNS},
 		Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777,
 	}}
-	reg := discover.NewRegistry(map[string]string{"d75884": "bench"},
+	reg := discover.NewRegistry(map[string]string{"d75884": "bench"}, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
 		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
 	)

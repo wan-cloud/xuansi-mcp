@@ -133,11 +133,11 @@ func runDiscover(credsPath string) int {
 		return h.finish("discover")
 	}
 	fmt.Printf("  boards.conf fixture: %s\n", conf)
-	aliases, err := discover.LoadBoardsFile(conf)
+	aliases, _, err := discover.LoadBoardsFile(conf)
 	h.check(err == nil && len(aliases) == 1 && aliases["d75884"] == "bench",
 		fmt.Sprintf("LoadBoardsFile: aliases=%v (malformed line skipped+warned above, err=%v)", aliases, err))
 
-	reg := discover.NewRegistry(aliases)
+	reg := discover.NewRegistry(aliases, nil)
 	t0 := time.Now()
 	err = reg.Refresh(ctx)
 	h.check(err == nil && reg.MDNSError() == "", fmt.Sprintf("Refresh dual-source (err=%v, mdnsErr=%q)", err, reg.MDNSError()))

@@ -381,11 +381,11 @@ func New(o Opts) (*Server, error) {
 		if path == "" {
 			path = defaultBoardsFile()
 		}
-		aliases, err := discover.LoadBoardsFile(path)
+		aliases, pins, err := discover.LoadBoardsFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("server: boards file: %w", err)
 		}
-		reg = discover.NewRegistry(aliases)
+		reg = discover.NewRegistry(aliases, pins)
 	}
 
 	if o.SockPath == "" {

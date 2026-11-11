@@ -46,7 +46,7 @@ func (f *fakeSources) mdnsFn(ctx context.Context) ([]Board, error) {
 
 func newFakeRegistry(aliases map[string]string) (*Registry, *fakeSources) {
 	f := &fakeSources{}
-	r := NewRegistry(aliases)
+	r := NewRegistry(aliases, nil)
 	r.usb, r.mdns = f.usbFn, f.mdnsFn
 	return r, f
 }
@@ -608,7 +608,7 @@ func TestLoadBoardsFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := LoadBoardsFile(path)
+	got, _, err := LoadBoardsFile(path)
 	if err != nil {
 		t.Fatalf("LoadBoardsFile: %v", err)
 	}
@@ -618,7 +618,7 @@ func TestLoadBoardsFile(t *testing.T) {
 	}
 
 	// missing file = no aliases (zero-config), not an error
-	got, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
+	got, _, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
 	if err != nil || len(got) != 0 {
 		t.Errorf("missing file: got (%#v, %v), want (empty, nil)", got, err)
 	}
@@ -648,5 +648,237 @@ func TestSnapshotIsolation(t *testing.T) {
 
 	if got := fmt.Sprint(s2[0].Sources); got != "[usb mdns]" {
 		t.Errorf("sources = %s, want [usb mdns] (Snapshot leaks the Sources array)", got)
+	}
+}
+
+// ------------------------------------------------------------------ pin (⑨) --
+
+// TestPinInjectsLiveEntry: Pin materializes the registry entry
+// IMMEDIATELY — no discovery sweep needed (the dogfood shape: a
+// cross-subnet board mDNS cannot see gets pinned, then leased straight
+// away). The entry carries exactly the pin source and endpoint, and the
+// alias fills when boards.conf knows the mac6.
+func TestPinInjectsLiveEntry(t *testing.T) {
+	r, _ := newFakeRegistry(map[string]string{"d75884": "bench"})
+	if err := r.Pin("d75884", "10.1.11.204", 7777); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	got := r.Snapshot()
+	if len(got) != 1 {
+		t.Fatalf("Snapshot = %#v, want the pinned entry immediately", got)
+	}
+	b := got[0]
+	if b.MAC6 != "d75884" || b.Alias != "bench" {
+		t.Errorf("entry = %#v, want mac6 d75884 alias bench", b)
+	}
+	if !reflect.DeepEqual(b.Sources, []string{SourcePin}) {
+		t.Errorf("sources = %v, want [pin]", b.Sources)
+	}
+	if b.IP != "10.1.11.204" || b.Port != 7777 {
+		t.Errorf("endpoint = %s:%d, want 10.1.11.204:7777", b.IP, b.Port)
+	}
+}
+
+// TestPinSurvivesEmptySweeps: the pin is a LIVE source by declaration —
+// a pinned board stays dialable across refreshes even when neither
+// discovery face has ever seen it (the cross-subnet bench: mDNS
+// unreachable from this host, USB unplugged).
+func TestPinSurvivesEmptySweeps(t *testing.T) {
+	r, f := newFakeRegistry(nil)
+	f.set(nil, nil)
+	if err := r.Pin("d75884", "10.1.11.204", 7777); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := r.Refresh(context.Background()); err != nil {
+			t.Fatalf("Refresh %d: %v", i, err)
+		}
+	}
+	b, err := r.Resolve("d75884")
+	if err != nil {
+		t.Fatalf("Resolve after refreshes: %v", err)
+	}
+	if !reflect.DeepEqual(b.Sources, []string{SourcePin}) || b.IP != "10.1.11.204" || b.Port != 7777 {
+		t.Errorf("pinned entry after empty sweeps = %#v, want [pin] at 10.1.11.204:7777", b)
+	}
+}
+
+// TestPinEndpointWinsOverDiscovery: the pinned endpoint is the user's
+// explicit intent for a board discovery gets wrong — it overrides the
+// mdns face's address/port in the merged entry while every other face
+// (TXT, USB path) still merges. Canonical source order stays
+// usb < pin < mdns.
+func TestPinEndpointWinsOverDiscovery(t *testing.T) {
+	r, f := newFakeRegistry(nil)
+	if err := r.Pin("d75884", "10.1.11.204", 7777); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	drifted := mdnsA
+	drifted.IP = "10.1.51.205"
+	f.set([]Board{usbA}, []Board{drifted})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	b, err := r.Resolve("d75884")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if b.IP != "10.1.11.204" || b.Port != 7777 {
+		t.Errorf("endpoint = %s:%d, want the PINNED 10.1.11.204:7777 (pin beats discovery)", b.IP, b.Port)
+	}
+	if !reflect.DeepEqual(b.Sources, []string{SourceUSB, SourcePin, SourceMDNS}) {
+		t.Errorf("sources = %v, want [usb pin mdns] (canonical order)", b.Sources)
+	}
+	if b.USBPath != usbA.USBPath || b.Host != "xuansi-d75884.local" {
+		t.Errorf("other faces lost in the merge: %#v", b)
+	}
+}
+
+// TestDialBoardPriorityUSBoverPinOverMDNS: the dial order is
+// usb > pin > mdns (B15 §4.9) — USB when its face is live, else the TCP
+// endpoint with the pin's address winning the slot over mdns's.
+func TestDialBoardPriorityUSBoverPinOverMDNS(t *testing.T) {
+	// all three live: USB wins
+	spy := stubDials(t)
+	b := Board{MAC6: "d75884", Sources: []string{"usb", "pin", "mdns"},
+		USBPath: usbA.USBPath, Host: "xuansi-d75884.local", IP: "10.1.11.204", Port: 7777}
+	if _, err := DialBoard(b, replclient.DialOpts{}); err == nil {
+		t.Fatal("spy dial returns an error; DialBoard must surface it")
+	}
+	if len(spy.usb) != 1 || len(spy.tcp) != 0 {
+		t.Errorf("dialed usb=%v tcp=%v, want exactly one USB dial (usb > pin > mdns)", spy.usb, spy.tcp)
+	}
+
+	// pin + mdns (the cross-subnet shape): the pinned address is dialed
+	spy = stubDials(t)
+	b = Board{MAC6: "d75884", Sources: []string{"pin", "mdns"},
+		Host: "xuansi-d75884.local", IP: "10.1.11.204", Port: 7777}
+	if _, err := DialBoard(b, replclient.DialOpts{}); err == nil {
+		t.Fatal("spy dial returns an error; DialBoard must surface it")
+	}
+	if len(spy.tcp) != 1 || spy.tcp[0] != "10.1.11.204:7777" {
+		t.Errorf("TCP dialed %v, want [10.1.11.204:7777] over the pin source", spy.tcp)
+	}
+}
+
+// TestUnpinDowngradesEntry: unpin removes exactly the pin source — a
+// board another face still sees keeps that face, a pin-only board
+// degrades to last-known (empty Sources — stale, not deleted; entries
+// never hard-delete). Unpinning a never-pinned mac6 reports false.
+func TestUnpinDowngradesEntry(t *testing.T) {
+	r, f := newFakeRegistry(nil)
+	if err := r.Pin("d75884", "10.1.11.204", 7777); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	if err := r.Pin("1a2b3c", "10.1.11.9", 7777); err != nil {
+		t.Fatalf("Pin 2: %v", err)
+	}
+	f.set(nil, []Board{mdnsA}) // d75884 mdns face returns; 1a2b3c stays pin-only
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !r.Unpin("d75884") {
+		t.Fatal("Unpin(d75884) = false, want true (it was pinned)")
+	}
+	if !r.Unpin("1a2b3c") {
+		t.Fatal("Unpin(1a2b3c) = false, want true (it was pinned)")
+	}
+	b, _ := r.Resolve("d75884")
+	if !reflect.DeepEqual(b.Sources, []string{SourceMDNS}) {
+		t.Errorf("dual-source board after unpin = %v, want [mdns] only", b.Sources)
+	}
+	b2, _ := r.Resolve("1a2b3c")
+	if len(b2.Sources) != 0 {
+		t.Errorf("pin-only board after unpin = %v, want empty (stale last-known)", b2.Sources)
+	}
+	if r.Unpin("1a2b3c") {
+		t.Error("Unpin of a never-pinned board = true, want false")
+	}
+}
+
+// TestPinValidation: Pin refuses a non-mac6 id, an empty host, and a
+// port outside 1..65535 — the daemon surfaces these as server-class
+// errors, so the registry must be the validator.
+func TestPinValidation(t *testing.T) {
+	r, _ := newFakeRegistry(nil)
+	for _, tc := range []struct {
+		mac6, host string
+		port       int
+		wantIn     string
+	}{
+		{"d7588", "10.1.11.204", 7777, "mac6"},
+		{"d7588z", "10.1.11.204", 7777, "mac6"},
+		{"d75884", "", 7777, "host"},
+		{"d75884", "10.1.11.204", 0, "port"},
+		{"d75884", "10.1.11.204", 65536, "port"},
+	} {
+		err := r.Pin(tc.mac6, tc.host, tc.port)
+		if err == nil || !strings.Contains(err.Error(), tc.wantIn) {
+			t.Errorf("Pin(%q,%q,%d) = %v, want an error naming %q", tc.mac6, tc.host, tc.port, err, tc.wantIn)
+		}
+	}
+	if len(r.Snapshot()) != 0 {
+		t.Errorf("a refused pin must not materialize an entry: %#v", r.Snapshot())
+	}
+}
+
+// TestNewRegistrySeedsPins: pins passed at construction (the
+// boards.conf `name=mac6@ip:port` seed) behave exactly like runtime
+// pins — the first sweep materializes their entries even with empty
+// discovery.
+func TestNewRegistrySeedsPins(t *testing.T) {
+	f := &fakeSources{}
+	r := NewRegistry(nil, map[string]Pin{"d75884": {Host: "10.1.11.204", Port: 7777}})
+	r.usb, r.mdns = f.usbFn, f.mdnsFn
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	b, err := r.Resolve("d75884")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !reflect.DeepEqual(b.Sources, []string{SourcePin}) || b.IP != "10.1.11.204" || b.Port != 7777 {
+		t.Errorf("seeded pin entry = %#v, want [pin] at 10.1.11.204:7777", b)
+	}
+}
+
+// TestLoadBoardsFileEndpoint: the `name=mac6@ip:port` line (B15 §4.9's
+// daemon static seed) parses into alias + pin; plain `name=mac6` lines
+// keep working (backward compat); malformed endpoints are skipped with
+// a warning like every other malformed line.
+func TestLoadBoardsFileEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "boards.conf")
+	content := "" +
+		"bench=d75884@10.1.11.204:7777\n" + // pin seed: alias + endpoint
+		"cam=1a2b3c\n" + // plain alias line: unchanged
+		"v6=abcdef@[fe80::1]:7777\n" + // bracketed v6 endpoint
+		"bad=d7588f@10.1.11.204\n" + // no port: skipped
+		"bad2=d7588e@10.1.11.204:0\n" + // port 0: skipped
+		"bad3=d7588d@10.1.11.204:99999\n" + // port out of range: skipped
+		"bad4=d7588c@\n" // empty endpoint: skipped
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliases, pins, err := LoadBoardsFile(path)
+	if err != nil {
+		t.Fatalf("LoadBoardsFile: %v", err)
+	}
+	wantAliases := map[string]string{"d75884": "bench", "1a2b3c": "cam", "abcdef": "v6", "d7588f": "bad", "d7588e": "bad2", "d7588d": "bad3", "d7588c": "bad4"}
+	if !reflect.DeepEqual(aliases, wantAliases) {
+		t.Errorf("aliases = %#v, want %#v (a bad ENDPOINT still names the board)", aliases, wantAliases)
+	}
+	wantPins := map[string]Pin{
+		"d75884": {Host: "10.1.11.204", Port: 7777},
+		"abcdef": {Host: "fe80::1", Port: 7777},
+	}
+	if !reflect.DeepEqual(pins, wantPins) {
+		t.Errorf("pins = %#v, want %#v", pins, wantPins)
+	}
+
+	// missing file = zero-config, not an error
+	aliases, pins, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
+	if err != nil || len(aliases) != 0 || len(pins) != 0 {
+		t.Errorf("missing file: got (%#v, %#v, %v), want (empty, empty, nil)", aliases, pins, err)
 	}
 }
