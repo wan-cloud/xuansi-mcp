@@ -35,6 +35,7 @@ var commands = []command{
 	{"serve", "run the daemon: discovery, leasing, unix-socket API", runServe},
 	{"list", "list boards known to the daemon (USB + mDNS, mac6-joined)", runList},
 	{"status", "show one board's live status", runStatus},
+	{"boards", "boards pin/unpin MAC6 — declare a board's TCP endpoint (registry pin source, ⑨)", runBoards},
 	{"lease", "take the exclusive lease on one board", runLease},
 	{"release", "release a board lease", runRelease},
 	{"eval", "evaluate one expression on a board and print the result", runEval},

@@ -191,6 +191,19 @@ type boardOpIn struct {
 	Holder string         `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
+// boardsPinIn / boardsUnpinIn are the ⑨ pin face (B15 §4.9): mac6 is
+// an EXACT board id, never a selector — the pin targets the registry
+// entry by identity.
+type boardsPinIn struct {
+	Mac6 string `json:"mac6" jsonschema:"exact board id — 6 lowercase hex chars (e.g. \"d75884\"), NOT a selector: the pin targets the registry entry by identity, and the entry materializes even when no discovery face has ever seen the board"`
+	IP   string `json:"ip" jsonschema:"the pinned TCP address — an IPv4/IPv6 literal or a resolvable hostname (the endpoint the daemon dials for this board)"`
+	Port int    `json:"port" jsonschema:"the pinned TCP port (the board's REPL listener, 7777)"`
+}
+
+type boardsUnpinIn struct {
+	Mac6 string `json:"mac6" jsonschema:"exact board id whose pin declaration to remove (6 lowercase hex chars)"`
+}
+
 // ---------------------------------------------------------------------------
 // output structs
 
@@ -235,7 +248,7 @@ type leaseView struct {
 }
 
 type boardStatusOut struct {
-	Board        map[string]any `json:"board" jsonschema:"the board's identity view (same shape as xuansi_list_boards entries: fw, boot identity boot_epoch/reset_reason/last_seen, ...)"`
+	Board        map[string]any `json:"board" jsonschema:"the board's identity view (same shape as xuansi_list_boards entries: fw, boot identity boot_epoch/reset_reason/last_seen, chip, and the freshness face transport/last_seen_age_ms/stale)"`
 	Connected    bool           `json:"connected" jsonschema:"whether the daemon holds a live warm controller connection to the board — a daemon-side link fact, NOT board liveness: false only means no contact yet or the last link died; judge board survival from boot_epoch/reset_reason/last_seen and board.reboot events"`
 	Lease        *leaseView     `json:"lease,omitempty" jsonschema:"the current lease; absent when the board is free"`
 	Scripts      []any          `json:"scripts,omitempty" jsonschema:"running scripts (present when connected); shapes are the board's script list"`
@@ -259,6 +272,17 @@ type leaseResultOut struct {
 type releaseOut struct {
 	Board  string `json:"board" jsonschema:"resolved mac6 of the released board"`
 	Holder string `json:"holder"`
+}
+
+// boardsPinOut / boardsUnpinOut are the ⑨ reply shapes (spec §5:
+// {pinned:mac6, endpoint:"ip:port"} / {unpinned:mac6}).
+type boardsPinOut struct {
+	Pinned   string `json:"pinned" jsonschema:"the pinned board's mac6, echoed"`
+	Endpoint string `json:"endpoint" jsonschema:"the pinned endpoint as ip:port (a v6 address renders bracketed)"`
+}
+
+type boardsUnpinOut struct {
+	Unpinned string `json:"unpinned" jsonschema:"the unpinned board's mac6, echoed (idempotent-shaped: a never-pinned mac6 echoes the same)"`
 }
 
 // frameOut is one collected stream frame in an eval reply / job event
@@ -304,8 +328,9 @@ type opResultOut = map[string]any
 // same names). B8 appends fs_rm + driver_pull after capture, then
 // session_reset after those; B10 task 5 appended driver_fetch; B11
 // task 2 appended toolchain_status, task 3 toolchain_fetch, task 5
-// wasm_build; B12-P2 T6 removed the stills tool (24 now): the
-// surviving tools keep their positions (nothing renumbers).
+// wasm_build; B12-P2 T6 removed the stills tool (24 then); B15 W1.T2
+// appended the ⑨ pin pair (26 now): the surviving tools keep their
+// positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -331,6 +356,8 @@ var staticToolNames = []string{
 	"xuansi_toolchain_status",
 	"xuansi_toolchain_fetch",
 	"xuansi_wasm_build",
+	"xuansi_boards_pin",
+	"xuansi_boards_unpin",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -403,7 +430,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_events_recent",
-		Description: "Read one board's most recent events from this process's local rings — cache-first, NEVER dials the board and never calls the daemon (frozen read semantics): an unreachable board still answers from the rings. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. " + boardRebootDesc + ". For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
+		Description: "Read one board's most recent events from this process's local rings — cache-first, NEVER dials the board and never calls the daemon (frozen read semantics): an unreachable board still answers from the rings. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. " + boardRebootDesc + " " + boardTransportDesc + ". For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
 	}, ts.eventsRecent)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -466,6 +493,16 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 			"AOT LANE (P3-T12, two knobs): aot=true is the DEFAULT lane — the freshly-built .wasm compiles one step further with the toolchain cache's toolchain-v3 SURGERY wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3; the cache must hold toolchain-v3 — a v2-or-empty cache refuses naming xuansi_toolchain_fetch) and lands as drivers/<name>@<version>.aot, manifest kind \"wasm\" — the cache-paired build; its .aot carries the split literal pool and fw 0.3.0+ places it in PSRAM exec. wamrc_path is the §6.4 DEVELOPER OVERRIDE of the lane's wamrc: same recipe and .aot landing, but bypassing the cache pairing evidence — a stock (toolchain-v2) wamrc there produces a v2 .aot that fw 0.4.0+ refuses to load (the internal-SRAM exec lane is retired; such an .aot loads only on fw 0.3.x boards) — and EITHER override (wamrc_path or wasi_sdk_path) marks the manifest entry kind \"wasm-dev\": visibly a dev artifact, not an index-paired build. wasi_sdk_path alone compiles with a local wasi-sdk tree (its bin/clang, never a PATH lookup). " +
 			"Storing is NOT activating — the manifest's Active only moves on a verified push. The compilers' stdout/stderr ride the reply's warnings verbatim (clang's, plus wamrc's on the aot lane); a failed compile refuses carrying the stderr tail and nothing lands. When this host cannot provision the toolchain through the face at all, the module can still be built by hand — see the xuansi-drivers README's \"User-compiled modules (agent path)\" section (the refusals point there too).",
 	}, ts.wasmBuild)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_boards_pin",
+		Description: "Pin a board's TCP endpoint into the daemon's registry — the pin source (⑨): for boards this host's mDNS cannot see (cross-subnet VLANs, multicast-blocked APs), the pin IS the dialable route. Dial priority is usb > pin > mdns; a pinned entry is live by declaration (never stale while pinned) and survives discovery refreshes, and the pinned endpoint OVERRIDES the mdns-discovered address while pinned. The pin takes effect IMMEDIATELY: list_boards shows source \"pin\" right away, a still-undiscovered board appears as a pin-only entry, and the next lease/op dials the pinned endpoint — no board contact here. Runtime pins are in-memory daemon state (gone on daemon restart); the durable form is boards.conf's `name=mac6@ip:port` line, read at daemon start. No lease needed. Reply: {pinned, endpoint}.",
+	}, ts.boardsPin)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "xuansi_boards_unpin",
+		Description: "Remove a board's pinned endpoint — the registry pin source's removal half (⑨). Idempotent-shaped: unpinning a board that was never pinned still answers {unpinned}. The board keeps every other live source (usb/mdns); a pin-only board degrades to stale last-known (entries are never hard-deleted — re-pin or let discovery find it). No lease, no board contact.",
+	}, ts.boardsUnpin)
 
 	ts.registerCapture(srv)
 }
@@ -553,6 +590,24 @@ func (ts *toolset) release(ctx context.Context, _ *mcpsdk.CallToolRequest, in re
 		return nil, releaseOut{}, err
 	}
 	return nil, releaseOut{Board: str(res, "board"), Holder: str(res, "holder")}, nil
+}
+
+// boardsPin / boardsUnpin cross the ⑨ pin face holder-less (daemon
+// routing config, not a lease op — like list_boards/board_status).
+func (ts *toolset) boardsPin(ctx context.Context, _ *mcpsdk.CallToolRequest, in boardsPinIn) (*mcpsdk.CallToolResult, boardsPinOut, error) {
+	res, err := ts.call(ctx, server.Request{Type: "boards_pin", Mac6: in.Mac6, IP: in.IP, Port: in.Port})
+	if err != nil {
+		return nil, boardsPinOut{}, err
+	}
+	return nil, boardsPinOut{Pinned: str(res, "pinned"), Endpoint: str(res, "endpoint")}, nil
+}
+
+func (ts *toolset) boardsUnpin(ctx context.Context, _ *mcpsdk.CallToolRequest, in boardsUnpinIn) (*mcpsdk.CallToolResult, boardsUnpinOut, error) {
+	res, err := ts.call(ctx, server.Request{Type: "boards_unpin", Mac6: in.Mac6})
+	if err != nil {
+		return nil, boardsUnpinOut{}, err
+	}
+	return nil, boardsUnpinOut{Unpinned: str(res, "unpinned")}, nil
 }
 
 func (ts *toolset) runLua(ctx context.Context, _ *mcpsdk.CallToolRequest, in runLuaIn) (*mcpsdk.CallToolResult, runLuaOut, error) {

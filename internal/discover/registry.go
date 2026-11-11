@@ -95,6 +95,10 @@ func isMac6(s string) bool {
 	return true
 }
 
+// IsMac6 is isMac6's exported face for the daemon's pin handlers (the
+// API's mac6 validation must be the registry's own).
+func IsMac6(s string) bool { return isMac6(s) }
+
 // discoverFunc is the discovery seam Refresh calls; tests inject
 // canned results or failures.
 type discoverFunc func(ctx context.Context) ([]Board, error)
