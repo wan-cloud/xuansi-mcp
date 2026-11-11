@@ -19,21 +19,22 @@ package mcp
 // exactly like the refresh's own call.
 //
 // Four static tools (numbers 13-16): xuansi_ws_put stores a version
-// (any size — the 16 KiB cap is a BOARD concern, checked at push
+// (any size — caps are a BOARD concern, checked at push
 // time, so a fat version can sit in the workspace until it slims),
 // xuansi_ws_list / xuansi_ws_get read the store back, and
 // xuansi_driver_push runs the gated pipeline
 //
 //	read file → load gate (B10 task 5, branched by artifact: .lua →
 //	--@api vs bench.api_version; .wasm/.aot → module magic) →
-//	fs_write (B10-T1: >16KB rides the chunked transport — fat
-//	.aot-era drivers push whole) → fs_read back → sha256 compare →
-//	manifest
+//	fs_write carrying the payload's sha256 (B15 §4.5②: the verified
+//	path — the board hashes the chunks as they land and its
+//	fs.write_commit verdict IS the verification; the post-push byte
+//	read-back is retired, halving the transfer) → manifest
 //
-// The manifest records the push ONLY after the read-back verifies
-// byte-exact — a corrupt board write never becomes history. B8 task 1
-// appends the removal half, xuansi_driver_pull (fs_rm of the effective
-// file + Active cleared, footprints kept), after the capture tool.
+// The manifest records the push ONLY after the commit verdict verifies
+// — a corrupt board write never becomes history. B8 task 1 appends
+// the removal half, xuansi_driver_pull (fs_rm of the effective file +
+// Active cleared, footprints kept), after the capture tool.
 
 import (
 	"bytes"
@@ -225,7 +226,7 @@ func gateModuleMagic(ext string, content []byte, file string) error {
 // exactly as before — then the delivery tracks: .wasm (INTERP, what
 // the fetch stores; the fw loader's fallback) and .aot
 // (meta-auxiliary; this stack's loader honestly refuses AOT execution
-// but the file still deploys whole and read-back-verified).
+// but the file still deploys whole and commit-verified).
 var pushExts = []string{"lua", "wasm", "aot"}
 
 // errWs is the workspace's local api-class refusal (the fs tools'
@@ -255,8 +256,14 @@ type wsListOut struct {
 }
 
 type wsDriverSummary struct {
-	Name     string          `json:"name"`
-	Active   string          `json:"active,omitempty" jsonschema:"the version a bare xuansi_driver_push deploys; absent when none was ever pushed"`
+	Name   string `json:"name"`
+	Active string `json:"active,omitempty" jsonschema:"the version a bare xuansi_driver_push deploys; absent when none was ever pushed"`
+	// Kind (B15 W1.T4) surfaces the drivers index's module kind the
+	// fetch persisted into the manifest — today's vocabulary
+	// (driver/algorithm) and the canary vocabulary the drivers-repo
+	// wave adds (production/test-canary) cross VERBATIM; hand-put
+	// versions and a kindless index leave it honestly absent.
+	Kind     string          `json:"kind,omitempty" jsonschema:"the module kind the fetch index carried (e.g. driver, algorithm; the drivers-repo canary wave adds production/test-canary) — verbatim from the index, persisted in the manifest; absent for hand-put versions and kindless indexes"`
 	Versions []wsVersionInfo `json:"versions" jsonschema:"every stored version, sorted"`
 }
 
@@ -298,15 +305,24 @@ type driverPushIn struct {
 type driverPushOut struct {
 	Board  string `json:"board" jsonschema:"the board the push landed on: resolved mac6 when the local board list knows it, else the raw selector"`
 	Path   string `json:"path" jsonschema:"the board's effective driver file that was overwritten (the .wasm deliverable's path on a paired push; the pushed artifact's on a single push)"`
-	Sha256 string `json:"sha256" jsonschema:"sha256 of the pushed bytes at path, verified by fs_read-back"`
+	Sha256 string `json:"sha256" jsonschema:"sha256 of the pushed bytes at path — the digest the board's fs.write_commit verdict verified"`
 	Bytes  int    `json:"bytes" jsonschema:"bytes written at path"`
+	// VerifiedBy (B15 §4.5②) names the verification axis: the push's
+	// fs_write carries the payload's sha256 and the board's own
+	// commit verdict (its chunk-by-chunk ledger) is what verified the
+	// landing — the post-push byte read-back is retired.
+	VerifiedBy string `json:"verified_by" jsonschema:"the verification axis: \"commit-sha256\" — the board's fs.write_commit verified the payload digest chunk-by-chunk as the file landed (the former post-push fs_read-back is retired; fs_read stays an independent tool)"`
+	// Kind (B15 W1.T4) surfaces the manifest's module kind on the
+	// deploy seat — the drivers index vocabulary the fetch persisted,
+	// verbatim; absent for hand-put versions.
+	Kind string `json:"kind,omitempty" jsonschema:"the module kind the workspace manifest carries for this driver (the fetch index's vocabulary, e.g. driver/algorithm; the canary wave adds production/test-canary) — absent for hand-put versions"`
 	// Paired (P3-T13): the honest pair claim. True only when BOTH legs
-	// of a .wasm + .aot pair landed read-back-verified; false on every
+	// of a .wasm + .aot pair landed commit-verified; false on every
 	// single-artifact push — the reply never claims a pair that did
 	// not happen (unknown chip, no manifest record, degraded file).
 	Paired    bool     `json:"paired" jsonschema:"true when the .wasm + .aot PAIR landed (the version's manifest aot.<target> matched the board's chip; the .aot leg verified FIRST, then the .wasm) — false on every single-artifact push: never a pairing claim that did not happen"`
 	AotPath   string   `json:"aot_path,omitempty" jsonschema:"the paired push's .aot board path (present only when paired)"`
-	AotSha256 string   `json:"aot_sha256,omitempty" jsonschema:"sha256 of the paired .aot leg, verified by its own fs_read-back (present only when paired)"`
+	AotSha256 string   `json:"aot_sha256,omitempty" jsonschema:"sha256 of the paired .aot leg, verified by its own commit verdict (present only when paired)"`
 	Swept     []string `json:"swept,omitempty" jsonschema:"sibling board paths an explicit artifact push EMPTIED (fs_rm; the F-5 sweep) — absent on paired and bare pushes (they overwrite every slot they touch), and lists nothing when the siblings were already empty"`
 }
 
@@ -385,7 +401,7 @@ func (ts *toolset) wsList(_ context.Context, _ *mcpsdk.CallToolRequest, _ wsList
 			vers = append(vers, v)
 		}
 		sort.Strings(vers)
-		s := wsDriverSummary{Name: n, Active: e.Active, Versions: make([]wsVersionInfo, 0, len(vers))}
+		s := wsDriverSummary{Name: n, Active: e.Active, Kind: e.Kind, Versions: make([]wsVersionInfo, 0, len(vers))}
 		for _, v := range vers {
 			fm := e.Files[v]
 			s.Versions = append(s.Versions, wsVersionInfo{Version: v, Size: fm.Size, Sha256: fm.Sha256, Aot: fm.Aot})
@@ -434,9 +450,9 @@ func (ts *toolset) wsGet(_ context.Context, _ *mcpsdk.CallToolRequest, in wsGetI
 // driverPush deploys one workspace version onto a board (the pipeline
 // is the file comment's gated chain). The daemon crossings: a
 // holder-less op caps (like the refresh's own call — never pre-binds
-// the connection), a HELD fs_write of /drv/<name>.lua (the lease the
-// agent took with xuansi_lease), a holder-less fs_read back. Only a
-// byte-exact read-back updates the manifest.
+// the connection), then a HELD fs_write of the artifact carrying its
+// sha256 (the verified path). Only the board's commit verdict updates
+// the manifest.
 func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in driverPushIn) (*mcpsdk.CallToolResult, driverPushOut, error) {
 	if !wsNameRe.MatchString(in.Name) {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: name must match [a-z0-9_-]+, got %q", in.Name)
@@ -588,15 +604,14 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		}
 	}
 
-	// write, read back, verify — then (and only then) the manifest.
-	// The WHOLE cycle rides wsMu (not just the manifest half): a
-	// concurrent driver_pull's fs_rm of the same path must not land
-	// between this fs_write and its fs_read-back (the read-back would
-	// see the removal and fail the sha check) — pull/push serialize as
-	// one unit per board file, the contract the B8 race test pins.
-	// P3-T13: a paired push rides the SAME serialization for BOTH legs
-	// plus its rollback rm — the pair lands or reverts as one unit
-	// against a pull too.
+	// write, verify (the board's own commit verdict), then (and only
+	// then) the manifest. The WHOLE cycle rides wsMu (not just the
+	// manifest half): a concurrent driver_pull's fs_rm of the same
+	// path must not land between this fs_write and its manifest
+	// record — pull/push serialize as one unit per board file, the
+	// contract the B8 race test pins. P3-T13: a paired push rides the
+	// SAME serialization for BOTH legs plus its rollback rm — the
+	// pair lands or reverts as one unit against a pull too.
 	sum := sha256hex(content)
 	aotPath := drvBoardPath(in.Name, "aot")
 	wsMu.Lock()
@@ -604,50 +619,32 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 
 	if paired {
 		// ruling 2's order: the .aot leg FIRST (the smaller failure
-		// face) — its failure leaves no residue and never touches the
-		// .wasm slot; then the .wasm, whose failure rolls the WHOLE
-		// pair back out (the .aot always, the .wasm when its write
-		// crossed — pre-push slots, never half a pair; Review Focus
-		// #4's 誠實錯: the error states the exact residual state).
-		if wrote, err := ts.pushArtifact(ctx, board, aotPath, aotContent, in.Holder); err != nil {
-			// no-residue cleanup: a refused fs_write changed nothing
-			// (the daemon's atomic-write contract — wrote=false, no rm
-			// crosses); a failed read-back left THIS push's bytes
-			// (wrote=true) — remove them so the failing leg truly
-			// leaves nothing behind.
-			if wrote {
-				if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: aotPath, Holder: in.Holder}); rerr != nil && !notFoundIsh(rerr) {
-					return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .aot leg failed (%v) AND its cleanup fs_rm failed (%v) — the board may hold an unverified %s; xuansi_driver_pull the driver before retrying; manifest untouched", err, rerr, aotPath)
-				}
-			}
+		// face) — a failed .aot leg leaves no residue at its path (a
+		// refused or verdict-failed commit lands NOTHING; only the
+		// fw's .part staging file can remain, kept by its own retry
+		// contract, never shadowing the real path); then the .wasm,
+		// whose failure rolls the WHOLE pair back out (the verified
+		// .aot always goes; the .wasm's slot was never touched —
+		// §4.5② made unverified-at-path impossible).
+		if err := ts.pushArtifact(ctx, board, aotPath, aotContent, in.Holder); err != nil {
 			return nil, driverPushOut{}, err
 		}
-		if wrote, err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
-			// rollback (ruling 2: pre-push slot state, honestly): BOTH
-			// halves go. The .aot always (it landed verified moments
-			// ago); the .wasm when its write crossed — a refused
-			// fs_write left nothing (the daemon's atomic-write
-			// contract), but a failed read-back left THIS push's
-			// UNVERIFIED bytes in the loader's fallback path, and
-			// "neither half" is only true once they are gone.
+		if err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
+			// rollback (ruling 2: pre-push slot state, honestly): the
+			// .aot half goes — it landed verified moments ago; the
+			// .wasm half never landed (an unverified commit refuses
+			// the rename; at most its .part remains, which the fw
+			// deliberately keeps for a from-off=0 retry).
 			var stuck []string
 			if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: aotPath, Holder: in.Holder}); rerr != nil && !notFoundIsh(rerr) {
-				stuck = append(stuck, fmt.Sprintf("the .aot at %s (%v)", aotPath, rerr))
-			}
-			cleared := aotPath
-			if wrote {
-				if _, rerr := ts.callHeld(ctx, server.Request{Type: "fs_rm", Board: board, Path: path, Holder: in.Holder}); rerr != nil && !notFoundIsh(rerr) {
-					stuck = append(stuck, fmt.Sprintf("the unverified .wasm at %s (%v)", path, rerr))
-				} else {
-					cleared = aotPath + " + the unverified " + path
-				}
+				stuck = append(stuck, fmt.Sprintf("the verified .aot at %s (%v)", aotPath, rerr))
 			}
 			if len(stuck) > 0 {
-				return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) AND the rollback could not clear %s — the board may hold UNVERIFIED bytes of this push; xuansi_driver_pull the driver before retrying; manifest untouched", err, strings.Join(stuck, "; "))
+				return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) AND the rollback could not clear %s — the board may hold the verified .aot half of this push; xuansi_driver_pull the driver before retrying; manifest untouched", err, strings.Join(stuck, "; "))
 			}
-			return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) — the pair was rolled back to the pre-push slots (fs_rm %s); the board holds neither half of the new pair, manifest untouched", err, cleared)
+			return nil, driverPushOut{}, errWs("xuansi_driver_push: the paired push's .wasm leg failed (%v) — the pair was rolled back to the pre-push slots (fs_rm %s; the .wasm leg itself never landed: a refused commit leaves only the fw's .part staging file, which the next push's off=0 reopen truncates); the board holds neither half of the new pair, manifest untouched", err, aotPath)
 		}
-	} else if _, err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
+	} else if err := ts.pushArtifact(ctx, board, path, content, in.Holder); err != nil {
 		return nil, driverPushOut{}, err
 	}
 
@@ -657,7 +654,7 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	// .aot), the foot-gun this kills; an already-empty sibling answers
 	// the fw's api not-found and is expected noise, not a failure. A
 	// REAL sweep failure refuses honestly with the manifest untouched
-	// (error ⇒ manifest untouched, the read-back contract's shape) —
+	// (error ⇒ manifest untouched, the verdict contract's shape) —
 	// the error says the shield may still be armed.
 	var swept []string
 	if in.Artifact != "" {
@@ -702,34 +699,30 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", err)
 	}
-	out := driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content), Swept: swept}
+	out := driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content), VerifiedBy: "commit-sha256", Kind: m.Drivers[in.Name].Kind, Swept: swept}
 	if paired {
 		out.Paired, out.AotPath, out.AotSha256 = true, aotPath, sha256hex(aotContent)
 	}
 	return nil, out, nil
 }
 
-// pushArtifact is one board leg of a push: the held fs_write plus the
-// holder-less byte-exact fs_read-back (the B8 verify cycle). wrote
-// reports whether the fs_write CROSSED successfully (the caller's
-// rollback signal: a refused write left nothing by the daemon's
-// atomic-write contract, a failed read-back left this push's bytes).
-// The CALLER owns serialization (wsMu) and any rollback or sweep
-// around the leg.
-func (ts *toolset) pushArtifact(ctx context.Context, board, path string, content []byte, holder string) (bool, error) {
-	if _, err := ts.callHeld(ctx, server.Request{Type: "fs_write", Board: board, Path: path, Data: content, Holder: holder}); err != nil {
-		return false, err
-	}
-	readRes, rerr := ts.call(ctx, server.Request{Type: "fs_read", Board: board, Path: path})
-	if rerr != nil {
-		return true, rerr
-	}
-	back, derr := base64.StdEncoding.DecodeString(str(readRes, "data"))
-	got := sha256hex(back)
-	if derr != nil || got != sha256hex(content) {
-		return true, errWs("xuansi_driver_push: %s on board %s: read-back sha256 %s != pushed %s — the board's file differs; manifest untouched", path, board, got, sha256hex(content))
-	}
-	return true, nil
+// pushArtifact is one board leg of a push: the held fs_write carrying
+// the payload AND its sha256 — the verified path (B15 §4.5②). The
+// daemon lands the file through fs.write_part × N + one
+// fs.write_commit carrying this digest; the board hashes chunk-by-
+// chunk as it writes and its commit verdict IS the verification (the
+// B8-era post-push byte read-back is retired — half the transfer). An
+// error here means the leg did NOT land: a board refusal crosses
+// verbatim (the commit's own msg), and a verdict mismatch leaves only
+// the fw's .part staging file (kept deliberately for a from-off=0
+// retry, never shadowing the real path). The CALLER owns
+// serialization (wsMu) and any rollback or sweep around the leg.
+func (ts *toolset) pushArtifact(ctx context.Context, board, path string, content []byte, holder string) error {
+	_, err := ts.callHeld(ctx, server.Request{
+		Type: "fs_write", Board: board, Path: path, Data: content,
+		Sha256: sha256hex(content), Holder: holder,
+	})
+	return err
 }
 
 // notFoundIsh recognizes the fw's absent-file vocabularies in an fs_rm
@@ -807,11 +800,10 @@ func (ts *toolset) driverPull(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	// Active (when no slot held the file, the FIRST slot's error — the
 	// api not-found on an absent file — crosses verbatim and the
 	// manifest below never runs). The batch rides wsMu TOGETHER with
-	// the manifest cycle: a concurrent driver_push's fs_write +
-	// fs_read-back of the same path must not interleave with these
-	// fs_rms (the read-back would see the removal and fail) — the whole
-	// board-file mutation + manifest cycle is one serialized unit (the
-	// contract TestDriverPullConcurrentWithPush pins).
+	// the manifest cycle: a concurrent driver_push's verified fs_write
+	// of the same path must not interleave with these fs_rms — the
+	// whole board-file mutation + manifest cycle is one serialized
+	// unit (the contract TestDriverPullConcurrentWithPush pins).
 	wsMu.Lock()
 	defer wsMu.Unlock()
 	var removed string

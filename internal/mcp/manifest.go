@@ -22,9 +22,11 @@ package mcp
 // drop one another's Active/footprint entries (classic lost update).
 // The blast radius is bounded: manifest.json itself always stays whole
 // (atomic rename), versioned driver files never collide (their names
-// are unique by construction), and board state stays read-back-verified
-// (sha256 read-back precedes any manifest write) — the worst case is a
-// stale Active or a missing audit entry, never a corrupt file or an
+// are unique by construction), and board state stays verified — the
+// manifest records a push ONLY after the commit verdict verifies, so a
+// corrupt board write never becomes history (B15 §4.5②; pre-§4.5 the
+// same guarantee rode a post-push byte read-back). The worst case is
+// a stale Active or a missing audit entry, never a corrupt file or an
 // unverified push. Don't run parallel MCP sessions against one
 // workspace.
 
@@ -43,10 +45,12 @@ type Manifest struct {
 
 // DriverEntry is one driver's record: the active version ("" until a
 // push activates one) and the per-version file metadata. Kind (B10
-// task 5) carries the fetch index's module kind ("driver",
-// "algorithm") for fetch-stored versions — additive: pre-B10
-// manifests without it load unchanged, and hand-put versions simply
-// leave it empty.
+// task 5, passthrough widened B15 W1.T4) carries the fetch index's
+// module kind VERBATIM — today's vocabulary ("driver", "algorithm")
+// and the canary vocabulary the drivers-repo wave adds
+// ("production"/"test-canary") cross unchanged; the daemon never
+// judges the value. Additive: pre-B10 manifests without it load
+// unchanged, and hand-put versions simply leave it empty.
 type DriverEntry struct {
 	Active string              `json:"active,omitempty"`
 	Kind   string              `json:"kind,omitempty"`

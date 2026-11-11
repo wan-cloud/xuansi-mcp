@@ -2458,7 +2458,6 @@ func (s *Server) hJobWait(ctx context.Context, req *Request) (any, error) {
 	return out, nil
 }
 
-
 // drainJobFrames ends one pending window at a job event: the buffered
 // frames ride the event's data (frames/frames_dropped, the same shape
 // the eval reply carries — absent when nothing was buffered). Called
