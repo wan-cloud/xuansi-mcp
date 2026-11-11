@@ -362,8 +362,9 @@ type opResultOut = map[string]any
 // session_reset after those; B10 task 5 appended driver_fetch; B11
 // task 2 appended toolchain_status, task 3 toolchain_fetch, task 5
 // wasm_build; B12-P2 T6 removed the stills tool (24 then); B15 W1.T2
-// appended the ⑨ pin pair, W1.T4 appended job_wait (27 now): the
-// surviving tools keep their positions (nothing renumbers).
+// appended the ⑨ pin pair, W1.T4 appended job_wait (27); W2.T4
+// appends abi_reference (28 here), then lua_lint + module_doc (30):
+// the surviving tools keep their positions (nothing renumbers).
 var staticToolNames = []string{
 	"xuansi_list_boards",
 	"xuansi_board_status",
@@ -392,6 +393,7 @@ var staticToolNames = []string{
 	"xuansi_boards_pin",
 	"xuansi_boards_unpin",
 	"xuansi_job_wait",
+	"xuansi_abi_reference",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -542,6 +544,8 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_job_wait",
 		Description: "Wait for ONE background job's completion — the daemon-side long-poll primitive (B15 §4.3): instead of polling the events face, this parks on the daemon's own event tap and returns the moment the job's event arrives. Input: the job's tag (the caller-chosen id you passed to xuansi_submit) and timeout_ms (1..55000). Reply: {done, elapsed_ms} plus value when the job finished ok and returned one, or error {class, msg, hint} when it DIED — class/msg are the board's own (a budget refusal names the exceeded budget and the fix: a per-call budget_ms 1..30000 on the next submit, or op budget.set for the session) and hint is the cleanup ritual (unload loaded wasm instances with eval bench.wasm.unload(name) FIRST, then release claimed pins with xuansi_session_reset — session_reset releases claims but does NOT unload instances). A timeout answers {done:false, elapsed_ms} — a RESULT, never an error: loop with fresh calls for longer waits. The daemon tracks jobs by tag from THEIR SUBMIT through this daemon (job events are direct-delivered to the submitting connection) — a tag it never saw is an api error, and a job submitted on another connection is invisible here, honestly. Read-only, no lease, never dials the board; a job that already finished answers immediately from the ledger.",
 	}, ts.jobWait)
+
+	ts.registerAbiReference(srv)
 
 	ts.registerCapture(srv)
 }
