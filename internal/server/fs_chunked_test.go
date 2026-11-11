@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -98,6 +99,13 @@ func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
 		path, _ := args["path"].(string)
 		off, _ := args["off"].(int)
 		length, _ := args["len"].(int)
+		// the fw's own reply-frame gate (board-caught in the W1.T4
+		// smoke): a window above 32640 draws this exact refusal — the
+		// pin that keeps the read window off the write-chunk axis
+		if length > 32640 {
+			return nil, &replclient.OpError{Op: "fs.read_part", Class: "api",
+				Msg: fmt.Sprintf("len %d too large for reply frame (max 32640)", length)}
+		}
 		f, ok := cf.files[path]
 		if !ok {
 			f, ok = cf.parts[path]
@@ -331,8 +339,9 @@ func makePattern(n int) []byte {
 }
 
 // TestFsReadChunkedAssembly: fs_read returns the WHOLE file assembled
-// from fs.read_part windows — a 111KB file lands as 65472+48192 with
-// one fs_read reply, byte-exact.
+// from fs.read_part windows — a 111KB file lands as 4 windows
+// (32640×3 + 25744, the reply-frame-capped read axis — NOT the 65472
+// write chunk) with one fs_read reply, byte-exact.
 func TestFsReadChunkedAssembly(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	cf := newChunkedFake(t, e, "d75884")
@@ -359,8 +368,8 @@ func TestFsReadChunkedAssembly(t *testing.T) {
 			parts++
 		}
 	}
-	if parts != 2 {
-		t.Fatalf("fs.read_part calls = %d, want 2 (65472+48192)", parts)
+	if parts != 4 {
+		t.Fatalf("fs.read_part calls = %d, want 4 (32640×3 + 25744)", parts)
 	}
 }
 
