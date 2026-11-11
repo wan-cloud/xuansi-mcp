@@ -3783,6 +3783,134 @@ func countOp(f *fakeCtl, op string) int {
 	return n
 }
 
+// TestBoardViewPathologyFields: B15 §4.1①/⑥ — every board view carries
+// transport (the CURRENT ACTUAL route; "" when never connected),
+// last_seen_age_ms (numeric age of the daemon's last crossing; -1 when
+// never crossed), and stale (no live discovery source AND no crossing
+// within staleAfter — a never-crossed source-less entry counts as
+// stale; its age is honestly ∞).
+func TestBoardViewPathologyFields(t *testing.T) {
+	// a Host-less first view: the startup audit only audits TCP-dialable
+	// (mdns+Host) boards, so this env starts with NOTHING connected —
+	// the honest "never touched" face the first assertion pins.
+	var mu sync.Mutex
+	view := discover.Board{MAC6: "d75884", Sources: []string{discover.SourceUSB, discover.SourceMDNS},
+		USBPath: "/dev/serial/by-id/fake-d75884"}
+	reg := discover.NewRegistry(nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return []discover.Board{view}, nil
+		}),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return []discover.Board{view}, nil
+		}),
+	)
+	sock := filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srv, err := New(Opts{
+		SockPath:        sock,
+		Registry:        reg,
+		GraceTTL:        10 * time.Second,
+		RefreshInterval: -1,
+		Log:             newTestLogf(t, "srv: "),
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			return board.NewSupervisor(ref, board.SupOpts{
+				Log:       newTestLogf(t, "sup: "),
+				RetryWait: time.Millisecond,
+				DialTCP: func() (board.Controller, error) {
+					return newFakeCtl(), nil
+				},
+				DialUSB: func() (board.Controller, error) {
+					return newFakeCtl(), nil
+				},
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	awaitSweep(t, reg, 1)
+	c := dialSock(t, sock)
+
+	// fresh: live sources, never touched
+	rep, _ := c.call(1, map[string]any{"type": "list_boards"})
+	v := asMap(asMap(rep["result"])["boards"].([]any)[0])
+	if asStr(v["transport"]) != "" || asInt(v["last_seen_age_ms"]) != -1 || v["stale"] != false {
+		t.Fatalf("fresh view = transport %q age %v stale %v, want \"\"/-1/false", asStr(v["transport"]), v["last_seen_age_ms"], v["stale"])
+	}
+
+	// a crossing warms the TCP route: transport tcp, age ~0, not stale
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ = c.call(3, map[string]any{"type": "eval", "board": "d75884", "code": "return 1", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	rep, _ = c.call(4, map[string]any{"type": "list_boards"})
+	v = asMap(asMap(rep["result"])["boards"].([]any)[0])
+	if asStr(v["transport"]) != "tcp" {
+		t.Fatalf("post-crossing transport = %q, want tcp", asStr(v["transport"]))
+	}
+	if age := asInt(v["last_seen_age_ms"]); age < 0 || age > 5000 {
+		t.Fatalf("post-crossing age = %d, want a small non-negative age", age)
+	}
+	if v["stale"] != false {
+		t.Fatalf("live-source crossed board must not be stale (%v)", v["stale"])
+	}
+
+	// USB route reports usb
+	rep, _ = c.call(5, map[string]any{"type": "lease", "board": "d75884", "holder": "w1", "transport": "usb"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease usb: %#v", rep)
+	}
+	rep, _ = c.call(6, map[string]any{"type": "list_boards"})
+	v = asMap(asMap(rep["result"])["boards"].([]any)[0])
+	if asStr(v["transport"]) != "usb" {
+		t.Fatalf("usb-leased transport = %q, want usb", asStr(v["transport"]))
+	}
+
+	// staleness is defined source-side + age-side: no live source AND no
+	// crossing for ≥staleAfter. The registry keeps the sources live, so
+	// pin the logic directly on crafted views.
+	srv.mu.Lock()
+	db := srv.sups["d75884"]
+	if db == nil {
+		srv.mu.Unlock()
+		t.Fatal("no daemonBoard after all the crossings above")
+	}
+	db.lastSeen = time.Now().Add(-10 * time.Second) // inside the window
+	srv.mu.Unlock()
+	if v := srv.boardView(discover.Board{MAC6: "d75884"}); v["stale"] != false {
+		t.Fatalf("no-source board crossed 10s ago must not be stale yet (%v)", v["stale"])
+	}
+	if v := srv.boardView(discover.Board{MAC6: "d75884", Sources: []string{discover.SourceMDNS}}); v["stale"] != false {
+		t.Fatalf("a live-source board is never stale (%v)", v["stale"])
+	}
+	srv.mu.Lock()
+	srv.sups["d75884"].lastSeen = time.Now().Add(-staleAfter - time.Second)
+	srv.mu.Unlock()
+	if v := srv.boardView(discover.Board{MAC6: "d75884"}); v["stale"] != true {
+		t.Fatalf("no-source board crossed >staleAfter ago must be stale (%v)", v["stale"])
+	}
+	srv.mu.Lock()
+	srv.sups["d75884"].lastSeen = time.Time{} // never crossed
+	srv.mu.Unlock()
+	if v := srv.boardView(discover.Board{MAC6: "d75884"}); v["stale"] != true {
+		t.Fatalf("never-crossed source-less entry counts as stale (%v)", v["stale"])
+	}
+	if v := srv.boardView(discover.Board{MAC6: "d75884", Sources: []string{discover.SourceUSB}}); v["stale"] != false {
+		t.Fatalf("never-crossed but live-source entry must not be stale (%v)", v["stale"])
+	}
+}
+
 // TestBindSockConcurrentRaceGracefulLosers: the spawn-race contract at
 // the bind level (task-2's promise, pinned after a task-10 HIL rerun
 // caught the narrow window): N servers binding the same sock path at

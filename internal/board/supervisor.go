@@ -427,6 +427,23 @@ func (s *Supervisor) Client() Controller {
 	return s.ctl
 }
 
+// Transport reports the CURRENT ACTUAL controller route (B15 §5):
+// "tcp" or "usb" for the live warm link, "" when nothing is connected —
+// never the preferred route, the one in hand (a USB-leased board's
+// later ops ride that USB controller up to release, whatever the
+// default route would dial). board_status/list_boards surface it.
+func (s *Supervisor) Transport() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctl == nil || s.ctl.Dead() {
+		return ""
+	}
+	if s.ctlUSB {
+		return "usb"
+	}
+	return "tcp"
+}
+
 // op runs one op over the warm connection. §4.2 (B15): a reply timeout
 // on a LIVE link resends the SAME op once on the SAME connection — the
 // supervisor's internal ops (script.list / diag.pins / wifi.status /

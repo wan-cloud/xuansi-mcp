@@ -4,6 +4,18 @@ package main
 // mDNS, mac6-joined), boards.conf aliases, exclusive per-board leases
 // with grace-TTL teardown, the startup orphan audit (report only), and
 // the unix-socket API.
+//
+// Ops note (B15 minor, detached-serve hygiene): most serves are not
+// started here — every client command auto-spawns a DETACHED serve
+// (spawn.go's ensureDaemon) that outlives its spawner. THAT serve's
+// life: stdout+stderr append to paths.StateDir()/serve.log (never the
+// spawning client's stdio), it self-exits once the idle window passes
+// with no API connections and no live captures (idle-exit defaults to
+// the grace TTL), and SIGINT/SIGTERM walk the graceful shutdown (board
+// links closed — scripts keep running; the socket removed). To manage
+// one by hand: read serve.log, check the socket
+// ($XDG_RUNTIME_DIR/xuansi/daemon.sock, fallback /tmp/xuansi-daemon.sock),
+// and signal by pid.
 
 import (
 	"context"

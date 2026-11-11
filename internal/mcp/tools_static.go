@@ -214,6 +214,11 @@ type boardInfo struct {
 	// chip the board's hello reported (e.g. ESP32-S3). omitempty keeps
 	// it honestly absent before the first crossing.
 	Chip string `json:"chip,omitempty" jsonschema:"the chip the board's hello reported (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source: a version whose manifest carries aot.<target> for THIS chip (ESP32-S3 → esp32s3) deploys as the .wasm + .aot PAIR; absent before the daemon's first hello crossing (then a bare push is the conservative single artifact)"`
+	// Freshness face (B15 §4.1⑥): the current ACTUAL route, the numeric
+	// contact age, and the staleness verdict.
+	Transport     string `json:"transport,omitempty" jsonschema:"the CURRENT ACTUAL controller transport (\"tcp\"/\"usb\") — the route in hand, not the preferred one; absent when the daemon holds no live controller (never connected, or the last link died)"`
+	LastSeenAgeMS int64  `json:"last_seen_age_ms" jsonschema:"milliseconds since the daemon's last protocol crossing with the board (hello or op reply); -1 = the daemon never crossed it"`
+	Stale         bool   `json:"stale" jsonschema:"true when the board has NO live discovery source AND no crossing within the last 30s (never-contacted counts) — last-known only: refresh discovery, check the cable/WiFi; board-touching ops will refuse fast with cause \"source gone\""`
 }
 
 type listBoardsOut struct {
@@ -332,12 +337,12 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source. Read-only, no lease.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source. Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; absent when the daemon holds no live link), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_status",
-		Description: "One board's status: identity, connected — whether the daemon holds a live warm controller connection, a daemon-side LINK fact, not board liveness (false only means no contact yet or the last link died; a rebooted or unreachable board can still read true until the next crossing fails — judge survival from the board view's boot_epoch/reset_reason/last_seen and board.reboot events instead) — plus the current lease (holder/session/grace deadline; absent when free) and its running scripts. Read-only, no lease. " + boardDesc + ".",
+		Description: "One board's status: identity, connected — whether the daemon holds a live warm controller connection, a daemon-side LINK fact, not board liveness (false only means no contact yet or the last link died; a rebooted or unreachable board can still read true until the next crossing fails — judge survival from the board view's boot_epoch/reset_reason/last_seen/last_seen_age_ms/stale and board.reboot events instead) — plus the current lease (holder/session/grace deadline; absent when free) and its running scripts. Cache-first, NEVER dials: the scripts listing rides only an ALREADY-WARM controller link; an unreachable or stale board answers from cache. The board view carries transport (current actual route), last_seen_age_ms (-1 = never crossed) and stale (no live source AND no crossing within 30s). Read-only, no lease. " + boardDesc + ".",
 	}, ts.boardStatus)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -387,12 +392,12 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_op",
-		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AllowlistedOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. Holder semantics: " + holderDesc + ".",
+		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AllowlistedOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. wifi.off honesty note: over TCP, turning the radio off drops the board's own network BEFORE the reply can leave — expect the op to surface as a dead-link/timeout error rather than a success; that error IS the expected outcome (verify later via list_boards staleness, a board.reboot sighting, or the USB route). Holder semantics: " + holderDesc + ".",
 	}, ts.boardOp)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_events_recent",
-		Description: "Read one board's most recent events from this process's local rings — no daemon call, no lease. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. " + boardRebootDesc + ". For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
+		Description: "Read one board's most recent events from this process's local rings — cache-first, NEVER dials the board and never calls the daemon (frozen read semantics): an unreachable board still answers from the rings. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. " + boardRebootDesc + ". For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
 	}, ts.eventsRecent)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -474,19 +479,26 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 		if !ok {
 			continue // a non-object entry is daemon drift; keep the rest
 		}
+		age := int64(-1) // absent key = daemon drift; report never-crossed
+		if v, ok := m["last_seen_age_ms"].(float64); ok {
+			age = int64(v)
+		}
 		out.Boards = append(out.Boards, boardInfo{
-			MAC6:        str(m, "mac6"),
-			Alias:       str(m, "alias"),
-			Sources:     strSlice(m["sources"]),
-			Host:        str(m, "host"),
-			Port:        num(m, "port"),
-			USBPath:     str(m, "usb_path"),
-			Fw:          str(m, "fw"),
-			FwVersion:   str(m, "fw_version"),
-			BootEpoch:   int64(num(m, "boot_epoch")),
-			ResetReason: str(m, "reset_reason"),
-			LastSeen:    str(m, "last_seen"),
-			Chip:        str(m, "chip"),
+			MAC6:          str(m, "mac6"),
+			Alias:         str(m, "alias"),
+			Sources:       strSlice(m["sources"]),
+			Host:          str(m, "host"),
+			Port:          num(m, "port"),
+			USBPath:       str(m, "usb_path"),
+			Fw:            str(m, "fw"),
+			FwVersion:     str(m, "fw_version"),
+			BootEpoch:     int64(num(m, "boot_epoch")),
+			ResetReason:   str(m, "reset_reason"),
+			LastSeen:      str(m, "last_seen"),
+			Chip:          str(m, "chip"),
+			Transport:     str(m, "transport"),
+			LastSeenAgeMS: age,
+			Stale:         bol(m, "stale"),
 		})
 	}
 	return nil, out, nil
