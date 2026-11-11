@@ -1118,6 +1118,10 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hCaptureStart(ctx, cc, req)
 	case "capture_stop":
 		result, err = s.hCaptureStop(req)
+	case "boards_pin":
+		result, err = s.hBoardsPin(req)
+	case "boards_unpin":
+		result, err = s.hBoardsUnpin(req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1475,6 +1479,38 @@ func (s *Server) hRelease(cc *clientConn, req *Request) (any, error) {
 		s.logf("server: board %s: USB controller yielded on release (§12 讓位) — next lease dials TCP", b.MAC6)
 	}
 	return map[string]any{"board": b.MAC6, "holder": holder}, nil
+}
+
+// hBoardsPin serves boards_pin (⑨, B15 §4.9): declare the registry's
+// pin source for mac6 at ip:port — validated and applied by the
+// registry (immediate effect, survives refreshes). No lease, no board
+// contact: the pin is daemon-side routing state; the NEXT lease/op
+// dials the endpoint. The reply echoes {pinned, endpoint} (JoinHostPort
+// — a v6 address renders bracketed).
+func (s *Server) hBoardsPin(req *Request) (any, error) {
+	if err := s.reg.Pin(req.Mac6, req.IP, req.Port); err != nil {
+		return nil, &RPCError{Class: "server", Msg: err.Error()}
+	}
+	mac6 := strings.ToLower(strings.TrimSpace(req.Mac6))
+	ep := net.JoinHostPort(req.IP, strconv.Itoa(req.Port))
+	s.logf("server: boards_pin %s → %s (registry pin source; dial priority usb > pin > mdns)", mac6, ep)
+	return map[string]any{"pinned": mac6, "endpoint": ep}, nil
+}
+
+// hBoardsUnpin serves boards_unpin (⑨): remove exactly the pin
+// declaration — idempotent-shaped (unpinning a never-pinned mac6
+// echoes success); the board keeps every other live source. No lease,
+// no board contact.
+func (s *Server) hBoardsUnpin(req *Request) (any, error) {
+	mac6 := strings.ToLower(strings.TrimSpace(req.Mac6))
+	if !discover.IsMac6(mac6) {
+		return nil, &RPCError{Class: "server",
+			Msg: fmt.Sprintf("boards_unpin: %q is not a mac6 (6 lowercase hex chars)", mac6)}
+	}
+	if s.reg.Unpin(mac6) {
+		s.logf("server: boards_unpin %s (pin removed; other live sources kept)", mac6)
+	}
+	return map[string]any{"unpinned": mac6}, nil
 }
 
 // connHolder returns the effective holder for a request: the request's

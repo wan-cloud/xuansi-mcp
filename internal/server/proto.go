@@ -61,6 +61,8 @@
 //	op             {board, op, args?, holder?}   → board reply result  (the ops face — see below)
 //	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; see the capture section below)
 //	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}
+//	boards_pin     {mac6, ip, port}              → {pinned, endpoint}  (⑨: declares the registry's pin source — see the pin section below)
+//	boards_unpin   {mac6}                        → {unpinned}       (removes exactly the pin declaration)
 //
 // eval/submit/op args numbers: the fw args bridge is int-only (v3 §4),
 // so the daemon validates the args tree BEFORE any board contact — an
@@ -186,6 +188,25 @@
 // ("usb" → "tcp", rebooted:false — §13 redial ≠ reboot). A same-route
 // re-lease, a release yield (route drops to none), and mere redials
 // never fire.
+//
+// # The pin face (⑨, B15 §4.9)
+//
+// boards_pin {mac6, ip, port} declares the registry's third source:
+// an explicit endpoint for a board this host's discovery cannot route
+// (cross-subnet mDNS blindness, multicast-blocked APs). The pin takes
+// effect IMMEDIATELY (list_boards shows the entry with source "pin"
+// right away; a still-undiscovered board appears as a pin-only entry)
+// and survives every discovery refresh — the pinned endpoint also
+// OVERRIDES the mdns face's address while pinned (the pin exists
+// because discovery gets this board's route wrong for this host).
+// Dial priority is usb > pin > mdns. Runtime pins are in-memory
+// daemon state (they do not survive a daemon restart); the durable
+// form is boards.conf's `name=mac6@ip:port` line, read at daemon
+// start. boards_unpin removes exactly the pin declaration — a board
+// another source still sees keeps that face; a pin-only entry
+// degrades to last-known (stale). A bad mac6 / empty ip / port
+// outside 1..65535 is a "server" class refusal (the registry is the
+// validator; a refused pin materializes nothing).
 //
 // # Transport (the lease route decision, B15 §4.4)
 //
@@ -338,6 +359,13 @@ type Request struct {
 	// opTimeoutFor: budget+margin), so a budgeted call is never cut off
 	// by the fixed eval ceiling.
 	BudgetMs int64 `json:"budget_ms,omitempty"`
+	// Mac6 is boards_pin/boards_unpin's exact board id (⑨): 6 hex
+	// chars, validated — never a selector.
+	Mac6 string `json:"mac6,omitempty"`
+	// IP/Port are boards_pin's pinned endpoint (validated daemon-side;
+	// the reply echoes the joined endpoint).
+	IP   string `json:"ip,omitempty"`
+	Port int    `json:"port,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.

@@ -671,6 +671,11 @@ var staticToolsRequiredAudit = map[string][]string{
 	// everything else defaults (version = 0.0.1, initial_memory =
 	// 262144, fw/wamrc_path/wasi_sdk_path = unset lanes).
 	"xuansi_wasm_build": {"name", "source"},
+
+	// ⑨ (B15 W1.T2): the pin pair — mac6/ip/port on pin, mac6 alone on
+	// unpin.
+	"xuansi_boards_pin":   {"mac6", "ip", "port"},
+	"xuansi_boards_unpin": {"mac6"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
