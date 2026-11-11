@@ -32,16 +32,6 @@ func usbOnlyBoardForRoute(mac6 string) discover.Board {
 	}
 }
 
-// wifiDeadBoard is §4.4 state 3's shape modeled at the REGISTRY level
-// (used by TestLeaseUpgradeOnRevivedTCP's phase dance: the mdns SOURCE
-// downgrades away while its endpoint fields survive as last-known —
-// the real WiFi-dead registry entry).
-func wifiDeadBoard(mac6 string) discover.Board {
-	b := mkBoard(mac6, "xuansi-d75884.local")
-	b.Sources = []string{discover.SourceUSB}
-	return b
-}
-
 // transportEventOf digs the first board-source transport event out of
 // a call()'s unsolicited pushes, failing when none arrived.
 func transportEventOf(t *testing.T, events []map[string]any) map[string]any {
@@ -345,7 +335,6 @@ func TestLeaseUSBTransportReplyShape(t *testing.T) {
 type transportEnv struct {
 	*env
 	reg     *discover.Registry
-	src     *mutableSources
 	setMDNS func([]discover.Board)
 }
 
@@ -439,7 +428,7 @@ func newTransportEnv(t *testing.T, usbBoards, mdnsBoards []discover.Board) *tran
 		distinct[b.MAC6] = true
 	}
 	awaitSweep(t, reg, len(distinct))
-	return &transportEnv{env: e, reg: reg, src: src, setMDNS: func(bs []discover.Board) {
+	return &transportEnv{env: e, reg: reg, setMDNS: func(bs []discover.Board) {
 		src.mu.Lock()
 		src.mdns = bs
 		src.mu.Unlock()
