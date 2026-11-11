@@ -5,16 +5,18 @@ import (
 	"fmt"
 )
 
-// fsFileMax is the board's per-CHUNK cap (XS_FILE_MAX = 16384B, surfaced
-// as caps limits.file_max): fs.write carries a whole file in ONE op and
-// is refused above it, while the v5 chunked transport (fs.write_part
-// below) moves bigger files 16384B at a time. One 16KB bin inside one
-// frame sits far under the 64KB frame limit.
-const fsFileMax = 16384
+// fsFileMax is the HIL helper's per-call cap (B15 §4.5 raised the fw's
+// XS_FILE_MAX family to 65526 — protocol_ver=7; the wire-realizable
+// single-op bound is 65482B, the write_part chunk bound 65472B): this
+// helper rides the conservative 65472B number the server's chunked
+// path also uses (server.go's fsFileMax), safe under both the single
+// fs.write and the fs.write_part face. Callers moving bigger files
+// still use the chunked trio (FsWritePart/FsWriteCommit, B10-T1).
+const fsFileMax = 65472
 
 // FsWrite stores data at path on the board's filesystem (op fs.write).
 // path must be inside the firmware whitelist (/lua/..., /drv/...);
-// data above the 16384B single-op cap is refused here, client-side,
+// data above the 65472B single-op cap is refused here, client-side,
 // before any bytes reach the wire — callers moving bigger files use the
 // chunked trio (FsWritePart/FsWriteCommit, B10-T1).
 func (c *Client) FsWrite(ctx context.Context, path string, data []byte) error {
