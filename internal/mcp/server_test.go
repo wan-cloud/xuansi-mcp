@@ -612,12 +612,12 @@ func TestConcurrentFirstHoldersRideTheWinner(t *testing.T) {
 }
 
 // TestLeaseUSBWarningVerbatim: the USB-transport lease carries the
-// transport field, and the daemon's reboot warning crosses into the
-// result verbatim.
+// §4.4 fields — transport, rebooted, and the daemon's reboot
+// disclosure crossing into the result verbatim.
 func TestLeaseUSBWarningVerbatim(t *testing.T) {
 	e, reqs := newEnv(t, []step{{result: map[string]any{
 		"board": "d75884", "holder": "mcp-fixed01", "session": 7.0,
-		"transport": "usb", "warning": server.USBRebootWarning,
+		"transport": "usb", "rebooted": true, "transport_note": server.USBTransportNote,
 	}}}, Options{Holder: "mcp-fixed01"})
 
 	res := e.call("xuansi_lease", map[string]any{"board": "d75884", "transport": "usb"})
@@ -629,8 +629,11 @@ func TestLeaseUSBWarningVerbatim(t *testing.T) {
 		t.Errorf("lease request = %+v, want lease/d75884/usb/mcp-fixed01", req)
 	}
 	m := structured(t, res)
-	if m["warning"] != server.USBRebootWarning {
-		t.Errorf("warning = %v, want the daemon's verbatim reboot warning", m["warning"])
+	if m["transport_note"] != server.USBTransportNote {
+		t.Errorf("transport_note = %v, want the daemon's verbatim reboot disclosure", m["transport_note"])
+	}
+	if m["rebooted"] != true {
+		t.Errorf("rebooted = %v, want true", m["rebooted"])
 	}
 	if m["transport"] != "usb" || m["session"] != 7.0 {
 		t.Errorf("lease result = %v, want transport usb session 7", m)

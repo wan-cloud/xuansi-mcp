@@ -107,7 +107,7 @@ type boardIn struct {
 type leaseIn struct {
 	Board     string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
 	Holder    string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
-	Transport string `json:"transport,omitempty" jsonschema:"lease route: omit for the default warm TCP route; \"usb\" is the deliberate fallback for a WiFi-unreachable board — opening the CDC port REBOOTS the board and kills running scripts, and the success reply carries that same warning. There is never a silent fallback"`
+	Transport string `json:"transport,omitempty" jsonschema:"lease route override: omit and the daemon decides (B15 §4.4) — TCP when a TCP-capable source (mdns or a pin) is live, never a gratuitous USB reboot; the USB auto-fallback (only USB live) opens the CDC port AT LEASE TIME, REBOOTING the board, and the reply discloses it (rebooted:true + transport_note). \"tcp\" forces the TCP route; \"usb\" forces the USB route with the same reboot and disclosure. Never a silent reboot"`
 }
 
 type releaseIn struct {
@@ -243,11 +243,17 @@ type boardStatusOut struct {
 }
 
 type leaseResultOut struct {
-	Board     string `json:"board" jsonschema:"resolved mac6 of the leased board"`
-	Holder    string `json:"holder"`
-	Session   int    `json:"session"`
-	Transport string `json:"transport,omitempty" jsonschema:"the route taken; \"usb\" when the deliberate USB fallback ran"`
-	Warning   string `json:"warning,omitempty" jsonschema:"the USB reboot warning, verbatim, whenever transport was usb"`
+	Board   string `json:"board" jsonschema:"resolved mac6 of the leased board"`
+	Holder  string `json:"holder"`
+	Session int    `json:"session"`
+	// The §4.4 face: the route this lease resolved (the daemon decides
+	// on the default — TCP when a TCP-capable source is live, the USB
+	// fallback when only USB is), whether THIS lease opened the CDC
+	// port (rebooted the board), and the disclosure note every
+	// usb-route lease carries.
+	Transport     string `json:"transport" jsonschema:"the route this lease resolved: \"tcp\" (default when a TCP-capable source is live) or \"usb\" (the fallback — its open reboots the board)"`
+	Rebooted      bool   `json:"rebooted" jsonschema:"true when THIS lease opened the CDC port and rebooted the board (one connection = one device session); a warm-USB re-lease rides the existing session and answers false"`
+	TransportNote string `json:"transport_note,omitempty" jsonschema:"the USB-route disclosure, verbatim — present on every usb-route lease (fresh open: the reboot warning; warm ride: the no-new-reboot note)"`
 }
 
 type releaseOut struct {
@@ -347,7 +353,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_lease",
-		Description: "Take the board's lease — required before run_lua/submit/script/fs_write/board_op mutate anything. Default route never touches the board. Supplying transport \"usb\" is the deliberate fallback for a WiFi-unreachable board: it REBOOTS the board (running scripts die) and the reply carries that warning. Holder semantics: " + holderDesc + ".",
+		Description: "Take the board's lease — required before run_lua/submit/script/fs_write/board_op mutate anything. The route is the daemon's decision (B15 §4.4) unless you override transport: default stays TCP whenever a TCP-capable source (mdns or a pin) is live — never a gratuitous USB reboot; when only USB is live the default AUTO-FALLS BACK to USB, which opens the CDC port and REBOOTS the board (running scripts die) — the reply always names the route (transport), whether this lease rebooted (rebooted), and the disclosure (transport_note); never silent. A later default lease upgrades back to TCP when TCP revives (a board.transport event on the events face carries every switch). Holder semantics: " + holderDesc + ".",
 	}, ts.lease)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -532,11 +538,12 @@ func (ts *toolset) lease(ctx context.Context, _ *mcpsdk.CallToolRequest, in leas
 		return nil, leaseResultOut{}, err
 	}
 	return nil, leaseResultOut{
-		Board:     str(res, "board"),
-		Holder:    str(res, "holder"),
-		Session:   num(res, "session"),
-		Transport: str(res, "transport"),
-		Warning:   str(res, "warning"),
+		Board:         str(res, "board"),
+		Holder:        str(res, "holder"),
+		Session:       num(res, "session"),
+		Transport:     str(res, "transport"),
+		Rebooted:      bol(res, "rebooted"),
+		TransportNote: str(res, "transport_note"),
 	}, nil
 }
 

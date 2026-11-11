@@ -143,12 +143,18 @@ var afterFunc = time.AfterFunc
 // names the socket path.
 var ErrAlreadyListening = errors.New("server: another daemon is already listening")
 
-// USBRebootWarning is the honest label the deliberate USB-transport
-// lease route must state everywhere it succeeds — in the API reply's
-// result (key "warning"), in the daemon log, and on the CLI's stdout
-// (T10 ruling: USB is the WiFi-dead bench's LAST resort; opening the
-// CDC port reboots the board, §2, killing every running script).
-const USBRebootWarning = "USB transport: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)"
+// USBTransportNote is the §4.4 (B15) disclosure carried by every lease
+// that OPENED the USB route — the daemon's auto-fallback (only USB
+// live) or the explicit transport:"usb": one connection = one device
+// session, so the open rebooted the board. It rides the lease reply
+// (key "transport_note"), the daemon log, and the CLI's stdout — the
+// anti-silent-reboot rule (§2 反目標).
+const USBTransportNote = "USB route: opening the CDC port REBOOTS the board (one connection = one device session) — running scripts were killed; when a TCP source is live again the next default lease upgrades back to TCP"
+
+// USBWarmNote is the §4.4 disclosure for a USB-route lease that found
+// the USB controller ALREADY warm: no new open, no second reboot — the
+// board keeps the device session the first open created.
+const USBWarmNote = "USB route (already connected): riding the existing CDC session — this lease did not reboot the board again"
 
 // DefaultSockPath is the daemon socket: $XDG_RUNTIME_DIR/xuansi/daemon.sock,
 // falling back to /tmp/xuansi-daemon.sock when XDG_RUNTIME_DIR is unset
@@ -1304,25 +1310,74 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 	return res, nil
 }
 
-// hLease serves lease. The default route never touches the board: the
-// lease is host-side state and the first op dials the warm TCP
-// controller. transport:"usb" is the DELIBERATE fallback (proto.go's
-// transport contract): the refusal checks run first (a board leased
-// by someone else must not be rebooted), then the controller is
-// established over USB — opening the CDC port REBOOTS the board —
-// and both the reply result and the daemon log carry
-// USBRebootWarning. A USB open that fails leaves the lease held
-// host-side (same as a TCP lease on an unreachable board: release or
-// retry; the next op redials per its own transport rules). Never a
-// silent fallback: a failed TCP dial stays unreachable — USB only
-// ever happens through this explicit field.
+// tcpDialable reports whether b carries a live TCP-capable source with
+// a dialable endpoint — the pin/mdns face (⑨'s pin counts here: a
+// pinned cross-subnet board's route IS the pin). §4.4's route decision
+// turns on this.
+func tcpDialable(b discover.Board) bool {
+	if !hasSource(b, discover.SourcePin) && !hasSource(b, discover.SourceMDNS) {
+		return false
+	}
+	return b.Port != 0 && (b.IP != "" || b.Host != "")
+}
+
+// noteTransport (B15 §4.4) broadcasts the synthetic board transport
+// event — the switch notification, following the board.reboot
+// precedent (same "board" source, kind inside data): data carries
+// {kind:"transport", from, to, rebooted}. from is the route in hand
+// before the switch ("" when the daemon held no live controller);
+// rebooted is true only when the switch OPENED the CDC port (to=usb,
+// §2 one-connection-one-session). Fired on every actual daemon-side
+// route switch at lease boundaries; never on a same-route re-lease or
+// a mere redial (§13: redial ≠ reboot).
+func (s *Server) noteTransport(mac6, from, to string, rebooted bool) {
+	if from == to {
+		return
+	}
+	s.logf("server: board %s transport %q → %q (rebooted=%v) — board.transport event", mac6, from, to, rebooted)
+	s.broadcast(mac6, replclient.Event{Source: "board", Data: map[string]any{
+		"kind":     "transport",
+		"from":     from,
+		"to":       to,
+		"rebooted": rebooted,
+	}})
+}
+
+// hLease serves lease with the §4.4 (B15) transport decision. The
+// explicit transport param still overrides; OMITTED, the DAEMON
+// resolves the route from the live sources:
+//
+//	TCP-capable source live (pin/mdns)  → tcp  — never a gratuitous
+//	                                      USB reboot, whatever USB's
+//	                                      state; the lease itself does
+//	                                      not touch the board.
+//	only USB live                       → usb  — the auto-fallback:
+//	                                      the CDC open happens AT
+//	                                      LEASE TIME, rebooting the
+//	                                      board, disclosed in the
+//	                                      reply (rebooted:true +
+//	                                      transport_note) — never
+//	                                      silent.
+//	no live source at all               → tcp  — the host-side lease
+//	                                      of an unreachable board
+//	                                      (ops refuse fast with
+//	                                      cause "source gone").
+//
+// A default lease that finds a warm USB controller with TCP now live
+// upgrades back to TCP: the §12 yield, the board.transport event
+// (usb→tcp, no reboot — §13), the next op dials TCP. The refusal
+// checks run before any USB open (a board leased by someone else must
+// not be rebooted); a lease whose USB open then fails stays held
+// host-side (release or retry). Warm-controller reuse stays
+// transport-agnostic: a USB-route lease with the USB controller
+// already warm rides it without a second open (rebooted:false, the
+// warm note).
 func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	switch req.Transport {
-	case "", "tcp": // the default warm route
-	case "usb":
+	case "", "tcp", "usb":
 	default:
 		return nil, &RPCError{Class: "server",
-			Msg: fmt.Sprintf("unknown transport %q (lease accepts \"usb\"; default is tcp and never falls back)", req.Transport)}
+			Msg: fmt.Sprintf("unknown transport %q (lease accepts \"tcp\" or \"usb\"; omitted = the daemon decides: TCP when a TCP-capable source is live, USB — with the reboot disclosure — when only USB is)", req.Transport)}
 	}
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -1333,25 +1388,67 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 		return nil, err
 	}
 	sess, _ := s.leases.Session(b.MAC6)
-	res := map[string]any{"board": b.MAC6, "holder": holder, "session": sess}
-	if req.Transport == "usb" {
-		if !hasSource(b, discover.SourceUSB) {
-			// fast-fail (§4.1②): the registry's current snapshot shows no
-			// live USB source — refuse with zero dial (cause "source gone")
-			return nil, s.boardFail(b.MAC6, fmt.Errorf("board %s: usb lease: %w", b.MAC6, errSourceGone))
+	res := map[string]any{"board": b.MAC6, "holder": holder, "session": sess, "rebooted": false}
+
+	usbLive := hasSource(b, discover.SourceUSB) && b.USBPath != ""
+	tcpLive := tcpDialable(b)
+	route := req.Transport
+	if route == "" {
+		route = "tcp"
+		if !tcpLive && usbLive {
+			route = "usb" // §4.4 auto-fallback: only USB live
 		}
-		db := s.supervisor(b)
-		db.connectMu.Lock() // deliberate: held across ConnectUSB (~5s bounded — drain + hello); connects and Close serialize behind it
-		ctl, cerr := db.sup.ConnectUSB(ctx)
-		db.connectMu.Unlock()
-		if cerr != nil {
-			return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: usb lease: %v", errUnreachable, cerr))
-		}
-		s.tap(b.MAC6, db, ctl)
-		res["transport"] = "usb"
-		res["warning"] = USBRebootWarning
-		s.logf("server: board %s leased over USB by holder %s — %s", b.MAC6, holder, USBRebootWarning)
 	}
+
+	if route != "usb" {
+		res["transport"] = "tcp"
+		// §4.4 upgrade: a warm USB controller with TCP now live — a
+		// default (or explicit-tcp) lease yields the §12 slot and
+		// re-arms the TCP route. No board touch: the next op dials.
+		db := s.supervisor(b)
+		db.connectMu.Lock()
+		if prev := db.sup.Transport(); prev == "usb" && tcpLive {
+			if db.sup.YieldUSBController() {
+				s.logf("server: board %s: TCP source live again — USB controller yielded, route upgraded to TCP (§4.4)", b.MAC6)
+				s.noteTransport(b.MAC6, "usb", "tcp", false)
+			}
+		}
+		db.connectMu.Unlock()
+		return res, nil
+	}
+
+	// route == usb (explicit or the auto-fallback)
+	if !usbLive {
+		// fast-fail (§4.1②): the registry's current snapshot shows no
+		// live USB source — refuse with zero dial (cause "source gone")
+		return nil, s.boardFail(b.MAC6, fmt.Errorf("board %s: usb lease: %w", b.MAC6, errSourceGone))
+	}
+	db := s.supervisor(b)
+	db.connectMu.Lock() // deliberate: held across ConnectUSB (~5s bounded — drain + hello); connects and Close serialize behind it
+	prev := db.sup.Transport()
+	var ctl board.Controller
+	if prev == "usb" {
+		ctl = db.sup.Client() // warm USB: ride the existing session — no second open, no second reboot
+	}
+	var cerr error
+	if ctl == nil {
+		ctl, cerr = db.sup.ConnectUSB(ctx)
+	}
+	db.connectMu.Unlock()
+	if cerr != nil {
+		return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: usb lease: %v", errUnreachable, cerr))
+	}
+	s.tap(b.MAC6, db, ctl)
+	res["transport"] = "usb"
+	if prev == "usb" && ctl != nil {
+		res["transport_note"] = USBWarmNote
+		s.logf("server: board %s leased over the warm USB controller by holder %s — no new open", b.MAC6, holder)
+		return res, nil
+	}
+	res["rebooted"] = true
+	res["transport_note"] = USBTransportNote
+	s.noteTransport(b.MAC6, prev, "usb", true)
+	s.logf("server: board %s leased over USB by holder %s — %s", b.MAC6, holder, USBTransportNote)
 	return res, nil
 }
 

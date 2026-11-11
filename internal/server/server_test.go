@@ -919,9 +919,10 @@ func TestLeaseEvalValueFaceAndReleaseTeardown(t *testing.T) {
 
 // TestLeaseUSBTransport: lease{transport:"usb"} is the deliberate USB
 // route (I-1): it reaches Supervisor.ConnectUSB (the DialUSB seam),
-// the reply carries transport:"usb" plus the exact USBRebootWarning,
-// the TCP seam is NOT touched by the lease itself, and subsequent ops
-// ride the warm USB controller.
+// the reply carries the §4.4 shape (transport "usb", rebooted true,
+// transport_note verbatim — the reply-shape table is
+// transport_test.go), the TCP seam is NOT touched by the lease itself,
+// and subsequent ops ride the warm USB controller.
 func TestLeaseUSBTransport(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -945,8 +946,11 @@ func TestLeaseUSBTransport(t *testing.T) {
 	if asStr(res["transport"]) != "usb" {
 		t.Fatalf("transport = %#v, want usb", res)
 	}
-	if asStr(res["warning"]) != USBRebootWarning {
-		t.Fatalf("warning = %#v\nwant  %q", res, USBRebootWarning)
+	if res["rebooted"] != true {
+		t.Fatalf("rebooted = %#v, want true", res)
+	}
+	if asStr(res["transport_note"]) != USBTransportNote {
+		t.Fatalf("transport_note = %#v\nwant  %q", res, USBTransportNote)
 	}
 
 	// the deliberate route hit the USB seam exactly once…
@@ -1064,8 +1068,10 @@ func TestCloseWaitsForInflightConnect(t *testing.T) {
 }
 
 // TestLeaseDefaultPathUnchanged: a plain lease (no transport) keeps the
-// default TCP semantics — no warning keys in the reply, the USB seam
-// never touched, the first op dials the warm TCP route.
+// default TCP semantics (§4.4 state 1 — both sources live → TCP): the
+// reply names the resolved route (transport "tcp", rebooted false, no
+// note — the full three-state decision table is transport_test.go),
+// the USB seam never touched, the first op dials the warm TCP route.
 func TestLeaseDefaultPathUnchanged(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	c := dialSock(t, e.sock)
@@ -1075,11 +1081,11 @@ func TestLeaseDefaultPathUnchanged(t *testing.T) {
 		t.Fatalf("lease: %#v", rep)
 	}
 	res := asMap(rep["result"])
-	if _, ok := res["transport"]; ok {
-		t.Fatalf("default lease reply carries transport: %#v", res)
+	if asStr(res["transport"]) != "tcp" || res["rebooted"] != false {
+		t.Fatalf("default lease reply = %#v, want transport tcp / rebooted false", res)
 	}
-	if _, ok := res["warning"]; ok {
-		t.Fatalf("default lease reply carries warning: %#v", res)
+	if _, ok := res["transport_note"]; ok {
+		t.Fatalf("default lease reply carries transport_note: %#v", res)
 	}
 	if n := e.dialedUSB("d75884"); n != 0 {
 		t.Fatalf("usb dials = %d after plain lease, want 0", n)
@@ -2386,7 +2392,11 @@ func TestBoardViewBootIdentity(t *testing.T) {
 			"reset_history": []any{"power-on", "usb"},
 		}, nil
 	})
-	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "bootid"})
+	// transport:"tcp" pins the no-board-touch lease this test needs —
+	// a default lease on a usb-only board now auto-falls back to USB
+	// (§4.4), whose tap hello would enrich the registry with the fake's
+	// DEFAULT identity instead of the scripted one below
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "bootid", "transport": "tcp"})
 	if asMap(rep["error"]) != nil {
 		t.Fatalf("lease: %#v", rep)
 	}
@@ -3845,8 +3855,12 @@ func TestBoardViewPathologyFields(t *testing.T) {
 		t.Fatalf("fresh view = transport %q age %v stale %v, want \"\"/-1/false", asStr(v["transport"]), v["last_seen_age_ms"], v["stale"])
 	}
 
-	// a crossing warms the TCP route: transport tcp, age ~0, not stale
-	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
+	// a crossing warms the TCP route: transport tcp, age ~0, not stale.
+	// (transport:"tcp" pins the route — this Host-less view has no
+	// dialable TCP endpoint, so the §4.4 default would resolve USB;
+	// this test's subject is the view's freshness fields, the decision
+	// table is transport_test.go's.)
+	rep, _ = c.call(2, map[string]any{"type": "lease", "board": "d75884", "holder": "w1", "transport": "tcp"})
 	if asMap(rep["error"]) != nil {
 		t.Fatalf("lease: %#v", rep)
 	}
