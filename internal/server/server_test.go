@@ -402,7 +402,7 @@ func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string
 		e.fakes[b.MAC6] = newFakeCtl()
 		e.usbFakes[b.MAC6] = newFakeCtl()
 	}
-	reg := discover.NewRegistry(aliases,
+	reg := discover.NewRegistry(aliases, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			return boards, nil
 		}),
@@ -1120,7 +1120,7 @@ func TestFailedTCPDialNeverFallsBackToUSB(t *testing.T) {
 	var mu sync.Mutex
 	usbDials := 0
 	usbFake := newFakeCtl()
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
 		}),
@@ -2878,7 +2878,7 @@ func TestNewAlreadyListeningSentinel(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
 		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
 	)
@@ -2899,7 +2899,7 @@ func TestStaleSockFileRemoved(t *testing.T) {
 	if err := os.WriteFile(path, []byte("corpse"), 0o600); err != nil {
 		t.Fatalf("write stale: %v", err)
 	}
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
 		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
 	)
@@ -3349,7 +3349,7 @@ func TestIdleExitBlockedByLiveCapture(t *testing.T) {
 // .local). The default wiring is asserted here so the IP cannot be
 // dropped between discover and board without a test failing.
 func TestSupervisorRefCarriesIP(t *testing.T) {
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
 		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
 			return []discover.Board{{
@@ -3404,7 +3404,7 @@ func TestSupervisorRebuildsOnEndpointDrift(t *testing.T) {
 		MAC6: "d75884", Sources: []string{discover.SourceUSB, discover.SourceMDNS},
 		USBPath: "/dev/serial/by-id/fake-d75884", Host: "xuansi-d75884.local", Port: 7777,
 	}
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -3567,7 +3567,7 @@ func TestOpWifiSelfReportEnrichesEndpoint(t *testing.T) {
 func TestOpFastFailSourceGone(t *testing.T) {
 	var mu sync.Mutex
 	live := []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -3668,7 +3668,7 @@ func TestOpFastFailSourceGone(t *testing.T) {
 // bounded dial (~3 × tcpConnectTimeout) ends in the honest structured
 // error instead of the 60s budget ride.
 func TestOpErrorCauseDialFailed(t *testing.T) {
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			return []discover.Board{mkBoard("d75884", "xuansi-d75884.local")}, nil
 		}),
@@ -3796,7 +3796,7 @@ func TestBoardViewPathologyFields(t *testing.T) {
 	var mu sync.Mutex
 	view := discover.Board{MAC6: "d75884", Sources: []string{discover.SourceUSB, discover.SourceMDNS},
 		USBPath: "/dev/serial/by-id/fake-d75884"}
-	reg := discover.NewRegistry(nil,
+	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			mu.Lock()
 			defer mu.Unlock()
