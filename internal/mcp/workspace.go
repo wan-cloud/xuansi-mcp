@@ -333,6 +333,25 @@ type driverPushOut struct {
 	AotPath   string   `json:"aot_path,omitempty" jsonschema:"the paired push's .aot board path (present only when paired)"`
 	AotSha256 string   `json:"aot_sha256,omitempty" jsonschema:"sha256 of the paired .aot leg, verified by its own commit verdict (present only when paired)"`
 	Swept     []string `json:"swept,omitempty" jsonschema:"sibling board paths an explicit artifact push EMPTIED (fs_rm; the F-5 sweep) — absent on paired and bare pushes (they overwrite every slot they touch), and lists nothing when the siblings were already empty"`
+	// Admission (B15 §4.12, W2-T4) is the wasm memory preflight — a
+	// PROJECTION, never a gate: the push proceeds whatever the
+	// verdict, because the board's own load-time admission check is
+	// the authority (its refusal carries the full arithmetic). Only a
+	// binary artifact (.wasm/.aot) whose version carries recorded
+	// footprint meta projects at all; a Lua push carries no admission
+	// (nothing to admit).
+	Admission *admissionOut `json:"admission,omitempty" jsonschema:"the wasm memory preflight (binary pushes with recorded footprint meta only): loaded_bytes + candidate_bytes vs budget_bytes under bench.wasm.plan's UNION arithmetic — an already-loaded module counts once, so pushing a module whose name is already loaded projects zero growth. projected:true = the live board account answered (one eval: plan + list); projected:false = it did not (pre-wave-2 board, eval refusal, board unreachable): loaded_bytes reads -1 and the verdict compares the candidate against the reference budget alone — re-run bench.wasm.plan on the board for its own arithmetic. The verdict NEVER blocks this push; the board's load gate is the authority"`
+}
+
+// admissionOut is the frozen §4.12 preflight shape: the loaded
+// account, the candidate's static footprint, the budget, whether the
+// numbers are a live projection, and the fits/over verdict.
+type admissionOut struct {
+	LoadedBytes    int64  `json:"loaded_bytes" jsonschema:"the board's live wasm memory account (sum of loaded instances' linear-memory bytes) when projected:true; -1 = unknown (the preflight eval did not answer)"`
+	CandidateBytes int64  `json:"candidate_bytes" jsonschema:"the pushed artifact's static footprint — its linear-memory initial from the version's recorded meta (the memory account bills initial only; text/pool are .aot info columns)"`
+	BudgetBytes    int64  `json:"budget_bytes" jsonschema:"the admission budget (caps wasm_memory_budget_bytes): the board's live value when projected:true, else the reference constant from the embedded ABI reference"`
+	Projected      bool   `json:"projected" jsonschema:"true = the live board account answered and the verdict is the real union projection; false = the board leg failed and the verdict compares the candidate against the reference budget alone (loaded unknown)"`
+	Verdict        string `json:"verdict" jsonschema:"\"fits\" | \"over\" — the projected post-load account against the budget. NEVER a gate: the push proceeded whatever this says; the board's load-time admission check is the authority and its refusal carries the arithmetic"`
 }
 
 type driverPullIn struct {
@@ -613,6 +632,19 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		}
 	}
 
+	// the admission preflight (B15 §4.12, W2-T4): the pre-push wasm
+	// memory projection — a REPORT, never a gate (the board's own
+	// load-time check is the authority; this runs BEFORE the first
+	// flash write so the numbers describe the pre-push account). Only
+	// a binary artifact with recorded footprint meta projects; a Lua
+	// push has nothing to admit.
+	var admission *admissionOut
+	if ext != "lua" {
+		if fp := m.entry(in.Name).Files[ver].Footprint; fp != nil {
+			admission = ts.admissionPreflight(ctx, board, in.Name, ext, paired, fp, in.Holder)
+		}
+	}
+
 	// write, verify (the board's own commit verdict), then (and only
 	// then) the manifest. The WHOLE cycle rides wsMu (not just the
 	// manifest half): a concurrent driver_pull's fs_rm of the same
@@ -708,7 +740,7 @@ func (ts *toolset) driverPush(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	if err := writeManifestAtomic(ts.ws.manifestPath(), m); err != nil {
 		return nil, driverPushOut{}, errWs("xuansi_driver_push: %v", err)
 	}
-	out := driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content), VerifiedBy: "commit-sha256", Swept: swept}
+	out := driverPushOut{Board: board, Path: path, Sha256: sum, Bytes: len(content), VerifiedBy: "commit-sha256", Swept: swept, Admission: admission}
 	// the kind ladder (one vocabulary at the seat): the index-level
 	// Kind the fetch persisted, else the pushed version's own meta
 	// release claim; hand-put versions carry neither — honest absence.
@@ -742,8 +774,109 @@ func (ts *toolset) pushArtifact(ctx context.Context, board, path string, content
 	return err
 }
 
-// notFoundIsh recognizes the fw's absent-file vocabularies in an fs_rm
-// refusal: a slot that never held the artifact is already the sweep's
+// admissionPreflight is driver_push's wasm memory projection (B15
+// §4.12, W2-T4): the candidate's static footprint (the version's
+// recorded meta — the memory account bills the linear-memory INITIAL
+// only, so the artifact's lane picks its initial: a paired push or a
+// single .aot reads the target record's initial, a .wasm push reads
+// the wasm pair) against the board's LIVE account, under the SAME
+// UNION arithmetic bench.wasm.plan uses — an already-loaded module
+// name counts ONCE, so pushing a name that is already loaded projects
+// ZERO growth (its old bytes are already inside loaded_bytes; the
+// load gate would answer the duplicate differently, but the plan
+// semantics are the frozen reference and this mirrors them).
+//
+// The board leg is ONE held eval riding the push's own holder:
+//
+//	return {plan = bench.wasm.plan({}), names = bench.wasm.list()}
+//
+// plan({}) answers the live loaded/budget account with zero side
+// effects (the dry-run face the fw froze for exactly this), list()
+// answers the loaded names (the union's membership test). Any failure
+// — a pre-wave-2 board without plan, an eval refusal, an unreachable
+// board — degrades to projected:false: loaded_bytes:-1, budget_bytes
+// = the reference constant (the embedded abi-reference's
+// wasm_memory_budget_bytes), and a verdict comparing the candidate
+// against the budget ALONE. The Desc and the field docs say all of
+// this; the push itself proceeds either way (the board's load gate is
+// the authority).
+func (ts *toolset) admissionPreflight(ctx context.Context, board, name, lane string, paired bool, fp *FootprintMeta, holder string) *admissionOut {
+	cand := fp.Wasm.Initial
+	if lane == "aot" || paired {
+		// the .aot's (or the pair's) initial — any target record; they
+		// share the linear-memory declaration in every real meta.
+		for _, a := range fp.Aot {
+			if a.Initial > 0 {
+				cand = a.Initial
+			}
+			break
+		}
+	}
+	if cand <= 0 {
+		return nil // no honest number to project: absent, never guessed
+	}
+	res, err := ts.callHeld(ctx, server.Request{
+		Type: "eval", Board: board, Holder: holder,
+		Code: "return {plan = bench.wasm.plan({}), names = bench.wasm.list()}",
+	})
+	if err == nil {
+		if v, ok := res["value"].(map[string]any); ok {
+			if plan, ok := v["plan"].(map[string]any); ok {
+				loaded, lok := num64(plan, "loaded_bytes")
+				budget, bok := num64(plan, "budget_bytes")
+				if lok && bok && budget > 0 {
+					alreadyLoaded := false
+					if names, ok := v["names"].([]any); ok {
+						for _, n := range names {
+							if s, ok := n.(string); ok && s == name {
+								alreadyLoaded = true
+								break
+							}
+						}
+					}
+					total := loaded // UNION: a loaded name adds nothing
+					if !alreadyLoaded {
+						total = loaded + cand
+					}
+					verdict := "fits"
+					if total > budget {
+						verdict = "over"
+					}
+					return &admissionOut{
+						LoadedBytes: loaded, CandidateBytes: cand, BudgetBytes: budget,
+						Projected: true, Verdict: verdict,
+					}
+				}
+			}
+		}
+	}
+	// degraded: the reference budget, the candidate, and the
+	// budget-alone comparison — honestly labeled projected:false.
+	budget := refWasmBudgetBytes()
+	if budget <= 0 {
+		budget = 2097152 // the checked-in wave-2 constant; unreachable unless the embed breaks
+	}
+	verdict := "fits"
+	if cand > budget {
+		verdict = "over"
+	}
+	return &admissionOut{
+		LoadedBytes: -1, CandidateBytes: cand, BudgetBytes: budget,
+		Projected: false, Verdict: verdict,
+	}
+}
+
+// num64 pulls one numeric field out of a daemon reply map (float64 is
+// JSON's only number shape).
+func num64(m map[string]any, k string) (int64, bool) {
+	f, ok := m[k].(float64)
+	if !ok {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// notFoundIsh recognizes the fw's absent-file vocabularies in an fs_rm// refusal: a slot that never held the artifact is already the sweep's
 // desired end state, the same expected noise driverPull tolerates on its
 // un-held slots. Two spellings are real on the wire: the READ path says
 // "'path' not found (No such file or directory)" (xs_fs.c's stat branch)
