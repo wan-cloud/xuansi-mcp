@@ -684,6 +684,11 @@ var staticToolsRequiredAudit = map[string][]string{
 	// §4.14 (B15 W2.T4): the reference face — everything optional
 	// (the section filter defaults to the whole document).
 	"xuansi_abi_reference": {},
+
+	// §4.15/§4.18 (B15 W2.T4): the lint needs its source; the doc
+	// needs its module name (the version resolves workspace-first).
+	"xuansi_lua_lint":   {"source"},
+	"xuansi_module_doc": {"name"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
