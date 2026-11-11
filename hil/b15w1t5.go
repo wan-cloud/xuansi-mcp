@@ -481,7 +481,7 @@ func runB15W1T5() int {
 		// rebind → the board returns
 		tBind := time.Now()
 		if !w5Sudo(h, "/sys/bus/usb/drivers/cdc_acm/bind", usbIf) {
-			h.check(false, "rebind failed — MANUAL RECOVERY NDED: sudo tee /sys/bus/usb/drivers/cdc_acm/bind <<< "+usbIf)
+			h.check(false, "rebind failed — MANUAL RECOVERY NEEDED: sudo tee /sys/bus/usb/drivers/cdc_acm/bind <<< "+usbIf)
 			return h.finish("b15w1t5")
 		}
 		okBack, backNote := pollUntil(time.Second, 45*time.Second, func() (bool, string) {
@@ -712,6 +712,101 @@ func lastLine(lines []any) string {
 		s = s[:90] + "…"
 	}
 	return s
+}
+
+// runB15W1T5Load is the spec §8.1 clause-2 acceptance leg (fix round 1,
+// controller ruling — the loaded-board shape, camera-free): occupy the
+// VM queue with CPU-heavy busy-loop jobs, then interleave a log.read
+// (conn-task ro op — must stay fast under VM load, the W1-T3 windowed
+// serialization's whole point) and an eval (VM-queued — bounded wait for
+// the running job, never a teardown spiral), prove the warm link
+// survives (board_status connected/transport stable), and land one
+// job_wait. Timing shapes decide PASS: hundreds of ms to low seconds,
+// NEVER minute-level.
+func runB15W1T5Load() int {
+	h := &harness{}
+	b2, holder := *w5Board2, *w5Holder+"-load"
+	fmt.Printf("=== b15 W1-T5 load leg (spec §8.1 clause 2 — 滿載 job 下 op 不觸發拆鏈螺旋) — %s ===\n", time.Now().Format(time.RFC3339))
+	fmt.Printf("board #2 %s (USB, fw %s) | holder %s | jobs: 3×4s busy loops (serial VM queue ≈12s window), eval budget 15s\n", b2, *w5FwBuild2, holder)
+
+	c := w5Dial(h, *w5Sock)
+	if c == nil {
+		return h.finish("b15w1t5load")
+	}
+	defer c.close()
+
+	// the initial discovery sweep is async: wait for board #2's USB
+	// enumeration before leasing (attempt 3 raced it — every call
+	// answered no_board before the sweep's first listing)
+	okEnum, enumNote := pollUntil(300*time.Millisecond, 20*time.Second, func() (bool, string) {
+		res, rerr, err, _ := c.call(10*time.Second, server.Request{Type: "list_boards"})
+		if err != nil || rerr != nil {
+			return false, "list_boards trouble"
+		}
+		return w5BoardView(res, b2) != nil, "board #2 not enumerated yet"
+	})
+	h.check(okEnum, fmt.Sprintf("board #2 enumerated before the load (sources %v) [%s]", func() []string {
+		res, _, _, _ := c.call(10*time.Second, server.Request{Type: "list_boards"})
+		if v := w5BoardView(res, b2); v != nil {
+			return w5Sources(v)
+		}
+		return nil
+	}(), enumNote))
+	if !okEnum {
+		return h.finish("b15w1t5load")
+	}
+
+	res, rerr, err, dL := c.call(35*time.Second, server.Request{Type: "lease", Board: b2, Holder: holder})
+	transport, _ := res["transport"].(string)
+	h.check(err == nil && rerr == nil && transport == "usb", fmt.Sprintf("lease %dms → transport=%v (the load rides this ONE warm controller)", dL.Milliseconds(), res["transport"]))
+
+	// three CPU-heavy jobs, each ~4s of busy loop (bench.millis-bounded,
+	// counted work): the VM runs them serially → a ~12s loaded window.
+	jobCode := "local x, t0 = 0, bench.millis() while bench.millis()-t0 < 4000 do x = x + 1 end return x"
+	for _, tag := range []string{"w1t5load1", "w1t5load2", "w1t5load3"} {
+		res, rerr, err, _ = c.call(15*time.Second, server.Request{Type: "submit", Board: b2, Code: jobCode, Tag: tag, Holder: holder, BudgetMs: 15000})
+		h.check(err == nil && rerr == nil && res["tag"] == tag, fmt.Sprintf("submit %s acked (async — the VM queue now carries it)", tag))
+	}
+
+	// (a) log.read DURING the load: conn-task ro op — the old pathology
+	// serialized the full ring on this path (minute-level under load);
+	// the v7 windowed shape must answer in hundreds of ms.
+	res, rerr, err, dLR := c.call(20*time.Second, server.Request{Type: "op", Board: b2, Holder: holder, Op: "log.read", Args: map[string]any{"tail": 5}})
+	lines, _ := res["lines"].([]any)
+	h.check(err == nil && rerr == nil && len(lines) == 5 && dLR < 2*time.Second,
+		fmt.Sprintf("log.read{tail:5} UNDER LOAD: %dms, %d lines (expect hundreds of ms — never minute-level)", dLR.Milliseconds(), len(lines)))
+
+	// (b) eval DURING the load: it queues behind the running jobs — a
+	// bounded wait (≤ the serial queue's remainder ≈12s) then answers;
+	// the daemon's same-link discipline must hold (no teardown spiral).
+	res, rerr, err, dEV := c.call(40*time.Second, server.Request{Type: "eval", Board: b2, Holder: holder, Code: "return 41+1", BudgetMs: 15000})
+	val, _ := res["value"].(float64)
+	h.check(err == nil && rerr == nil && val == 42 && dEV < 25*time.Second,
+		fmt.Sprintf("eval under load: %dms → value=%v (queued behind the jobs, bounded — low seconds, no spiral)", dEV.Milliseconds(), val))
+
+	// (c) the warm link survived: board_status's view still names the
+	// same transport and a live connection (transport rides the board
+	// VIEW — res["board"]["transport"], not a top-level key).
+	res, rerr, err, _ = c.call(10*time.Second, server.Request{Type: "board_status", Board: b2})
+	stLV, _ := res["board"].(map[string]any)
+	h.check(err == nil && rerr == nil && res["connected"] == true && stLV != nil && stLV["transport"] == "usb",
+		fmt.Sprintf("board_status after the load window: connected=%v board-view transport=%v (no redial, no teardown)", res["connected"], sg(stLV, "transport")))
+
+	// (d) one job_wait lands: the last job's completion delivers.
+	res, rerr, err, dJW := c.call(30*time.Second, server.Request{Type: "job_wait", Board: b2, Tag: "w1t5load3", TimeoutMS: 25000})
+	jv, _ := res["value"].(float64)
+	h.check(err == nil && rerr == nil && res["done"] == true && jv > 0 && dJW < 26*time.Second,
+		fmt.Sprintf("job_wait w1t5load3 delivered in %dms: {done:%v, value:%.0f} (the busy loop counted)", dJW.Milliseconds(), res["done"], jv))
+
+	// teardown: drain the remaining jobs' waits (bounded), then release.
+	for _, tag := range []string{"w1t5load1", "w1t5load2"} {
+		c.call(30*time.Second, server.Request{Type: "job_wait", Board: b2, Tag: tag, TimeoutMS: 25000})
+	}
+	res, rerr, err, _ = c.call(35*time.Second, server.Request{Type: "release", Board: b2, Holder: holder})
+	h.check(err == nil && rerr == nil, fmt.Sprintf("release (board #2 dormant as found) → %v", res))
+	h.note("daemon-log cross-check: the wrapper's tee carries the daemon's own lines — a teardown spiral would show link-dead/redial/'USB fallback connection up' repeats beyond the single lease-time open")
+
+	return h.finish("b15w1t5load")
 }
 
 func sg(m map[string]any, k string) string {
