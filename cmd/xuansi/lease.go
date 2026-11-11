@@ -6,8 +6,9 @@ package main
 // TTL adopts the lease back without touching the board (see
 // internal/server/proto.go's holder contract). Without --holder the
 // daemon binds a generated per-connection id — printed, so it can be
-// re-supplied. --usb is the DELIBERATE fallback route (T10 ruling):
-// it reboots the board at open — never implied, never automatic.
+// re-supplied. The route is the daemon's §4.4 decision (default: TCP
+// when a TCP-capable source is live, USB — disclosed in the reply,
+// never silent — when only USB is); --usb forces the USB route.
 
 import (
 	"errors"
@@ -23,7 +24,7 @@ func runLease(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	fs.SetOutput(stderr)
 	sock := clientFlags(fs)
 	holder := fs.String("holder", "", "lease holder identity (re-supply the same value to adopt within the grace TTL)")
-	usb := fs.Bool("usb", false, "deliberate USB fallback route: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)")
+	usb := fs.Bool("usb", false, "force the USB route: opening the port REBOOTS the board — running scripts are killed; omitted, the daemon decides (TCP when a TCP-capable source is live, USB with this same disclosure when only USB is)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -31,7 +32,7 @@ func runLease(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintf(stderr, "Usage: xuansi lease BOARD [--holder H] [--usb] [--sock S]\n\nBOARD: mac6 / alias / hostname prefix (unique)\n--usb:  deliberate USB fallback (reboots the board; TCP stays the default)\n")
+		fmt.Fprintf(stderr, "Usage: xuansi lease BOARD [--holder H] [--usb] [--sock S]\n\nBOARD: mac6 / alias / hostname prefix (unique)\n--usb:  force the USB route (reboots the board); omitted, the daemon decides\n")
 		return exitUsage
 	}
 	setupLogging(fsVerbose, stderr)
@@ -56,13 +57,18 @@ func runLease(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	}
 	sess, _ := res["session"].(float64)
 	h, _ := res["holder"].(string)
-	if *usb {
-		fmt.Fprintf(stdout, "leased %s holder=%s session=%d transport=usb\n", fs.Arg(0), h, int64(sess))
-		// the daemon's reply carries the same string (result.warning);
-		// print it regardless so the --usb caller cannot miss it
-		fmt.Fprintf(stdout, "WARNING: %s\n", server.USBRebootWarning)
-	} else {
-		fmt.Fprintf(stdout, "leased %s holder=%s session=%d\n", fs.Arg(0), h, int64(sess))
+	// §4.4: the daemon's reply names the route it resolved (default
+	// leases included — the auto-fallback to USB discloses itself
+	// here), whether THIS lease rebooted the board, and the note.
+	tr, _ := res["transport"].(string)
+	if tr == "" {
+		tr = "tcp"
+	}
+	rebooted, _ := res["rebooted"].(bool)
+	note, _ := res["transport_note"].(string)
+	fmt.Fprintf(stdout, "leased %s holder=%s session=%d transport=%s\n", fs.Arg(0), h, int64(sess), tr)
+	if note != "" {
+		fmt.Fprintf(stdout, "%s: %s\n", map[bool]string{true: "WARNING", false: "NOTE"}[rebooted], note)
 	}
 	if *holder == "" {
 		fmt.Fprintf(stdout, "(holder generated — re-supply `--holder %s` on later commands to keep/adopt this lease)\n", h)

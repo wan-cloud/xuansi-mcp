@@ -96,10 +96,12 @@ Leases are holder-scoped: ` + "`xuansi lease B --holder H`" + ` binds the
 identity H; later commands re-supplying the same --holder adopt the
 lease back within the grace TTL after a disconnect.
 
-USB is a deliberate last-resort route: ` + "`xuansi lease B --usb`" + ` opens
-the CDC port, which REBOOTS the board (running scripts are killed —
-T10 ruling). TCP stays the default everywhere and a failed TCP dial
-never falls back to USB on its own.
+USB is a route the daemon picks honestly: a default lease stays on TCP
+whenever a TCP-capable source is live, and auto-falls back to USB —
+REBOOTING the board, running scripts killed — only when USB is the one
+live source (the lease reply always discloses the route, the reboot,
+and the note; ` + "`xuansi lease B --usb`" + ` forces it). Ops never
+silently re-route: whatever controller is warm carries them.
 
 Flags:
 

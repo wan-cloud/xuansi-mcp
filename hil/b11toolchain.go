@@ -77,13 +77,13 @@ const (
 	b11Holder  = "b11tc-hil"
 	b11TCPEndp = "xuansi-d75884.local:7777"
 
-	// b11USBRebootWarning mirrors internal/server.USBRebootWarning
+	// b11USBTransportNote mirrors internal/server.USBTransportNote
 	// byte-for-byte (hil is a standalone package main and does not
 	// import internal/ - the same local-map policy as b11Pins
 	// mirroring the index): the usb-route W00 asserts the lease reply
-	// carries THIS string verbatim, and the S0 note passes it through
-	// unchanged.
-	b11USBRebootWarning = "USB transport: opening the port REBOOTS the board — running scripts are killed (last resort per T10 ruling)"
+	// carries THIS string verbatim (key transport_note, B15 §4.4), and
+	// the S0 note passes it through unchanged.
+	b11USBTransportNote = "USB route: opening the CDC port REBOOTS the board (one connection = one device session) — running scripts were killed; when a TCP source is live again the next default lease upgrades back to TCP"
 
 	// the module this run builds + deploys + calls
 	b11ModName = "hilhello"
@@ -597,10 +597,10 @@ func runB11Toolchain(attempt int, daemonBin, runDir string) int {
 	leaseSess, _ := b6Num(m, "session")
 	if usbTransport {
 		h.check(!isErr && b6Str(m, "board") == b11Board && b6Str(m, "holder") == b11Holder && leaseSess > 0 &&
-			b6Str(m, "transport") == "usb" && b6Str(m, "warning") == b11USBRebootWarning,
-			fmt.Sprintf("W00 lease holder=%s session=%.0f transport=usb (the deliberate reboot route - the daemon's warning rode the reply verbatim)", b11Holder, leaseSess))
+			b6Str(m, "transport") == "usb" && m["rebooted"] == true && b6Str(m, "transport_note") == b11USBTransportNote,
+			fmt.Sprintf("W00 lease holder=%s session=%.0f transport=usb (the deliberate reboot route - the §4.4 disclosure rode the reply verbatim)", b11Holder, leaseSess))
 		h.note("USB route: lease reboots the board (deliberate fallback, b10-series precedent) - the win leg rides the board's physically-attached USB to bypass the mDNS known limitation")
-		h.note("port-open reboot warning, verbatim: %s", b6Str(m, "warning"))
+		h.note("port-open reboot disclosure, verbatim: %s", b6Str(m, "transport_note"))
 		// the lease's USB hello is what enriches a usb-only leg's fw
 		// row - the BUILD BINDING runs here, after it
 		boardRow = nil

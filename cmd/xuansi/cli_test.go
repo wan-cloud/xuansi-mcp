@@ -88,7 +88,8 @@ func startMockDaemonUSB(t *testing.T) (string, *cmdFake) {
 	usbFake := &cmdFake{}
 	boards := []discover.Board{{
 		MAC6: "d75884", Sources: []string{discover.SourceUSB, discover.SourceMDNS},
-		Host: "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777,
+		USBPath: "/dev/serial/by-id/fake-d75884",
+		Host:    "xuansi-d75884.local", IP: "10.1.51.205", Port: 7777,
 	}}
 	reg := discover.NewRegistry(map[string]string{"d75884": "bench"}, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
@@ -283,7 +284,7 @@ func TestLeaseUSBPrintsRebootWarning(t *testing.T) {
 		t.Fatalf("lease --usb exit=%d: %q %q", code, out.String(), errb.String())
 	}
 	got := out.String()
-	for _, want := range []string{"transport=usb", "WARNING:", "REBOOTS the board", "running scripts are killed", "last resort"} {
+	for _, want := range []string{"transport=usb", "WARNING:", "REBOOTS the board", "one connection = one device session", "running scripts were killed"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lease --usb output missing %q: %q", want, got)
 		}

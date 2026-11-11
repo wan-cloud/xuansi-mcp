@@ -47,7 +47,7 @@
 //
 //	list_boards    {}                          → {boards:[{mac6,alias,sources,host,ip,port,usb_path,fw,fw_version,boot_epoch?,reset_reason?,chip?,last_seen?,transport,last_seen_age_ms,stale}],mdns_error}
 //	board_status   {board}                      → {board:{...}, connected, transport, last_seen_age_ms, stale, lease:{holder,since,session,grace_deadline}?|null, scripts?, scripts_error?}
-//	lease          {board, holder?, transport?} → {board, holder, session, transport?, warning?}
+//	lease          {board, holder?, transport?} → {board, holder, session, transport:"tcp"|"usb", rebooted:bool, transport_note?}
 //	release        {board, holder?}             → {board, holder}
 //	eval           {board, code, args?, holder?} → {out, value?}   (lease required)
 //	submit         {board, code, tag, args?, holder?} → board ack {tag, queued}  (lease required)
@@ -171,37 +171,67 @@
 // kept entries ride and reasons_partial:true flags the cut. Pre-v6 fw
 // (no ring): the key is absent, honestly.
 //
-// # Transport (the lease request's deliberate USB route)
+// # board.transport (the synthesized route-switch event, B15 §4.4)
 //
-// lease's optional "transport" field selects the controller route:
+// The daemon switches a board's controller route only at lease
+// boundaries; every ACTUAL switch fires one board event — source
+// "board", data {kind:"transport", from, to, rebooted} — fanned out
+// like any board event. from is the route in hand before the switch
+// ("" when no live controller), to the route after ("tcp"/"usb");
+// rebooted is true only when the switch OPENED the CDC port (§2: one
+// connection = one device session — the USB open IS a reboot). The
+// switches: any lease taking the USB route with a fresh open
+// (auto-fallback or explicit; from "tcp" or "" → "usb"), and the
+// USB→TCP upgrade a default lease performs when TCP revives
+// ("usb" → "tcp", rebooted:false — §13 redial ≠ reboot). A same-route
+// re-lease, a release yield (route drops to none), and mere redials
+// never fire.
 //
-//	"" (absent) | "tcp"  the warm TCP route — the default everywhere;
-//	                       a plain lease never touches the board
-//	"usb"                  the DELIBERATE USB fallback (T10 ruling:
-//	                       WiFi 不可達時的後備). Opening the CDC port
-//	                       REBOOTS the board — running scripts are
-//	                       killed. The success reply carries
-//	                       transport:"usb" plus a "warning" stating
-//	                       exactly that, and the daemon log records the
-//	                       same line.
+// # Transport (the lease route decision, B15 §4.4)
 //
-// USB is reached ONLY through this explicit field (CLI: `xuansi lease
-// BOARD --usb`). There is NEVER a silent fallback: a failed TCP dial
-// reports unreachable and does NOT auto-try USB — the caller decides
-// whether a reboot is acceptable. The held/refusal checks run BEFORE
-// the USB open (a lease held by someone else must not reboot the
-// board); a lease whose USB open then fails stays held host-side
-// (same as a TCP lease on an unreachable board — release or retry).
-// Warm-controller reuse is transport-agnostic: whichever controller
+// lease's optional "transport" field still OVERRIDES; omitted, the
+// DAEMON resolves the route from the live registry sources:
+//
+//	"" (absent)            the daemon decides — a TCP-capable source
+//	                       (pin/mdns) live ⇒ tcp (NEVER a gratuitous
+//	                       USB reboot, whatever USB's state; the lease
+//	                       itself touches no board); only USB live ⇒
+//	                       usb, the AUTO-FALLBACK: the CDC open happens
+//	                       AT LEASE TIME and REBOOTS the board,
+//	                       disclosed in the reply (rebooted:true +
+//	                       transport_note — never silent); no live
+//	                       source ⇒ the host-side lease of an
+//	                       unreachable board (ops refuse fast with
+//	                       cause "source gone").
+//	"tcp"                  force the TCP route (honest unreachable at
+//	                       op time when TCP is dead — never a silent
+//	                       USB open).
+//	"usb"                  force the USB route: same §2 reboot, same
+//	                       disclosure.
+//
+// The reply always names the resolved route: transport ("tcp"/"usb"),
+// rebooted (true only when THIS lease opened the CDC port — a
+// USB-route lease that found the controller already warm rides it
+// with no second open, rebooted:false and the warm note), and
+// transport_note (the disclosure text, present on every usb-route
+// lease). The held/refusal checks run BEFORE any USB open (a board
+// leased by someone else must not be rebooted); a lease whose USB
+// open then fails stays held host-side (release or retry).
+//
+// USB→TCP upgrade: a default (or explicit-tcp) lease that finds a
+// warm USB controller with TCP live again YIELDS the §12 slot and
+// re-arms the TCP route (no board touch; the first op dials) — one
+// board.transport event carries the switch (below).
+//
+// Warm-controller reuse stays transport-agnostic: whichever controller
 // is live serves every subsequent request — a USB lease's warm link
 // carries default-transport ops up to release, with no implicit
-// dialing of the other seam.
-// An unknown transport value is a "server" class error. Releasing a
-// USB-transport lease (and daemon shutdown on a live USB controller)
-// voluntarily YIELDS the controller slot first (§12 讓位 — observer
-// hello, then close): the board cannot see a CDC close, so this is
-// what lets the next TCP lease take controller without any reboot
-// ritual.
+// dialing of the other seam. Releasing a USB-transport lease (and
+// daemon shutdown on a live USB controller) voluntarily YIELDS the
+// controller slot first (§12 讓位 — observer hello, then close): the
+// board cannot see a CDC close, so this is what lets the next TCP
+// lease take controller without any reboot ritual.
+// An unknown transport value is a "server" class error.
 //
 // # Holder semantics (the lease identity — read this twice)
 //
@@ -270,10 +300,13 @@ type Request struct {
 	ID     int64  `json:"id"`
 	Board  string `json:"board,omitempty"`
 	Holder string `json:"holder,omitempty"`
-	// Transport selects the lease route: "" (default) = warm TCP,
-	// "usb" = the deliberate fallback whose open reboots the board.
-	// Lease only; see the transport contract above. Unknown values
-	// are a "server" class error.
+	// Transport selects the lease route: "" (default) = the daemon
+	// decides from the live sources (TCP when a TCP-capable source is
+	// live; the USB auto-fallback — with the reboot disclosure in the
+	// reply — when only USB is), "tcp" forces the TCP route, "usb"
+	// forces the fallback whose open reboots the board. Lease only;
+	// see the transport contract above. Unknown values are a "server"
+	// class error.
 	Transport string `json:"transport,omitempty"`
 	Code      string `json:"code,omitempty"`
 	Tag       string `json:"tag,omitempty"`
@@ -356,7 +389,8 @@ type Reply struct {
 }
 
 // WireEvent is the §8 event payload: source (gpio.N / uartN.rx /
-// stdout / net / job) and its data map.
+// stdout / net / job; "board" for the daemon-synthesized kinds —
+// board.reboot, transport) and its data map.
 type WireEvent struct {
 	Source string         `json:"source"`
 	Data   map[string]any `json:"data,omitempty"`
