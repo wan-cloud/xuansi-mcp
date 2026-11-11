@@ -3,7 +3,7 @@
     "header": "src/xuansi_host.h",
     "header_sha256": "3a3dc8c82f30f05cb14bd5cd96132f031ee48aa98e602ddb438af3a711731f23",
     "sidecar": "tools/gen-abi-reference/sidecar.json",
-    "sidecar_sha256": "4e541998c2d3282a6d9aa2275b2cfafc27a6fd04822d410924912813ca82a790",
+    "sidecar_sha256": "7cc7d067499d9c081e4b474ad4aeeefcc6b20f4a15534c13924295d259b47c62",
     "generator": "tools/gen-abi-reference/gen.py",
     "note": "regenerate with tools/gen-abi-reference/gen.py; the checked-in outputs are the single source the daemon embeds (xuansi_abi_reference) — CI byte-compares"
   },
@@ -248,6 +248,10 @@
         {
           "sig": "bench.millis() -> u32",
           "semantics": "boot milliseconds (wraps at 49.7 days) — the Lua-face timing source (a hclock wasm module is no longer needed for this)"
+        },
+        {
+          "sig": "bench.timer_ms(period_ms, fn)",
+          "semantics": "resident-scripts-only periodic event source (since batch 5): period_ms 1..3600000, fn any function; the esp_timer fires periodically and each fire resumes the owner coroutine with fn as the yielded event value (local f = coroutine.yield()); budget counts per resume (event_ms); all of a script's timers are deleted when it dies (stop/teardown/budget/error/normal end); eval context is refused ('resident scripts only'); table full = 16 slots shared across ALL scripts (boundary #5), create failure is the esp_timer error"
         }
       ],
       "meta": [

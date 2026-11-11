@@ -106,8 +106,9 @@ func TestBenchIndexCoversTheRegistrationTable(t *testing.T) {
 			t.Errorf("bench.wasm.%s missing from the bench index", op)
 		}
 	}
-	// the bare members
-	for _, m := range []string{"millis", "caps", "gc", "api_version"} {
+	// the bare members (timer_ms joined the generated table with the
+	// W2.T5 seat finding — pinned here so a sidecar regression fails)
+	for _, m := range []string{"millis", "timer_ms", "caps", "gc", "api_version"} {
 		if !idx.Members[m] {
 			t.Errorf("bare member bench.%s missing from the index", m)
 		}
