@@ -171,8 +171,9 @@ const aotFWFloor = "0.3.0"
 // P3-T12 that is toolchain-v3, the surgery wamrc (kind
 // xuansi-surgery-wamrc): its .aot carries the split literal pool and
 // fw 0.3.0+ places it in PSRAM exec. toolchain-v2's stock wamrc is
-// deliberately NOT the default (its .aot lands in fw-internal SRAM
-// within the caps aot_exec_budget_bytes ceiling — the narrower lane);
+// deliberately NOT the default (fw 0.4.0 retired its lane: a stock
+// .aot rode the internal-SRAM exec region, and fw 0.4.0+ honestly
+// refuses it at load — such an .aot loads only on fw 0.3.x boards);
 // a cache holding v2 refuses the default lane honestly, naming fetch
 // and the wamrc_path override. Locked to the embedded snapshot's
 // latest by TestEmbeddedSnapshotDriftLock (the drift-lock's
@@ -202,11 +203,11 @@ func aotGate(r buildReq) error {
 // cache-paired half P3-T12 opened. The cache state IS the pairing
 // evidence (the build face never reads an index): the state's
 // generation label must be exactly aotDefaultGen (toolchain-v3 — the
-// surgery wamrc; a v2 cache's stock wamrc compiles the narrower
-// internal-SRAM lane and is not silently substituted), and the wamrc
-// record's Dir must still exist on disk. Every failure refuses with
-// its honest why and the next step (fetch, or the wamrc_path dev
-// override).
+// surgery wamrc; a v2 cache's stock wamrc produces .aot that fw
+// 0.4.0+ refuses to load — the internal-SRAM lane is retired — and
+// is not silently substituted), and the wamrc record's Dir must
+// still exist on disk. Every failure refuses with its honest why and
+// the next step (fetch, or the wamrc_path dev override).
 func (ts *toolset) resolveAOTWamrc() (string, error) {
 	root := tcCacheRoot()
 	if root == "" {
@@ -224,7 +225,7 @@ func (ts *toolset) resolveAOTWamrc() (string, error) {
 		if st.Generation == "" {
 			return "", errWs("xuansi_wasm_build: the aot lane's default wamrc is %s and nothing is installed in the toolchain cache — call xuansi_toolchain_fetch, or pass wamrc_path to point at a local wamrc (dev override)", aotDefaultGen)
 		}
-		return "", errWs("xuansi_wasm_build: the toolchain cache holds generation %q, not %s — the default aot lane demands the surgery wamrc (its .aot rides PSRAM exec on fw 0.3.0+; the %q wamrc compiles the narrower fw-internal-SRAM lane); call xuansi_toolchain_fetch to install %s, or pass wamrc_path to override (dev)", st.Generation, aotDefaultGen, st.Generation, aotDefaultGen)
+		return "", errWs("xuansi_wasm_build: the toolchain cache holds generation %q, not %s — the default aot lane demands the surgery wamrc (its .aot rides PSRAM exec on fw 0.3.0+; the %q wamrc compiles a stock .aot that fw 0.4.0+ refuses to load — the internal-SRAM exec lane is retired, fw 0.3.x boards only); call xuansi_toolchain_fetch to install %s, or pass wamrc_path to override (dev)", st.Generation, aotDefaultGen, st.Generation, aotDefaultGen)
 	}
 	rec, ok := st.Installed["wamrc"]
 	if !ok || rec.Dir == "" || !tcPathExists(filepath.Join(root, rec.Dir)) {
@@ -271,7 +272,7 @@ func fwGateWasm(fw string) error {
 // bounds ONE compiler run — clang's and wamrc's each get their own).
 func wamrcExec(ctx context.Context, r buildReq, wasm []byte) (aotBytes []byte, warnings string, err error) {
 	if _, serr := os.Stat(r.WamrcPath); serr != nil {
-		return nil, "", errWs("xuansi_wasm_build: no wamrc at %s — the aot lane needs the %s surgery wamrc (xuansi_toolchain_fetch installs it as the default; toolchain-v2's stock wamrc is the narrower internal-SRAM lane) or an explicit local build; manual steps: see the xuansi-drivers README's User-compiled modules section", r.WamrcPath, aotDefaultGen)
+		return nil, "", errWs("xuansi_wasm_build: no wamrc at %s — the aot lane needs the %s surgery wamrc (xuansi_toolchain_fetch installs it as the default; toolchain-v2's stock wamrc compiles a .aot that fw 0.4.0+ refuses to load — the internal-SRAM exec lane is retired) or an explicit local build; manual steps: see the xuansi-drivers README's User-compiled modules section", r.WamrcPath, aotDefaultGen)
 	}
 	base := "module"
 	if r.Name != "" {
@@ -538,7 +539,7 @@ type wasmBuildIn struct {
 	// aot lane's EXPLICIT override (aot=true is the default lane);
 	// WasiSDKPath compiles with a local wasi-sdk tree (bin/clang
 	// inside it) instead of the cache's landed record.
-	WamrcPath   string `json:"wamrc_path,omitempty" jsonschema:"the §6.4 developer override of the aot lane's wamrc: given, the freshly-built .wasm compiles one step further with THIS wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3) and the artifact lands as drivers/<name>@<version>.aot, manifest kind \"wasm-dev\" — bypassing the cache pairing evidence (aot=true is the cache-paired default: toolchain-v3's surgery wamrc, PSRAM exec on fw 0.3.0+; a stock wamrc produces the narrower fw-internal-SRAM .aot within the caps aot_exec_budget_bytes ceiling)"`
+	WamrcPath   string `json:"wamrc_path,omitempty" jsonschema:"the §6.4 developer override of the aot lane's wamrc: given, the freshly-built .wasm compiles one step further with THIS wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3) and the artifact lands as drivers/<name>@<version>.aot, manifest kind \"wasm-dev\" — bypassing the cache pairing evidence (aot=true is the cache-paired default: toolchain-v3's surgery wamrc, PSRAM exec on fw 0.3.0+; a stock (toolchain-v2) wamrc produces a v2 .aot that fw 0.4.0+ refuses to load — the internal-SRAM exec lane is retired, fw 0.3.x boards only)"`
 	WasiSDKPath string `json:"wasi_sdk_path,omitempty" jsonschema:"the §6.4 developer override: compile with this local wasi-sdk tree (its bin/clang, never a PATH lookup) instead of the toolchain cache's landed record — explicitly bypassing the index pairing evidence, and marks the manifest entry kind \"wasm-dev\""`
 }
 

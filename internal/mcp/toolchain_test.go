@@ -90,22 +90,25 @@ func TestParseToolchainIndexVerGate(t *testing.T) {
 
 // TestEmbeddedSnapshotDriftLock (B11 task 1's TestEmbeddedSnapshotParses,
 // grown the T8 pin verbatim lock and the P3-T12 dual-generation +
-// mechanical cross-assertion legs): pins the embedded snapshot's shape,
-// every real pin verbatim — all five wasi_sdk entries and the built
-// wamrc assets of BOTH generations (v2: linux-x64 + both mac legs;
-// v3: the same three legs) against hardcoded truth — and, the T7-③
-// debt closed, MECHANICALLY cross-asserts the build face's hardcoded
-// constants against the snapshot itself: every generation that opens
-// an aot lane pins exactly ">=" + aotFWFloor (a future floor move
-// turns this red in every test run, moving all the legs in one
-// sweep), and the snapshot's latest IS aotDefaultGen (the default
-// aot lane resolves a generation the shipped snapshot actually
-// names). A snapshot that no longer mirrors the drivers repo's
-// published toolchain-index.json (stale copy, bad manual
-// transcription) fails HERE, in every test run, instead of at a
-// user's fetch. linux-arm64/win-x64 wamrc stay honest nulls in both
-// generations (no leg built; the win best-effort leg failed its
-// MSVC probe — tracked P2).
+// mechanical cross-assertion legs, then the 0.4.0 retirement): pins
+// the embedded snapshot's shape, every real pin verbatim — all five
+// wasi_sdk entries and the built wamrc assets of BOTH generations
+// (v2: linux-x64 + both mac legs; v3: the same three legs) against
+// hardcoded truth — and, the T7-③ debt closed, MECHANICALLY
+// cross-asserts the build face's hardcoded constants against the
+// snapshot itself: v3 (the aot lane's default) pins exactly ">=" +
+// aotFWFloor (a future floor move turns this red in every test run,
+// moving all the legs in one sweep), v2 pins the RETIRED lane's
+// closed domain ">=0.3.0 <0.4.0" (fw 0.4.0 removed the
+// internal-SRAM exec lane — a stock .aot loads only on fw 0.3.x),
+// and the snapshot's latest IS aotDefaultGen (the default aot lane
+// resolves a generation the shipped snapshot actually names). A
+// snapshot that no longer mirrors the drivers repo's published
+// toolchain-index.json (stale copy, bad manual transcription) fails
+// HERE, in every test run, instead of at a user's fetch.
+// linux-arm64/win-x64 wamrc stay honest nulls in both generations
+// (no leg built; the win best-effort leg failed its MSVC probe —
+// tracked P2).
 func TestEmbeddedSnapshotDriftLock(t *testing.T) {
 	ix := embeddedToolchainIndex()
 	if ix.IndexVer != 1 { // trivially true past the gate; pins that the gate ran
@@ -213,14 +216,21 @@ func TestEmbeddedSnapshotDriftLock(t *testing.T) {
 
 	// ---- the mechanical cross-assertions (T7-③'s debt closed: the
 	// build face's hardcoded constants are locked to the SNAPSHOT, in
-	// both directions) ----
+	// both directions; 0.4.0 split the aot-domain rule per
+	// generation) ----
+	// v3 — the aot lane's default — keeps the OPEN domain: exactly
+	// the hardcoded floor. A floor move must land here red.
+	if aot := v3.FwCompat["aot"]; aot != ">="+aotFWFloor {
+		t.Errorf("toolchain-v3 fw_compat.aot = %q, want exactly %q (aotFWFloor=%s — a floor move must land here red)", aot, ">="+aotFWFloor, aotFWFloor)
+	}
+	// v2 — the RETIRED lane (fw 0.4.0 removed the internal-SRAM exec
+	// lane): the open floor plus the closed top, so a stock .aot
+	// reads as 0.3.x-only. An un-retirement or a moved boundary must
+	// land here red, deliberately.
+	if aot := v2.FwCompat["aot"]; aot != ">="+aotFWFloor+" <0.4.0" {
+		t.Errorf("toolchain-v2 fw_compat.aot = %q, want exactly %q (the retired internal-SRAM lane: a stock .aot loads only on fw 0.3.x — fw 0.4.0+ refuses it at load)", aot, ">="+aotFWFloor+" <0.4.0")
+	}
 	for genName, gen := range map[string]tcGen{"toolchain-v2": v2, "toolchain-v3": v3} {
-		if aot, ok := gen.FwCompat["aot"]; ok && aot != "" {
-			// an OPEN aot domain must be exactly the hardcoded floor
-			if want := ">=" + aotFWFloor; aot != want {
-				t.Errorf("%s fw_compat.aot = %q, want exactly %q (aotFWFloor=%s — a floor move must land here red)", genName, aot, want, aotFWFloor)
-			}
-		}
 		if gen.FwCompat["wasm"] != ">=0.2.0" {
 			t.Errorf("%s fw_compat.wasm = %q, want the wide \">=0.2.0\" domain", genName, gen.FwCompat["wasm"])
 		}
@@ -238,18 +248,19 @@ func TestEmbeddedSnapshotDriftLock(t *testing.T) {
 	}
 }
 
-// TestToolchainDescAOTDomain (P3-T7, extended P3-T12): the
-// toolchain/build Descriptions are the face's fw-compat pairing
-// surface, and they must speak the DUAL-GENERATION read — aot >=0.3.0
-// with toolchain-v3 (the latest/default: the surgery wamrc, PSRAM
-// exec) and toolchain-v2 (the stock wamrc, fw-internal SRAM within
-// aot_exec_budget_bytes) — while every retired future-tense marker
-// ("aot = null", "arrives with the A1 runtime", "refused until A1",
-// "arrives later with toolchain-v3") must be GONE: v3 is the present,
-// not a horizon. The drift this pins is the T8-minor⑤ staleness
-// class: a Desc that describes a mechanism the product no longer has
-// (or does not yet have) is a documentation defect the seat carries
-// to every agent.
+// TestToolchainDescAOTDomain (P3-T7, extended P3-T12, rewritten for
+// 0.4.0): the toolchain/build Descriptions are the face's fw-compat
+// pairing surface, and they must speak the 0.4.0 read — aot on ONE
+// live lane, toolchain-v3 (the latest/default: the surgery wamrc,
+// PSRAM exec), while toolchain-v2's aot lane is RETIRED
+// (fw_compat.aot ">=0.3.0 <0.4.0": a stock .aot loads only on fw
+// 0.3.x; fw 0.4.0+ honestly refuses it at load — the internal-SRAM
+// exec lane is gone). Every retired marker — the old future-tense
+// set AND the 0.3.x-era live-lane vocabulary (caps
+// aot_exec_budget_bytes, "the narrower lane", the DUAL-GEN framing)
+// — must be GONE: a Desc that describes a mechanism the product no
+// longer has (or does not yet have) is a documentation defect the
+// seat carries to every agent.
 func TestToolchainDescAOTDomain(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -263,51 +274,58 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 		desc[tool.Name] = tool.Description
 	}
 
-	// status: the pairing matrix sentence, present tense, the four
-	// ruling-mandated elements + BOTH generations of the dual-gen read.
+	// status: the pairing matrix sentence, present tense — one live
+	// aot lane (v3) plus the v2 retirement stated with its closed
+	// domain, the boundary version, and the honest refusal.
 	st := desc["xuansi_toolchain_status"]
 	for _, want := range []string{
-		"aot >=0.3.0",           // the open domain + its floor
-		"aot_exec_budget_bytes", // v2's ceiling's caps key (T6 caps face)
-		"INTERNAL SRAM",         // v2 placement: fw-internal, not PSRAM
-		"honestly refused",      // over-budget semantics: no silent swap
-		"toolchain-v3",          // the latest generation
-		"toolchain-v2",          // the kept stock generation
-		"xuansi-surgery-wamrc",  // v3's kind
-		"PSRAM exec",            // v3's placement lane
+		"wasm >=0.2.0",         // the wide wasm domain both generations keep
+		"toolchain-v3",         // the latest generation (the one live aot lane)
+		"PSRAM exec",           // v3's placement lane
+		"xuansi-surgery-wamrc", // v3's kind
+		"toolchain-v2",         // the kept stock generation (wasm track)
+		">=0.3.0 <0.4.0",       // v2's closed aot domain
+		"retired",              // the retirement stated, not implied
+		"0.4.0",                // the boundary version named
+		"honestly refuse",      // load-time refusal semantics: no silent swap
 	} {
 		if !strings.Contains(st, want) {
-			t.Errorf("toolchain_status Desc: want %q (the dual-generation aot read), missing from:\n%s", want, st)
+			t.Errorf("toolchain_status Desc: want %q (the 0.4.0 aot read), missing from:\n%s", want, st)
 		}
 	}
 
-	// the retired future-tense markers must be gone from ALL three —
-	// including T12's own retiree: "arrives later with toolchain-v3"
-	// (v3 IS the present now).
+	// the retired markers must be gone from ALL three — the T7/T12
+	// future-tense set AND the 0.3.x-era live-lane vocabulary the
+	// 0.4.0 face must no longer claim (the caps key is gone with the
+	// lane; v2 is not "the narrower lane" but a refused lane).
 	for name, d := range desc {
 		switch name {
 		case "xuansi_toolchain_status", "xuansi_toolchain_fetch", "xuansi_wasm_build":
 		default:
 			continue
 		}
-		for _, stale := range []string{"aot = null", "aot empty", "refused until A1", "arrives with the A1 runtime", "empty domain", "arrives later with toolchain-v3", "arrives with toolchain-v3"} {
+		for _, stale := range []string{"aot = null", "aot empty", "refused until A1", "arrives with the A1 runtime", "empty domain", "arrives later with toolchain-v3", "arrives with toolchain-v3", "aot_exec_budget_bytes", "narrower", "in TWO generations", "DUAL-GEN", "read DUAL"} {
 			if strings.Contains(d, stale) {
-				t.Errorf("%s Desc: retired future-tense marker %q still present:\n%s", name, stale, d)
+				t.Errorf("%s Desc: retired marker %q still present:\n%s", name, stale, d)
 			}
 		}
 	}
 
-	// fetch: the PAIRING sentence states the dual generations.
+	// fetch: the PAIRING sentence keeps BOTH generations' vocabulary
+	// (the wasm track is unchanged — v2 stays installable) with the
+	// v2 retirement stated.
 	fx := desc["xuansi_toolchain_fetch"]
-	for _, want := range []string{"aot >=0.3.0", "toolchain-v3", "PSRAM exec"} {
+	for _, want := range []string{"wasm >=0.2.0", "toolchain-v3", "PSRAM exec", "toolchain-v2", "retired", "0.4.0"} {
 		if !strings.Contains(fx, want) {
-			t.Errorf("toolchain_fetch Desc: want %q in the dual-generation pairing sentence, missing from:\n%s", want, fx)
+			t.Errorf("toolchain_fetch Desc: want %q in the pairing sentence, missing from:\n%s", want, fx)
 		}
 	}
 
-	// build: the aot lane's TWO knobs + the frozen recipe named.
+	// build: the aot lane's TWO knobs + the frozen recipe named, and
+	// the wamrc_path override's stock-wamrc warning speaks the
+	// 0.4.0 refusal (not the retired "narrower lane").
 	bd := desc["xuansi_wasm_build"]
-	for _, want := range []string{"--target=xtensa", "--cpu=esp32s3", "drivers/<name>@<version>.aot", "wasm-dev", "aot=true"} {
+	for _, want := range []string{"--target=xtensa", "--cpu=esp32s3", "drivers/<name>@<version>.aot", "wasm-dev", "aot=true", "0.4.0", "refuses to load"} {
 		if !strings.Contains(bd, want) {
 			t.Errorf("wasm_build Desc: want %q (the dual-knob aot lane), missing from:\n%s", want, bd)
 		}
@@ -315,7 +333,8 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 
 	// build input schema: the aot knob's Desc carries the lane
 	// semantics; the wamrc_path field Desc keeps the dev-override
-	// semantics (the seat a client actually reads first).
+	// semantics (the seat a client actually reads first), now with
+	// the 0.4.0 stock-wamrc refusal.
 	for _, tool := range lr.Tools {
 		if tool.Name != "xuansi_wasm_build" {
 			continue
@@ -339,7 +358,7 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 					}
 				}
 			case "wamrc_path":
-				for _, want := range []string{".aot", "wasm-dev"} {
+				for _, want := range []string{".aot", "wasm-dev", "0.4.0", "refuses to load"} {
 					if !strings.Contains(fd, want) {
 						t.Errorf("wamrc_path schema Desc: want %q, missing from:\n%s", want, fd)
 					}
@@ -352,6 +371,28 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 						t.Errorf("fw schema Desc: want the dual-floor wording (%s), missing from:\n%s", want, fd)
 					}
 				}
+			}
+		}
+	}
+
+	// fetch input schema: the generation field's Desc still carries
+	// toolchain-v2 (the wasm track keeps the generation installable)
+	// with the retirement caveat — the vocabulary the brief's
+	// wasm-track-unchanged leg pins.
+	for _, tool := range lr.Tools {
+		if tool.Name != "xuansi_toolchain_fetch" {
+			continue
+		}
+		m, _ := tool.InputSchema.(map[string]any)
+		props, _ := m["properties"].(map[string]any)
+		f, ok := props["generation"].(map[string]any)
+		if !ok {
+			t.Fatalf("toolchain_fetch input schema: no generation property")
+		}
+		fd, _ := f["description"].(string)
+		for _, want := range []string{"toolchain-v3", "toolchain-v2", "wasm", "retired"} {
+			if !strings.Contains(fd, want) {
+				t.Errorf("toolchain_fetch generation schema Desc: want %q, missing from:\n%s", want, fd)
 			}
 		}
 	}
