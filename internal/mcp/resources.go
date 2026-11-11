@@ -82,6 +82,13 @@ const boardRebootDesc = "board.reboot reading: source \"board\" events with kind
 // event-reading faces.
 const boardTransportDesc = "board.transport reading: source \"board\" events with kind transport are synthesized daemon-side on every switch of a daemon-held controller link. data carries from/to/rebooted: to:\"usb\" means the switch OPENED the CDC port — the board rebooted (rebooted:true, one connection = one device session; scripts died; the lease reply that caused it carries the same disclosure); from:\"usb\" to:\"tcp\" is the §4.4 upgrade back (rebooted:false — a redial is not a reboot, §13; scripts survive), which happens at a default lease when TCP revives OR when an endpoint change forces the daemon to rebuild the board's dial seams over the live USB link. from \"\" just means no live controller was in hand before. A same-route re-lease, a release/shutdown yield (the route drops to none, not to another route), and mere redials fire nothing."
 
+// eventsSourcesDesc (B15 §4.6/§4.7, the W1.T5 SA2-gap fix) is the
+// shared source-vocabulary + arming guide both event-reading faces
+// carry: the full v7 push-source list, which sources need arming and
+// which arm themselves, and what arming-follows-connection means for
+// the reader.
+const eventsSourcesDesc = "Event sources: gpio.N / uartN.rx / stdout / net / job — and, on protocol_ver≥7 boards (the list_boards protocol_ver column), log (ring lines incl. boot/phase/identity/wasm-load, as they land) and script (lifecycle kinds started / finished / killed, killed carrying its cause: budget / error / stop — a budget-killed script's verdict rides the event, not the eval reply) — plus the daemon-synthesized source board (kinds board.reboot and transport, below). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. log and script are AUTO-ARMED by this face: every xuansi_lease on a v7 board re-subscribes both (idempotent), so they flow without any extra call; the board-side arming rides the daemon's controller link and dies on a controller change (yield/redial/endpoint drift — the frozen arming-follows-connection semantic), and the NEXT lease restores it. Arming is deliberately not undone at release — the daemon has no source-unsubscribe path (subscriptions die with the connection only), so log/script events keep flowing into the ring between leases. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so they appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide."
+
 // notifyQueueDepth bounds the per-board re-read hint queue. The
 // in-flight flag makes a board occupy AT MOST ONE slot — queued or
 // being delivered — so occupancy never exceeds the number of DISTINCT
@@ -243,7 +250,7 @@ func (es *eventState) reconcile(boards []dynBoard) (needWatch []string) {
 			Name:     "board " + mac6 + " events",
 			MIMEType: "application/json",
 			Description: fmt.Sprintf(
-				"Recent events of board %s — this process's local ring of the last %d WHOLE events per source (gpio.N / uartN.rx / stdout / net / job), newest last, with per-source overflow counts in the JSON. Subscribe to be notified when new events land, then re-read this resource for the snapshot (poll xuansi_events_recent for filtered reads); notifications are per-board coalesced re-read hints — every event is followed by one, bursts collapse, and the snapshot you read is always complete. The daemon's own event delivery is fire-and-forget, so a board flooding events can lose some at its queues. Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so this ring sees job events only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. "+boardRebootDesc+" "+boardTransportDesc, mac6, ringCap),
+				"Recent events of board %s — this process's local ring of the last %d WHOLE events per source, newest last, with per-source overflow counts in the JSON. Subscribe to be notified when new events land, then re-read this resource for the snapshot (poll xuansi_events_recent for filtered reads); notifications are per-board coalesced re-read hints — every event is followed by one, bursts collapse, and the snapshot you read is always complete. The daemon's own event delivery is fire-and-forget, so a board flooding events can lose some at its queues. "+eventsSourcesDesc+" "+boardRebootDesc+" "+boardTransportDesc, mac6, ringCap),
 		}, es.readHandler(mac6))
 	}
 	for _, mac6 := range remove {
@@ -340,6 +347,22 @@ func (es *eventState) chip(mac6 string) string {
 		}
 	}
 	return ""
+}
+
+// protocolVerAtLeast answers whether the board's last-refresh hello
+// sighting reported a protocol version ≥ v — the seat's feature gate
+// (W2-T4: v7 = the log/script event sources). A board the list does
+// not carry, or one never sighted (protoVer 0), answers false —
+// conservative: no arming crossing until the era is known.
+func (es *eventState) protocolVerAtLeast(mac6 string, v int64) bool {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	for _, b := range es.boards {
+		if b.mac6 == mac6 {
+			return b.protoVer >= v
+		}
+	}
+	return false
 }
 
 func joinCandidates(boards []dynBoard) string {

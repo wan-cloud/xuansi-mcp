@@ -260,6 +260,12 @@ type boardInfo struct {
 	// chip the board's hello reported (e.g. ESP32-S3). omitempty keeps
 	// it honestly absent before the first crossing.
 	Chip string `json:"chip,omitempty" jsonschema:"the chip the board's hello reported (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source: a version whose manifest carries aot.<target> for THIS chip (ESP32-S3 → esp32s3) deploys as the .wasm + .aot PAIR; absent before the daemon's first hello crossing (then a bare push is the conservative single artifact)"`
+	// ProtocolVer (B15 W2-T4) is the protocol era the daemon's last
+	// hello sighting reported — the seat's v7 feature gate: 7+ means
+	// the log/script event sources, bench.wasm.plan and the numeric
+	// caps table exist on this board. Rides the same sighting as
+	// boot_epoch (absent before the first crossing).
+	ProtocolVer int64 `json:"protocol_ver,omitempty" jsonschema:"the REPL protocol version the daemon's last hello sighting reported — 7+ carries the wave-1/2 additions (the log/script event sources — this face auto-arms both under a lease; bench.wasm.plan; the numeric caps limits table); absent before the daemon's first crossing of the board"`
 	// Freshness face (B15 §4.1⑥): the current ACTUAL route, the numeric
 	// contact age, and the staleness verdict.
 	Transport     string `json:"transport,omitempty" jsonschema:"the CURRENT ACTUAL controller transport (\"tcp\"/\"usb\") — the route in hand, not the preferred one; absent when the daemon holds no live controller (never connected, or the last link died)"`
@@ -468,7 +474,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_events_recent",
-		Description: "Read one board's most recent events from this process's local rings — cache-first, NEVER dials the board and never calls the daemon (frozen read semantics): an unreachable board still answers from the rings. The rings hold the last 256 WHOLE events per (board, source) — gpio.N / uartN.rx / stdout / net / job — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\"), limit caps the merged newest-last view (default 50; truncated flags the cut). Arming precondition: gpio.N / uartN.rx / stdout / net events flow only after the source is armed board-side (events.subscribe) — in this MCP face the in-contract arming path is xuansi_capture. Job-source caveat: job events are direct-delivered to the connection that SUBMITTED the job (§8), so job events appear here only for jobs submitted through THIS process (e.g. xuansi_submit) — never board-wide. " + boardRebootDesc + " " + boardTransportDesc + ". For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
+		Description: "Read one board's most recent events from this process's local rings — cache-first, NEVER dials the board and never calls the daemon (frozen read semantics): an unreachable board still answers from the rings. The rings hold the last 256 WHOLE events per (board, source) — evicting oldest-first per source under overflow (per-source dropped counts ride the reply). source_prefix filters by source (\"gpio\", \"uart1.rx\", \"job\", \"log\", \"script\"), limit caps the merged newest-last view (default 50; truncated flags the cut). " + eventsSourcesDesc + " " + boardRebootDesc + " " + boardTransportDesc + ". For push-style updates subscribe to the xuansi://boards/<mac6>/events resource.",
 	}, ts.eventsRecent)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -586,6 +592,7 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			ResetReason:   str(m, "reset_reason"),
 			LastSeen:      str(m, "last_seen"),
 			Chip:          str(m, "chip"),
+			ProtocolVer:   int64(num(m, "protocol_ver")),
 			Transport:     str(m, "transport"),
 			LastSeenAgeMS: age,
 			Stale:         bol(m, "stale"),
@@ -621,14 +628,55 @@ func (ts *toolset) lease(ctx context.Context, _ *mcpsdk.CallToolRequest, in leas
 	if err != nil {
 		return nil, leaseResultOut{}, err
 	}
-	return nil, leaseResultOut{
+	out := leaseResultOut{
 		Board:         str(res, "board"),
 		Holder:        str(res, "holder"),
 		Session:       num(res, "session"),
 		Transport:     str(res, "transport"),
 		Rebooted:      bol(res, "rebooted"),
 		TransportNote: str(res, "transport_note"),
-	}, nil
+	}
+	ts.armLogScript(ctx, in.Board)
+	return nil, out, nil
+}
+
+// armLogScript (B15 §4.6, the W1.T5 SA2-gap fix) auto-arms the v7
+// `log` and `script` event sources whenever this face takes a lease on
+// a protocol_ver≥7 board — spec design "daemon 持 lease 時自動武裝".
+// The mechanism is the seat's own existing arming path, the
+// watch_events{source} crossing (the daemon subscribes the source
+// board-side via events.subscribe, HIL-proven in the W1.T5 S5/S6
+// legs): idempotent board-side, so EVERY lease re-arms — the frozen
+// arming-follows-connection semantic means a controller change (yield,
+// redial, endpoint drift) loses the board-side arming, and the next
+// lease restores it without any state of our own.
+//
+// Deliberately NO disarm on release: no daemon request can unsubscribe
+// a source (proto.go's frozen policy — "subscriptions die with the
+// connection only"; capture_stop's mirror deliberately does not
+// unsubscribe either, so another watcher of the same source never
+// loses its feed), so log/script events keep flowing into the ring
+// after release — the ring semantics (错过＝events_recent 補) are
+// unchanged. A refusal (a not-yet-sighted board, a v6 board that
+// cannot know the sources) is one log line, never a lease failure: the
+// lease itself is not this face's to unwind.
+func (ts *toolset) armLogScript(ctx context.Context, boardSel string) {
+	es := ts.ev
+	if es == nil {
+		return // static-only face: no board list, no era gate, no arming
+	}
+	mac6, err := es.resolve(boardSel)
+	if err != nil {
+		return // unknown board (or the refresh never listed it): the daemon answers the lease authoritatively; arming is opportunistic
+	}
+	if !es.protocolVerAtLeast(mac6, 7) {
+		return // pre-v7 board, or never sighted: conservative no-crossing
+	}
+	for _, src := range []string{"log", "script"} {
+		if _, werr := ts.call(ctx, server.Request{Type: "watch_events", Board: mac6, Source: src}); werr != nil {
+			ts.logline("mcp: board %s: auto-arm of the %q event source under the lease refused (%v) — log/script events will not flow until a later lease re-arms successfully", mac6, src, werr)
+		}
+	}
 }
 
 func (ts *toolset) release(ctx context.Context, _ *mcpsdk.CallToolRequest, in releaseIn) (*mcpsdk.CallToolResult, releaseOut, error) {

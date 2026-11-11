@@ -1255,7 +1255,8 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 		fwVer = b.Hello.FwVersion // B10-T8c: semver beside the build id (esp_app_desc face)
 		v["boot_epoch"] = int64(b.Hello.BootEpoch)
 		v["reset_reason"] = b.Hello.ResetReason
-		if b.Hello.Chip != "" { // P3-T13: the pairing source rides the same sighting
+		v["protocol_ver"] = b.Hello.ProtocolVer // B15 W2-T4: the protocol era the hello sighted (v7 = the log/script event sources, plan, the numeric caps table) — the seat's feature gate
+		if b.Hello.Chip != "" {                 // P3-T13: the pairing source rides the same sighting
 			v["chip"] = b.Hello.Chip
 		}
 	}
@@ -1456,8 +1457,12 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 	// route == usb (explicit or the auto-fallback)
 	if !usbLive {
 		// fast-fail (§4.1②): the registry's current snapshot shows no
-		// live USB source — refuse with zero dial (cause "source gone")
-		return nil, s.boardFail(b.MAC6, fmt.Errorf("board %s: usb lease: %w", b.MAC6, errSourceGone))
+		// live USB source — refuse with zero dial (cause "source gone").
+		// Wrapped in errUnreachable since W2-T4 (the W1.T5 seat
+		// audit's class-vocabulary minor): every source-gone refusal
+		// reads class unreachable + cause "source gone" — the eval
+		// path's shape (preflightSource), never a bare server class.
+		return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: board %s: usb lease: %w", errUnreachable, b.MAC6, errSourceGone))
 	}
 	db := s.supervisor(b)
 	db.connectMu.Lock() // deliberate: held across ConnectUSB (~5s bounded — drain + hello); connects and Close serialize behind it
@@ -1926,6 +1931,15 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 	if req.Sha256 == "" && len(req.Data) <= fsFileMax {
 		return s.boardOp(ctx, b, "fs.write", map[string]any{"path": req.Path, "data": req.Data})
 	}
+	// The EMPTY verified write (a present sha256 key + zero-length
+	// data) is unreachable from every shipped face — the MCP fs_write
+	// carries no sha field, and driver_push gates non-empty content
+	// before any write (the --@api parse / module magic refuse empty
+	// payloads first) — and the fw refuses it anyway (fs.write_commit
+	// answers "no .part": zero write_parts ever opened the staging
+	// file). W1.T4 minor ②, noted W2-T4 rather than guarded: a
+	// daemon-side refusal for a shape only test harnesses can produce
+	// would be dead code guarding the fw's own refusal.
 	shaHex := req.Sha256
 	if shaHex == "" {
 		sum := sha256.Sum256(req.Data)
@@ -2383,34 +2397,36 @@ func (db *daemonBoard) jobDeliver(ev *replclient.Event) {
 // direct-delivers job events to the submitting connection, so a foreign
 // connection's jobs are invisible, honestly). The timeout answers
 // (nil, false, nil) — a RESULT, never an error.
+//
+// The not-done observation and the wake-channel capture share ONE
+// critical section (W1.T4 minor, fixed W2-T4): a delivery that lands
+// between a peek and a separately-locked channel read would swap the
+// wake channel under the waiter (wakeJobsLocked closes the old and
+// arms a fresh one) — the waiter would then park on the FRESH channel
+// and sleep past the delivery it just missed. Under one lock-scope
+// every interleaving is safe: the delivery either happened before the
+// observation (done answers) or closes the channel we captured.
 func (db *daemonBoard) jobWait(ctx context.Context, tag string, timeout time.Duration) (map[string]any, bool, error) {
 	unknown := &RPCError{Class: "api",
 		Msg: fmt.Sprintf("job_wait: no job tagged %q is known to this daemon — jobs are tracked from their submit through this daemon (a job submitted on another connection delivers its event there, not here)", tag)}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	// peek reads the ledger under jobsMu and hands the DATA reference
-	// out under the same lock — a racing tag-reuse delivery (jobDeliver
-	// swaps e.data under the lock) must never be observed half-way by a
-	// reader that dropped the lock first.
-	peek := func() (data map[string]any, done, known bool) {
-		db.jobsMu.Lock()
-		defer db.jobsMu.Unlock()
-		e, ok := db.jobs[tag]
-		if !ok {
-			return nil, false, false
-		}
-		return e.data, e.done, true
-	}
-	if data, done, known := peek(); !known {
-		return nil, false, unknown
-	} else if done {
-		return data, true, nil
-	}
-	var wake chan struct{}
-	db.jobsMu.Lock()
-	wake = db.jobWake
-	db.jobsMu.Unlock()
 	for {
+		db.jobsMu.Lock()
+		e, ok := db.jobs[tag]
+		if !ok { // never seen, or jobReset orphaned it mid-wait
+			db.jobsMu.Unlock()
+			return nil, false, unknown
+		}
+		if e.done {
+			data := e.data // handed out under the same lock: a racing
+			// tag-reuse delivery swaps e.data under jobsMu and must
+			// never be observed half-way
+			db.jobsMu.Unlock()
+			return data, true, nil
+		}
+		wake := db.jobWake // captured WITH the not-done observation: no missed-wake window
+		db.jobsMu.Unlock()
 		select {
 		case <-wake:
 		case <-timer.C:
@@ -2418,14 +2434,6 @@ func (db *daemonBoard) jobWait(ctx context.Context, tag string, timeout time.Dur
 		case <-ctx.Done():
 			return nil, false, nil // the request ctx died; the reply goes nowhere anyway
 		}
-		if data, done, known := peek(); !known { // jobReset orphaned it mid-wait
-			return nil, false, unknown
-		} else if done {
-			return data, true, nil
-		}
-		db.jobsMu.Lock()
-		wake = db.jobWake
-		db.jobsMu.Unlock()
 	}
 }
 
