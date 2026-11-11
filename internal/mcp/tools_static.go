@@ -380,7 +380,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_lease",
-		Description: "Take the board's lease — required before run_lua/submit/script/fs_write/board_op mutate anything. The route is the daemon's decision (B15 §4.4) unless you override transport: default stays TCP whenever a TCP-capable source (mdns or a pin) is live — never a gratuitous USB reboot; when only USB is live the default AUTO-FALLS BACK to USB, which opens the CDC port and REBOOTS the board (running scripts die) — the reply always names the route (transport), whether this lease rebooted (rebooted), and the disclosure (transport_note); never silent. A later default lease upgrades back to TCP when TCP revives (a board.transport event on the events face carries every switch). Holder semantics: " + holderDesc + ".",
+		Description: "Take the board's lease — required before run_lua/submit/script/fs_write/board_op mutate anything. The route is the daemon's decision (B15 §4.4) unless you override transport: default stays TCP whenever a TCP-capable source (mdns or a pin) is live — never a gratuitous USB reboot; when only USB is live the default AUTO-FALLS BACK to USB, which opens the CDC port and REBOOTS the board (running scripts die) — the reply always names the route (transport), whether this lease rebooted (rebooted), and the disclosure (transport_note); never silent. A later default lease upgrades back to TCP when TCP revives (a board.transport event on the events face carries every switch of the daemon-held controller link). Holder semantics: " + holderDesc + ".",
 	}, ts.lease)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{

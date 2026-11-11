@@ -175,19 +175,25 @@
 //
 // # board.transport (the synthesized route-switch event, B15 §4.4)
 //
-// The daemon switches a board's controller route only at lease
-// boundaries; every ACTUAL switch fires one board event — source
-// "board", data {kind:"transport", from, to, rebooted} — fanned out
-// like any board event. from is the route in hand before the switch
-// ("" when no live controller), to the route after ("tcp"/"usb");
-// rebooted is true only when the switch OPENED the CDC port (§2: one
-// connection = one device session — the USB open IS a reboot). The
-// switches: any lease taking the USB route with a fresh open
-// (auto-fallback or explicit; from "tcp" or "" → "usb"), and the
-// USB→TCP upgrade a default lease performs when TCP revives
-// ("usb" → "tcp", rebooted:false — §13 redial ≠ reboot). A same-route
-// re-lease, a release yield (route drops to none), and mere redials
-// never fire.
+// The daemon fires one board event on every switch of a daemon-held
+// controller link — source "board", data {kind:"transport", from, to,
+// rebooted} — fanned out like any board event. from is the route in
+// hand before the switch ("" when no live controller), to the route
+// after ("tcp"/"usb"); rebooted is true only when the switch OPENED
+// the CDC port (§2: one connection = one device session — the USB
+// open IS a reboot). The switch sites:
+//
+//   - any lease taking the USB route with a fresh open (auto-fallback
+//     or explicit; from "tcp" or "" → "usb", rebooted:true);
+//   - the USB→TCP upgrade — a default lease finding a warm USB
+//     controller with TCP live again ("usb" → "tcp", rebooted:false —
+//     §13 redial ≠ reboot), OR the endpoint-drift seam rebuild closing
+//     a live USB route whose fresh resolution is TCP-capable
+//     (supervisor()'s rebuild branch — the same upgrade completing
+//     outside any lease; TCP revived WITH an endpoint change).
+//
+// A same-route re-lease, a release/shutdown yield (the route drops to
+// none, not to another route), and mere redials never fire.
 //
 // # The pin face (⑨, B15 §4.9)
 //
