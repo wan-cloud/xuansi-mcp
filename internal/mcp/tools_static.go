@@ -186,7 +186,7 @@ type boardOpIn struct {
 	// Op's tag list is hand-maintained (a struct tag cannot render
 	// from the daemon's table) and pinned to server.AllowlistedOps()
 	// by TestBoardOpAllowlistSingleSource — update both together.
-	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats, log.read, wifi.off, wifi.setup, wifi.status (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools)"`
+	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats, log.read, lua.check, wifi.off, wifi.setup, wifi.status (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools). lua.check is the fw's ro SYNTAX ground truth {code}→{ok, line?, msg?} — the authority xuansi_lua_lint's advisory findings defer to"`
 	Args   map[string]any `json:"args,omitempty" jsonschema:"the op's parameters as a JSON object; numbers must be integers with absolute value below 2^53 (validated daemon-side with an \"api\" error); every other value shape crosses verbatim — the board is the authority"`
 	Holder string         `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
@@ -484,7 +484,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_ws_list",
-		Description: "List the driver workspace: per driver the ACTIVE version (what a bare xuansi_driver_push re-deploys; absent until a first push), the module kind the fetch index carried (verbatim — driver/algorithm today, production/test-canary when the drivers-repo canary wave lands; absent for hand-put versions), and every stored version with size + sha256 — the deploy menu, history included.",
+		Description: "List the driver workspace: per driver the ACTIVE version (what a bare xuansi_driver_push re-deploys; absent until a first push), the RELEASE CLASS the fetch index carried in its kind field (production / test-canary — the one kind vocabulary at every seat face; absent for hand-put versions and kindless indexes, and a built version makes no release-class claim), each stored version with size + sha256 — and its per-version facts: the aot.<target> pairing records and the dev lane marker (a §6.4 override build) — the deploy menu, history included. See xuansi_module_doc for a version's ops/measured documentation.",
 	}, ts.wsList)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
