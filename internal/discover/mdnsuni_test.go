@@ -545,3 +545,233 @@ func TestDiscoverMDNSBothLanes(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Bug 2① (B15 §4.11): the A/AAAA followup round for SRV-without-address
+// sweeps — the Windows responder shape.
+// ---------------------------------------------------------------------------
+
+// TestUnicastHostQueryByteExact: the followup query's wire shape — the
+// same frozen header as the proven PTR query (id 0, RD=1, one IN
+// question), QNAME the SRV target's labels, QTYPE A (1) or AAAA (28).
+func TestUnicastHostQueryByteExact(t *testing.T) {
+	got := unicastHostQuery("xuansi-d75884.local", 1)
+	want := hexBytes(t, "0000010000010000000000000d7875616e73692d643735383834056c6f63616c0000010001")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("A query =\n %x\nwant\n %x", got, want)
+	}
+	got6 := unicastHostQuery("xuansi-d75884.local", 28)
+	want6 := hexBytes(t, "0000010000010000000000000d7875616e73692d643735383834056c6f63616c00001c0001")
+	if !reflect.DeepEqual(got6, want6) {
+		t.Errorf("AAAA query =\n %x\nwant\n %x", got6, want6)
+	}
+}
+
+// fakeAResponder is a loopback mDNS responder for the followup leg: it
+// answers a unicast A/AAAA question with one matching record for host
+// (staying silent on everything else), so the followup runs over real
+// UDP exactly as the daemon runs it.
+type fakeAResponder struct {
+	conn   *net.UDPConn
+	queryQ chan []byte
+	v6Only bool // answers only AAAA questions (the v6 test's A-silent shape)
+}
+
+func startFakeAResponder(t *testing.T, host string) *fakeAResponder {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("fake A responder listen: %v", err)
+	}
+	fr := &fakeAResponder{conn: conn, queryQ: make(chan []byte, 16)}
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, raddr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			q := append([]byte(nil), buf[:n]...)
+			select {
+			case fr.queryQ <- q:
+			default:
+			}
+			// one question frame: [header 12][QNAME labels… 00][QTYPE 2][QCLASS 2]
+			if len(q) < 12+6 {
+				continue
+			}
+			off := 12
+			var name []byte
+			for off < len(q) && q[off] != 0 {
+				l := int(q[off])
+				if off+1+l > len(q) {
+					name = nil
+					break
+				}
+				if len(name) > 0 {
+					name = append(name, '.')
+				}
+				name = append(name, q[off+1:off+1+l]...)
+				off += 1 + l
+			}
+			if name == nil || off+5 > len(q) {
+				continue
+			}
+			qtype := uint16(q[off+1])<<8 | uint16(q[off+2])
+			if fr.v6Only && qtype != 28 {
+				continue
+			}
+			var frame []byte
+			switch qtype {
+			case 1:
+				frame = wireResponse(wireRR(host, 1, []byte{10, 1, 51, 205}))
+			case 28:
+				ip := net.ParseIP("fe80::1").To16()
+				frame = wireResponse(wireRR(host, 28, ip))
+			default:
+				continue
+			}
+			conn.WriteToUDP(frame, raddr)
+		}
+	}()
+	t.Cleanup(func() { conn.Close() })
+	return fr
+}
+
+// TestDiscoverMDNSAddrFollowup: Bug 2① — a browse whose SRV records
+// arrive WITHOUT A/AAAA (the Windows responder shape: the sweep knows
+// the service exists and its hostname, but the hostname dials as .local
+// and SERVFAILs under the CGO=0 pure resolver) triggers ONE bounded
+// unicast A followup round whose answer fills Board.IP. A board that
+// already carries an address is left alone; a silent responder degrades
+// to IP="" — the hostname fallback, never an error.
+func TestDiscoverMDNSAddrFollowup(t *testing.T) {
+	origIfaces, origNew, origIfIP := browseIfaces, newResolverFunc, ifaceIPv4
+	t.Cleanup(func() { browseIfaces, newResolverFunc, ifaceIPv4 = origIfaces, origNew, origIfIP })
+	browseIfaces = func() []net.Interface {
+		return []net.Interface{{Index: 94, Name: "fake0", Flags: net.FlagUp | net.FlagMulticast}}
+	}
+	ifaceIPv4 = func(net.Interface) net.IP { return net.IPv4(127, 0, 0, 1) }
+
+	t.Run("SRV without A: followup fills the IP", func(t *testing.T) {
+		srvOnly := &zeroconf.ServiceEntry{ // the windows shape: SRV+TXT, no addrs
+			ServiceRecord: zeroconf.ServiceRecord{Instance: "xuansi-d75884"},
+			HostName:      "xuansi-d75884.local.",
+			Port:          7777,
+			Text:          []string{"ver=5", "api=1"},
+		}
+		newResolverFunc = func(...zeroconf.ClientOption) (mdnsBrowser, error) {
+			return &fakeBrowser{entries: []*zeroconf.ServiceEntry{srvOnly}}, nil
+		}
+		fr := startFakeAResponder(t, "xuansi-d75884.local")
+		overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
+		boards, err := DiscoverMDNS(context.Background())
+		if err != nil {
+			t.Fatalf("DiscoverMDNS: %v", err)
+		}
+		if len(boards) != 1 {
+			t.Fatalf("boards = %#v, want 1", boards)
+		}
+		if boards[0].IP != "10.1.51.205" {
+			t.Errorf("IP = %q, want 10.1.51.205 from the followup round", boards[0].IP)
+		}
+		if boards[0].Host != "xuansi-d75884.local" || boards[0].Port != 7777 {
+			t.Errorf("face mangled by the followup: %#v", boards[0])
+		}
+		// the unicast PTR lane's questions ride the same socket — drain
+		// until the followup's own A question for the host arrives
+		deadline := time.After(time.Second)
+		for {
+			select {
+			case q := <-fr.queryQ:
+				if len(q) >= 6 && q[len(q)-4] == 0 && q[len(q)-3] == 1 && strings.Contains(string(q), "xuansi-d75884") {
+					goto sawA
+				}
+			case <-deadline:
+				t.Error("the followup never sent its A question")
+				goto sawA
+			}
+		}
+	sawA:
+		if t.Failed() {
+			return
+		}
+	})
+
+	t.Run("browse already carried A: no followup round", func(t *testing.T) {
+		complete := &zeroconf.ServiceEntry{
+			ServiceRecord: zeroconf.ServiceRecord{Instance: "xuansi-d75884"},
+			HostName:      "xuansi-d75884.local.",
+			Port:          7777,
+			AddrIPv4:      []net.IP{net.IPv4(10, 1, 51, 205)},
+		}
+		newResolverFunc = func(...zeroconf.ClientOption) (mdnsBrowser, error) {
+			return &fakeBrowser{entries: []*zeroconf.ServiceEntry{complete}}, nil
+		}
+		fr := startFakeAResponder(t, "xuansi-d75884.local")
+		overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
+		boards, err := DiscoverMDNS(context.Background())
+		if err != nil {
+			t.Fatalf("DiscoverMDNS: %v", err)
+		}
+		if len(boards) != 1 || boards[0].IP != "10.1.51.205" {
+			t.Fatalf("boards = %#v, want the browse-carried address untouched", boards)
+		}
+		// only PTR questions (the sweep lanes') may have arrived — no
+		// A/AAAA followup question for the host
+		for {
+			select {
+			case q := <-fr.queryQ:
+				if len(q) >= 6 && (q[len(q)-3] == 1 || q[len(q)-3] == 28) {
+					t.Errorf("followup fired anyway: %x", q)
+				}
+				continue
+			default:
+			}
+			break
+		}
+	})
+
+	t.Run("silent responder degrades to empty IP", func(t *testing.T) {
+		srvOnly := &zeroconf.ServiceEntry{
+			ServiceRecord: zeroconf.ServiceRecord{Instance: "xuansi-d75884"},
+			HostName:      "xuansi-d75884.local.",
+			Port:          7777,
+		}
+		newResolverFunc = func(...zeroconf.ClientOption) (mdnsBrowser, error) {
+			return &fakeBrowser{entries: []*zeroconf.ServiceEntry{srvOnly}}, nil
+		}
+		fr := startFakeAResponder(t, "other-host.local") // answers only the wrong name
+		overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
+		start := time.Now()
+		boards, err := DiscoverMDNS(context.Background())
+		if err != nil {
+			t.Fatalf("DiscoverMDNS: %v", err)
+		}
+		if len(boards) != 1 || boards[0].IP != "" {
+			t.Fatalf("boards = %#v, want honest IP=\"\" (hostname remains the fallback)", boards)
+		}
+		if elapsed := time.Since(start); elapsed > 6*time.Second {
+			t.Errorf("followup took %v — the bounded budget leaked", elapsed)
+		}
+	})
+}
+
+// TestFollowupAddrIPv6: the AAAA round covers a v6-only answer when the
+// A round came back empty (the followup walks A then AAAA; the v6 form
+// renders through net.IP.String, dialable later via JoinHostPort).
+func TestFollowupAddrIPv6(t *testing.T) {
+	origIfIP := ifaceIPv4
+	t.Cleanup(func() { ifaceIPv4 = origIfIP })
+	ifaceIPv4 = func(net.Interface) net.IP { return net.IPv4(127, 0, 0, 1) }
+	fr := startFakeAResponder(t, "xuansi-d75884.local")
+	fr.v6Only = true // the A round stays silent; only the AAAA round answers
+	overrideUnicastSeams(t, fr.conn.LocalAddr().(*net.UDPAddr))
+	ifaces := []net.Interface{{Index: 95, Name: "fake0", Flags: net.FlagUp | net.FlagMulticast}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got := followupAddr(ctx, ifaces, "xuansi-d75884.local")
+	if got != "fe80::1" {
+		t.Errorf("followupAddr = %q, want fe80::1 (AAAA round after a silent A round)", got)
+	}
+}

@@ -3498,6 +3498,46 @@ func TestSupervisorRebuildsOnEndpointDrift(t *testing.T) {
 	}
 }
 
+// TestOpWifiSelfReportEnrichesEndpoint: Bug 2② — wifi.status/wifi.setup
+// replies carry the board's own ip/port; the ops face writes them back
+// onto the registry entry, so the next list_boards dials the
+// self-reported address (a USB-only first appearance gains its TCP
+// endpoint without waiting for the next mDNS sweep to resolve one).
+func TestOpWifiSelfReportEnrichesEndpoint(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	e.fakes["d75884"].on("wifi.status", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"state": "up", "ssid": "bench", "ip": "10.1.51.205", "port": int64(7777)}, nil
+	})
+
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ = c.call(2, map[string]any{"type": "op", "board": "d75884", "op": "wifi.status", "holder": "w1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("op wifi.status: %#v", rep)
+	}
+	// the registry entry now carries the self-reported endpoint
+	for _, b := range e.srv.reg.Snapshot() {
+		if b.MAC6 != "d75884" {
+			continue
+		}
+		if b.IP != "10.1.51.205" || b.Port != 7777 {
+			t.Fatalf("registry endpoint after wifi.status = ip %q port %d, want the self-reported 10.1.51.205:7777", b.IP, b.Port)
+		}
+	}
+	// and the board view surfaces it (list_boards' ip field)
+	rep, _ = c.call(3, map[string]any{"type": "list_boards"})
+	boards, _ := rep["result"].(map[string]any)["boards"].([]any)
+	if len(boards) != 1 {
+		t.Fatalf("list_boards: %#v", rep)
+	}
+	if asStr(asMap(boards[0])["ip"]) != "10.1.51.205" {
+		t.Errorf("list_boards ip = %q, want the self-reported address", asStr(asMap(boards[0])["ip"]))
+	}
+}
+
 // TestBindSockConcurrentRaceGracefulLosers: the spawn-race contract at
 // the bind level (task-2's promise, pinned after a task-10 HIL rerun
 // caught the narrow window): N servers binding the same sock path at

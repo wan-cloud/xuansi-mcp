@@ -1553,7 +1553,25 @@ func (s *Server) hOp(ctx context.Context, cc *clientConn, req *Request) (any, er
 		}
 		return out, nil
 	}
-	return s.boardOp(ctx, b, req.Op, args)
+	res, err := s.boardOp(ctx, b, req.Op, args)
+	if err != nil {
+		return nil, err
+	}
+	// Bug 2② (B15 §4.9③): wifi.setup/wifi.status replies self-report the
+	// board's ip/port — write them back onto the registry entry (the one
+	// address source guaranteed current; discovery may have resolved
+	// nothing, or a stale address from before a re-association).
+	if req.Op == "wifi.setup" || req.Op == "wifi.status" {
+		ip, _ := res["ip"].(string)
+		port, _ := resU64(res, "port")
+		if ip != "" || port > 0 {
+			s.reg.EnrichEndpoint(b.MAC6, ip, int(port))
+			if ip != "" && ip != b.IP {
+				s.logf("server: board %s self-reported endpoint %s:%d (wifi op reply) — registry updated", b.MAC6, ip, port)
+			}
+		}
+	}
+	return res, nil
 }
 
 func (s *Server) hScriptStart(ctx context.Context, cc *clientConn, req *Request) (any, error) {
