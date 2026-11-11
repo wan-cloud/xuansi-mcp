@@ -57,6 +57,13 @@ const (
 	// fs.write_commit, transparent to internal-API clients (the request
 	// type and reply shape are unchanged).
 	fsFileMax = 65472
+	// fsReadMax is the READ window on the chunked read face: the fw's
+	// fs.read_part caps the REPLY frame at 32640B (board-caught during
+	// the W1.T4 smoke — the write chunk and the read window are
+	// different axes: a 65472B read window drew "len 65472 too large
+	// for reply frame (max 32640)"). hFsRead walks files in windows of
+	// this size.
+	fsReadMax = 32640
 	// outboundQ is the per-connection event/reply buffer. A full queue
 	// drops an incoming EVENT (fire-and-forget, fw §8 style); a REPLY
 	// evicts the oldest queued event — or, in the all-replies wedge of
@@ -1957,8 +1964,9 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 // must be 64 hex chars").
 var sha256HexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// hFsRead reads a whole board file back through the v5 chunked read
-// face: fs.read_part windows of 16384B assembled until eof (a file at
+// hFsRead reads a whole board file back through the chunked read
+// face: fs.read_part windows of fsReadMax (32640B — the fw's reply-
+// frame cap) assembled until eof (a file at
 // or below the cap completes in one call; bigger files loop — the
 // frozen fs.read op still refuses them). The reply shape is unchanged
 // ({data: base64}); a missing file surfaces as the board's own api
@@ -1978,7 +1986,7 @@ func (s *Server) hFsRead(ctx context.Context, req *Request) (any, error) {
 		var off uint32
 		for {
 			res, err := s.opSameLink(ctx, b, ctl, "fs.read_part", map[string]any{
-				"path": req.Path, "off": int(off), "len": fsFileMax,
+				"path": req.Path, "off": int(off), "len": fsReadMax,
 			}, true, nil)
 			if err != nil {
 				return err
