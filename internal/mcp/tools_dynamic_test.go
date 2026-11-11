@@ -121,7 +121,7 @@ func (df *dynFake) handle(conn net.Conn) {
 			} else {
 				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{"out": ""}}
 			}
-		case "lease":
+		case "lease", "release":
 			rep = &server.Reply{Type: "reply", ID: req.ID,
 				Result: map[string]any{"board": req.Board, "holder": req.Holder, "session": 1.0}}
 		case "watch_events":
