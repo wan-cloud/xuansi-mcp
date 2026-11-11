@@ -149,7 +149,7 @@ func runB10T8B(attempt int, daemonBin, runDir string) int {
 	// the startup audit dials the board and taps it: its hello is the
 	// FIRST boot sighting (baseline E1, silent by design)
 	ok, last = pollUntil(500*time.Millisecond, 45*time.Second, func() (bool, string) {
-		return serve.has("startup audit board "+b10t8bBoard), "audit line"
+		return serve.has("startup audit board " + b10t8bBoard), "audit line"
 	})
 	h.check(ok, fmt.Sprintf("startup audit tapped the board (first sighting = baseline epoch): %s", last))
 

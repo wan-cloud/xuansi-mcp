@@ -2360,9 +2360,9 @@ func TestBoardViewBootIdentity(t *testing.T) {
 		return map[string]any{
 			"protocol_ver": int64(6), "role": "controller", "fw": "xuansi-fw v0.2.0",
 			"fw_build": "dcaa9ae", "fw_version": "0.2.0", "fs": true,
-			"chip":         "ESP32-S3",
-			"boot_epoch":   int64(8),
-			"reset_reason": "usb",
+			"chip":          "ESP32-S3",
+			"boot_epoch":    int64(8),
+			"reset_reason":  "usb",
 			"reset_history": []any{"power-on", "usb"},
 		}, nil
 	})

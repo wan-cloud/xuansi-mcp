@@ -465,10 +465,10 @@ func TestDialBoardUSBStillPreferred(t *testing.T) {
 func TestDialBoardNoSourceErrorUnchanged(t *testing.T) {
 	spy := stubDials(t)
 	for _, b := range []Board{
-		{MAC6: "d75884", Sources: []string{"mdns"}, Port: 7777},              // no host, no IP
-		{MAC6: "d75884", Sources: []string{"mdns"}, IP: "10.1.51.205"},      // no port
+		{MAC6: "d75884", Sources: []string{"mdns"}, Port: 7777},                  // no host, no IP
+		{MAC6: "d75884", Sources: []string{"mdns"}, IP: "10.1.51.205"},           // no port
 		{MAC6: "d75884", Sources: []string{"mdns"}, Host: "xuansi-d75884.local"}, // no port
-		{MAC6: "d75884", Sources: []string{"usb"}},                           // no USBPath
+		{MAC6: "d75884", Sources: []string{"usb"}},                               // no USBPath
 	} {
 		_, err := DialBoard(b, replclient.DialOpts{})
 		if err == nil || !strings.Contains(err.Error(), "no live source") {

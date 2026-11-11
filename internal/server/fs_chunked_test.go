@@ -21,10 +21,10 @@ import (
 // chunkedFake scripts the three chunked ops over an in-memory .part
 // mirror, recording every call for the boundary assertions.
 type chunkedFake struct {
-	inner  *fakeCtl
-	parts  map[string][]byte // logical .part path -> staged bytes
-	files  map[string][]byte // committed files
-	calls  []string          // "op off/len" trace
+	inner *fakeCtl
+	parts map[string][]byte // logical .part path -> staged bytes
+	files map[string][]byte // committed files
+	calls []string          // "op off/len" trace
 }
 
 func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
@@ -51,7 +51,7 @@ func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
 		} else {
 			if got := len(cf.parts[key]); got != off {
 				return nil, &replclient.OpError{Op: "fs.write_part", Class: "api",
-					Msg: "off mismatch (fake .part is %d bytes)", }
+					Msg: "off mismatch (fake .part is %d bytes)"}
 			}
 			cf.parts[key] = append(cf.parts[key], data...)
 		}

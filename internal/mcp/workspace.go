@@ -292,7 +292,7 @@ type driverPushIn struct {
 	// Omitted = the manifest-driven default (pairing, see the tool
 	// Desc).
 	Artifact string `json:"artifact,omitempty" jsonschema:"\"wasm\" or \"aot\": push exactly that artifact AND fs_rm every sibling slot (/drv/<name>.<lua|wasm|aot> minus the pushed one — the F-5 sweep, driver_pull's mirror; an already-empty sibling is expected not-found noise). The kill for the stale-shield foot-gun: the loader PREFERS .aot, so redeploying a .wasm while an old .aot sits in its slot would silently keep running the old compiled code — artifact \"wasm\" removes it. Omit for the manifest-driven default: .wasm + .aot PAIR when the version's manifest record aot.<target> matches the board's chip (see the tool Desc), else the single resolved artifact (.lua → .wasm → .aot priority). NOT \"lua\": a Lua driver just pushes bare (it has no binary sibling to shield)"`
-	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
+	Holder   string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
 type driverPushOut struct {
