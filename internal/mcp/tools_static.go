@@ -845,11 +845,16 @@ type fetchFileOut struct {
 }
 
 type driverFetchOut struct {
-	Name    string         `json:"name"`
-	Version string         `json:"version"`
-	Kind    string         `json:"kind" jsonschema:"the index's module kind (e.g. driver, algorithm) — persisted to the workspace manifest's Kind"`
-	Files   []fetchFileOut `json:"files" jsonschema:"one entry per landed artifact, in index order"`
-	Bytes   int            `json:"bytes" jsonschema:"total stored bytes across files"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	// Kind (B15 W1.T4) crosses VERBATIM from the index's module kind —
+	// today's vocabulary (driver/algorithm) and the canary vocabulary
+	// the drivers-repo wave adds (production/test-canary) alike — and
+	// is ABSENT when the index carried no kind (omitempty: the
+	// passthrough tolerates absence, never inventing a value).
+	Kind  string         `json:"kind,omitempty" jsonschema:"the index's module kind, verbatim (e.g. driver, algorithm; the drivers-repo canary wave adds production/test-canary) — persisted to the workspace manifest; absent when the index carried none"`
+	Files []fetchFileOut `json:"files" jsonschema:"one entry per landed artifact, in index order"`
+	Bytes int            `json:"bytes" jsonschema:"total stored bytes across files"`
 }
 
 // fetchIndex / fetchModule / fetchFileRef mirror task 3's index schema

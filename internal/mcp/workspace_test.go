@@ -1,15 +1,17 @@
 package mcp
 
-// workspace_test.go — task 11's driver-workspace tests: the put/push/
-// read-back pipeline against the fake daemon (wire shapes asserted on
-// every crossing: the holder-less op caps, the held fs_write carrying
-// the sanitized /drv/<name>.lua path, the holder-less fs_read), the
-// --@api gate (missing / mismatched with BOTH values in the refusal),
-// the board's single-file cap enforced at PUSH time (the workspace
-// itself keeps fat files), the read-back sha256 verify that leaves the
-// manifest untouched on mismatch, footprint idempotency, concurrent
-// pushes merged into a consistent manifest, name/version sanitization,
-// and the version-defaults-to-Active semantic. The workspace root is
+// workspace_test.go — task 11's driver-workspace tests: the put/push
+// pipeline against the fake daemon (wire shapes asserted on every
+// crossing: the holder-less op caps, the held fs_write carrying the
+// sanitized /drv/<name>.lua path AND its sha256 — the verified path
+// whose board-side commit verdict is the push's verification, B15
+// §4.5②; no read-back crossing anymore), the --@api gate (missing /
+// mismatched with BOTH values in the refusal), the board's single-file
+// cap enforced at PUSH time (the workspace itself keeps fat files),
+// the commit-sha mismatch that leaves the manifest untouched on
+// mismatch, footprint idempotency, concurrent pushes merged into a
+// consistent manifest, name/version sanitization, and the
+// version-defaults-to-Active semantic. The workspace root is
 // injected via Options.WorkspaceRoot — never by mutating the
 // environment.
 
@@ -56,10 +58,13 @@ func capsStep(ver int) step {
 }
 
 // servePushDaemon scripts the push pipeline's daemon half: op caps →
-// api_version ver; fs_write records the payload per (board, path);
-// fs_read echoes the recorded bytes back byte-exact (tamper flips the
-// last bit first, simulating a corrupt/truncated board file). Anything
-// else on the wire fails the test.
+// api_version ver; fs_write records the payload per (board, path) and
+// — when the request carries the verified path's sha256 key — acts the
+// board's commit verdict: the sha of the bytes that actually STAGED
+// must equal it, else an api refusal in the fw's own spelling and
+// nothing lands (tamper flips the last staged bit first, simulating a
+// corrupted/mid-transfer byte). Anything else on the wire fails the
+// test.
 func servePushDaemon(t *testing.T, fd *fakeDaemon, ver int, tamper bool) chan server.Request {
 	t.Helper()
 	reqs := make(chan server.Request, 16)
@@ -81,13 +86,22 @@ func servePushDaemon(t *testing.T, fd *fakeDaemon, ver int, tamper bool) chan se
 				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{
 					"api_version": float64(ver), "primitives": map[string]any{}}}
 			case "fs_write":
-				files[req.Board+"\x00"+req.Path] = req.Data
+				staged := append([]byte(nil), req.Data...)
+				if tamper && len(staged) > 0 {
+					staged[len(staged)-1] ^= 1 // the mid-transfer byte that goes wrong
+				}
+				if req.Sha256 != "" {
+					if got := sha256hex(staged); got != req.Sha256 {
+						rep = &server.Reply{Type: "reply", ID: req.ID,
+							Error: &server.RPCError{Class: "api",
+								Msg: fmt.Sprintf("sha256 mismatch (.part=%s, expected=%s)", got, req.Sha256)}}
+						break // the commit verdict refuses; nothing lands
+					}
+				}
+				files[req.Board+"\x00"+req.Path] = staged
 				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{"ok": true}}
 			case "fs_read":
 				data := append([]byte(nil), files[req.Board+"\x00"+req.Path]...)
-				if tamper && len(data) > 0 {
-					data[len(data)-1] ^= 1
-				}
 				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{
 					"data": base64.StdEncoding.EncodeToString(data)}}
 			case "fs_rm":
@@ -324,12 +338,15 @@ func TestWriteDurableFileNeverTorn(t *testing.T) {
 // ---------------------------------------------------------------------------
 // the push pipeline
 
-// TestDriverPutPushReadBackHappyPath: put stores (sha256, size, Files
+// TestDriverPutPushCommitShaHappyPath: put stores (sha256, size, Files
 // entry, NOT Active); push runs the gated pipeline — holder-less op
 // caps, HELD fs_write of the sanitized /drv/<name>.lua path carrying
-// the decoded bytes, holder-less fs_read back — and only then the
-// manifest records Active, PushedAt and the board footprint.
-func TestDriverPutPushReadBackHappyPath(t *testing.T) {
+// the decoded bytes AND their sha256 (the verified path — B15 §4.5②:
+// the board's commit-sha verdict is the verification, the byte
+// read-back is retired) — and only then the manifest records Active,
+// PushedAt and the board footprint. The reply carries
+// verified_by:"commit-sha256".
+func TestDriverPutPushCommitShaHappyPath(t *testing.T) {
 	e, reqs, root := newWsPushEnv(t, 1, false)
 	content := "--@api 1\n-- ads1115 v1.3.0\nlocal M = {}\nreturn M\n"
 	noContact(t, reqs) // ws_put is pure workspace: zero daemon contact
@@ -352,7 +369,8 @@ func TestDriverPutPushReadBackHappyPath(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("driver_push failed: %s", resultText(t, res))
 	}
-	// wire shapes, in pipeline order
+	// wire shapes, in pipeline order: caps, then the one verified write
+	// (no fs_read — the read-back is retired, §4.5②)
 	capsReq := wantReq(t, reqs)
 	if capsReq.Type != "op" || capsReq.Op != "caps" || capsReq.Board != "d75884" || capsReq.Holder != "" {
 		t.Errorf("caps request = %+v, want a holder-less op caps on d75884", capsReq)
@@ -364,10 +382,10 @@ func TestDriverPutPushReadBackHappyPath(t *testing.T) {
 	if !reflect.DeepEqual(writeReq.Data, []byte(content)) {
 		t.Errorf("fs_write data = %q, want the driver file verbatim", writeReq.Data)
 	}
-	readReq := wantReq(t, reqs)
-	if readReq.Type != "fs_read" || readReq.Path != "/drv/ads1115.lua" || readReq.Holder != "" {
-		t.Errorf("fs_read request = %+v, want the holder-less read-back at the same path", readReq)
+	if writeReq.Sha256 != sha {
+		t.Errorf("fs_write sha256 = %q, want the payload's %q (the commit verdict's expected digest)", writeReq.Sha256, sha)
 	}
+	noContact(t, reqs)
 
 	out := structured(t, res)
 	if out["board"] != "d75884" || out["path"] != "/drv/ads1115.lua" || out["sha256"] != sha {
@@ -375,6 +393,12 @@ func TestDriverPutPushReadBackHappyPath(t *testing.T) {
 	}
 	if bytes, _ := out["bytes"].(float64); int(bytes) != len(content) {
 		t.Errorf("push bytes = %v, want %d", out["bytes"], len(content))
+	}
+	if out["verified_by"] != "commit-sha256" {
+		t.Errorf("verified_by = %v, want commit-sha256", out["verified_by"])
+	}
+	if _, has := out["kind"]; has {
+		t.Errorf("kind = %v on a hand-put driver, want honest absence", out["kind"])
 	}
 
 	m = wsManifest(t, root)
@@ -446,15 +470,18 @@ func TestDriverPushAPIDirectiveMissingRefusedLocally(t *testing.T) {
 }
 
 // TestWorkspaceFatFilePushesWholeOverChunkedTransport: the workspace
-// keeps files of any size, and since B10-T1 the PUSH crosses whole —
-// the daemon-side chunked transport (fs.write_part × N + sha-verifying
-// commit) carries payloads above the board's 16384B single-op cap, so
-// a fat .aot-era driver deploys in one push with the read-back verify.
+// keeps files of any size, and the PUSH crosses whole — the daemon-side
+// chunked transport (fs.write_part × N + sha-verifying commit; 64KB
+// chunks since B15 §4.5) carries payloads above the board's old 16KB
+// single-op cap, so a fat .aot-era driver deploys in one push — an
+// 111KB module crosses as ONE internal fs_write whose sha256 the
+// board's commit verifies (the 2-chunk split is pinned server-side in
+// internal/server/fs_chunked_test.go).
 func TestWorkspaceFatFilePushesWholeOverChunkedTransport(t *testing.T) {
 	e, reqs, root := newWsPushEnv(t, 1, false)
-	content := drvBody("--@api 1", 20000)
-	if len(content) <= 16384 {
-		t.Fatalf("test content is %dB, want it above the 16384B single-op cap", len(content))
+	content := drvBody("--@api 1", 113664) // 111KB
+	if len(content) <= 65472 {
+		t.Fatalf("test content is %dB, want it above the 65472B chunk", len(content))
 	}
 	mustPut(t, e, "fatdrv", "2.0.0", content) // storing is size-free
 
@@ -476,10 +503,10 @@ func TestWorkspaceFatFilePushesWholeOverChunkedTransport(t *testing.T) {
 	if len(writeReq.Data) != len(content) {
 		t.Errorf("fs_write carried %d bytes, want the whole %d-byte driver", len(writeReq.Data), len(content))
 	}
-	readReq := wantReq(t, reqs)
-	if readReq.Type != "fs_read" || readReq.Path != "/drv/fatdrv.lua" {
-		t.Errorf("fs_read request = %+v, want the holder-less read-back", readReq)
+	if writeReq.Sha256 != sha256hex([]byte(content)) {
+		t.Errorf("fs_write sha256 = %s, want the whole payload's digest (verified in 2×64KB chunks board-side)", writeReq.Sha256)
 	}
+	noContact(t, reqs) // no read-back: the commit verdict verified it
 	if _, err := os.Stat(filepath.Join(root, "drivers", "fatdrv@2.0.0.lua")); err != nil {
 		t.Errorf("workspace dropped the fat file: %v", err)
 	}
@@ -488,11 +515,13 @@ func TestWorkspaceFatFilePushesWholeOverChunkedTransport(t *testing.T) {
 	}
 }
 
-// TestDriverPushReadBackMismatchLeavesManifestUntouched: when the
-// board's file reads back different bytes, the push fails and the
-// manifest records nothing — history only ever holds verified deploys.
-func TestDriverPushReadBackMismatchLeavesManifestUntouched(t *testing.T) {
-	e, _, root := newWsPushEnv(t, 1, true) // tamper flips the last bit on read-back
+// TestDriverPushCommitShaMismatchLeavesManifestUntouched: when the
+// bytes that actually stage on the board differ from the payload (the
+// tamper fake corrupts one mid-transfer byte), the commit-sha verdict
+// REFUSES the write — the fw's own api error crosses verbatim and the
+// manifest records nothing. History only ever holds verified deploys.
+func TestDriverPushCommitShaMismatchLeavesManifestUntouched(t *testing.T) {
+	e, _, root := newWsPushEnv(t, 1, true) // tamper corrupts the staged bytes
 	content := "--@api 1\n-- v1\nreturn {}\n"
 	mustPut(t, e, "ads1115", "1.1.0", content)
 
@@ -500,19 +529,19 @@ func TestDriverPushReadBackMismatchLeavesManifestUntouched(t *testing.T) {
 		"board": "d75884", "name": "ads1115", "version": "1.1.0",
 	})
 	if !res.IsError {
-		t.Fatalf("tampered read-back push succeeded: %+v", res)
+		t.Fatalf("corrupted-staging push succeeded: %+v", res)
 	}
 	got := resultText(t, res)
-	for _, want := range []string{"read-back", "manifest untouched", sha256hex([]byte(content))} {
+	for _, want := range []string{"api:", "sha256 mismatch", "expected=" + sha256hex([]byte(content))} {
 		if !strings.Contains(got, want) {
-			t.Errorf("error text = %q, want it to contain %q", got, want)
+			t.Errorf("error text = %q, want it to contain %q (the fw's commit verdict)", got, want)
 		}
 	}
 
 	m := wsManifest(t, root)
 	fm := m.Drivers["ads1115"].Files["1.1.0"]
 	if m.Drivers["ads1115"].Active != "" || !fm.PushedAt.IsZero() || len(fm.Boards) != 0 {
-		t.Errorf("manifest after read-back mismatch = %+v, want no activation/footprint", m.Drivers["ads1115"])
+		t.Errorf("manifest after commit-sha mismatch = %+v, want no activation/footprint", m.Drivers["ads1115"])
 	}
 	if fm.Sha256 != sha256hex([]byte(content)) || fm.Size != len(content) {
 		t.Errorf("put-time Files entry = %+v, want it intact", fm)
@@ -569,7 +598,7 @@ func TestConcurrentPushesConsistentManifest(t *testing.T) {
 			t.Fatalf("concurrent push failed: %s", resultText(t, res))
 		}
 	}
-	for i := 0; i < 6; i++ { // caps+write+read per push, some interleaving
+	for i := 0; i < 4; i++ { // caps+write per push, some interleaving
 		wantReq(t, reqs)
 	}
 
@@ -609,10 +638,10 @@ func TestDriverPushRefreshesManifestShaFromDisk(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("push of the externally modified file failed: %s", resultText(t, res))
 	}
-	// the pipeline crossing order: caps, write, read-back
+	// the pipeline crossing order: caps, write
 	wantReq(t, reqs)
 	writeReq := wantReq(t, reqs)
-	wantReq(t, reqs)
+	noContact(t, reqs)
 	if !reflect.DeepEqual(writeReq.Data, []byte(v2)) {
 		t.Fatalf("fs_write shipped %q, want the MODIFIED disk bytes", writeReq.Data)
 	}
@@ -651,12 +680,12 @@ func TestDriverPushDefaultsToActiveVersion(t *testing.T) {
 	}); res.IsError {
 		t.Fatalf("explicit push failed: %s", resultText(t, res))
 	}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		wantReq(t, reqs)
 	}
 
 	// default = Active (1.3.0), NOT the newest put (1.2.0). No caps
-	// cache in this static-only env, so this push makes the same three
+	// cache in this static-only env, so this push makes the same two
 	// crossings as any push.
 	res := e.call("xuansi_driver_push", map[string]any{"board": "d75884", "name": "ads1115"})
 	if res.IsError {
@@ -668,7 +697,7 @@ func TestDriverPushDefaultsToActiveVersion(t *testing.T) {
 	if req := wantReq(t, reqs); req.Type != "fs_write" || !reflect.DeepEqual(req.Data, []byte(v13)) {
 		t.Errorf("default-version write = %+v (%d bytes), want the ACTIVE 1.3.0 payload", req, len(req.Data))
 	}
-	wantReq(t, reqs) // the read-back
+	noContact(t, reqs) // the verified write is the last crossing
 
 	// no active version: local refusal, no daemon contact
 	mustPut(t, e, "orphan", "0.1.0", "--@api 1\nreturn {}\n")
@@ -750,7 +779,7 @@ func TestDriverPushReusesFreshCapsCache(t *testing.T) {
 	if req := wantReq(t, reqs); req.Type != "fs_write" {
 		t.Errorf("first crossing = %+v, want fs_write (caps must come from the cache)", req)
 	}
-	wantReq(t, reqs) // the read-back
+	noContact(t, reqs) // the verified write is the last crossing
 
 	// stale cache: the next push fetches caps again
 	e.ts.dyn.mu.Lock()
@@ -1095,6 +1124,123 @@ func TestDriverFetchTwoFilesKindAndManifest(t *testing.T) {
 	if ent.Active != "" {
 		t.Errorf("Active = %q after a fetch, want none (a push activates)", ent.Active)
 	}
+
+	// ws_list surfaces the manifest's Kind — the seat sees the index's
+	// module kind without reading the manifest file (B15 W1.T4's kind
+	// passthrough face)
+	lres := e.call("xuansi_ws_list", map[string]any{})
+	if lres.IsError {
+		t.Fatalf("ws_list failed: %s", resultText(t, lres))
+	}
+	drivers, _ := structured(t, lres)["drivers"].([]any)
+	if len(drivers) != 1 {
+		t.Fatalf("ws_list drivers = %v, want the one", drivers)
+	}
+	if d0, _ := drivers[0].(map[string]any); d0["kind"] != "driver" {
+		t.Errorf("ws_list kind = %v, want the index's kind surfaced", d0["kind"])
+	}
+}
+
+// TestKindPassthroughTolerantAndCanary (B15 W1.T4): the drivers index's
+// kind field crosses VERBATIM wherever the index carries it — today's
+// module-kind vocabulary (driver/algorithm) and the canary vocabulary
+// the drivers-repo wave adds (production/test-canary) alike — and an
+// index WITHOUT the key fetches cleanly with the kind honestly absent
+// everywhere (fetch reply, manifest, ws_list, driver_push reply): the
+// passthrough must tolerate absence, never invent a value.
+func TestKindPassthroughTolerantAndCanary(t *testing.T) {
+	wbody := fetchWasmBody(48)
+
+	// a kindless index (the pre-canary index shape, and any index_ver 1
+	// entry that simply omits the key)
+	mux := http.NewServeMux()
+	idxJ := fmt.Sprintf(`{"index_ver":1,"modules":[{"name":"quietmod","version":"1.0.0","abi":1,`+
+		`"files":[{"path":"modules/quietmod/1.0.0/quietmod.wasm","sha256":%q,"bytes":%d}]}]}`,
+		sha256hex(wbody), len(wbody))
+	mux.HandleFunc("/index.json", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(idxJ))
+	})
+	mux.HandleFunc("/modules/quietmod/1.0.0/quietmod.wasm", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(wbody)
+	})
+	kindless := httptest.NewServer(mux)
+	t.Cleanup(kindless.Close)
+
+	e, _, root := newWsEnv(t, nil)
+	res := e.call("xuansi_driver_fetch", map[string]any{
+		"name": "quietmod", "version": "1.0.0", "index_url": kindless.URL + "/index.json",
+	})
+	if res.IsError {
+		t.Fatalf("kindless fetch failed: %s", resultText(t, res))
+	}
+	if _, has := structured(t, res)["kind"]; has {
+		t.Errorf("kindless fetch reply carries kind = %v, want honest absence", structured(t, res)["kind"])
+	}
+	if m := wsManifest(t, root); m.Drivers["quietmod"].Kind != "" {
+		t.Errorf("kindless manifest Kind = %q, want empty", m.Drivers["quietmod"].Kind)
+	}
+	lres := e.call("xuansi_ws_list", map[string]any{})
+	drivers, _ := structured(t, lres)["drivers"].([]any)
+	if len(drivers) != 1 {
+		t.Fatalf("ws_list drivers = %v, want the one", drivers)
+	}
+	d0, _ := drivers[0].(map[string]any)
+	if d0["name"] != "quietmod" {
+		t.Fatalf("ws_list driver = %v, want quietmod", d0)
+	}
+	if _, has := d0["kind"]; has {
+		t.Errorf("ws_list kind = %v on a kindless fetch, want absent", d0["kind"])
+	}
+
+	// a CANARY-kind index (the drivers-repo wave's vocabulary): the
+	// value crosses verbatim — fetch reply, manifest, ws_list, and the
+	// driver_push reply
+	cbody := fetchWasmBody(56)
+	curl, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "hello", kind: "test-canary", version: "1.0.0",
+		files: []fetchFileSpec{fetchSpec(t, "modules/hello/1.0.0/hello.wasm", cbody, "")},
+	}})
+	e2, reqs, root2 := newWsPushEnv(t, 1, false)
+	res = e2.call("xuansi_driver_fetch", map[string]any{
+		"name": "hello", "version": "1.0.0", "index_url": curl,
+	})
+	if res.IsError {
+		t.Fatalf("canary fetch failed: %s", resultText(t, res))
+	}
+	if k := structured(t, res)["kind"]; k != "test-canary" {
+		t.Errorf("canary fetch kind = %v, want test-canary verbatim", k)
+	}
+	if m := wsManifest(t, root2); m.Drivers["hello"].Kind != "test-canary" {
+		t.Errorf("canary manifest Kind = %q, want test-canary", m.Drivers["hello"].Kind)
+	}
+	lres = e2.call("xuansi_ws_list", map[string]any{})
+	drivers, _ = structured(t, lres)["drivers"].([]any)
+	var sawCanary bool
+	for _, d := range drivers {
+		dm, _ := d.(map[string]any)
+		if dm["name"] == "hello" {
+			sawCanary = dm["kind"] == "test-canary"
+		}
+	}
+	if !sawCanary {
+		t.Errorf("ws_list never surfaced hello's test-canary kind: %v", drivers)
+	}
+
+	// the push reply carries the kind too (the deploy seat sees what it
+	// is deploying)
+	pres := e2.call("xuansi_driver_push", map[string]any{
+		"board": "d75884", "name": "hello", "version": "1.0.0",
+	})
+	if pres.IsError {
+		t.Fatalf("canary push failed: %s", resultText(t, pres))
+	}
+	if k := structured(t, pres)["kind"]; k != "test-canary" {
+		t.Errorf("push reply kind = %v, want test-canary (the manifest's)", k)
+	}
+	if req := wantReq(t, reqs); req.Type != "fs_write" || req.Sha256 != sha256hex(cbody) {
+		t.Errorf("push fs_write = %+v, want the verified write carrying the artifact's sha", req)
+	}
+	noContact(t, reqs)
 }
 
 // TestDriverFetchAotTargetHandling (P3-T13): the .aot target field's
@@ -1150,8 +1296,10 @@ func TestDriverFetchAotTargetHandling(t *testing.T) {
 // and the explicit single-artifact sibling sweep
 
 // pairD is servePushDaemon's T13 twin: the same fs store plus per-path
-// failure injection (a refused fs_write, a tampered fs_read read-back,
-// a REAL fs_rm refusal) and the file table exposed for final-state
+// failure injection (a refused fs_write, a commit-sha mismatch — the
+// corruptSha leg refuses the write in the fw's own spelling and lands
+// nothing, exactly the verdict a corrupted/mid-transfer byte draws —
+// and a REAL fs_rm refusal) and the file table exposed for final-state
 // assertions. fs_rm of an ABSENT file refuses with the fw's own
 // "'path' not found" vocabulary (the sweep tolerance's contract).
 type pairD struct {
@@ -1159,7 +1307,7 @@ type pairD struct {
 	reqs       chan server.Request
 	files      map[string][]byte // board\x00path → payload
 	failWrite  map[string]string // path → api error msg on fs_write
-	tamperRead map[string]bool   // path → flip the last bit on fs_read
+	corruptSha map[string]bool   // path → refuse the write as a sha mismatch, land nothing
 	failRm     map[string]string // path → api error msg on fs_rm (a REAL refusal)
 }
 
@@ -1169,7 +1317,7 @@ func newPairEnv(t *testing.T) (*env, *pairD, string) {
 		reqs:       make(chan server.Request, 32),
 		files:      map[string][]byte{},
 		failWrite:  map[string]string{},
-		tamperRead: map[string]bool{},
+		corruptSha: map[string]bool{},
 		failRm:     map[string]string{},
 	}
 	pd.fd = newFakeDaemon(t)
@@ -1192,15 +1340,19 @@ func newPairEnv(t *testing.T) (*env, *pairD, string) {
 						Error: &server.RPCError{Class: "api", Msg: msg}}
 					break
 				}
+				if pd.corruptSha[req.Path] && req.Sha256 != "" {
+					// the board's commit verdict on corrupted staging: the
+					// fw's own spelling, nothing landed (only its .part,
+					// kept for a from-off=0 retry)
+					staged := append([]byte(nil), req.Data...)
+					staged[len(staged)-1] ^= 1
+					rep = &server.Reply{Type: "reply", ID: req.ID,
+						Error: &server.RPCError{Class: "api",
+							Msg: fmt.Sprintf("sha256 mismatch (.part=%s, expected=%s)", sha256hex(staged), req.Sha256)}}
+					break
+				}
 				pd.files[req.Board+"\x00"+req.Path] = req.Data
 				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{"ok": true}}
-			case "fs_read":
-				data := append([]byte(nil), pd.files[req.Board+"\x00"+req.Path]...)
-				if pd.tamperRead[req.Path] && len(data) > 0 {
-					data[len(data)-1] ^= 1
-				}
-				rep = &server.Reply{Type: "reply", ID: req.ID, Result: map[string]any{
-					"data": base64.StdEncoding.EncodeToString(data)}}
 			case "fs_rm":
 				if msg, ok := pd.failRm[req.Path]; ok {
 					rep = &server.Reply{Type: "reply", ID: req.ID,
@@ -1303,8 +1455,9 @@ func TestChipTargetMapping(t *testing.T) {
 // TestDriverPushPairedWasmAotHappyPath: a bare push whose version
 // carries aot.<target> AND whose board's chip maps to that target
 // deploys the PAIR — the .aot leg FIRST (ruling 2), then the .wasm —
-// both read-back verified, no sweep, Active moves, and the reply
-// claims the pair honestly (paired/aot_path/aot_sha256).
+// both commit-verified (each fs_write carries its payload's sha256;
+// the board's verdict is the verification), no sweep, Active moves,
+// and the reply claims the pair honestly (paired/aot_path/aot_sha256).
 func TestDriverPushPairedWasmAotHappyPath(t *testing.T) {
 	e, pd, root := newPairEnv(t)
 	seedChipBoard(t, e, "d75884", "ESP32-S3")
@@ -1316,15 +1469,14 @@ func TestDriverPushPairedWasmAotHappyPath(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("paired push failed: %s", resultText(t, res))
 	}
-	// wire order: the .aot leg first (write + read-back), then .wasm
+	// wire order: the .aot leg first, then .wasm — one verified write
+	// each, no read-backs (the commit verdict verified both)
 	for i, want := range []struct {
 		typ  string
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.aot"},
-		{"fs_read", "/drv/pairmod.aot"},
 		{"fs_write", "/drv/pairmod.wasm"},
-		{"fs_read", "/drv/pairmod.wasm"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -1345,6 +1497,9 @@ func TestDriverPushPairedWasmAotHappyPath(t *testing.T) {
 	}
 	if out["aot_path"] != "/drv/pairmod.aot" || out["aot_sha256"] != sha256hex(aot) {
 		t.Errorf("out aot leg = %v, want the .aot path + verified sha", out)
+	}
+	if out["verified_by"] != "commit-sha256" {
+		t.Errorf("verified_by = %v, want commit-sha256 (both legs)", out["verified_by"])
 	}
 	if _, swept := out["swept"]; swept {
 		t.Errorf("out swept = %v, want absent (no sweep on the paired push)", out["swept"])
@@ -1388,20 +1543,21 @@ func TestDriverPushPairedWasmAotHappyPath(t *testing.T) {
 }
 
 // TestDriverPushPairedWasmLegFailRollsBackAot: the pair's .wasm leg
-// failing rolls the WHOLE pair back out — the .aot always, and the
-// .wasm too when its write crossed (a tampered read-back left this
-// push's unverified bytes in the loader's fallback path; fix round 1:
-// "neither half" is only true once they are gone). A REFUSED .wasm
-// write crosses no .wasm rm (nothing of ours landed there), and a
-// rollback rm that itself fails errors naming the exact residual
-// state. The manifest is untouched on every leg.
+// failing rolls the WHOLE pair back out — the .aot always (it landed
+// verified moments ago); the .wasm's own slot needs no rollback rm:
+// since the commit-sha verdict (B15 §4.5②) an unverified leg lands
+// NOTHING at the logical path (the fw keeps only the .part staging
+// file, which never shadows the real path and is truncated by the next
+// push's off=0 reopen). A rollback rm that itself fails errors naming
+// the exact residual state. The manifest is untouched on every leg.
 func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
-	// leg 1: the .wasm write lands, the read-back is tampered — both
-	// halves roll back, the board's slot table ends empty
+	// leg 1: the .wasm staging corrupts mid-transfer — the commit-sha
+	// verdict refuses it, the .aot rolls back, the board's slot table
+	// ends empty of the pair
 	e, pd, root := newPairEnv(t)
 	seedChipBoard(t, e, "d75884", "ESP32-S3")
 	storePairVersion(t, root, "pairmod", "1.0.0", "esp32s3")
-	pd.tamperRead["/drv/pairmod.wasm"] = true
+	pd.corruptSha["/drv/pairmod.wasm"] = true
 
 	res := e.call("xuansi_driver_push", map[string]any{
 		"board": "d75884", "name": "pairmod", "version": "1.0.0",
@@ -1409,18 +1565,15 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("paired push with a failing .wasm leg succeeded: %+v", res)
 	}
-	// wire order: .aot write + clean read-back, .wasm write + tampered
-	// read-back, then the ROLLBACK fs_rm of BOTH halves (.aot, .wasm)
+	// wire order: .aot write, .wasm write (verdict-refused), then the
+	// ROLLBACK fs_rm of the landed .aot half
 	for i, want := range []struct {
 		typ  string
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.aot"},
-		{"fs_read", "/drv/pairmod.aot"},
 		{"fs_write", "/drv/pairmod.wasm"},
-		{"fs_read", "/drv/pairmod.wasm"},
 		{"fs_rm", "/drv/pairmod.aot"},
-		{"fs_rm", "/drv/pairmod.wasm"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -1435,7 +1588,7 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 	}
 
 	got := resultText(t, res)
-	for _, want := range []string{"read-back sha256", "rolled back", "/drv/pairmod.aot", "/drv/pairmod.wasm", "neither half", "manifest untouched"} {
+	for _, want := range []string{"sha256 mismatch", "rolled back", "/drv/pairmod.aot", "neither half", "manifest untouched"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("error text = %q, want it to contain %q", got, want)
 		}
@@ -1449,8 +1602,8 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 		t.Errorf("Files[1.0.0] = %+v, want zero push footprints (pre-push manifest state)", fm)
 	}
 
-	// leg 2: the board REFUSES the .wasm fs_write — nothing of ours in
-	// that slot, so the rollback rms the .aot only (no .wasm rm)
+	// leg 2: the board REFUSES the .wasm fs_write outright — same
+	// rollback (the .aot only), same honest error
 	e2, pd2, root2 := newPairEnv(t)
 	seedChipBoard(t, e2, "d75884", "ESP32-S3")
 	storePairVersion(t, root2, "pairmod", "1.0.0", "esp32s3")
@@ -1466,7 +1619,6 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.aot"},
-		{"fs_read", "/drv/pairmod.aot"},
 		{"fs_write", "/drv/pairmod.wasm"},
 		{"fs_rm", "/drv/pairmod.aot"},
 	} {
@@ -1480,30 +1632,27 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 		t.Errorf("leg2 error text = %q, want the neither-half claim (true here: the write never landed)", got)
 	}
 
-	// leg 3: the .wasm rollback rm itself fails — the error names the
-	// UNVERIFIED residual bytes honestly instead of claiming neither
+	// leg 3: the .aot rollback rm itself fails — the error names the
+	// VERIFIED residual half honestly instead of claiming neither
 	e3, pd3, root3 := newPairEnv(t)
 	seedChipBoard(t, e3, "d75884", "ESP32-S3")
 	storePairVersion(t, root3, "pairmod", "1.0.0", "esp32s3")
-	pd3.tamperRead["/drv/pairmod.wasm"] = true
-	pd3.failRm["/drv/pairmod.wasm"] = "lease vanished mid-rollback"
+	pd3.failWrite["/drv/pairmod.wasm"] = "flash write refused: no space left on device"
+	pd3.failRm["/drv/pairmod.aot"] = "lease vanished mid-rollback"
 	res3 := e3.call("xuansi_driver_push", map[string]any{
 		"board": "d75884", "name": "pairmod", "version": "1.0.0",
 	})
 	if !res3.IsError {
-		t.Fatalf("paired push with a failing .wasm rollback succeeded: %+v", res3)
+		t.Fatalf("paired push with a failing .aot rollback succeeded: %+v", res3)
 	}
 	got3 := resultText(t, res3)
-	for _, want := range []string{"could not clear", "unverified .wasm at /drv/pairmod.wasm", "lease vanished mid-rollback", "xuansi_driver_pull", "manifest untouched"} {
+	for _, want := range []string{"could not clear", "verified .aot at /drv/pairmod.aot", "lease vanished mid-rollback", "xuansi_driver_pull", "manifest untouched"} {
 		if !strings.Contains(got3, want) {
 			t.Errorf("leg3 error text = %q, want it to contain %q", got3, want)
 		}
 	}
-	if _, still := pd3.files["d75884\x00/drv/pairmod.wasm"]; !still {
-		t.Errorf("leg3 board lost the .wasm the daemon refused to rm — the fixture disagrees with the script")
-	}
-	if _, still := pd3.files["d75884\x00/drv/pairmod.aot"]; still {
-		t.Errorf("leg3 board still holds the .aot — its rollback rm was not in failRm and must have cleared")
+	if _, still := pd3.files["d75884\x00/drv/pairmod.aot"]; !still {
+		t.Errorf("leg3 board lost the .aot the daemon refused to rm — the fixture disagrees with the script")
 	}
 	if m3 := wsManifest(t, root3); m3.Drivers["pairmod"].Active != "" {
 		t.Errorf("leg3 Active = %q after the failed rollback, want none (manifest untouched)", m3.Drivers["pairmod"].Active)
@@ -1511,9 +1660,11 @@ func TestDriverPushPairedWasmLegFailRollsBackAot(t *testing.T) {
 }
 
 // TestDriverPushPairedAotLegFailNoResidue: the .aot leg failing leaves
-// NO residue — a refused fs_write changed nothing (daemon contract), a
-// tampered .aot read-back removes the bytes this push wrote. Either
-// way the .wasm leg never crosses and the manifest stays untouched.
+// NO residue — a refused fs_write changed nothing (daemon contract),
+// and since the commit-sha verdict a leg whose staging corrupted never
+// lands either (the verdict refuses; only the fw's own .part remains,
+// which never shadows the real path). Either way the .wasm leg never
+// crosses and the manifest stays untouched.
 func TestDriverPushPairedAotLegFailNoResidue(t *testing.T) {
 	e, pd, root := newPairEnv(t)
 	seedChipBoard(t, e, "d75884", "ESP32-S3")
@@ -1539,34 +1690,28 @@ func TestDriverPushPairedAotLegFailNoResidue(t *testing.T) {
 		t.Errorf("board holds an .aot after a refused .aot write")
 	}
 
-	// leg 2: the .aot write lands but the read-back is corrupt — the
-	// push removes its OWN bytes on the way out ("aot 失敗→無殘留")
+	// leg 2: the .aot staging corrupts mid-transfer — the commit-sha
+	// verdict refuses, nothing lands, no cleanup rm needed ("aot 失敗→無殘留")
 	e2, pd2, root2 := newPairEnv(t)
 	seedChipBoard(t, e2, "d75884", "ESP32-S3")
 	storePairVersion(t, root2, "pairmod", "1.0.0", "esp32s3")
-	pd2.tamperRead["/drv/pairmod.aot"] = true
+	pd2.corruptSha["/drv/pairmod.aot"] = true
 	res2 := e2.call("xuansi_driver_push", map[string]any{
 		"board": "d75884", "name": "pairmod", "version": "1.0.0",
 	})
 	if !res2.IsError {
-		t.Fatalf("paired push with a corrupt .aot read-back succeeded: %+v", res2)
+		t.Fatalf("paired push with a corrupt .aot staging succeeded: %+v", res2)
 	}
-	for i, want := range []struct {
-		typ  string
-		path string
-	}{
-		{"fs_write", "/drv/pairmod.aot"},
-		{"fs_read", "/drv/pairmod.aot"},
-		{"fs_rm", "/drv/pairmod.aot"},
-	} {
-		req := wantReq(t, pd2.reqs)
-		if req.Type != want.typ || req.Path != want.path {
-			t.Errorf("crossing %d = %s %s, want %s %s", i, req.Type, req.Path, want.typ, want.path)
-		}
+	if got := resultText(t, res2); !strings.Contains(got, "sha256 mismatch") {
+		t.Errorf("error text = %q, want the commit verdict crossing verbatim", got)
 	}
-	noContact(t, pd2.reqs)
+	req = wantReq(t, pd2.reqs)
+	if req.Type != "fs_write" || req.Path != "/drv/pairmod.aot" {
+		t.Errorf("crossing = %s %s, want the .aot fs_write (the only one)", req.Type, req.Path)
+	}
+	noContact(t, pd2.reqs) // no .wasm leg, no rm — the verdict left nothing to clean
 	if _, ok := pd2.files["d75884\x00/drv/pairmod.aot"]; ok {
-		t.Errorf("board holds the corrupt .aot this push wrote — residue")
+		t.Errorf("board holds the corrupt .aot — the verdict must have refused the landing")
 	}
 	if m := wsManifest(t, root2); m.Drivers["pairmod"].Active != "" {
 		t.Errorf("Active = %q after the failed .aot leg, want none", m.Drivers["pairmod"].Active)
@@ -1593,7 +1738,6 @@ func TestDriverPushPairUnknownChipConservativeSingle(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.wasm"},
-		{"fs_read", "/drv/pairmod.wasm"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -1634,7 +1778,6 @@ func TestDriverPushPairNoAotRecordSingle(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.wasm"},
-		{"fs_read", "/drv/pairmod.wasm"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -1699,7 +1842,6 @@ func TestDriverPushPairAotFileAbsentDegradesSingle(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.wasm"},
-		{"fs_read", "/drv/pairmod.wasm"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -1731,7 +1873,6 @@ func TestDriverPushPairUnresolvedBoardSingle(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.wasm"},
-		{"fs_read", "/drv/pairmod.wasm"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -1767,7 +1908,6 @@ func TestDriverPushExplicitWasmSweepsSiblings(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.wasm"},
-		{"fs_read", "/drv/pairmod.wasm"},
 		{"fs_rm", "/drv/pairmod.lua"},
 		{"fs_rm", "/drv/pairmod.aot"},
 	} {
@@ -1818,7 +1958,6 @@ func TestDriverPushExplicitAotSweepsWasmSibling(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/pairmod.aot"},
-		{"fs_read", "/drv/pairmod.aot"},
 		{"fs_rm", "/drv/pairmod.lua"},
 		{"fs_rm", "/drv/pairmod.wasm"},
 	} {
@@ -1949,7 +2088,6 @@ func TestDriverPushBareAotOnlyStillSingle(t *testing.T) {
 		path string
 	}{
 		{"fs_write", "/drv/onlyaot.aot"},
-		{"fs_read", "/drv/onlyaot.aot"},
 	} {
 		req := wantReq(t, pd.reqs)
 		if req.Type != want.typ || req.Path != want.path {
@@ -2257,7 +2395,9 @@ func TestDriverPushWasmArtifactMagicGated(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("wasm push failed: %s", resultText(t, res))
 	}
-	// pipeline: fs_write FIRST (no op caps for a wasm artifact), then the read-back
+	// pipeline: fs_write FIRST and ONLY (no op caps for a wasm artifact;
+	// no read-back — the sha256 the write carries is verified by the
+	// board's commit, B15 §4.5②)
 	writeReq := wantReq(t, reqs)
 	if writeReq.Type != "fs_write" || writeReq.Path != "/drv/hellow.wasm" || writeReq.Holder != "mcp-fixed01" {
 		t.Errorf("first crossing = %+v, want the held fs_write at /drv/hellow.wasm (no caps for the wasm track)", writeReq)
@@ -2265,9 +2405,8 @@ func TestDriverPushWasmArtifactMagicGated(t *testing.T) {
 	if !bytes.Equal(writeReq.Data, body) {
 		t.Errorf("fs_write data = %d bytes, want the artifact verbatim", len(writeReq.Data))
 	}
-	readReq := wantReq(t, reqs)
-	if readReq.Type != "fs_read" || readReq.Path != "/drv/hellow.wasm" {
-		t.Errorf("read-back = %+v, want fs_read at /drv/hellow.wasm", readReq)
+	if writeReq.Sha256 != sha256hex(body) {
+		t.Errorf("fs_write sha256 = %s, want the artifact's digest", writeReq.Sha256)
 	}
 	noContact(t, reqs)
 	if out := structured(t, res); out["path"] != "/drv/hellow.wasm" || out["sha256"] != sha256hex(body) {
@@ -2323,7 +2462,7 @@ func TestDriverPushAotArtifactAndLuaPriority(t *testing.T) {
 	if writeReq.Type != "fs_write" || writeReq.Path != "/drv/watchaot.aot" {
 		t.Errorf("aot push crossing = %+v, want fs_write at /drv/watchaot.aot", writeReq)
 	}
-	wantReq(t, reqs) // the read-back
+	noContact(t, reqs) // the verified write is the last crossing
 
 	// the priority leg: .lua + .wasm both stored → the .lua deploys
 	// (caps crossing first — the --@api gate unchanged)
@@ -2344,7 +2483,7 @@ func TestDriverPushAotArtifactAndLuaPriority(t *testing.T) {
 	if req := wantReq(t, reqs); req.Type != "fs_write" || req.Path != "/drv/mixmod.lua" || !bytes.Equal(req.Data, []byte(luaBody)) {
 		t.Errorf("mixed push write = %+v, want the .lua artifact at /drv/mixmod.lua", req)
 	}
-	wantReq(t, reqs) // the read-back
+	noContact(t, reqs) // the verified write is the last crossing
 }
 
 // TestDriverPushShortArtifactMagicRefused (fix round 1, minor b): a
@@ -2415,7 +2554,7 @@ func TestDriverPullClearsActiveKeepsFootprints(t *testing.T) {
 	}); res.IsError {
 		t.Fatalf("push failed: %s", resultText(t, res))
 	}
-	for i := 0; i < 3; i++ { // caps + write + read-back
+	for i := 0; i < 2; i++ { // caps + write
 		wantReq(t, reqs)
 	}
 
@@ -2487,10 +2626,9 @@ func TestDriverPullBoardErrorVerbatimAndManifestUntouched(t *testing.T) {
 	content := "--@api 1\n-- ghost v1.0.0\nreturn {}\n"
 	want := "rm '/drv/ghost.lua' failed (No such file or directory)"
 	e, reqs, root := newWsEnv(t, []step{
-		capsStep(1),                          // push: caps
-		{result: map[string]any{"ok": true}}, // push: fs_write
-		{result: map[string]any{"data": base64.StdEncoding.EncodeToString([]byte(content))}},                   // push: fs_read back
-		{rerr: &server.RPCError{Class: "api", Msg: want}},                                                      // pull: fs_rm .lua refused
+		capsStep(1),                                       // push: caps
+		{result: map[string]any{"ok": true}},              // push: fs_write (verified — the commit verdict)
+		{rerr: &server.RPCError{Class: "api", Msg: want}}, // pull: fs_rm .lua refused
 		{rerr: &server.RPCError{Class: "api", Msg: "rm '/drv/ghost.wasm' failed (No such file or directory)"}}, // pull: .wasm slot equally absent
 		{rerr: &server.RPCError{Class: "api", Msg: "rm '/drv/ghost.aot' failed (No such file or directory)"}},  // pull: .aot slot equally absent
 	})
@@ -2500,7 +2638,7 @@ func TestDriverPullBoardErrorVerbatimAndManifestUntouched(t *testing.T) {
 	}); res.IsError {
 		t.Fatalf("push failed: %s", resultText(t, res))
 	}
-	for i := 0; i < 3; i++ { // the push's caps + write + read-back
+	for i := 0; i < 2; i++ { // the push's caps + write
 		wantReq(t, reqs)
 	}
 
@@ -2578,7 +2716,7 @@ func TestDriverPullConcurrentWithPush(t *testing.T) {
 	}); res.IsError {
 		t.Fatalf("seed push failed: %s", resultText(t, res))
 	}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		wantReq(t, reqs)
 	}
 
@@ -2589,7 +2727,7 @@ func TestDriverPullConcurrentWithPush(t *testing.T) {
 			t.Fatalf("concurrent pull/push failed: %s", resultText(t, res))
 		}
 	}
-	for i := 0; i < 6; i++ { // pull: fs_rm ×3 (the sweep); push: caps + write + read-back
+	for i := 0; i < 5; i++ { // pull: fs_rm ×3 (the sweep); push: caps + write
 		wantReq(t, reqs)
 	}
 
@@ -2623,11 +2761,10 @@ func TestDriverPullRemovesFetchedWasmBoardFile(t *testing.T) {
 		return &server.RPCError{Class: "api", Msg: "rm '" + p + "' failed (No such file or directory)"}
 	}
 	e, reqs, root := newWsEnv(t, []step{
-		{result: map[string]any{"ok": true}},                                      // push: fs_write (wasm track: no caps crossing)
-		{result: map[string]any{"data": base64.StdEncoding.EncodeToString(body)}}, // push: fs_read back
-		{rerr: nf("/drv/wbmod.lua")},                                              // pull: .lua slot absent — tolerated
-		{result: map[string]any{}},                                                // pull: .wasm slot removed
-		{rerr: nf("/drv/wbmod.aot")},                                              // pull: .aot slot absent — tolerated
+		{result: map[string]any{"ok": true}}, // push: fs_write (verified — the commit verdict; wasm track: no caps crossing)
+		{rerr: nf("/drv/wbmod.lua")},         // pull: .lua slot absent — tolerated
+		{result: map[string]any{}},           // pull: .wasm slot removed
+		{rerr: nf("/drv/wbmod.aot")},         // pull: .aot slot absent — tolerated
 	})
 	drvDir := filepath.Join(root, "drivers")
 	if err := os.MkdirAll(drvDir, 0o755); err != nil {
@@ -2641,7 +2778,7 @@ func TestDriverPullRemovesFetchedWasmBoardFile(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("wasm push failed: %s", resultText(t, res))
 	}
-	for i := 0; i < 2; i++ { // push: fs_write + fs_read-back
+	for i := 0; i < 1; i++ { // push: the one verified fs_write
 		wantReq(t, reqs)
 	}
 
