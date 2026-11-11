@@ -192,6 +192,32 @@ func TestBoardsUnpinDowngrades(t *testing.T) {
 	}
 }
 
+// TestBoardsPinEchoesNormalized (fix round 1, Minor-3): the reply's
+// endpoint is echoed from the NORMALIZED values the registry stores —
+// padded input pins the trimmed endpoint and answers with it, so the
+// echoed endpoint always matches what was actually pinned.
+func TestBoardsPinEchoesNormalized(t *testing.T) {
+	pe := newPinEnv(t)
+	c := dialSock(t, pe.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "boards_pin",
+		"mac6": " D75884 ", "ip": " 10.1.11.204 ", "port": 7777})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("boards_pin (padded): %#v", rep)
+	}
+	res := asMap(rep["result"])
+	if asStr(res["pinned"]) != "d75884" || asStr(res["endpoint"]) != "10.1.11.204:7777" {
+		t.Fatalf("normalized echo = %#v, want {pinned:d75884, endpoint:10.1.11.204:7777} (what the registry actually stores)", res)
+	}
+
+	// the registry view matches the echo byte-for-byte
+	rep, _ = c.call(2, map[string]any{"type": "list_boards"})
+	v := asMap(asMap(rep["result"])["boards"].([]any)[0])
+	if asStr(v["mac6"]) != "d75884" || asStr(v["ip"]) != "10.1.11.204" {
+		t.Fatalf("registry view = %#v, want the normalized values", v)
+	}
+}
+
 // TestBoardsPinValidation: a non-mac6 id or an out-of-range port is a
 // server-class refusal (the registry is the validator) — and a refused
 // pin materializes nothing.

@@ -1331,9 +1331,15 @@ func tcpDialable(b discover.Board) bool {
 // {kind:"transport", from, to, rebooted}. from is the route in hand
 // before the switch ("" when the daemon held no live controller);
 // rebooted is true only when the switch OPENED the CDC port (to=usb,
-// §2 one-connection-one-session). Fired on every actual daemon-side
-// route switch at lease boundaries; never on a same-route re-lease or
-// a mere redial (§13: redial ≠ reboot).
+// §2 one-connection-one-session). Fired on every actual switch of a
+// daemon-held controller link — a lease taking the USB route with a
+// fresh open (auto-fallback or explicit), the USB→TCP upgrade at a
+// default lease (TCP revived, endpoint unchanged), and the
+// endpoint-drift seam rebuild closing a live USB route with TCP
+// capable in the fresh resolution (supervisor()'s rebuild branch —
+// the upgrade completing outside any lease). Never on a same-route
+// re-lease, a release/shutdown yield (the route drops to none, not to
+// another route), or a mere redial (§13: redial ≠ reboot).
 func (s *Server) noteTransport(mac6, from, to string, rebooted bool) {
 	if from == to {
 		return
@@ -1434,8 +1440,14 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 	if prev == "usb" {
 		ctl = db.sup.Client() // warm USB: ride the existing session — no second open, no second reboot
 	}
+	// fresh labels whether THIS call opens the CDC port — the branch
+	// the reply rides (fix round 1, Minor-2): if Dead() flipped in the
+	// Transport()→Client() gap, Client() answers nil and the fresh
+	// open below is an ACTUAL reboot; labeling it from the stale
+	// prev=="usb" reading would have said rebooted:false.
+	fresh := ctl == nil
 	var cerr error
-	if ctl == nil {
+	if fresh {
 		ctl, cerr = db.sup.ConnectUSB(ctx)
 	}
 	db.connectMu.Unlock()
@@ -1444,7 +1456,7 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 	}
 	s.tap(b.MAC6, db, ctl)
 	res["transport"] = "usb"
-	if prev == "usb" && ctl != nil {
+	if !fresh {
 		res["transport_note"] = USBWarmNote
 		s.logf("server: board %s leased over the warm USB controller by holder %s — no new open", b.MAC6, holder)
 		return res, nil
@@ -1485,14 +1497,17 @@ func (s *Server) hRelease(cc *clientConn, req *Request) (any, error) {
 // pin source for mac6 at ip:port — validated and applied by the
 // registry (immediate effect, survives refreshes). No lease, no board
 // contact: the pin is daemon-side routing state; the NEXT lease/op
-// dials the endpoint. The reply echoes {pinned, endpoint} (JoinHostPort
-// — a v6 address renders bracketed).
+// dials the endpoint. The reply echoes {pinned, endpoint} from the
+// NORMALIZED values (the registry stores trimmed/lowercased — the
+// echoed endpoint is exactly what was pinned; JoinHostPort renders a
+// v6 address bracketed).
 func (s *Server) hBoardsPin(req *Request) (any, error) {
-	if err := s.reg.Pin(req.Mac6, req.IP, req.Port); err != nil {
+	mac6 := strings.ToLower(strings.TrimSpace(req.Mac6))
+	ip := strings.TrimSpace(req.IP)
+	if err := s.reg.Pin(mac6, ip, req.Port); err != nil {
 		return nil, &RPCError{Class: "server", Msg: err.Error()}
 	}
-	mac6 := strings.ToLower(strings.TrimSpace(req.Mac6))
-	ep := net.JoinHostPort(req.IP, strconv.Itoa(req.Port))
+	ep := net.JoinHostPort(ip, strconv.Itoa(req.Port))
 	s.logf("server: boards_pin %s → %s (registry pin source; dial priority usb > pin > mdns)", mac6, ep)
 	return map[string]any{"pinned": mac6, "endpoint": ep}, nil
 }
@@ -2084,9 +2099,28 @@ func (s *Server) supervisor(b discover.Board) *daemonBoard {
 				b.MAC6, ref.Host, ref.IP, ref.Port, ref.USBPath)
 		}
 		s.mu.Unlock()
+		// oldRoute is read OUTSIDE s.mu (still under connectMu, which
+		// serializes every controller-touching path on this board) —
+		// the supervisor's own short-lived mutex must not nest inside
+		// the server lock. Before the Close below nils the controller.
+		oldRoute := ""
+		if old != nil {
+			oldRoute = old.Transport()
+		}
 		db.connectMu.Unlock()
 		if old != nil {
 			old.Close() // drop the corpse: TCP close releases the board's controller slot (§12)
+			// Fix round 1 (Important-1): a rebuild that closes a live USB
+			// route while the fresh resolution is TCP-capable IS the
+			// USB→TCP upgrade — the §4.4 switch completing OUTSIDE any
+			// lease (TCP revived WITH an endpoint change; the no-drift
+			// revive upgrades at the next default lease instead). The
+			// next lease cannot report it (the fresh supervisor reads
+			// Transport()==""), so this is the event's only emission site.
+			if oldRoute == "usb" && tcpDialable(b) {
+				s.logf("server: board %s: drift rebuild closed the USB route with TCP live — route upgraded to TCP (§4.4)", b.MAC6)
+				s.noteTransport(b.MAC6, "usb", "tcp", false)
+			}
 		}
 		return db
 	}
