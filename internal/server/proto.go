@@ -10,7 +10,7 @@
 // len counts ONLY the JSON payload. Messages above MaxMsgBytes (1 MiB —
 // the largest legitimate payload is a chunked fs_write: ~786KB of file
 // bytes base64-encoded with ample margin; the board itself carries the
-// file 16 KiB at a time over the v5 chunked transport) are a protocol
+// file 64 KiB at a time over the chunked transport) are a protocol
 // violation: the writer refuses them and the reader drops the
 // connection.
 //
@@ -53,10 +53,11 @@
 //	submit         {board, code, tag, args?, holder?} → board ack {tag, queued}  (lease required)
 //	script_start   {board, name, code, holder?}  → board ack       (lease required; runs under the LEASE's session namespace — the T10 eval ruling)
 //	script_stop    {board, name, holder?}        → board ack       (lease required)
-//	fs_write       {board, path, data, holder?}  → {size}          (lease required; data = base64 (JSON []byte). <=16384B is one verbatim fs.write; above rides the v5 chunked transport — fs.write_part per 16KiB chunk + one fs.write_commit with the payload's sha256 — transparent here: same request, same {size} reply. B10-T1)
-//	fs_read        {board, path}                 → {data: base64}  (read-only, no lease; assembled from fs.read_part windows — files beyond the fw's 16 KiB single-op read cap come back complete; reply shape unchanged. B10-T1)
+//	fs_write       {board, path, data, holder?, sha256?} → {size}     (lease required; data = base64 (JSON []byte). Chunks are 64KB since B15 §4.5: <=65472B with no sha256 key is one verbatim fs.write; everything else rides the chunked transport — fs.write_part per 65472B chunk + one fs.write_commit carrying the payload's sha256 — transparent here: same request, same {size} reply. A PRESENT sha256 key (64 hex) switches the write to the verified path for ANY size: even a small payload rides write_part + commit and the board's own commit-sha verdict is the verification (the daemon refuses a malformed sha with zero board contact). B10-T1 + B15 §4.5②)
+//	fs_read        {board, path}                 → {data: base64}  (read-only, no lease; assembled from fs.read_part windows — files beyond the fw's 64KB chunk come back complete; reply shape unchanged. B10-T1; the independent read tool — the push path no longer reads back, B15 §4.5②)
 //	fs_rm          {board, path, holder?}        → {}              (lease required; the removal path — the board's own fs.rm {path} verbatim, same gate as fs_write; a missing file is the board's api not-found, class/msg unmodified)
 //	session_reset  {board, session?, holder?}    → {stopped:n}     (lease required; session omitted = 0. The board's own session.reset {session} verbatim under eval's gate — releases that session's scripts AND pins. ns-0 is where bare evals claim pins (owner _eval, shared across evals, §2/§3.2): the b7 S4b HIL could only sweep it by the release-lease/re-lease detour because session.* is deliberately outside the ops allowlist (batch-6 ruling) — THIS request type is the dedicated path instead. {stopped:n} counts scripts stopped (a pins-only ns-0 sweep answers 0 while still releasing the pins); board error class/msg crosses unmodified)
+//	job_wait       {board, tag, timeout_ms}      → {done:bool, value?, error?, elapsed_ms}  (read-only, NO lease, never dials the board — B15 §4.3: the daemon parks on its OWN event tap for the job's completion event. Tracks jobs SUBMITTED THROUGH THIS daemon (the board direct-delivers job events to the submitting connection — a foreign connection's jobs are invisible, honestly): a tag never submitted and never seen is an api refusal; done:true carries the job's bridged value, or error {class, msg, hint — the cleanup ritual} when the job died; timeout_ms 1..55000 bounds the wait (under the 60s request ceiling) and a timeout answers {done:false, elapsed_ms} — a RESULT, never an error)
 //	watch_events   {board, source?}              → {board}         (subscribes THIS connection; source, when given, is additionally events.subscribe'd board-side)
 //	op             {board, op, args?, holder?}   → board reply result  (the ops face — see below)
 //	capture_start  {board, source, max_bytes?, max_seconds?, dest?, holder?} → {capture_id, path}  (lease required; see the capture section below)
@@ -365,6 +366,19 @@ type Request struct {
 	// opTimeoutFor: budget+margin), so a budgeted call is never cut off
 	// by the fixed eval ceiling.
 	BudgetMs int64 `json:"budget_ms,omitempty"`
+	// Sha256 is fs_write's expected-content digest (B15 §4.5②): when
+	// present (64 hex chars — anything else is a zero-contact api
+	// refusal) the write rides the VERIFIED path for any size, the
+	// chunked transport landing the file with one fs.write_commit
+	// carrying this sha; the board's own commit verdict (its
+	// chunk-by-chunk ledger) is the verification. Absent = the classic
+	// split (<=65472B one fs.write, above it the chunked transport with
+	// the daemon-computed digest).
+	Sha256 string `json:"sha256,omitempty"`
+	// TimeoutMS bounds job_wait's park on the event tap (1..55000 —
+	// under the 60s per-request ceiling so the timeout reply always
+	// leaves the daemon before the request ctx dies).
+	TimeoutMS int64 `json:"timeout_ms,omitempty"`
 	// Mac6 is boards_pin/boards_unpin's exact board id (⑨): 6 hex
 	// chars, validated — never a selector.
 	Mac6 string `json:"mac6,omitempty"`
