@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"xuansi/internal/replclient"
 )
@@ -26,25 +27,53 @@ import (
 // chunkedFake scripts the three chunked ops over an in-memory .part
 // mirror, recording every call for the boundary assertions. corrupt
 // (the tamper leg) flips a byte in each staged write_part — the
-// mid-transfer corruption whose commit verdict must refuse.
+// mid-transfer corruption whose commit verdict must refuse. readLens
+// records every fs.read_part's REQUESTED len (the walk's window — the
+// W3.T4a era-clamp pin); writeCap > 0 arms an era-capped write gate
+// (the v6 fs_write asymmetry pin — 0 = the uncapped default).
 type chunkedFake struct {
-	inner   *fakeCtl
-	parts   map[string][]byte // logical .part path -> staged bytes
-	files   map[string][]byte // committed files
-	calls   []string          // "op off/len" trace
-	corrupt bool
+	inner    *fakeCtl
+	parts    map[string][]byte // logical .part path -> staged bytes
+	files    map[string][]byte // committed files
+	calls    []string          // "op off/len" trace
+	readLens []int             // every fs.read_part's requested len
+	writeCap int               // >0: refuse write payloads over this (era gate)
+	corrupt  bool
 }
 
 func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
+	return newChunkedFakeEra(t, e, mac6, 7)
+}
+
+// newChunkedFakeEra is newChunkedFake with the fake board sighted at
+// protocol_ver pv. The chunked transport is a v7-era face (the 64KB
+// chunk and the 32640 reply frame were both measured on v7 builds),
+// so the default fake says 7; the W3.T4a clamp tests script the
+// pre-v7 eras. pv<7 also lowers the fake's own fs.read_part gate to
+// the era's 16384 cap with the v6 fw's refusal spelling.
+func newChunkedFakeEra(t *testing.T, e *env, mac6 string, pv int64) *chunkedFake {
 	t.Helper()
 	cf := &chunkedFake{
 		inner: e.fakes[mac6],
 		parts: map[string][]byte{},
 		files: map[string][]byte{},
 	}
+	cf.inner.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{
+			"protocol_ver": pv, "role": "controller",
+			"fw": "xuansi-fw v0.5.0", "fw_build": "4d9d9ca", "fs": true,
+		}, nil
+	})
 	cf.inner.on("fs.write", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		path, _ := args["path"].(string)
 		data, _ := args["data"].([]byte)
+		if cf.writeCap > 0 && len(data) > cf.writeCap {
+			// the era-capped write gate (the W3.T4a asymmetry pin):
+			// a v6-era fw refuses an over-cap write chunk honestly —
+			// the daemon must surface this verbatim, NOT chunk down
+			return nil, &replclient.OpError{Op: "fs.write", Class: "api",
+				Msg: fmt.Sprintf("chunk too large (%d > %d bytes)", len(data), cf.writeCap)}
+		}
 		cf.calls = append(cf.calls, "fs.write")
 		cf.files[path] = append([]byte{}, data...)
 		return map[string]any{"size": int64(len(data))}, nil
@@ -53,6 +82,10 @@ func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
 		path, _ := args["path"].(string)
 		off, _ := args["off"].(int)
 		data, _ := args["data"].([]byte)
+		if cf.writeCap > 0 && len(data) > cf.writeCap {
+			return nil, &replclient.OpError{Op: "fs.write_part", Class: "api",
+				Msg: fmt.Sprintf("chunk too large (%d > %d bytes)", len(data), cf.writeCap)}
+		}
 		key := path + ".part"
 		if off == 0 {
 			cf.parts[key] = append([]byte{}, data...)
@@ -95,16 +128,29 @@ func newChunkedFake(t *testing.T, e *env, mac6 string) *chunkedFake {
 		cf.calls = append(cf.calls, "fs.write_commit")
 		return map[string]any{"size": int64(wantLen)}, nil
 	})
+	readCap := 32640
+	if pv < 7 {
+		readCap = 16384
+	}
 	cf.inner.on("fs.read_part", func(args map[string]any) (map[string]any, *replclient.OpError) {
 		path, _ := args["path"].(string)
 		off, _ := args["off"].(int)
 		length, _ := args["len"].(int)
-		// the fw's own reply-frame gate (board-caught in the W1.T4
-		// smoke): a window above 32640 draws this exact refusal — the
-		// pin that keeps the read window off the write-chunk axis
-		if length > 32640 {
+		cf.readLens = append(cf.readLens, length)
+		if length > readCap {
+			if pv >= 7 {
+				// the fw's own reply-frame gate (board-caught in the
+				// W1.T4 smoke): a window above 32640 draws this exact
+				// refusal — the pin that keeps the read window off the
+				// write-chunk axis
+				return nil, &replclient.OpError{Op: "fs.read_part", Class: "api",
+					Msg: fmt.Sprintf("len %d too large for reply frame (max %d)", length, readCap)}
+			}
+			// the v6 fw's own spelling (the W3.T3 field finding:
+			// fw 0.4.0 refuses ANY window over 16384 with exactly
+			// this, regardless of file size)
 			return nil, &replclient.OpError{Op: "fs.read_part", Class: "api",
-				Msg: fmt.Sprintf("len %d too large for reply frame (max 32640)", length)}
+				Msg: fmt.Sprintf("chunk too large (%d > %d bytes)", length, readCap)}
 		}
 		f, ok := cf.files[path]
 		if !ok {
@@ -468,5 +514,112 @@ func TestFsReadRedialDoesNotDuplicate(t *testing.T) {
 	}
 	if e.dialedTCP("d75884") < 2 {
 		t.Fatalf("dials = %d, want the one redial", e.dialedTCP("d75884"))
+	}
+}
+
+// TestFsReadWindowClampsByProtocolVer (W3.T4a): the walk's window
+// follows the board's cached protocol era — the hello sighting's
+// protocol_ver. A pv6 board (fw 0.4.0 — Board #1 in the field) caps
+// fs.read_part at 16384 and refuses any larger window with "chunk
+// too large (N > 16384 bytes)" REGARDLESS of file size, so the
+// daemon's old fixed 32640 window killed EVERY fs_read on it (the
+// W3.T3 source-corroborated finding); the walk must clamp to 16384
+// there and keep the 32640 reply-frame window on pv>=7. 40000B pins
+// both eras' arithmetic: pv6 = 16384×2 + 7232 (3 windows), pv7 =
+// 32640 + 7360 (2 windows).
+func TestFsReadWindowClampsByProtocolVer(t *testing.T) {
+	for _, tc := range []struct {
+		pv        int64
+		wantLen   int
+		wantParts int
+	}{
+		{6, 16384, 3},
+		{7, 32640, 2},
+	} {
+		e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+		// The startup audit taps a DEFAULT-hello (pv5) sighting on the
+		// board before this body runs — wait it out, then swap in the
+		// era's fake and kill the audit-warmed link. The walk's first
+		// window then hits the corpse, withController redials onto the
+		// era fake, and the redial's re-tap sights the scripted
+		// protocol_ver — the real semantics the clamp rides (an era
+		// change surfaces on the next reconnect's re-tap).
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			b, ok := e.srv.lookupExact("d75884")
+			if ok && b.Hello != nil {
+				break // the audit's tap enriched its sighting
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if b, ok := e.srv.lookupExact("d75884"); !ok || b.Hello == nil {
+			t.Fatalf("pv%d: the startup audit never sighted the board", tc.pv)
+		}
+		old := e.fakes["d75884"]
+		e.dmu.Lock()
+		e.fakes["d75884"] = newFakeCtl()
+		e.dmu.Unlock()
+		cf := newChunkedFakeEra(t, e, "d75884", tc.pv)
+		old.markDead() // the audit-warmed link dies under the walk
+
+		want := makePattern(40000)
+		cf.files["/drv/mod.aot"] = want
+
+		rep, _ := dialSock(t, e.sock).call(1, map[string]any{
+			"type": "fs_read", "board": "d75884", "path": "/drv/mod.aot",
+		})
+		res := asMap(rep["result"])
+		if res == nil {
+			t.Fatalf("pv%d: fs_read: %#v (the walk's window drew the era's refusal?)", tc.pv, rep)
+		}
+		b64, _ := res["data"].(string)
+		got, derr := base64.StdEncoding.DecodeString(b64)
+		if derr != nil {
+			t.Fatalf("pv%d: decode: %v", tc.pv, derr)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("pv%d: fs_read = %d bytes, want the full 40000 byte-exact", tc.pv, len(got))
+		}
+		if len(cf.readLens) != tc.wantParts {
+			t.Fatalf("pv%d: fs.read_part calls = %d (lens %v), want %d", tc.pv, len(cf.readLens), cf.readLens, tc.wantParts)
+		}
+		for i, l := range cf.readLens {
+			if l != tc.wantLen {
+				t.Fatalf("pv%d: window %d = %dB, want the era's %dB window (lens %v)", tc.pv, i, l, tc.wantLen, cf.readLens)
+			}
+		}
+	}
+}
+
+// TestFsWriteChunkEraAgnostic (W3.T4a): the WRITE path is
+// deliberately NOT era-clamped — the W1.T4 ruling keeps the chunk
+// trio moving together by design: an old-fw board honestly refuses
+// an over-cap write with its own chunk-too-large error, and that
+// refusal IS the era signal. A pv6 fake (write gate armed at 16384)
+// still receives the daemon's 65472B write_part — and refuses it;
+// the daemon must surface the board's refusal verbatim, never
+// silently chunk down. The read/write asymmetry is the point: reads
+// must not break (a field 0.4.0 board still serves fs_read), writes
+// teach (fsReadWindow's comment).
+func TestFsWriteChunkEraAgnostic(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	cf := newChunkedFakeEra(t, e, "d75884", 6)
+	cf.writeCap = 16384 // the v6 fw's write gate — same class as its read gate
+
+	w := dialSock(t, e.sock)
+	rep, _ := w.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "chunky"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ = w.call(2, map[string]any{
+		"type": "fs_write", "board": "d75884", "path": "/drv/mod.aot",
+		"data": base64.StdEncoding.EncodeToString(makePattern(70000)), // 65472 + 4528
+	})
+	er := asMap(rep["error"])
+	if er == nil || asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "chunk too large") {
+		t.Fatalf("v6 fs_write = %#v, want the board's chunk-too-large refusal crossing verbatim (writes are NOT clamped — the W1.T4 trio ruling)", rep)
+	}
+	if len(cf.files) != 0 || len(cf.parts) != 0 {
+		t.Fatal("a refused write must land nothing")
 	}
 }
