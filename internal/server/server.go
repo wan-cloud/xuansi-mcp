@@ -57,13 +57,22 @@ const (
 	// fs.write_commit, transparent to internal-API clients (the request
 	// type and reply shape are unchanged).
 	fsFileMax = 65472
-	// fsReadMax is the READ window on the chunked read face: the fw's
-	// fs.read_part caps the REPLY frame at 32640B (board-caught during
-	// the W1.T4 smoke — the write chunk and the read window are
-	// different axes: a 65472B read window drew "len 65472 too large
-	// for reply frame (max 32640)"). hFsRead walks files in windows of
-	// this size.
+	// fsReadMax is the READ window on the chunked read face for
+	// protocol_ver>=7 boards: the fw's fs.read_part caps the REPLY
+	// frame at 32640B (board-caught during the W1.T4 smoke — the
+	// write chunk and the read window are different axes: a 65472B
+	// read window drew "len 65472 too large for reply frame (max
+	// 32640)"). hFsRead walks files in windows of this size on v7-era
+	// boards; fsReadWindow clamps pre-v7 boards down.
 	fsReadMax = 32640
+	// fsReadMaxPreV7 is the READ window for protocol_ver<7 boards
+	// (fw 0.4.0 = pv6 — Board #1 in the field): the pre-v7 fw caps
+	// fs.read_part's len argument at 16384B, so a 32640 window draws
+	// "api: chunk too large (32640 > 16384 bytes)" on ANY fs_read,
+	// regardless of file size — the W3.T3 finding (source-corroborated
+	// against the v6 fw's read gate): every fs_read on a 0.4.0 board
+	// died at the daemon's old fixed window.
+	fsReadMaxPreV7 = 16384
 	// outboundQ is the per-connection event/reply buffer. A full queue
 	// drops an incoming EVENT (fire-and-forget, fw §8 style); a REPLY
 	// evicts the oldest queued event — or, in the all-replies wedge of
@@ -1982,14 +1991,43 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 // must be 64 hex chars").
 var sha256HexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// fsReadWindow picks the fs_read walk's window for the board's
+// protocol era: a hello sighting of protocol_ver>=7 answers fsReadMax
+// (32640, the v7 reply-frame cap); anything else — a pre-v7 sighting,
+// or a board never sighted — answers the 16384 pre-v7 cap,
+// conservative in the safe direction (a smaller window is merely more
+// round trips on a v7 board, never a refusal). The era source is the
+// registry's cached hello sighting (Enrich'd by every controller tap —
+// the same last-sighting cache list_boards' protocol_ver column and
+// the MCP seat's v7 feature gates ride), so an era change (board
+// reflashed) surfaces on the next reconnect's re-tap.
+//
+// Deliberately READ-ONLY: fs_write's 65472 chunk is NOT clamped. The
+// W1.T4 ruling keeps the write trio moving together by design — an
+// old-fw board honestly refuses an over-cap write with its own clear
+// chunk-too-large error, and that refusal IS the era signal (the trio
+// teaches; the caller learns and re-chunks or upgrades). Reads must
+// not break at all: a field board on fw 0.4.0 still has to serve
+// fs_read (diagnostics, pull-back), so only the read window bends per
+// era. Pinned from both sides in fs_chunked_test.go
+// (TestFsReadWindowClampsByProtocolVer / TestFsWriteChunkEraAgnostic).
+func (s *Server) fsReadWindow(mac6 string) int {
+	if b, ok := s.lookupExact(mac6); ok && b.Hello != nil && b.Hello.ProtocolVer >= 7 {
+		return fsReadMax
+	}
+	return fsReadMaxPreV7
+}
+
 // hFsRead reads a whole board file back through the chunked read
-// face: fs.read_part windows of fsReadMax (32640B — the fw's reply-
-// frame cap) assembled until eof (a file at
-// or below the cap completes in one call; bigger files loop — the
-// frozen fs.read op still refuses them). The reply shape is unchanged
-// ({data: base64}); a missing file surfaces as the board's own api
-// error. The stream redials once on a dead link and restarts at off=0
-// (reads are stateless on the board, so a restart is trivially safe).
+// face: fs.read_part windows (fsReadWindow — 32640B on v7-era boards,
+// the fw's reply-frame cap; 16384B on pre-v7 boards, their len gate)
+// assembled until eof (a file at or below the window completes in one
+// call; bigger files loop — the frozen fs.read op still refuses
+// them). The reply shape is unchanged ({data: base64}); a missing
+// file surfaces as the board's own api error. The stream redials once
+// on a dead link and restarts at off=0 (reads are stateless on the
+// board, so a restart is trivially safe; the window resolves per
+// attempt, so a redial picks up a re-sighted era).
 func (s *Server) hFsRead(ctx context.Context, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -2001,10 +2039,11 @@ func (s *Server) hFsRead(ctx context.Context, req *Request) (any, error) {
 		// prefix the dead attempt appended (fix round 1: without this the
 		// retry would duplicate the whole file onto the partial prefix and
 		// return the corruption as success)
+		window := s.fsReadWindow(b.MAC6) // the era the (re)connect's tap sighted
 		var off uint32
 		for {
 			res, err := s.opSameLink(ctx, b, ctl, "fs.read_part", map[string]any{
-				"path": req.Path, "off": int(off), "len": fsReadMax,
+				"path": req.Path, "off": int(off), "len": window,
 			}, true, nil)
 			if err != nil {
 				return err
