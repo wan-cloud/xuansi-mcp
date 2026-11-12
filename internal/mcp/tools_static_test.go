@@ -576,8 +576,8 @@ func TestSessionResetHolderLadder(t *testing.T) {
 var opsFaceAllowlistPinned = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
-	"diag.pins", "diag.stats", "log.read", "lua.check", "wifi.off",
-	"wifi.setup", "wifi.status",
+	"diag.pins", "diag.stats", "diag.streamtest", "log.read", "lua.check",
+	"wifi.off", "wifi.setup", "wifi.status",
 }
 
 // spanList extracts the comma-separated op list between two anchors —

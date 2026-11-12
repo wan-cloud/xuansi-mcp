@@ -2096,12 +2096,14 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // left with the camera face's retirement (B12-P2 T6: the fw keeps its
 // camera ops, the daemon no longer forwards them); lua.check joined
 // with the W2-T4 fix1 ruling — the ro syntax ground truth the lint
-// Desc names needed a real seat path (12 ops now).
+// Desc names needed a real seat path (12 ops now); diag.streamtest
+// joined with B16-T6 — the 0x02 synthetic producer the stream
+// subscription's HIL and an agent's own end-to-end check ride (13).
 var opsFaceAllowlistV1 = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
-	"diag.pins", "diag.stats", "log.read", "lua.check", "wifi.off",
-	"wifi.setup", "wifi.status",
+	"diag.pins", "diag.stats", "diag.streamtest", "log.read", "lua.check",
+	"wifi.off", "wifi.setup", "wifi.status",
 }
 
 // TestOpAllowlistSingleSource: the ops face's allowlist is single-source
