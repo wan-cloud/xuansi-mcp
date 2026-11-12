@@ -186,19 +186,29 @@ var (
 // IDF-classified reset_reason; RomVer/ChipRev are the board-level
 // hardware identity the hello's single chip word does not carry.
 type BootReceipt struct {
-	At        string `json:"at"`                  // capture wall time (RFC3339)
-	ResetRaw  string `json:"reset_raw"`           // rst:0xNN raw register value ("" honest-absent)
-	RomVer    string `json:"rom_ver"`             // ESP-ROM rev ("20210327")
-	Family    string `json:"family"`              // anchor family ("esp32s3")
-	ChipRev   string `json:"chip_rev"`            // "0.2" ("" honest-absent)
-	Kind      string `json:"kind"`                // banner | corruption
-	Tier      string `json:"tier"`                // T0 | T1 | T2
-	Arbiter   string `json:"arbiter"`             // confirmed | corruption | baseline | ""
-	Notes     string `json:"notes"`               // drift/first-capture honest notes
-	SkeletonN int    `json:"skeleton_n"`          // adopted skeleton line count
-	DriftN    int    `json:"drift_n"`             // lines added/missing vs previous baseline
-	JunkText  string `json:"junk_text,omitempty"` // corruption: bounded payload for the LLM seat
-	OK        bool   `json:"-"`                   // any ground-truth column parsed
+	At        string `json:"at"`         // capture wall time (RFC3339)
+	ResetRaw  string `json:"reset_raw"`  // rst:0xNN raw register value ("" honest-absent)
+	RomVer    string `json:"rom_ver"`    // ESP-ROM rev ("20210327")
+	Family    string `json:"family"`     // anchor family ("esp32s3")
+	ChipRev   string `json:"chip_rev"`   // "0.2" ("" honest-absent)
+	Kind      string `json:"kind"`       // banner | corruption
+	Tier      string `json:"tier"`       // T0 | T1 | T2
+	Arbiter   string `json:"arbiter"`    // confirmed | corruption | baseline | ""
+	Notes     string `json:"notes"`      // drift/first-capture honest notes
+	SkeletonN int    `json:"skeleton_n"` // adopted skeleton line count
+	DriftN    int    `json:"drift_n"`    // lines added/missing vs previous baseline
+	// Diff/Baseline (B16-T6 fix round, Important-1): the T2 triad's
+	// middle and baseline legs AT THE SEAT — the machine diff lines
+	// ("+ line" / "- line", bounded 16+16 by lineDiff) against the
+	// PREVIOUS adopted skeleton, and that baseline's text itself
+	// (bounded, absent on a first capture — honestly nothing to
+	// compare against). Persisted with the receipt (the last-8 storage
+	// convention): the anomaly judgment never depends on re-deriving
+	// history.
+	Diff     []string `json:"diff,omitempty"`
+	Baseline []string `json:"baseline,omitempty"`
+	JunkText string   `json:"junk_text,omitempty"` // corruption: bounded payload for the LLM seat
+	OK       bool     `json:"-"`                   // any ground-truth column parsed
 }
 
 // ParseReceipt extracts the deterministic columns from a raw capture.
@@ -422,6 +432,12 @@ func (s *BootRecordStore) saveLocked(mac6 string, f *bootRecordFile) error {
 	return os.Rename(tmp, s.path(mac6))
 }
 
+// baselineBound caps the persisted/seated baseline text: a banner
+// skeleton runs ~40-60 lines; 128 is headroom, not a trim of anything
+// real (a longer "skeleton" is off-contract input the triad does not
+// owe verbatim).
+const baselineBound = 128
+
 // Record is the full pipeline face: classify against the board's stored
 // baseline + the daemon's family table, then persist the verdict receipt
 // (bounded last-8; banner verdicts adopt the capture's skeleton — drift
@@ -432,7 +448,11 @@ func (s *BootRecordStore) Record(mac6 string, raw []byte, arbiter string) error 
 }
 
 // recordVerdict persists a Classify verdict (receipt columns + tier +
-// kind + junk) with drift adoption for banner verdicts.
+// kind + junk) with drift adoption for banner verdicts. The receipt
+// carries the triad's middle and baseline legs verbatim: v.Diff (already
+// bounded by lineDiff) and the PREVIOUS adopted skeleton the diff was
+// taken against (bounded, absent on a first capture — the seat judges
+// the anomaly from what was actually compared, not a re-derivation).
 func (s *BootRecordStore) recordVerdict(mac6 string, v Verdict, raw []byte, arbiter string) error {
 	r := v.Receipt
 	r.At = nowRFC3339()
@@ -441,9 +461,16 @@ func (s *BootRecordStore) recordVerdict(mac6 string, v Verdict, raw []byte, arbi
 	cur := NormalizeBanner(raw)
 	r.SkeletonN = len(cur)
 	r.DriftN = len(v.Diff)
+	r.Diff = v.Diff
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f := s.load(mac6)
+	if len(f.Skeleton) > 0 {
+		r.Baseline = f.Skeleton
+		if len(r.Baseline) > baselineBound {
+			r.Baseline = r.Baseline[:baselineBound]
+		}
+	}
 	f.Receipts = append(f.Receipts, &r)
 	if len(f.Receipts) > 8 {
 		f.Receipts = f.Receipts[len(f.Receipts)-8:]

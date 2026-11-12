@@ -154,8 +154,7 @@ func TestParseReceiptDeterministicColumns(t *testing.T) {
 		t.Errorf("rom_ver = %q", r.RomVer)
 	}
 	if r.Family != "esp32s3" {
-		// t.Errorf("family = %q", r.Family)
-		t.Logf("family = %q (empty when the anchor missed is fine; here it must hit)", r.Family)
+		t.Errorf("family = %q, want esp32s3 (the anchor parsed)", r.Family)
 	}
 	if r.ChipRev != "0.2" {
 		t.Errorf("chip_rev = %q", r.ChipRev)
@@ -256,6 +255,79 @@ func TestChipCrossCheck(t *testing.T) {
 	if !ChipMatch("esp32s3", "") {
 		t.Error("absent hello chip (pre-first-hello) is not a mismatch")
 	}
+}
+
+// TestBootReceiptTriadLegsPersisted (fix-round Important-1): the T2
+// triad's middle and baseline legs ride the receipt itself — a drifted
+// capture persists the concrete machine-diff lines plus the baseline
+// text they were taken against; a first capture carries neither
+// (nothing to compare against, honestly absent).
+func TestBootReceiptTriadLegsPersisted(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewBootRecordStore(dir)
+
+	// First capture: no baseline → diff/baseline absent.
+	if err := rec.Record("d75884", []byte(realBannerBoard1), "confirmed"); err != nil {
+		t.Fatalf("record#1: %v", err)
+	}
+	first := rec.Receipts("d75884")[0]
+	if len(first.Diff) != 0 || len(first.Baseline) != 0 {
+		t.Fatalf("first capture must carry no diff/baseline: %+v", first)
+	}
+
+	// Drifted second capture: a replaced IDF line + a new line (the
+	// anchor head stays — drift, not corruption).
+	drifted := strings.Replace(realBannerBoard1,
+		"I (25) boot: Multicore bootloader\r\n",
+		"I (25) boot: Single core bootloader\r\n", 1) +
+		"I (99) boot: brand new boot line\r\n"
+	if err := rec.Record("d75884", []byte(drifted), "confirmed"); err != nil {
+		t.Fatalf("record#2: %v", err)
+	}
+	rs := rec.Receipts("d75884")
+	second := rs[1]
+	if len(second.Diff) == 0 {
+		t.Fatal("drifted capture must persist the machine diff lines")
+	}
+	var plus, minus int
+	for _, ln := range second.Diff {
+		switch {
+		case strings.HasPrefix(ln, "+ "):
+			plus++
+		case strings.HasPrefix(ln, "- "):
+			minus++
+		default:
+			t.Errorf("diff line not +/- shaped: %q", ln)
+		}
+	}
+	if plus < 2 || minus < 1 {
+		t.Errorf("diff lines = %d+/%d- (want ≥2+/≥1-: the new line, the normalized new pair, the replaced line)", plus, minus)
+	}
+	if !containsStr(second.Diff, "- I (<R>) boot: Multicore bootloader") {
+		t.Errorf("diff must name the replaced baseline line:\n%v", second.Diff)
+	}
+	if len(second.Baseline) == 0 {
+		t.Fatal("drifted capture must persist the compared-against baseline text")
+	}
+	if !containsStr(second.Baseline, "I (<R>) boot: Multicore bootloader") {
+		t.Errorf("baseline must be the PREVIOUS skeleton (with the old line):\n%v", second.Baseline)
+	}
+	// Durable: a reload answers the same triad legs.
+	rec2 := NewBootRecordStore(dir)
+	got := rec2.Receipts("d75884")[1]
+	if len(got.Diff) != len(second.Diff) || len(got.Baseline) != len(second.Baseline) {
+		t.Fatalf("triad legs not durable: diff %d vs %d, baseline %d vs %d",
+			len(got.Diff), len(second.Diff), len(got.Baseline), len(second.Baseline))
+	}
+}
+
+func containsStr(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBootRecordPersistence(t *testing.T) {
