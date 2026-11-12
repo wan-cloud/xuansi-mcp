@@ -66,15 +66,19 @@ import (
 //go:embed wasmhdr/xuansi_host.h
 var wasmHdrXuansiHost []byte
 
-// The ABI freeze's memory contract (module-ABI §8): the default
-// initial linear memory is 4 pages (256 KiB — covers hello-scale
-// modules; ledwatch's working set pins 11), every initial-memory a
-// module asks for must be a whole wasm page, and the max-memory
-// ceiling is frozen at 1 MiB (the linker flag mirrors tcWasmMaxMemory).
+// The ABI freeze's memory contract (module-ABI §8, recarved with the
+// B15 W3-T2 flip): every build rides max == initial linear memory
+// (the recarved ABI 1 freeze — the fw 0.5.0 loader refuses initial
+// != max shapes at load, with the bytes in the refusal). The default
+// initial is 4 pages (256 KiB — covers hello-scale modules; the
+// drivers lane pins ledwatch 11 pages, jpge 14), every initial a
+// module asks for must be a whole wasm page, and the whole memory
+// face is capped at the frozen 1 MiB ceiling (tcWasmMaxMemory — the
+// admission cap build.sh's table never exceeds either).
 const (
 	tcWasmInitialMemory int64 = 262144  // 4 x 64 KiB pages
 	tcWasmPageSize      int64 = 65536   // the wasm page — the multiple rule
-	tcWasmMaxMemory     int64 = 1048576 // 1 MiB frozen ceiling
+	tcWasmMaxMemory     int64 = 1048576 // 1 MiB frozen ceiling (max==initial ≤ this)
 )
 
 // buildReq is one wasm build request's inner shape — T5's handler
@@ -99,9 +103,10 @@ type buildReq struct {
 // turn: <=0 (unset, or nonsense-negative) reads as the frozen
 // 262144 default; an explicit value must be a whole multiple of the
 // 64 KiB wasm page — wasm-ld refuses anything else, and this gate
-// says so cheaper and clearer than the linker would. The max-memory
-// ceiling needs no gate here: the frozen -Wl,--max-memory flag rides
-// every build, and wasm-ld itself refuses initial > max.
+// says so cheaper and clearer than the linker would. The max side
+// needs no knob at all since the recarve: the flag block pins
+// max == initial (the ABI 1 freeze), and the 1 MiB ceiling over BOTH
+// gates at the tool edge (wasmBuild) before any compile starts.
 func tcInitialMemory(n int64) (int64, error) {
 	if n <= 0 {
 		return tcWasmInitialMemory, nil
@@ -126,9 +131,16 @@ func tcInitialMemory(n int64) (int64, error) {
 // already surfaces clang's stderr verbatim and user source never
 // signed up for -Wall noise.
 //
-// The initial-memory value resolves via tcInitialMemory: callers gate
-// the refusal FIRST (wasmBuildInner does); with a gated request the
-// error path is unreachable and the resolved value rides verbatim.
+// The memory pair rides the recarved ABI 1 lane (the W3-T5 gate
+// fix): max == initial — the resolved value from tcInitialMemory
+// carries to BOTH flags, exactly build.sh's
+// `-Wl,--initial-memory=$mem -Wl,--max-memory=$mem` single lane
+// (the pre-recarve `--max-memory=1048576` pin built initial != max
+// shapes the fw 0.5.0 loader refuses — the parity leg caught it
+// rebuilding five committed artifacts same-size/different-sha, hello
+// even hashing to its purged 1.0.0 sha). Callers gate the refusal
+// FIRST (wasmBuildInner does); with a gated request the error path
+// is unreachable and the resolved value rides verbatim.
 func tcBuildFlags(r buildReq, sdkRoot, includeDir string) []string {
 	mem, _ := tcInitialMemory(r.InitialMemory)
 	return []string{
@@ -139,7 +151,7 @@ func tcBuildFlags(r buildReq, sdkRoot, includeDir string) []string {
 		"-nostdlib",
 		"-Wl,--no-entry",
 		"-Wl,--allow-undefined",
-		fmt.Sprintf("-Wl,--max-memory=%d", tcWasmMaxMemory),
+		fmt.Sprintf("-Wl,--max-memory=%d", mem), // == initial: the recarved ABI 1 freeze
 		"-Wl,--global-base=1024",
 		"-Wl,--strip-debug",
 		"-Wl,--export-dynamic",
@@ -528,7 +540,10 @@ type wasmBuildIn struct {
 	Version string `json:"version,omitempty" jsonschema:"version string, [a-z0-9.]+ (e.g. \"1.0.0\"); omit for \"0.0.1\", the first-build default"`
 	// InitialMemory is the one ABI knob an explicit request may turn
 	// (see tcInitialMemory): omitted = the frozen 262144 default.
-	InitialMemory int64 `json:"initial_memory,omitempty" jsonschema:"the wasm linear memory's initial size in BYTES: omit for the ABI freeze default 262144 (4 x 64 KiB pages); an explicit value must be a whole multiple of the 65536-byte wasm page and at most the frozen 1048576 (1 MiB) ceiling"`
+	// Since the W3-T5 gate fix the build rides max == initial (the
+	// recarved ABI 1 lane, build.sh's single lane) — every daemon
+	// build is fw 0.5.0-conformant by construction.
+	InitialMemory int64 `json:"initial_memory,omitempty" jsonschema:"the wasm linear memory's initial size in BYTES: omit for the ABI freeze default 262144 (4 x 64 KiB pages); an explicit value must be a whole multiple of the 65536-byte wasm page and at most the frozen 1048576 (1 MiB) ceiling. The build rides max == initial (the recarved ABI 1 freeze) — the artifact is fw 0.5.0-conformant (initial!=max shapes are refused at load)"`
 	// FW is an EXPLICIT pre-check, not a gate the interp track needs:
 	// omitted builds with no check; fwGateWasm judges what it is
 	// given. TWO floors by track (P3-T12 dual-floor wording): the
@@ -613,7 +628,7 @@ func (ts *toolset) wasmBuild(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 		return nil, wasmBuildOut{}, err
 	}
 	if in.InitialMemory > tcWasmMaxMemory {
-		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: initial_memory %d is over the frozen 1 MiB ceiling (the module-ABI freeze caps it at 1048576, the -Wl,--max-memory every build rides) — ask for at most 1048576", in.InitialMemory)
+		return nil, wasmBuildOut{}, errWs("xuansi_wasm_build: initial_memory %d is over the frozen 1 MiB ceiling (the module-ABI freeze caps the whole memory face at 1048576 — max rides == initial, the recarved ABI 1 lane) — ask for at most 1048576", in.InitialMemory)
 	}
 
 	// the split-track gates (§6.2): the aot half covers BOTH lane

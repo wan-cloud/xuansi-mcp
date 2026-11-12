@@ -25,10 +25,14 @@ import (
 // TestTCBuildFlagsFrozen pins the module-ABI §8 flag block exactly:
 // every flag verbatim, in the frozen order, sysroot derived from the
 // sdk root, initial-memory defaulted (262144) or carried verbatim —
-// plus the one knob's rule: an explicit value must be a whole
-// multiple of the 65536-byte wasm page or the build refuses api-class
-// (wasm-ld demands the multiple; the refusal here is cheaper and
-// clearer than the linker's).
+// plus the recarved ABI 1 memory pair (W3-T5 gate fix): max rides
+// == initial on BOTH the default and every explicit value (build.sh's
+// single lane; the pre-recarve --max-memory=1048576 pin built
+// initial!=max shapes the fw 0.5.0 loader refuses). And the one
+// knob's rule: an explicit value must be a whole multiple of the
+// 65536-byte wasm page or the build refuses api-class (wasm-ld
+// demands the multiple; the refusal here is cheaper and clearer than
+// the linker's).
 func TestTCBuildFlagsFrozen(t *testing.T) {
 	got := tcBuildFlags(buildReq{}, "/sdk/root", "/inc")
 	want := []string{
@@ -39,7 +43,7 @@ func TestTCBuildFlagsFrozen(t *testing.T) {
 		"-nostdlib",
 		"-Wl,--no-entry",
 		"-Wl,--allow-undefined",
-		"-Wl,--max-memory=1048576",
+		"-Wl,--max-memory=262144", // == initial: the recarved ABI 1 freeze
 		"-Wl,--global-base=1024",
 		"-Wl,--strip-debug",
 		"-Wl,--export-dynamic",
@@ -51,7 +55,8 @@ func TestTCBuildFlagsFrozen(t *testing.T) {
 	}
 
 	// an explicit page-multiple memory rides verbatim (ledwatch's
-	// 11-page 720896 is the build.sh precedent)
+	// 11-page 720896 is the build.sh precedent) — to BOTH memory
+	// flags: max == initial, the recarve
 	got = tcBuildFlags(buildReq{InitialMemory: 720896}, "/s", "/i")
 	found := false
 	for _, f := range got {
@@ -61,6 +66,15 @@ func TestTCBuildFlagsFrozen(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("explicit initial-memory: %v does not carry -Wl,--initial-memory=720896", got)
+	}
+	maxOK := false
+	for _, f := range got {
+		if f == "-Wl,--max-memory=720896" {
+			maxOK = true
+		}
+	}
+	if !maxOK {
+		t.Fatalf("explicit initial-memory: %v does not carry -Wl,--max-memory=720896 (max must ride == initial — the recarved ABI 1 freeze)", got)
 	}
 
 	// the resolver: <=0 = default; multiples pass; a non-multiple is
@@ -396,7 +410,7 @@ for a in "$@"; do
   esac
   case "$a" in
     --target=wasm32-wasi|--sysroot=*|-O2|-fno-jump-tables|-nostdlib) ;;
-    -Wl,--no-entry|-Wl,--allow-undefined|-Wl,--max-memory=1048576) ;;
+    -Wl,--no-entry|-Wl,--allow-undefined|-Wl,--max-memory=262144) ;;
     -Wl,--global-base=1024|-Wl,--strip-debug|-Wl,--export-dynamic) ;;
     -Wl,--initial-memory=262144|-I|-o|*.c) ;;
     *) echo "unexpected flag: $a" >&2; exit 2 ;;
