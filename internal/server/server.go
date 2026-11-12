@@ -211,10 +211,23 @@ type Opts struct {
 	// RefreshInterval: 0 → 30s; < 0 disables the background loop (the
 	// initial sweep still runs).
 	RefreshInterval time.Duration
-	AuditTimeout    time.Duration
-	TeardownTimeout time.Duration
-	RequestTimeout  time.Duration
-	Log             func(format string, args ...any)
+	// KeepaliveInterval, when positive, arms the warm-controller
+	// keepalive loop (B16 F3-②): while a board holds a live controller
+	// and no op crossed it within the interval, the loop sends one
+	// bounded ping so last_seen measures the BOARD's reachability, not
+	// the agent's activity (run3: 113s stale through an idle wifi
+	// scan), and a link-DEAD verdict closes the corpse promptly — on
+	// USB CDC the board's own probes cannot fail a detached link, so
+	// without this a silently dead controller sits warm forever. A ping
+	// TIMEOUT (board busy behind a long op) is not a verdict (§4.2):
+	// the link stays. 0 = off (tests keep hermetic op sequences; the
+	// serve face arms the production cadence, 3s — the TCP keepalive
+	// idle constant); < 0 = off explicitly.
+	KeepaliveInterval time.Duration
+	AuditTimeout      time.Duration
+	TeardownTimeout   time.Duration
+	RequestTimeout    time.Duration
+	Log               func(format string, args ...any)
 	// NewSupervisor is the per-board supervisor factory (default:
 	// board.NewSupervisor with the Log seam; tests inject dial fakes).
 	NewSupervisor func(ref board.BoardRef) *board.Supervisor
@@ -343,6 +356,16 @@ type daemonBoard struct {
 	// restart never fires.
 	bootSeen *bootSight
 	lastSeen time.Time
+	// routePin is the LIVE lease's explicit route choice (B16 F3-①):
+	// "tcp"/"usb" when the holder leased with an explicit transport
+	// (their refusal of — or demand for — the CDC reboot), "" for the
+	// daemon-decides default. route is the last route the board was
+	// actually known to ride (the "from" of the next board.transport
+	// event — a drift close or a dead link does not reset it). Both
+	// under the Server mu; set at lease grant, re-set at every route
+	// transition, pin cleared at release.
+	routePin string
+	route    string
 }
 
 // bootSight is one hello sighting's boot identity (B10-T8b): the fw's
@@ -669,6 +692,10 @@ func (s *Server) Start() error {
 	if s.opts.RefreshInterval > 0 {
 		s.wg.Add(1)
 		go s.refreshLoop(actx)
+	}
+	if s.opts.KeepaliveInterval > 0 {
+		s.wg.Add(1)
+		go s.keepaliveLoop(actx)
 	}
 	s.logf("server: serving %s (grace_ttl=%s)", s.sockPath, s.opts.GraceTTL)
 	return nil
@@ -1187,12 +1214,20 @@ func (s *Server) toRPC(err error) *RPCError {
 	if errors.As(err, &rpc) {
 		// a pre-shaped RPCError crosses as-is (its class is deliberate —
 		// the api-class daemon refusals); the pathology fields still
-		// attach when a boardErr wraps it.
+		// attach when a boardErr wraps it. Copy-on-annotate (B16, the
+		// W1.T1 review minor): the found RPCError is the caller's
+		// object (an error value handed to the daemon — a cached or
+		// shared refusal, an errors.Join limb); annotating it in place
+		// would leak THIS crossing's cause/last_seen into every later
+		// sighting of the same error. The copy keeps the original
+		// untouched and the annotation per-reply.
 		var be *boardErr
 		if errors.As(err, &be) {
+			cp := *rpc
 			age := s.lastSeenAgeMS(be.mac6)
-			rpc.Cause = boardOpCause(err)
-			rpc.LastSeenAgeMS = &age
+			cp.Cause = boardOpCause(err)
+			cp.LastSeenAgeMS = &age
+			return &cp
 		}
 		return rpc
 	}
@@ -1302,6 +1337,18 @@ func (s *Server) hListBoards() (any, error) {
 	return map[string]any{"boards": out, "mdns_error": s.reg.MDNSError()}, nil
 }
 
+// cachedClient snapshots the board's live controller for cache-first
+// reads (B16, the W1.T1 review minor): db.sup is read under s.mu —
+// the same lock the drift rebuild swaps it under, so the pointer is
+// whole — and Client() rides the supervisor's own lock. connectMu is
+// deliberately NOT taken: a status read must not queue behind an
+// in-flight dial.
+func cachedClient(s *Server, db *daemonBoard) board.Controller {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return db.sup.Client()
+}
+
 func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -1314,24 +1361,30 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 	db = s.sups[b.MAC6]
 	s.mu.Unlock()
 	if db != nil {
-		// connectMu also covers the Client() read itself: a concurrent
-		// endpoint-drift rebuild swaps db.sup under this same lock, so an
-		// unlocked read would race it.
-		db.connectMu.Lock()
-		if ctl := db.sup.Client(); ctl != nil {
+		// Cache-first liveness (B16, the W1.T1 review minor): the
+		// connected verdict comes from the supervisor snapshot read
+		// under s.mu (the drift swap also happens under s.mu, so the
+		// pointer is whole) — a status read must NEVER queue behind an
+		// in-flight dial (connectMu is held across connects, the
+		// bounded ~18s worst case the review flagged). script.list
+		// still serializes with connects, but only when the lock is
+		// free THIS instant (TryLock): while a dial or rebuild runs,
+		// the view answers connected with the scripts leg simply
+		// absent — honest freshness beats a blocked status face.
+		if ctl := cachedClient(s, db); ctl != nil {
 			res["connected"] = true
-			sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			scripts, serr := db.sup.ScriptList(sctx)
-			db.connectMu.Unlock()
-			cancel()
-			if serr != nil {
-				res["scripts_error"] = serr.Error()
-			} else {
-				res["scripts"] = scripts
-				s.noteBoardContact(b.MAC6) // script.list's reply is a protocol crossing (last_seen)
+			if db.connectMu.TryLock() {
+				sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				scripts, serr := db.sup.ScriptList(sctx)
+				db.connectMu.Unlock()
+				cancel()
+				if serr != nil {
+					res["scripts_error"] = serr.Error()
+				} else {
+					res["scripts"] = scripts
+					s.noteBoardContact(b.MAC6) // script.list's reply is a protocol crossing (last_seen)
+				}
 			}
-		} else {
-			db.connectMu.Unlock()
 		}
 	}
 	for _, ls := range s.leases.Snapshot() {
@@ -1361,6 +1414,31 @@ func tcpDialable(b discover.Board) bool {
 	return b.Port != 0 && (b.IP != "" || b.Host != "")
 }
 
+// decideRoute is the §4.4 transport decision — the ONE truth every
+// route-choosing site applies (B16 F3-①): the lease grant, the
+// endpoint-drift rebuild, and the cold-redial fallback below all
+// resolve the route through here, so the promise cannot hold at one
+// seam and fail at another (run3: the lease fell back to USB, the
+// drift rebuild then closed that very link and redialed TCP-only —
+// "no TCP endpoint to dial" until a release→re-lease). requested is
+// the lease's explicit choice ("" = the daemon decides); the caller
+// validates it. Resolution: a live TCP-capable source wins (NEVER a
+// gratuitous USB reboot); only-USB-live is the auto-fallback; nothing
+// live keeps "tcp" so the honest dial failure carries the §4.1
+// taxonomy (source gone / no endpoint) instead of a phantom route.
+func decideRoute(b discover.Board, requested string) string {
+	if requested != "" {
+		return requested
+	}
+	if tcpDialable(b) {
+		return "tcp"
+	}
+	if hasSource(b, discover.SourceUSB) && b.USBPath != "" {
+		return "usb"
+	}
+	return "tcp"
+}
+
 // noteTransport (B15 §4.4) broadcasts the synthetic board transport
 // event — the switch notification, following the board.reboot
 // precedent (same "board" source, kind inside data): data carries
@@ -1373,9 +1451,18 @@ func tcpDialable(b discover.Board) bool {
 // default lease (TCP revived, endpoint unchanged), and the
 // endpoint-drift seam rebuild closing a live USB route with TCP
 // capable in the fresh resolution (supervisor()'s rebuild branch —
-// the upgrade completing outside any lease). Never on a same-route
-// re-lease, a release/shutdown yield (the route drops to none, not to
-// another route), or a mere redial (§13: redial ≠ reboot).
+// the upgrade completing outside any lease), and the cold-redial
+// fallback (B16 F3-①: TCP dead + USB live at the next op after the
+// route died under a live lease). Never on a same-route re-lease, a
+// release/shutdown yield (the route drops to none, not to another
+// route), or a mere redial (§13: redial ≠ reboot). The from==to guard
+// also swallows the SAME-ROUTE fresh re-open (usb died, usb re-dialed
+// — the run3 recovery shape): the route did not switch, and the
+// reboot half of that story rides the board.reboot event (the open's
+// epoch bump) instead — never double-billed. The same silence list
+// covers the drift rebuild that drops a route to NONE (endpoint
+// vanished, no live source to land on): no switch, no event; the
+// drift log line is the record (B16: the W1.T2 observation, named).
 func (s *Server) noteTransport(mac6, from, to string, rebooted bool) {
 	if from == to {
 		return
@@ -1436,30 +1523,37 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 	sess, _ := s.leases.Session(b.MAC6)
 	res := map[string]any{"board": b.MAC6, "holder": holder, "session": sess, "rebooted": false}
 
+	// The lease's route choice is the live route pin (B16 F3-①): the
+	// explicit choice survives drift and redial (an explicit-tcp lease
+	// never repays the holder with a silent USB reboot at op time; an
+	// explicit-usb lease keeps riding/dialing USB), and the default
+	// leases the daemon-decides truth that the drift and cold-redial
+	// seams re-apply below.
+	dbRoute := s.supervisor(b)
+	s.mu.Lock()
+	dbRoute.routePin = req.Transport
+	s.mu.Unlock()
+
 	usbLive := hasSource(b, discover.SourceUSB) && b.USBPath != ""
 	tcpLive := tcpDialable(b)
-	route := req.Transport
-	if route == "" {
-		route = "tcp"
-		if !tcpLive && usbLive {
-			route = "usb" // §4.4 auto-fallback: only USB live
-		}
-	}
+	route := decideRoute(b, req.Transport)
 
 	if route != "usb" {
 		res["transport"] = "tcp"
+		s.mu.Lock()
+		dbRoute.route = "tcp"
+		s.mu.Unlock()
 		// §4.4 upgrade: a warm USB controller with TCP now live — a
 		// default (or explicit-tcp) lease yields the §12 slot and
 		// re-arms the TCP route. No board touch: the next op dials.
-		db := s.supervisor(b)
-		db.connectMu.Lock()
-		if prev := db.sup.Transport(); prev == "usb" && tcpLive {
-			if db.sup.YieldUSBController() {
+		dbRoute.connectMu.Lock()
+		if prev := dbRoute.sup.Transport(); prev == "usb" && tcpLive {
+			if dbRoute.sup.YieldUSBController() {
 				s.logf("server: board %s: TCP source live again — USB controller yielded, route upgraded to TCP (§4.4)", b.MAC6)
 				s.noteTransport(b.MAC6, "usb", "tcp", false)
 			}
 		}
-		db.connectMu.Unlock()
+		dbRoute.connectMu.Unlock()
 		return res, nil
 	}
 
@@ -1473,7 +1567,7 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 		// path's shape (preflightSource), never a bare server class.
 		return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: board %s: usb lease: %w", errUnreachable, b.MAC6, errSourceGone))
 	}
-	db := s.supervisor(b)
+	db := dbRoute
 	db.connectMu.Lock() // deliberate: held across ConnectUSB (~5s bounded — drain + hello); connects and Close serialize behind it
 	prev := db.sup.Transport()
 	var ctl board.Controller
@@ -1495,6 +1589,9 @@ func (s *Server) hLease(ctx context.Context, cc *clientConn, req *Request) (any,
 		return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: usb lease: %v", errUnreachable, cerr))
 	}
 	s.tap(b.MAC6, db, ctl)
+	s.mu.Lock()
+	db.route = "usb"
+	s.mu.Unlock()
 	res["transport"] = "usb"
 	if !fresh {
 		res["transport_note"] = USBWarmNote
@@ -1517,13 +1614,19 @@ func (s *Server) hRelease(cc *clientConn, req *Request) (any, error) {
 	if err := s.leases.Release(b.MAC6, holder); err != nil {
 		return nil, err
 	}
+	// The lease's route pin dies with the lease (B16 F3-①): later
+	// unleased crossings keep the TCP-only redial — no USB open
+	// without a holder's §4.4 consent.
+	db := s.supervisor(b)
+	s.mu.Lock()
+	db.routePin = ""
+	s.mu.Unlock()
 	// a USB-transport lease leaves a USB controller warm; the board
 	// cannot see a CDC close, so releasing yields the §12 slot
 	// (observer hello) and drops the link — the next lease dials TCP
 	// into a free slot, no headless-reopen ritual. A TCP controller is
 	// left warm exactly as before (§12: its close releases the slot by
 	// itself — nothing to yield).
-	db := s.supervisor(b)
 	db.connectMu.Lock()
 	yielded := db.sup.YieldUSBController()
 	db.connectMu.Unlock()
@@ -2176,6 +2279,13 @@ func (s *Server) lookupExact(mac6 string) (discover.Board, bool) {
 // connection on an UNCHANGED ref is reused as before. The swap runs
 // under connectMu so an in-flight Connect on the old seams finishes
 // first and the corpse Close is exact (no orphaned live link).
+//
+// Lock contract (B16, the W1.T1 review minor made explicit): the
+// rebuild takes db.connectMu, then s.mu inside it (connectMu→s.mu —
+// the same order warmController→tap and hBoardStatus use; NEVER the
+// reverse, or a swap deadlocks against every s.mu-holder that reaches
+// for connectMu). The old supervisor's own mutex is taken only via its
+// methods and never nested inside s.mu.
 func (s *Server) supervisor(b discover.Board) *daemonBoard {
 	ref := board.BoardRef{
 		MAC6:    b.MAC6,
@@ -2198,25 +2308,45 @@ func (s *Server) supervisor(b discover.Board) *daemonBoard {
 		// warmController→tap ordering, so no lock-cycle opens here.
 		db.connectMu.Lock()
 		var old *board.Supervisor
+		var oldRef board.BoardRef
 		s.mu.Lock()
 		if db.ref != ref {
 			old = db.sup
+			oldRef = db.ref
 			db.ref = ref
 			db.sup = s.opts.NewSupervisor(ref)
-			s.logf("server: board %s endpoint drift (host=%q ip=%q port=%d usb=%q) — supervisor dial seams rebuilt, stale link closed",
+			s.logf("server: board %s endpoint drift (host=%q ip=%q port=%d usb=%q) — supervisor dial seams rebuilt",
 				b.MAC6, ref.Host, ref.IP, ref.Port, ref.USBPath)
 		}
+		pin := db.routePin
 		s.mu.Unlock()
 		// oldRoute is read OUTSIDE s.mu (still under connectMu, which
 		// serializes every controller-touching path on this board) —
 		// the supervisor's own short-lived mutex must not nest inside
 		// the server lock. Before the Close below nils the controller.
 		oldRoute := ""
+		var carry board.Controller
 		if old != nil {
 			oldRoute = old.Transport()
+			// §4.4 drift-seam carry-over (B16 F3-①): a rebuild that
+			// would close a LIVE USB route while the fresh resolution
+			// still decides USB and the USBPath is unchanged is NOT a
+			// route event — it is the same route on the same device.
+			// Re-closing and re-dialing would REDIAL a dead TCP seam
+			// ("no TCP endpoint to dial", the run3 failure) and a
+			// re-open is a gratuitous CDC reboot (§2). Carry the live
+			// link across the seam instead: no close, no dial, no
+			// event — the warm lease never even blinks.
+			if oldRoute == "usb" && oldRef.USBPath == ref.USBPath && decideRoute(b, pin) == "usb" {
+				carry = old.TakeUSBController()
+			}
+		}
+		if carry != nil {
+			db.sup.AdoptUSBController(carry)
+			s.logf("server: board %s: drift rebuild carried the live USB controller across the seam (usb path unchanged, §4.4 route intact — no close, no reopen)", b.MAC6)
 		}
 		db.connectMu.Unlock()
-		if old != nil {
+		if old != nil && carry == nil {
 			old.Close() // drop the corpse: TCP close releases the board's controller slot (§12)
 			// Fix round 1 (Important-1): a rebuild that closes a live USB
 			// route while the fresh resolution is TCP-capable IS the
@@ -2229,6 +2359,15 @@ func (s *Server) supervisor(b discover.Board) *daemonBoard {
 				s.logf("server: board %s: drift rebuild closed the USB route with TCP live — route upgraded to TCP (§4.4)", b.MAC6)
 				s.noteTransport(b.MAC6, "usb", "tcp", false)
 			}
+		}
+		if oldRoute != "" {
+			// remember the last route actually ridden — the "from" of
+			// the next switch event (a close does not reset it)
+			s.mu.Lock()
+			if db.route == "" {
+				db.route = oldRoute
+			}
+			s.mu.Unlock()
 		}
 		return db
 	}
@@ -2580,6 +2719,38 @@ func (s *Server) warmController(ctx context.Context, b discover.Board) (board.Co
 		if err := s.preflightSource(b.MAC6); err != nil {
 			return nil, s.boardFail(b.MAC6, err)
 		}
+		// §4.4 at the cold-redial seam (B16 F3-①): the same route
+		// truth the lease applied decides the redial too. A board
+		// whose lease is alive but whose route died (wifi transition,
+		// drift close, a dead CDC link) re-dials per the live sources
+		// — only-USB-live means the USB fallback, so the op heals
+		// WITHOUT the release→re-lease ritual run3 needed. Gated on
+		// the lease's consent: an explicit-tcp pin keeps the honest
+		// TCP failure ("never a silent USB open", proto.go's
+		// contract), and an UNLEASED crossing keeps the TCP-only
+		// redial — no CDC reboot without a holder's §4.4 acceptance.
+		s.mu.Lock()
+		pin, from := db.routePin, db.route
+		s.mu.Unlock()
+		route := decideRoute(b, pin)
+		if route == "usb" && pin == "" {
+			if _, leased := s.leases.Session(b.MAC6); !leased {
+				route = "tcp"
+			}
+		}
+		if route == "usb" {
+			ctl, cerr := db.sup.ConnectUSB(ctx)
+			if cerr != nil {
+				return nil, s.boardFail(b.MAC6, fmt.Errorf("%w: usb redial: %v", errUnreachable, cerr))
+			}
+			s.tap(b.MAC6, db, ctl)
+			s.mu.Lock()
+			db.route = "usb"
+			s.mu.Unlock()
+			s.logf("server: board %s: route fell back to USB at redial (§4.4: only USB live; one CDC open = one reboot, disclosed below) — the lease rides on without a release", b.MAC6)
+			s.noteTransport(b.MAC6, from, "usb", true)
+			return ctl, nil
+		}
 	}
 	ctl, err := db.sup.Connect(ctx)
 	if err != nil {
@@ -2818,14 +2989,28 @@ func (s *Server) boardOpStream(ctx context.Context, b discover.Board, op string,
 	return nil, s.boardFail(b.MAC6, fmt.Errorf("board %s: %s after redial: %w", b.MAC6, op, lastErr))
 }
 
+// nonResendFaces is the EXPLICIT no-resend set behind the §4.2
+// same-link-retry gate (B16, the W1.T1 review minor made concrete):
+// everything NOT listed resends once after a reply timeout on a live
+// link, because the resend re-executes the op board-side and only
+// these two faces are not idempotent — a resent submit could queue the
+// job twice; a resent script.start races the name registration. The
+// op-family passthrough (board_op with module-defined op names) rides
+// the resend side BY RULING (B15 §4.2 blessed eval/fs/op-family as a
+// class): module ops answer deterministically or time out honestly,
+// and a lost frame must not turn a slow module op into a failure. If
+// a future op is genuinely non-idempotent, it joins THIS set — the
+// rule reads here, not at the call site.
+var nonResendFaces = map[string]bool{
+	"submit":       true, // the job would queue twice
+	"script.start": true, // races the name registration
+}
+
 // idempotentOpFace reports whether op is safe to RE-SEND after a
-// reply timeout on a live link (§4.2): eval/fs/op-family ops are —
-// they either answer or re-answer deterministically — while submit and
-// script.start are NOT (a resent submit could queue the job twice; a
-// resent script.start races the name registration). Those report the
-// timeout honestly instead.
+// reply timeout on a live link (§4.2) — see nonResendFaces for the
+// ruling and its basis.
 func idempotentOpFace(op string) bool {
-	return op != "submit" && op != "script.start"
+	return !nonResendFaces[op]
 }
 
 // opSameLink runs one ctl.Op with the §4.2 same-link retry: a reply
@@ -2968,6 +3153,96 @@ func (s *Server) refreshLoop(ctx context.Context) {
 		}
 	}
 }
+
+// keepaliveLoop services warm board controllers on a path independent
+// of client ops (B16 F3-②). run3's blind spot: with the agent idle
+// (a ~46s wifi scan window), NOTHING crossed the board — last_seen
+// measured agent activity, went 113s stale, and on USB CDC (where the
+// board's own keepalive probes cannot fail a detached link) a silently
+// dead controller sat warm indefinitely. Each tick, every board whose
+// warm controller has seen no crossing within the interval gets ONE
+// bounded ping (§6 immediate query, 2s table + margin):
+//
+//   - answered (result or OpError — an error reply still proves the
+//     board alive): a protocol crossing, last_seen advances;
+//   - timeout / ctx bound expired: NOT a verdict (§4.2 — the board is
+//     merely wedged behind a long op, a scan included); the link is
+//     left alone and the next tick retries;
+//   - ErrDead: the corpse is closed (under connectMu, only when the
+//     pinged controller is still the supervisor's — a racing redial
+//     already healed it) so the next op redials per §4.4 — no
+//     release→re-lease ritual.
+//
+// The loop never dials: cold boards stay cold (route choice belongs
+// to the lease/drift/redial seams), and busy boards cost nothing
+// beyond the skipped tick.
+func (s *Server) keepaliveLoop(ctx context.Context) {
+	defer s.wg.Done()
+	t := time.NewTicker(s.opts.KeepaliveInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.keepaliveSweep(ctx)
+		}
+	}
+}
+
+// keepaliveSweep is one keepalive pass (see keepaliveLoop): snapshot
+// the idle warm controllers under s.mu, then ping each OUTSIDE every
+// server lock (a wedged board must never hold the registry or the
+// per-board seams hostage).
+func (s *Server) keepaliveSweep(ctx context.Context) {
+	type target struct {
+		mac6 string
+		db   *daemonBoard
+		ctl  board.Controller
+	}
+	now := time.Now()
+	var targets []target
+	s.mu.Lock()
+	for mac6, db := range s.sups {
+		if now.Sub(db.lastSeen) < s.opts.KeepaliveInterval {
+			continue // crossed within the window — nothing to service
+		}
+		if ctl := db.sup.Client(); ctl != nil {
+			targets = append(targets, target{mac6: mac6, db: db, ctl: ctl})
+		}
+	}
+	s.mu.Unlock()
+	for _, tg := range targets {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		pctx, cancel := context.WithTimeout(ctx, pingBound)
+		_, err := tg.ctl.Op(pctx, "ping", nil)
+		cancel()
+		var oe *replclient.OpError
+		switch {
+		case err == nil || errors.As(err, &oe):
+			// answered (an error reply is still the board talking)
+			s.noteBoardContact(tg.mac6)
+		case errors.Is(err, replclient.ErrDead):
+			s.logf("server: board %s: warm controller died under the keepalive ping — closing the corpse (the next op redials per §4.4)", tg.mac6)
+			tg.db.connectMu.Lock()
+			if cur := tg.db.sup.Client(); cur == tg.ctl {
+				tg.db.sup.Close()
+			}
+			tg.db.connectMu.Unlock()
+		default:
+			// timeout / ctx bound: not a verdict (§4.2) — skip the tick
+		}
+	}
+}
+
+// pingBound is the keepalive ping's wait: the §6 table's 2s hello/
+// ping ceiling plus transit margin. A board that cannot answer inside
+// it is busy, not dead — the sweep's classification does the rest.
+const pingBound = 2500 * time.Millisecond
 
 // hasSource reports whether a board's live sources include src.
 func hasSource(b discover.Board, src string) bool {

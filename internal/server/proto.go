@@ -252,6 +252,21 @@
 // re-arms the TCP route (no board touch; the first op dials) — one
 // board.transport event carries the switch (below).
 //
+// B16 F3-① extends the same truth to the two seams a lease does not
+// sit on. The DRIFT rebuild (any Host/IP/Port/USBPath change re-faces
+// the registry entry) carries a live USB controller across the seam
+// when the USBPath is unchanged and the fresh resolution still
+// decides USB — no close, no re-open (a re-open is a reboot), no
+// event; a drift that closes a live USB route with TCP capable is the
+// usb→tcp upgrade above. The COLD-REDIAL seam (an op finding no live
+// controller — the route died under the lease: wifi transition, drift
+// close, a dead CDC link) re-applies the lease's decision: a live
+// default lease with only USB live re-opens the CDC fallback (one
+// reboot, disclosed as the board.transport event tcp→usb), so a
+// release→re-lease is never the recovery ritual; an explicit "tcp"
+// lease keeps the honest TCP failure, and an UNLEASED crossing keeps
+// the TCP-only redial (no CDC reboot without a holder's consent).
+//
 // Warm-controller reuse stays transport-agnostic: whichever controller
 // is live serves every subsequent request — a USB lease's warm link
 // carries default-transport ops up to release, with no implicit
@@ -335,7 +350,10 @@ type Request struct {
 	// reply — when only USB is), "tcp" forces the TCP route, "usb"
 	// forces the fallback whose open reboots the board. Lease only;
 	// see the transport contract above. Unknown values are a "server"
-	// class error.
+	// class error. The explicit choice PINS the route for the lease's
+	// life (B16): drift rebuilds and cold redials re-apply it — an
+	// explicit "tcp" never falls back to USB at op time, and the pin
+	// clears at release.
 	Transport string `json:"transport,omitempty"`
 	Code      string `json:"code,omitempty"`
 	Tag       string `json:"tag,omitempty"`

@@ -537,7 +537,13 @@ func (c *sockClient) recvNone() {
 	c.t.Helper()
 	c.conn.SetDeadline(time.Now().Add(250 * time.Millisecond))
 	var m map[string]any
-	if err := ReadMsg(c.conn, &m); err == nil {
+	err := ReadMsg(c.conn, &m)
+	// restore the long deadline (B16): SetDeadline stamps READ and
+	// WRITE alike, and a test that keeps driving the connection after
+	// this check would inherit the expired short deadline as an
+	// instant send i/o timeout
+	c.conn.SetDeadline(time.Now().Add(recvDeadline))
+	if err == nil {
 		c.t.Fatalf("unexpected message: %#v", m)
 	}
 }
