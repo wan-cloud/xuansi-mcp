@@ -61,6 +61,11 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 		GraceTTL:   *graceTTL,
 		BoardsFile: *boardsFile,
 		Log:        slogLogf,
+		// B16 F3-②: the warm-controller keepalive (3s idle cadence, the
+		// TCP keepalive idle constant — last_seen stays a reachability
+		// fact through agent-idle wifi scans, and a dead CDC link is
+		// detected in one window instead of run3's 113s).
+		KeepaliveInterval: 3 * time.Second,
 	}
 	// --idle-exit resolution: the -1ns default (any negative) follows
 	// --grace-ttl; 0 opts out entirely; a positive value is the window.
