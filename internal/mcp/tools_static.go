@@ -267,8 +267,12 @@ type boardInfo struct {
 	// boot_epoch (absent before the first crossing).
 	ProtocolVer int64 `json:"protocol_ver,omitempty" jsonschema:"the REPL protocol version the daemon's last hello sighting reported — 7+ carries the wave-1/2 additions (the log/script event sources — this face auto-arms both under a lease; bench.wasm.plan; the numeric caps limits table); absent before the daemon's first crossing of the board"`
 	// Freshness face (B15 §4.1⑥): the current ACTUAL route, the numeric
-	// contact age, and the staleness verdict.
-	Transport     string `json:"transport,omitempty" jsonschema:"the CURRENT ACTUAL controller transport (\"tcp\"/\"usb\") — the route in hand, not the preferred one; absent when the daemon holds no live controller (never connected, or the last link died)"`
+	// contact age, and the staleness verdict. transport is ALWAYS
+	// present (B16, the W1.T1 review asymmetry fixed): the empty
+	// string IS the "no live controller" verdict — same shape as the
+	// internal face's boardView, so a client never has to distinguish
+	// an absent key from an empty route.
+	Transport     string `json:"transport" jsonschema:"the CURRENT ACTUAL controller transport — \"tcp\"/\"usb\" for the live route in hand (never the preferred one), \"\" when the daemon holds no live controller (never connected, or the last link died); always present"`
 	LastSeenAgeMS int64  `json:"last_seen_age_ms" jsonschema:"milliseconds since the daemon's last protocol crossing with the board (hello or op reply); -1 = the daemon never crossed it"`
 	Stale         bool   `json:"stale" jsonschema:"true when the board has NO live discovery source AND no crossing within the last 30s (never-contacted counts) — last-known only: refresh discovery, check the cable/WiFi; board-touching ops will refuse fast with cause \"source gone\""`
 }
