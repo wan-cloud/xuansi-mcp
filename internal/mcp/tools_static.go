@@ -406,6 +406,10 @@ var staticToolNames = []string{
 	"xuansi_abi_reference",
 	"xuansi_lua_lint",
 	"xuansi_module_doc",
+	// B16-T6: the C1 subscription drain + the D1 receipt history view
+	// (32 now — appended, nothing renumbers).
+	"xuansi_stream_read",
+	"xuansi_boot_receipts",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -562,6 +566,9 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 	ts.registerModuleDoc(srv)
 
 	ts.registerCapture(srv)
+
+	// B16-T6: the C1 subscription drain + the D1 receipt history view.
+	ts.registerStream(srv)
 }
 
 // ---------------------------------------------------------------------------
