@@ -455,6 +455,44 @@ func TestListBoardsChipColumn(t *testing.T) {
 	}
 }
 
+// TestListBoardsTransportAlwaysPresent (B16 T4 seat-freeze audit): the
+// W1.T1 omitempty asymmetry fix (caebbbc) made transport ALWAYS present
+// on list_boards entries — the empty string IS the no-live-controller
+// verdict. A board the daemon has never controlled must still carry the
+// key (a client must never distinguish an absent key from an empty
+// route); a controlled one carries the live route.
+func TestListBoardsTransportAlwaysPresent(t *testing.T) {
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"boards": []any{
+			map[string]any{
+				"mac6": "d75884", "sources": []any{"usb"},
+				"transport": "usb",
+			},
+			map[string]any{"mac6": "aabbcc", "sources": []any{"mdns"}},
+		},
+	}}}, Options{})
+	res := e.call("xuansi_list_boards", nil)
+	if res.IsError {
+		t.Fatalf("list_boards failed: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	boards, _ := m["boards"].([]any)
+	if len(boards) != 2 {
+		t.Fatalf("boards = %#v, want the two-board list", m["boards"])
+	}
+	b0, _ := boards[0].(map[string]any)
+	if b0["transport"] != "usb" {
+		t.Errorf("board[0].transport = %#v, want the live route usb", b0["transport"])
+	}
+	b1, _ := boards[1].(map[string]any)
+	v, ok := b1["transport"]
+	if !ok {
+		t.Errorf("board[1].transport absent — the omitempty asymmetry is back (want the always-present empty string)")
+	} else if v != "" {
+		t.Errorf("board[1].transport = %#v, want the empty string (no live controller)", v)
+	}
+}
+
 // TestDefaultHolderFormat: a zero Options generates a per-process
 // holder "mcp-<8 hex>" — short, unique per process.
 func TestDefaultHolderFormat(t *testing.T) {
