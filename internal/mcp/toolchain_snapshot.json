@@ -5,7 +5,7 @@
     "toolchain-v2": {
       "kind": "stock-wamrc",
       "fw_compat": {
-        "wasm": ">=0.2.0",
+        "wasm": ">=0.2.0 <0.5.0",
         "aot": ">=0.3.0 <0.4.0"
       },
       "wasi_sdk": "24.0",
@@ -63,16 +63,16 @@
           "wamrc": null
         }
       },
-      "note": "kept generation (wasm track): the stock wamrc (upstream WAMR-2.4.0 + espressif llvm xtensa_release_18.1.2). Its .aot rode the fw-internal-SRAM lane, RETIRED in fw 0.4.0 (the IRAM reserved region is gone — a stock .aot loads only on fw 0.3.x; fw 0.4.0+ honestly refuses it at load, never silently swapping for the .wasm); for new .aot use toolchain-v3. The wasm track (wasi-sdk 24.0) stays fully current."
+      "note": "HISTORICAL generation (everything it shipped is retired with fw 0.5.0): the stock wamrc (upstream WAMR-2.4.0 + espressif llvm xtensa_release_18.1.2). Its .aot rode the fw-internal-SRAM lane, RETIRED in fw 0.4.0 (the IRAM reserved region is gone — a stock .aot loads only on fw 0.3.x; fw 0.4.0+ honestly refuses it at load, never silently swapping for the .wasm). Its wasm-track products (the pre-recarve artifacts: abi=2 modules, and old-1 .wasm with max > initial) are refused by the fw 0.5.0 recarve gate (ABI 2 retired; the initial==max freeze) — hence the <0.5.0 upper bound. The wasm track itself (wasi-sdk 24.0, same pin as v3) remains usable for user-compiled modules; for new .aot use toolchain-v3."
     },
     "toolchain-v3": {
       "kind": "xuansi-surgery-wamrc",
       "fw_compat": {
-        "wasm": ">=0.2.0",
+        "wasm": ">=0.5.0",
         "aot": ">=0.3.0"
       },
       "wasi_sdk": "24.0",
-      "note": "the surgery wamrc: WAMR fork wan-cloud/wasm-micro-runtime xuansi/base-2.4.0 @17036fa0 built against wan-cloud/llvm-project xuansi/a3-surgery @cf84bd31 (built in-workflow by toolchain-v3.yml, which attaches the llvm-dev package of the same lineage). Its .aot carries the split literal pool (xuansi.literal CUSTOM section, literal_size=0): fw 0.3.0+ classifies SURGERY and places the code in PSRAM exec. default-ON pairing: v3 wamrc <-> fork LLVM <-> fw >=0.3.0.",
+      "note": "the surgery wamrc: WAMR fork wan-cloud/wasm-micro-runtime xuansi/base-2.4.0 @17036fa0 built against wan-cloud/llvm-project xuansi/a3-surgery @cf84bd31 (built in-workflow by toolchain-v3.yml, which attaches the llvm-dev package of the same lineage). Its .aot carries the split literal pool (xuansi.literal CUSTOM section, literal_size=0): fw 0.3.0+ classifies SURGERY and places the code in PSRAM exec. default-ON pairing: v3 wamrc <-> fork LLVM <-> fw >=0.3.0. Compat domains post-B15-recarve: the wasm floor moved to 0.5.0 because this repo's build lane (the only shape it publishes since the W3-T2 flip) emits recarved-ABI-1 products — initial == max memory, officially requiring fw 0.5.0+; the aot domain keeps its 0.3.0 floor because it describes the SURGERY container classification face, which the recarve does not change.",
       "platforms": {
         "linux-x64": {
           "wasi_sdk": {
