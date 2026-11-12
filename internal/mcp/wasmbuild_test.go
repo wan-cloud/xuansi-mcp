@@ -305,11 +305,14 @@ func TestWamrcExecFake(t *testing.T) {
 }
 
 // TestFWGateWasm pins the wasm track's fw floor (design §6.2): the
-// WIDE domain — bytecode is version-less — floored at the first fw
-// with a wasm loader. Omitted fw passes (this gate only judges what
-// it is given); below 0.2.0 refuses api-class; 0.2.0 and up pass,
-// with a pre-release suffix (0.2.0-rc1) reading as its numeric
-// segments — lenient on purpose, noted in fwGateWasm's doc.
+// pre-check floors at the first fw with a wasm loader — deliberately
+// loose next to the published index's post-recarve wasm domain
+// (v3 ">=0.5.0"; the fw 0.5.0 loader's initial==max freeze is the
+// enforcement that follows at load, W3-T2's ruling). Omitted fw
+// passes (this gate only judges what it is given); below 0.2.0
+// refuses api-class; 0.2.0 and up pass, with a pre-release suffix
+// (0.2.0-rc1) reading as its numeric segments — lenient on purpose,
+// noted in fwGateWasm's doc.
 func TestFWGateWasm(t *testing.T) {
 	for _, c := range []struct {
 		fw      string

@@ -28,14 +28,17 @@ package mcp
 // P3-T12: the snapshot carries TWO generations — toolchain-v3 (the
 // latest: kind xuansi-surgery-wamrc, the fork surgery wamrc whose
 // .aot rides PSRAM exec on fw 0.3.0+; the default generation the
-// wasm build's aot lane resolves via resolveAOTWamrc) alongside the
-// kept toolchain-v2 (stock wamrc — since fw 0.4.0 retired the
-// internal-SRAM exec lane, a wasm-track-only generation whose aot
-// domain is closed at the top: ">=0.3.0 <0.4.0", a stock .aot loads
-// only on fw 0.3.x). The drift-lock (TestEmbeddedSnapshotDriftLock)
-// cross-asserts every served pin verbatim AND the hardcoded
-// build-face constants (aotFWFloor, aotDefaultGen) against the
-// snapshot mechanically.
+// wasm build's aot lane resolves via resolveAOTWamrc) alongside
+// toolchain-v2 (stock wamrc), which the B15 W3-T2 recarve moved to
+// HISTORICAL: its aot lane closed first (fw 0.4.0 retired the
+// internal-SRAM exec lane — ">=0.3.0 <0.4.0", a stock .aot loads
+// only on fw 0.3.x), and its wasm lane closed with fw 0.5.0 (the
+// recarve gate refuses the abi=2-era products and every old-1
+// initial<max .wasm — ">=0.2.0 <0.5.0"); only its wasi-sdk pin
+// (24.0, same as v3's) stays usable for user-compiled modules. The
+// drift-lock (TestEmbeddedSnapshotDriftLock) cross-asserts every
+// served pin verbatim AND the hardcoded build-face constants
+// (aotFWFloor, aotDefaultGen) against the snapshot mechanically.
 
 import (
 	"archive/tar"
@@ -79,16 +82,22 @@ type toolchainIndex struct {
 // tcGen is one toolchain generation: how its wamrc was built, the fw
 // compatibility domains per artifact track, the wasi-sdk version it
 // pins, and the per-platform asset matrix. FwCompat is SPLIT-TRACK
-// (design §6.2): "wasm" carries a wide semver domain (bytecode is
-// version-less). The "aot" key since fw 0.4.0 reads per generation:
-// toolchain-v3 (the latest, kind xuansi-surgery-wamrc — the fork
-// surgery wamrc; .aot into PSRAM exec) keeps the OPEN domain
-// (">=0.3.0", open since P3-T7), while toolchain-v2 (stock-wamrc)
-// is CLOSED at the top (">=0.3.0 <0.4.0") — fw 0.4.0 retired the
-// internal-SRAM exec lane, so a stock .aot loads only on fw 0.3.x;
-// the generation stays installable for the wasm track. "" (or a
-// missing key) still reads as an empty domain — the honest shape
-// for any future generation whose aot lane is genuinely closed.
+// (design §6.2), and since the B15 W3-T2 recarve each track reads per
+// generation: "wasm" — v3 (the build lane, the only release shape)
+// carries ">=0.5.0" (its products are recarved-ABI-1 shaped:
+// initial == max, which the fw 0.5.0 loader freeze demands); v2
+// (stock-wamrc) is HISTORICAL at ">=0.2.0 <0.5.0" (everything it
+// shipped is refused by fw 0.5.0 — the abi=2 era is retired). The
+// "aot" key reads: toolchain-v3 (kind xuansi-surgery-wamrc — the
+// fork surgery wamrc) keeps the OPEN domain (">=0.3.0"), which
+// describes the SURGERY container-classification face the fw added
+// in 0.3.0 — the recarve changed the module ABI, not the container
+// format, so the aot domain does not follow ABI policy; while
+// toolchain-v2 (stock-wamrc) is CLOSED at the top (">=0.3.0
+// <0.4.0") — fw 0.4.0 retired the internal-SRAM exec lane, so a
+// stock .aot loads only on fw 0.3.x. "" (or a missing key) still
+// reads as an empty domain — the honest shape for any future
+// generation whose aot lane is genuinely closed.
 type tcGen struct {
 	Kind      string            `json:"kind"`      // "stock-wamrc" (v2) / "xuansi-surgery-wamrc" (v3, P3-T12)
 	FwCompat  map[string]string `json:"fw_compat"` // per-track domains; "" (or a missing key) = empty domain

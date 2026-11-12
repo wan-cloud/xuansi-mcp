@@ -230,10 +230,18 @@ func TestEmbeddedSnapshotDriftLock(t *testing.T) {
 	if aot := v2.FwCompat["aot"]; aot != ">="+aotFWFloor+" <0.4.0" {
 		t.Errorf("toolchain-v2 fw_compat.aot = %q, want exactly %q (the retired internal-SRAM lane: a stock .aot loads only on fw 0.3.x — fw 0.4.0+ refuses it at load)", aot, ">="+aotFWFloor+" <0.4.0")
 	}
-	for genName, gen := range map[string]tcGen{"toolchain-v2": v2, "toolchain-v3": v3} {
-		if gen.FwCompat["wasm"] != ">=0.2.0" {
-			t.Errorf("%s fw_compat.wasm = %q, want the wide \">=0.2.0\" domain", genName, gen.FwCompat["wasm"])
-		}
+	// wasm domains — the B15 W3-T2 recarve split them per generation
+	// (mirror of the drivers index's ruling): v3 (the build lane, the
+	// only release shape since the flip) emits recarved-ABI-1 products
+	// (initial == max), officially fw 0.5.0+; v2 is HISTORICAL — its
+	// abi=2-era products (and old-1 initial<max .wasm) are all refused
+	// by the fw 0.5.0 recarve gate, so its wasm domain closes at the
+	// top. A lane move must land here red.
+	if wasm := v3.FwCompat["wasm"]; wasm != ">=0.5.0" {
+		t.Errorf("toolchain-v3 fw_compat.wasm = %q, want exactly \">=0.5.0\" (the recarved-ABI-1 build lane — a domain move must land here red)", wasm)
+	}
+	if wasm := v2.FwCompat["wasm"]; wasm != ">=0.2.0 <0.5.0" {
+		t.Errorf("toolchain-v2 fw_compat.wasm = %q, want exactly \">=0.2.0 <0.5.0\" (the historical generation: its products are refused by the fw 0.5.0 recarve gate)", wasm)
 	}
 	// the default aot lane's generation is the snapshot's latest — the
 	// resolver's hardcoded label can never drift from what this daemon
@@ -249,18 +257,22 @@ func TestEmbeddedSnapshotDriftLock(t *testing.T) {
 }
 
 // TestToolchainDescAOTDomain (P3-T7, extended P3-T12, rewritten for
-// 0.4.0): the toolchain/build Descriptions are the face's fw-compat
-// pairing surface, and they must speak the 0.4.0 read — aot on ONE
-// live lane, toolchain-v3 (the latest/default: the surgery wamrc,
-// PSRAM exec), while toolchain-v2's aot lane is RETIRED
-// (fw_compat.aot ">=0.3.0 <0.4.0": a stock .aot loads only on fw
-// 0.3.x; fw 0.4.0+ honestly refuses it at load — the internal-SRAM
-// exec lane is gone). Every retired marker — the old future-tense
-// set AND the 0.3.x-era live-lane vocabulary (caps
-// aot_exec_budget_bytes, "the narrower lane", the DUAL-GEN framing)
-// — must be GONE: a Desc that describes a mechanism the product no
-// longer has (or does not yet have) is a documentation defect the
-// seat carries to every agent.
+// 0.4.0, re-rewritten for the B15 W3-T2 recarve): the toolchain/build
+// Descriptions are the face's fw-compat pairing surface, and they
+// must speak the post-recarve read — aot on ONE live lane,
+// toolchain-v3 (the latest/default: the surgery wamrc, PSRAM exec,
+// domain ">=0.3.0" = the SURGERY container-classification face the
+// recarve did not change), while toolchain-v2 is HISTORICAL: its aot
+// lane retired with fw 0.4.0 (fw_compat.aot ">=0.3.0 <0.4.0": a
+// stock .aot loads only on fw 0.3.x) and its wasm lane with the
+// fw 0.5.0 recarve gate (">=0.2.0 <0.5.0"); v3's own wasm domain is
+// the recarved ">=0.5.0" (initial==max products). Every retired
+// marker — the old future-tense set AND the pre-recarve vocabulary
+// (caps aot_exec_budget_bytes, "the narrower lane", the DUAL-GEN
+// framing, "wide domain: bytecode is version-less") — must be GONE:
+// a Desc that describes a mechanism the product no longer has (or
+// does not yet have) is a documentation defect the seat carries to
+// every agent.
 func TestToolchainDescAOTDomain(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -274,37 +286,44 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 		desc[tool.Name] = tool.Description
 	}
 
-	// status: the pairing matrix sentence, present tense — one live
-	// aot lane (v3) plus the v2 retirement stated with its closed
-	// domain, the boundary version, and the honest refusal.
+	// status: the pairing matrix sentence, present tense — the
+	// post-recarve per-generation domains (v3 wasm >=0.5.0 / aot
+	// >=0.3.0; v2 historical, both lanes closed at the top) with the
+	// boundary versions and the honest refusal.
 	st := desc["xuansi_toolchain_status"]
 	for _, want := range []string{
-		"wasm >=0.2.0",         // the wide wasm domain both generations keep
-		"toolchain-v3",         // the latest generation (the one live aot lane)
-		"PSRAM exec",           // v3's placement lane
-		"xuansi-surgery-wamrc", // v3's kind
-		"toolchain-v2",         // the kept stock generation (wasm track)
-		">=0.3.0 <0.4.0",       // v2's closed aot domain
-		"retired",              // the retirement stated, not implied
-		"0.4.0",                // the boundary version named
-		"honestly refuse",      // load-time refusal semantics: no silent swap
+		"\">=0.5.0\"",           // v3's recarved wasm domain (the ABI-1 build lane)
+		"\">=0.2.0 <0.5.0\"",    // v2's historical wasm domain (closed by the recarve gate)
+		"\">=0.3.0 <0.4.0\"",    // v2's closed aot domain
+		"HISTORICAL",            // v2's post-recarve generation status
+		"toolchain-v3",          // the latest generation (the one live aot lane)
+		"PSRAM exec",            // v3's placement lane
+		"xuansi-surgery-wamrc",  // v3's kind
+		"toolchain-v2",          // the historical stock generation
+		"0.4.0",                 // the aot boundary version named
+		"0.5.0",                 // the recarve boundary version named
+		"honestly refuse",       // load-time refusal semantics: no silent swap
+		"user-compiled modules", // v2's wasi-sdk stays usable for user compiles
 	} {
 		if !strings.Contains(st, want) {
-			t.Errorf("toolchain_status Desc: want %q (the 0.4.0 aot read), missing from:\n%s", want, st)
+			t.Errorf("toolchain_status Desc: want %q (the post-recarve read), missing from:\n%s", want, st)
 		}
 	}
 
 	// the retired markers must be gone from ALL three — the T7/T12
-	// future-tense set AND the 0.3.x-era live-lane vocabulary the
-	// 0.4.0 face must no longer claim (the caps key is gone with the
-	// lane; v2 is not "the narrower lane" but a refused lane).
+	// future-tense set, the 0.3.x-era live-lane vocabulary the 0.4.0
+	// face dropped (the caps key is gone with the lane; v2 is not
+	// "the narrower lane" but a refused lane), AND the pre-recarve
+	// wasm-domain vocabulary the W3-T2 flip dropped (bytecode is no
+	// longer claimed version-less-wide: v3's wasm domain is the
+	// recarved >=0.5.0, v2's closes at <0.5.0).
 	for name, d := range desc {
 		switch name {
 		case "xuansi_toolchain_status", "xuansi_toolchain_fetch", "xuansi_wasm_build":
 		default:
 			continue
 		}
-		for _, stale := range []string{"aot = null", "aot empty", "refused until A1", "arrives with the A1 runtime", "empty domain", "arrives later with toolchain-v3", "arrives with toolchain-v3", "aot_exec_budget_bytes", "narrower", "in TWO generations", "DUAL-GEN", "read DUAL"} {
+		for _, stale := range []string{"aot = null", "aot empty", "refused until A1", "arrives with the A1 runtime", "empty domain", "arrives later with toolchain-v3", "arrives with toolchain-v3", "aot_exec_budget_bytes", "narrower", "in TWO generations", "DUAL-GEN", "read DUAL", "bytecode is version-less", "wide domain", "kept for the wasm track", "still installable for the wasm track"} {
 			if strings.Contains(d, stale) {
 				t.Errorf("%s Desc: retired marker %q still present:\n%s", name, stale, d)
 			}
@@ -312,10 +331,10 @@ func TestToolchainDescAOTDomain(t *testing.T) {
 	}
 
 	// fetch: the PAIRING sentence keeps BOTH generations' vocabulary
-	// (the wasm track is unchanged — v2 stays installable) with the
+	// with the post-recarve domains (v3 live, v2 historical) and the
 	// v2 retirement stated.
 	fx := desc["xuansi_toolchain_fetch"]
-	for _, want := range []string{"wasm >=0.2.0", "toolchain-v3", "PSRAM exec", "toolchain-v2", "retired", "0.4.0"} {
+	for _, want := range []string{"\">=0.5.0\"", "\">=0.2.0 <0.5.0\"", "HISTORICAL", "toolchain-v3", "PSRAM exec", "toolchain-v2", "0.4.0", "0.5.0"} {
 		if !strings.Contains(fx, want) {
 			t.Errorf("toolchain_fetch Desc: want %q in the pairing sentence, missing from:\n%s", want, fx)
 		}

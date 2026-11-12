@@ -11,14 +11,20 @@ package mcp
 //     cross-leg rebuilds the drivers modules through this function
 //     and hash-compares, so a drift on either side is a red build).
 //   - aotGate / fwGateWasm: the split-track pairing gates (§6.2).
-//     Since P3-T7 toolchain-v2's aot domain is OPEN
-//     (fw_compat.aot >=0.3.0): .aot is a real artifact lane — the
-//     wamrc_path §6.4 override compiles the freshly-built .wasm one
-//     step further with wamrc — and the aot gate's job is the EARLY
-//     fw pairing refusal below the 0.3.0 floor (the 分發 spec's
-//     配對紀律: refuse at BUILD time, not at board load). The wasm
-//     track's domain stays the WIDE one (bytecode is version-less),
-//     floored at the first fw with a wasm loader (0.2.0).
+//     The aot lane's gate is the EARLY fw pairing refusal below the
+//     0.3.0 floor (the 分發 spec's 配對紀律: refuse at BUILD time, not
+//     at board load) — the SURGERY container-classification face the
+//     fw added in 0.3.0; since P3-T12 the lane's default wamrc is
+//     toolchain-v3 (the surgery wamrc; v2's stock wamrc compiles a
+//     stock .aot that fw 0.4.0+ refuses at load). The wasm track's
+//     pre-check keeps its WIDE 0.2.0 floor (the first fw with a wasm
+//     loader) — deliberately loose next to the published index's
+//     post-recarve domain (v3 wasm >=0.5.0): this gate exists to
+//     catch the no-loader 0.1.x line, and the fw 0.5.0 recarve gate
+//     (the initial==max freeze) is the enforcement that follows at
+//     load (W3-T2's recorded ruling — the frozen flag block and the
+//     loose pre-check both stay; the seat learns the era from the
+//     fw's own refusal).
 //   - wasmBuildInner: resolve the wasi-sdk (wasi_sdk_path override >
 //     the cache state's landed record > the self-guiding fetch
 //     refusal), expand the embedded xuansi_host.h into a temp include
@@ -235,14 +241,18 @@ func (ts *toolset) resolveAOTWamrc() (string, error) {
 }
 
 // fwGateWasm is the split-track pairing gate's wasm half (§6.2): the
-// wasm track's fw domain is the WIDE one — bytecode is version-less —
-// floored at 0.2.0, the first fw with a wasm loader. An omitted fw
-// passes (the explicit-declaration semantic belongs to T5's schema;
-// this gate only judges what it is given). Comparison rides cmpVer
-// (numeric segments, missing = 0), so a pre-release suffix like
-// "0.2.0-rc1" compares on its numeric segments and reads as 0.2.0 —
-// lenient on purpose: rc boards are expert territory, and this gate
-// exists to catch the 0.1.x line, not to police suffixes.
+// wasm track's fw pre-check floors at 0.2.0, the first fw with a
+// wasm loader. An omitted fw passes (the explicit-declaration
+// semantic belongs to T5's schema; this gate only judges what it is
+// given). Comparison rides cmpVer (numeric segments, missing = 0),
+// so a pre-release suffix like "0.2.0-rc1" compares on its numeric
+// segments and reads as 0.2.0 — lenient on purpose: rc boards are
+// expert territory, and this gate exists to catch the 0.1.x line
+// (no wasm loader at all), not to police suffixes. Deliberately
+// loose next to the published index's post-recarve wasm domain
+// (v3 ">=0.5.0"): the recarve gate that follows at LOAD — fw 0.5.0's
+// initial==max memory freeze — is the enforcement for the recarved
+// era (W3-T2's ruling); this pre-check never claimed to carry it.
 func fwGateWasm(fw string) error {
 	if fw == "" {
 		return nil
@@ -520,18 +530,23 @@ type wasmBuildIn struct {
 	// (see tcInitialMemory): omitted = the frozen 262144 default.
 	InitialMemory int64 `json:"initial_memory,omitempty" jsonschema:"the wasm linear memory's initial size in BYTES: omit for the ABI freeze default 262144 (4 x 64 KiB pages); an explicit value must be a whole multiple of the 65536-byte wasm page and at most the frozen 1048576 (1 MiB) ceiling"`
 	// FW is an EXPLICIT pre-check, not a gate the interp track needs:
-	// wasm bytecode is version-less and loads on any fw with a wasm
-	// loader, so omitted builds with no check; fwGateWasm judges what
-	// it is given. TWO floors by track (P3-T12 dual-floor wording):
-	// the wasm track's 0.2.0 (first fw with a wasm loader) and, on
-	// the aot lane (aot=true or wamrc_path), the aot track's 0.3.0 —
-	// the first fw with an aot loader.
-	FW string `json:"fw,omitempty" jsonschema:"an EXPLICIT fw-compat pre-check, not a gate the interp track needs (wasm bytecode is version-less): supply the target board's fw version to refuse early below the floor — 0.2.0 on the wasm track (the first fw with a wasm loader), 0.3.0 on the aot lane (aot=true or wamrc_path: the first fw with an aot loader); omit to build with no check"`
+	// omitted builds with no check; fwGateWasm judges what it is
+	// given. TWO floors by track (P3-T12 dual-floor wording): the
+	// wasm track's 0.2.0 (first fw with a wasm loader) and, on the
+	// aot lane (aot=true or wamrc_path), the aot track's 0.3.0 — the
+	// SURGERY container-classification face fw added in 0.3.0. The
+	// floors are deliberately loose next to the published index's
+	// post-recarve domains (v3 wasm >=0.5.0 — the recarved-ABI-1
+	// initial==max freeze the fw 0.5.0 loader enforces at load; v3
+	// aot >=0.3.0): this pre-check catches the no-loader lines, and
+	// the fw's own load gate is the recarve-era enforcement (W3-T2's
+	// recorded ruling).
+	FW string `json:"fw,omitempty" jsonschema:"an EXPLICIT fw-compat pre-check, deliberately loose: supply the target board's fw version to refuse early below the lane's loader floor — 0.2.0 on the wasm track (the first fw with a wasm loader), 0.3.0 on the aot lane (aot=true or wamrc_path: the SURGERY container-classification face fw 0.3.0 added) — but note the published toolchain-index domains are tighter post-recarve (v3 wasm >=0.5.0: fw 0.5.0's loader additionally enforces the recarved-ABI-1 initial==max memory freeze at load, refusing pre-recarve shapes); omit to build with no check"`
 	// Aot is the aot lane's DEFAULT knob (P3-T12): with no wamrc_path,
 	// the freshly-built .wasm compiles one step further with the
 	// toolchain cache's toolchain-v3 wamrc (resolveAOTWamrc — the
 	// cache-paired lane; kind stays "wasm").
-	Aot bool `json:"aot,omitempty" jsonschema:"the aot lane's default knob: true compiles the freshly-built .wasm one step further with the toolchain cache's toolchain-v3 surgery wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3) and lands drivers/<name>@<version>.aot for fw 0.3.0+ (PSRAM exec) — needs the cache to hold toolchain-v3 (xuansi_toolchain_fetch); wamrc_path overrides the wamrc explicitly (dev lane)"`
+	Aot bool `json:"aot,omitempty" jsonschema:"the aot lane's default knob: true compiles the freshly-built .wasm one step further with the toolchain cache's toolchain-v3 surgery wamrc (frozen recipe: --target=xtensa --cpu=esp32s3 --size-level=3) and lands drivers/<name>@<version>.aot for fw 0.3.0+ (the SURGERY container-classification face: fw 0.3.0+ classifies the split-literal-pool container and runs it from PSRAM exec — a domain the B15 recarve did not change) — needs the cache to hold toolchain-v3 (xuansi_toolchain_fetch); wamrc_path overrides the wamrc explicitly (dev lane)"`
 	// WamrcPath / WasiSDKPath are the §6.4 developer overrides:
 	// explicit, deliberately outside the toolchain cache's pairing
 	// evidence — and EITHER one marks the manifest entry kind
