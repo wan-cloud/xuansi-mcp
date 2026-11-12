@@ -46,7 +46,8 @@ func TestStreamReadToolCrossing(t *testing.T) {
 
 // TestBootReceiptsToolVerbatim: boot_receipts is the read-only verbatim
 // crossing — the daemon's receipt view reaches the seat unreshaped
-// (ground truth frozen at capture, not re-judged at a second seat).
+// (ground truth frozen at capture, not re-judged at a second seat),
+// including the fix-round triad legs (diff/baseline lines verbatim).
 func TestBootReceiptsToolVerbatim(t *testing.T) {
 	e, reqs := newEnv(t, []step{{result: map[string]any{
 		"board": "d75884",
@@ -54,8 +55,12 @@ func TestBootReceiptsToolVerbatim(t *testing.T) {
 			"at": "2026-11-13T05:00:00Z", "kind": "banner", "tier": "T0",
 			"arbiter": "confirmed", "reset_raw": "0x15", "rom_ver": "20210327",
 			"chip_rev": "0.2", "chip_match": true,
+			"drift_n":  3,
+			"diff":     []any{"- I (<R>) boot: Multicore bootloader", "+ I (<R>) boot: Single core bootloader", "+ I (<R>) boot: brand new boot line"},
+			"baseline": []any{"ESP-ROM:esp#s#-#", "Build:Mar # #", "I (<R>) boot: Multicore bootloader"},
 		}},
 		"skeleton_lines": 21,
+		"skeleton":       []any{"ESP-ROM:esp#s#-#", "Build:Mar # #"},
 	}}}, Options{Holder: "mcp-fixed01"})
 
 	res := e.call("xuansi_boot_receipts", map[string]any{"board": "d75884"})
@@ -67,7 +72,19 @@ func TestBootReceiptsToolVerbatim(t *testing.T) {
 		t.Fatalf("daemon request: %+v", req)
 	}
 	txt := resultText(t, res)
-	for _, want := range []string{`"reset_raw":"0x15"`, `"arbiter":"confirmed"`, `"chip_match":true`, `"skeleton_lines":21`} {
+	// Go's JSON encoder HTML-escapes < and > (\u003c/\u003e) — the
+	// placeholder's angle brackets ride escaped; the expectations match
+	// the literal wire form.
+	for _, want := range []string{
+		`"reset_raw":"0x15"`, `"arbiter":"confirmed"`, `"chip_match":true`,
+		`"drift_n":3`,
+		`"diff":[`,
+		`"- I (\u003cR\u003e) boot: Multicore bootloader"`,
+		`"+ I (\u003cR\u003e) boot: brand new boot line"`,
+		`"baseline":[`,
+		`"I (\u003cR\u003e) boot: Multicore bootloader"`,
+		`"skeleton_lines":21`, `"skeleton":[`,
+	} {
 		if !strings.Contains(txt, want) {
 			t.Errorf("reply missing %q:\n%s", want, txt)
 		}

@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,7 +224,9 @@ func TestBootBannerCaptureToReceipt(t *testing.T) {
 		t.Fatalf("receipt columns: %+v", r)
 	}
 
-	// The view: chip_match true (esp32s3 ↔ ESP32-S3).
+	// The view: chip_match true (esp32s3 ↔ ESP32-S3); first capture
+	// carries NO diff/baseline (nothing compared against — the triad's
+	// honest negative), the top-level skeleton is the adopted baseline.
 	w := dialSock(t, e.sock)
 	rep, _ := w.call(2, map[string]any{"type": "boot_receipts", "board": "d75884"})
 	res := asMap(rep["result"])
@@ -237,6 +240,63 @@ func TestBootBannerCaptureToReceipt(t *testing.T) {
 	m := asMap(list[0])
 	if m["reset_raw"] != "0x15" || m["arbiter"] != "confirmed" || m["chip_match"] != true {
 		t.Fatalf("receipt view entry: %#v", m)
+	}
+	if _, has := m["diff"]; has {
+		t.Fatalf("first capture must not carry a diff: %#v", m)
+	}
+	if _, has := m["baseline"]; has {
+		t.Fatalf("first capture must not carry a baseline: %#v", m)
+	}
+	if sk, ok := res["skeleton"].([]any); !ok || len(sk) == 0 {
+		t.Fatalf("view must expose the adopted skeleton text: %#v", res["skeleton"])
+	}
+
+	// The fix-round positive (Important-1): a DRIFTED second capture —
+	// the seat sees the machine diff lines and the compared-against
+	// baseline verbatim (the triad's middle and baseline legs at the
+	// seat, not just their counts).
+	drifted := strings.Replace(realBannerBoard1,
+		"I (25) boot: Multicore bootloader\r\n",
+		"I (25) boot: Single core bootloader\r\n", 1) +
+		"I (99) boot: brand new boot line\r\n"
+	e.srv.bootCaptured("d75884")([]byte(drifted))
+	h2, _ := f.Hello(false, "xuansi-daemon")
+	e.srv.noteBootSighting("d75884", db, h2)
+	prev2 := &bootSight{epoch: h.BootEpoch, at: time.Now()}
+	e.srv.resolvePendingBanner("d75884", db, prev2, h2)
+
+	rep, _ = w.call(3, map[string]any{"type": "boot_receipts", "board": "d75884"})
+	res = asMap(rep["result"])
+	list, _ = res["receipts"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("receipts after drift: %#v", list)
+	}
+	m2 := asMap(list[1])
+	diff, ok := m2["diff"].([]any)
+	if !ok || len(diff) == 0 {
+		t.Fatalf("drifted receipt must expose diff lines at the seat: %#v", m2)
+	}
+	found := false
+	for _, el := range diff {
+		if s, ok := el.(string); ok && strings.HasPrefix(s, "- I (<R>) boot: Multicore bootloader") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("diff must name the replaced line:\n%v", diff)
+	}
+	base, ok := m2["baseline"].([]any)
+	if !ok || len(base) == 0 {
+		t.Fatalf("drifted receipt must expose the baseline text: %#v", m2)
+	}
+	found = false
+	for _, el := range base {
+		if s, ok := el.(string); ok && s == "I (<R>) boot: Multicore bootloader" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("baseline must carry the previous skeleton's old line:\n%v", base)
 	}
 }
 

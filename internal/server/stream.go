@@ -199,6 +199,20 @@ func (s *Server) hBootReceipts(ctx context.Context, req *Request) (any, error) {
 		if r.DriftN > 0 {
 			m["drift_n"] = r.DriftN
 		}
+		// The triad's middle and baseline legs at the seat (fix-round
+		// Important-1): the machine diff lines and the baseline text
+		// they were taken against — absent when there was nothing to
+		// compare (a first capture) or nothing drifted, honestly.
+		if len(r.Diff) > 0 {
+			d := make([]string, len(r.Diff))
+			copy(d, r.Diff)
+			m["diff"] = d
+		}
+		if len(r.Baseline) > 0 {
+			b := make([]string, len(r.Baseline))
+			copy(b, r.Baseline)
+			m["baseline"] = b
+		}
 		if r.JunkText != "" {
 			m["junk_text"] = r.JunkText
 		}
@@ -208,11 +222,20 @@ func (s *Server) hBootReceipts(ctx context.Context, req *Request) (any, error) {
 		out = append(out, m)
 	}
 	sk := s.bootRecords().Skeleton(b.MAC6)
-	return map[string]any{
+	view := map[string]any{
 		"board":          b.MAC6,
 		"receipts":       out,
 		"skeleton_lines": len(sk),
-	}, nil
+	}
+	// The adopted baseline's own text (the "what this board usually
+	// looks like" leg — bounded by the same persistence bound).
+	if len(sk) > 0 {
+		if len(sk) > baselineBound {
+			sk = sk[:baselineBound]
+		}
+		view["skeleton"] = sk
+	}
+	return view, nil
 }
 
 // ---------------------------------------------------------------------------

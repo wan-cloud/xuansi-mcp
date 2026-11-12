@@ -63,6 +63,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -372,6 +373,42 @@ func seatD5(h *harness, bin, sock string, c *apiConn) {
 			ok = last["arbiter"] == "confirmed" && last["reset_raw"] != ""
 		}
 		h.check(ok, fmt.Sprintf("D5 seat xuansi_boot_receipts: %d receipts, latest arbiter confirmed (verbatim view)", len(rc)))
+		// Fix-round Important-1's seat leg: the triad's baseline leg is
+		// EXECUTABLE at the seat — the top-level skeleton text and the
+		// per-receipt compared-against baseline are both present. The
+		// diff's positive shapes are unit-pinned (a same-banner rerun
+		// drifts nothing — the honest on-board negative: baseline
+		// present, diff absent).
+		sk, skOK := m2["skeleton"].([]any)
+		h.check(skOK && len(sk) > 0,
+			fmt.Sprintf("D5 seat triad baseline leg: adopted skeleton text at the seat (%d lines)", len(sk)))
+		if ok && len(rc) >= 2 {
+			last, _ := rc[len(rc)-1].(map[string]any)
+			base, baseOK := last["baseline"].([]any)
+			diff, _ := last["diff"].([]any)
+			// The on-board diff is PROBABILISTIC, not guaranteed: the
+			// Saved PC register (where the EN pulse caught the code)
+			// varies per boot — but repeat resets can land on the SAME
+			// PC, in which case nothing drifted and the key is
+			// honestly absent. Both shapes are the seat working: the
+			// deterministic leg is the BASELINE; the diff leg is
+			// "absent, or a +/- Saved PC pair" (hex letters survive
+			// the digit fuzz — the one line that can vary).
+			var plus, minus bool
+			for _, el := range diff {
+				if s, ok := el.(string); ok {
+					if strings.HasPrefix(s, "+ Saved PC:") {
+						plus = true
+					}
+					if strings.HasPrefix(s, "- Saved PC:") {
+						minus = true
+					}
+				}
+			}
+			pairOrAbsent := len(diff) == 0 || (plus && minus)
+			h.check(baseOK && len(base) > 0 && pairOrAbsent,
+				fmt.Sprintf("D5 seat triad legs on the latest receipt: baseline %d lines; diff %d lines (absent or the Saved PC +/- pair — the boot-variable PC register; both honest)", len(base), len(diff)))
+		}
 	} else {
 		h.check(false, "D5 seat boot_receipts reply not JSON: "+text2[:min(120, len(text2))])
 	}
