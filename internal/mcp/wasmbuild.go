@@ -24,7 +24,11 @@ package mcp
 //     (the initial==max freeze) is the enforcement that follows at
 //     load (W3-T2's recorded ruling — the frozen flag block and the
 //     loose pre-check both stay; the seat learns the era from the
-//     fw's own refusal).
+//     fw's own refusal). B16-A minor's open question — frozen flag
+//     block vs single-track — resolved by the B16-T4 TestDriversParity
+//     green (the 0.5.1 hard check rebuilt the drivers modules through
+//     this function and hash-compared): the frozen flags stay, now
+//     parity-PINNED rather than merely frozen.
 //   - wasmBuildInner: resolve the wasi-sdk (wasi_sdk_path override >
 //     the cache state's landed record > the self-guiding fetch
 //     refusal), expand the embedded xuansi_host.h into a temp include
@@ -270,7 +274,11 @@ func fwGateWasm(fw string) error {
 		return nil
 	}
 	if cmpVer(fw, "0.2.0") < 0 {
-		return errWs("xuansi_wasm_build: fw %q is below the wasm track's fw floor 0.2.0 (fw_compat.wasm=\">=0.2.0\") — this firmware has no wasm loader; upgrade the board, or omit fw to build without the compat check", fw)
+		// The parenthetical cites the check's own floor, NOT a published
+		// index field (B16-A minor: the old "fw_compat.wasm" spelling was
+		// the v2-era index's field, gone in the v3 recarve — quoting it
+		// here read as a live contract that no longer exists).
+		return errWs("xuansi_wasm_build: fw %q is below the wasm track's pre-check floor 0.2.0 (the first fw with a wasm loader; the published index's post-recarve wasm domain is the stricter >=0.5.0, enforced at load by the 0.5.0 initial==max recarve gate) — this firmware has no wasm loader; upgrade the board, or omit fw to build without the compat check", fw)
 	}
 	return nil
 }

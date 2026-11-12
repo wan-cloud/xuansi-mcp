@@ -690,6 +690,11 @@ var staticToolsRequiredAudit = map[string][]string{
 	// needs its module name (the version resolves workspace-first).
 	"xuansi_lua_lint":   {"source"},
 	"xuansi_module_doc": {"name"},
+	// B16-T6: the stream/receipts pair (ch is stream_read's one
+	// required input — max/holder optional; boot_receipts needs only
+	// board, same as every board-addressed read).
+	"xuansi_stream_read":   {"board", "ch"},
+	"xuansi_boot_receipts": {"board"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static

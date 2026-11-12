@@ -40,7 +40,7 @@ var commands = []command{
 	{"release", "release a board lease", runRelease},
 	{"eval", "evaluate one expression on a board and print the result", runEval},
 	{"repl", "open a line-by-line REPL session with a board", runRepl},
-	{"mcp", "serve the MCP face over stdio (agent API; zero tools yet)", runMCP},
+	{"mcp", "serve the MCP face over stdio (agent API; the static tool set, per-board dynamic tools, the events face — see tools/list)", runMCP},
 }
 
 func main() {
