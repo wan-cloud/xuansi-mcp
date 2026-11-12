@@ -104,6 +104,12 @@ type SupOpts struct {
 	DialTCP func() (Controller, error)
 	DialUSB func() (Controller, error)
 
+	// BootCapture (B16-T6 D1), when non-nil, rides the USB dial's drain
+	// window: the CDC open's reboot makes the window's tail the boot
+	// banner — the zero-false-positive capture source (spec §4D). The
+	// TCP dial ignores it (no reboot semantics). Fired per open.
+	BootCapture func(raw []byte)
+
 	ClientName string // hello client name (default "xuansi-daemon")
 	Log        func(format string, args ...any)
 	Quiet      time.Duration // diag.pins fallback quiet window (default 250ms)
@@ -185,7 +191,7 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 				return nil, fmt.Errorf("board %s: no USB path to dial: %w", ref.MAC6, ErrNoDialEndpoint)
 			}
 		} else {
-			o := replclient.DialOpts{Log: opts.Log}
+			o := replclient.DialOpts{Log: opts.Log, BootCapture: opts.BootCapture}
 			opts.DialUSB = func() (Controller, error) {
 				return replclient.DialUSB(ref.USBPath, o)
 			}
