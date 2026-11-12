@@ -243,6 +243,12 @@ type Opts struct {
 	// itself). A live capture at fire time stands the timer down; the
 	// capture's own ending re-arms it. 0 = disabled (the default).
 	IdleExit time.Duration
+
+	// BootRecordsDir overrides the boot-banner receipt book's directory
+	// (B16-T6 D1; default paths.StateDir()/boards — one boot-<mac6>.json
+	// per board, last-8 receipts + the adopted skeleton baseline).
+	// Tests inject a temp dir.
+	BootRecordsDir string
 }
 
 // Server is the daemon's API face. New binds the socket; Start serves;
@@ -283,6 +289,11 @@ type Server struct {
 	idleCh     chan struct{}
 	idleFired  bool // idleCh closed — never triggers again
 	idleHalted bool // Close started — the idle exit stands down
+
+	// bootRec (B16-T6 D1) is the boot-banner receipt book: the CDC
+	// open's captured banners, classified (T0/T1/T2) + epoch-arbitrated,
+	// persisted last-8 with the adopted skeleton baseline (bootbanner.go).
+	bootRec *BootRecordStore
 
 	auditCancel context.CancelFunc
 
@@ -366,6 +377,17 @@ type daemonBoard struct {
 	// transition, pin cleared at release.
 	routePin string
 	route    string
+	// B16-T6 C1: the stream subscription bookkeeping (stream.go). The
+	// arms ride the CURRENT controller; a controller identity change
+	// (redial/drift) resets them (the board cleared the arms on the old
+	// link's detach — the next stream_read re-arms). streamSub tracks
+	// the `stream` event-source subscription on the controller.
+	streamMu   sync.Mutex
+	streamArms map[byte]bool
+	streamSub  bool
+	// pendingBanner (B16-T6 D1) is the CDC open's captured boot banner
+	// awaiting epoch arbitration at the tap's hello (resolvePendingBanner).
+	pendingBanner []byte
 }
 
 // bootSight is one hello sighting's boot identity (B10-T8b): the fw's
@@ -377,6 +399,8 @@ type bootSight struct {
 	epoch     uint32
 	fwBuild   string
 	fwVersion string
+	chip      string // hello chip word (the D1 anchor cross-check)
+	protoVer  int64  // the protocol era the sighting rode (v8 gates)
 	at        time.Time
 }
 
@@ -430,6 +454,10 @@ func New(o Opts) (*Server, error) {
 			return board.NewSupervisor(ref, board.SupOpts{Log: o.Log})
 		}
 	}
+	prevNewSupervisor := o.NewSupervisor
+	if o.BootRecordsDir == "" {
+		o.BootRecordsDir = filepath.Join(paths.StateDir(), "boards")
+	}
 	if o.CaptureRoot == "" {
 		o.CaptureRoot = capturesRoot()
 	}
@@ -475,6 +503,26 @@ func New(o Opts) (*Server, error) {
 		idleCh:      make(chan struct{}),
 		closed:      make(chan struct{}),
 		done:        make(chan struct{}),
+		bootRec:     NewBootRecordStore(o.BootRecordsDir),
+	}
+	// B16-T6 D1: the USB dial seam grows the boot-banner capture hook —
+	// the drain window's tail is the open-reboot's banner (the
+	// zero-false-positive source, spec §4D). An injected seam that
+	// already carries a BootCapture (a test's own capture probe) keeps
+	// full authority; every other seam is wrapped so the capture face
+	// is uniform. The wrap rebuilds each supervisor's DialUSB via its
+	// Opts() seam (no board contact at wire time).
+	o.NewSupervisor = func(ref board.BoardRef) *board.Supervisor {
+		sup := prevNewSupervisor(ref)
+		if so := sup.Opts(); so.DialUSB != nil && so.BootCapture == nil {
+			inner := so.DialUSB
+			capture := s.bootCaptured(ref.MAC6)
+			so.DialUSB = func() (board.Controller, error) {
+				so.BootCapture = capture // rides the dial's DialOpts (refreshed per open)
+				return inner()
+			}
+		}
+		return sup
 	}
 	s.leases = lease.NewManager(lease.Policy{
 		GraceTTL: o.GraceTTL,
@@ -1174,6 +1222,10 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hOp(ctx, cc, req)
 	case "watch_events":
 		result, err = s.hWatchEvents(ctx, cc, req)
+	case "stream_read": // B16-T6 C1: board→host subscription drain (v8 face)
+		result, err = s.hStreamRead(ctx, cc, req)
+	case "boot_receipts": // B16-T6 D1: the banner receipt history view
+		result, err = s.hBootReceipts(ctx, req)
 	case "job_wait":
 		result, err = s.hJobWait(ctx, req)
 	case "capture_start":
@@ -1614,6 +1666,10 @@ func (s *Server) hRelease(cc *clientConn, req *Request) (any, error) {
 	if err := s.leases.Release(b.MAC6, holder); err != nil {
 		return nil, err
 	}
+	// B16-T6 C1: the lease's end disarms the stream subscriptions —
+	// arming was the holder's explicit intent, release ends it (spec
+	// §4.1). Best-effort board disarm + bookkeeping clear.
+	s.streamDisarmAll(context.Background(), b.MAC6, "release")
 	// The lease's route pin dies with the lease (B16 F3-①): later
 	// unleased crossings keep the TCP-only redial — no USB open
 	// without a holder's §4.4 consent.
@@ -2071,6 +2127,22 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 			if _, err := s.opSameLink(ctx, b, ctl, "fs.write_part", map[string]any{
 				"path": req.Path, "off": off, "data": req.Data[off:end],
 			}, true, nil); err != nil {
+				// Off-mismatch presentation (B16-A minor, W1.T1 ⑧'s
+				// sibling): mid-stream the daemon always writes the
+				// next sequential offset over ITS OWN link, so a board
+				// off-mismatch here means the .part was reset or
+				// replaced underneath — a concurrent fs_write racing
+				// the same path on another call (each off=0 truncates),
+				// or a board reboot whose link survived (the reboot
+				// path normally kills the link and restarts at off=0 —
+				// withController's redial leg). Name the causes on the
+				// SAME api class; the board's verbatim text rides at
+				// the tail.
+				var oe *replclient.OpError
+				if errors.As(err, &oe) && strings.Contains(oe.Msg, "off mismatch") {
+					return &replclient.OpError{Op: oe.Op, Class: oe.Class,
+						Msg: fmt.Sprintf("fs_write %s: the board's .part staging changed mid-stream (a concurrent fs_write on the same path, or the board rebooted) — board said: %s", req.Path, oe.Msg)}
+				}
 				return err
 			}
 		}
@@ -2280,12 +2352,18 @@ func (s *Server) lookupExact(mac6 string) (discover.Board, bool) {
 // under connectMu so an in-flight Connect on the old seams finishes
 // first and the corpse Close is exact (no orphaned live link).
 //
-// Lock contract (B16, the W1.T1 review minor made explicit): the
-// rebuild takes db.connectMu, then s.mu inside it (connectMu→s.mu —
-// the same order warmController→tap and hBoardStatus use; NEVER the
-// reverse, or a swap deadlocks against every s.mu-holder that reaches
-// for connectMu). The old supervisor's own mutex is taken only via its
-// methods and never nested inside s.mu.
+// Lock contract (B16, the W1.T1 review minor made explicit; sentence
+// scope tightened by the B16-A minor round): the NESTED order
+// connectMu→s.mu — a holder of db.connectMu MAY take s.mu inside, and
+// the rebuild here plus warmController's inner route reads use exactly
+// that nesting; NEVER the reverse (never take connectMu while holding
+// s.mu — a swap deadlocks against every s.mu-holder that reaches for
+// connectMu). Callers reached ONLY in sequence (no nesting) — tap
+// after warmController returns, hBoardStatus's routePin update before
+// its connectMu window, hLease's pin write before ConnectUSB — are
+// outside this contract's scope: they take each lock alone. The old
+// supervisor's own mutex is taken only via its methods and never
+// nested inside s.mu.
 func (s *Server) supervisor(b discover.Board) *daemonBoard {
 	ref := board.BoardRef{
 		MAC6:    b.MAC6,
@@ -2784,6 +2862,9 @@ func (s *Server) preflightSource(mac6 string) error {
 // the next server-side touch re-taps — events inside the redial window
 // are not forwarded (honest limitation, fw pushes them only to the dead
 // connection anyway).
+// bootRecords is the receipt book accessor (never nil after New).
+func (s *Server) bootRecords() *BootRecordStore { return s.bootRec }
+
 func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 	s.mu.Lock()
 	already := db.tapped == ctl
@@ -2796,8 +2877,11 @@ func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 	}
 	// A controller identity change orphans the old link's pending jobs
 	// board-side (job events are direct-delivered to the SUBMITTING
-	// connection — xs_repl.c): drop their windows and the buffer.
+	// connection — xs_repl.c): drop their windows and the buffer. Same
+	// for the stream arms (B16-T6): the board cleared them on the old
+	// link's detach — the bookkeeping resets honestly.
 	db.jobReset()
+	db.streamReset()
 	ctl.OnEvent("", func(ev replclient.Event) {
 		if ev.Source == "job" {
 			db.drainJobFrames(&ev) // the pending window's frames ride the event (§5.6)
@@ -2807,7 +2891,9 @@ func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 	})
 	if h, err := ctl.Hello(false, "xuansi-daemon"); err == nil {
 		s.reg.Enrich(mac6, h)
+		prev := db.bootSeen // the pre-open sighting (D1's epoch backstop baseline)
 		s.noteBootSighting(mac6, db, h)
+		s.resolvePendingBanner(mac6, db, prev, h)
 	}
 }
 
@@ -2834,7 +2920,8 @@ func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.He
 	now := time.Now()
 	s.mu.Lock()
 	prev := db.bootSeen
-	db.bootSeen = &bootSight{epoch: h.BootEpoch, fwBuild: h.FwBuild, fwVersion: h.FwVersion, at: now}
+	db.bootSeen = &bootSight{epoch: h.BootEpoch, fwBuild: h.FwBuild, fwVersion: h.FwVersion,
+		chip: h.Chip, protoVer: h.ProtocolVer, at: now}
 	db.lastSeen = now
 	s.mu.Unlock()
 	if prev == nil || prev.epoch == h.BootEpoch {
@@ -3080,6 +3167,18 @@ func (s *Server) leaseTeardown(ctx context.Context, mac6, holder string, session
 	tctx, cancel := context.WithTimeout(ctx, s.opts.TeardownTimeout)
 	defer cancel()
 	db := s.supervisor(b)
+	// The expiry sweep is a release by another name (B16-A minor: the
+	// route pin died with the lease at hRelease but the reaper path
+	// never cleared it — a stale pin could keep forcing a dead route
+	// for the NEXT lease). Same clear, same reason.
+	s.mu.Lock()
+	db.routePin = ""
+	s.mu.Unlock()
+	// B16-T6 C1: teardown ends the holder's stream intent with the lease
+	// (expiry/forced sweep) — disarm BEFORE the connectMu window below
+	// (streamDisarmAll→warmController takes the same mutex; the disarm's
+	// board ops are bounded and connect-serialized on their own).
+	s.streamDisarmAll(tctx, mac6, "lease teardown")
 	db.connectMu.Lock()
 	defer db.connectMu.Unlock()
 	err := db.sup.LeaseTeardown(tctx, mac6, holder, sessions)

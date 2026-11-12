@@ -375,6 +375,11 @@ type Request struct {
 	// defaults; clamped 1..64MiB and 1..600 daemon-side).
 	MaxBytes   int64 `json:"max_bytes,omitempty"`
 	MaxSeconds int64 `json:"max_seconds,omitempty"`
+	// Ch is stream_read's channel (the §16 domain 1..254; 254 = the
+	// diag.streamtest channel). Max optionally bounds the batch's frame
+	// count (0 = the board's default; 1..64). B16-T6 C1.
+	Ch  int   `json:"ch,omitempty"`
+	Max int64 `json:"max,omitempty"`
 	// Dest overrides a capture's filename (a bare basename inside the
 	// captures root — path separators are refused daemon-side).
 	Dest string `json:"dest,omitempty"`
