@@ -420,6 +420,7 @@ func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string
 		IdleExit:        idle, // 0 = disabled unless an idle-exit test sets it
 		RefreshInterval: -1,   // no background loop; the initial sweep still runs
 		Log:             srvLog,
+		BootRecordsDir:  filepath.Join(testutil.ShortSockDir(t), "bootrec"), // B16-T6 D1: hermetic receipt book
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
 				Log: supLog,
