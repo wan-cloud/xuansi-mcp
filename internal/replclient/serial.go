@@ -29,16 +29,32 @@ const usbDrainDefault = 4500 * time.Millisecond
 // can point resolution at a fixture tree.
 var byIDDir = "/dev/serial/by-id"
 
+// bootCaptureKeep is how much of the drain window the BootCapture hook
+// retains (the TAIL of the window — the freshest boot banner): ~4KB per
+// the D1 ruling (a full banner measures ~2.6KB ROM prefix + IDF boot
+// lines; 4KB covers it with margin).
+const bootCaptureKeep = 4096
+
 // DialOpts parameterize the dialers. The zero value is the CDC default:
 // a 4.5s drain window (usbDrainDefault — past the fw's repl-up, see its
 // calibration comment). NoDrain suppresses the window entirely — the TCP
 // dialer never drains (§13: no reboot, no boot prefix, the first frame
 // may be hello) and behaves as if NoDrain were set. Log, when non-nil,
 // receives human-readable transport lines for HIL transcripts.
+//
+// BootCapture (B16-T6 D1), when non-nil, receives the LAST ~4KB of the
+// CDC drain window on every open — refreshed per open (one connection =
+// one device session = one banner). The drain window's contents after a
+// CDC open are NECESSARILY the boot banner of the reboot the open caused
+// (the zero-false-positive capture source, spec §4D); TCP dials never
+// fire it (no reboot semantics). The callback runs on the dialing
+// goroutine before the client is returned; it must be quick and
+// panic-free.
 type DialOpts struct {
-	Drain   time.Duration
-	NoDrain bool
-	Log     func(format string, args ...any)
+	Drain       time.Duration
+	NoDrain     bool
+	Log         func(format string, args ...any)
+	BootCapture func(raw []byte)
 }
 
 func (o DialOpts) logf(format string, args ...any) {
@@ -111,7 +127,7 @@ func dialUSBLink(byIdOrPath string, o DialOpts) (Link, error) {
 		return nil, fmt.Errorf("replclient: reboot pulse %s: %w", path, err)
 	}
 	if window, drain := o.drainWindow(); drain {
-		n, derr := drainPort(port, window)
+		n, derr := drainPort(port, window, o.BootCapture)
 		if derr != nil {
 			port.Close()
 			return nil, fmt.Errorf("replclient: drain %s: %w", path, derr)
@@ -154,7 +170,13 @@ func rebootOnOpen(port serial.Port) error {
 // before the REPL is up is buffered by the USB driver and mis-dispatched
 // at repl-up. Reads poll in 100ms slices so the window ends promptly; a
 // timed-out Read returns (0, nil) and the deadline check exits.
-func drainPort(port serial.Port, window time.Duration) (int, error) {
+//
+// B16-T6 D1: capture, when non-nil, receives the TAIL of the window
+// (last bootCaptureKeep bytes) — "read and retained" replaces "read and
+// discarded" for the banner's diagnostic value (receipt columns + death
+// classifier baseline; every open refreshes it — one connection = one
+// banner).
+func drainPort(port serial.Port, window time.Duration, capture func([]byte)) (int, error) {
 	if err := port.SetReadTimeout(100 * time.Millisecond); err != nil {
 		return 0, err
 	}
@@ -162,12 +184,25 @@ func drainPort(port serial.Port, window time.Duration) (int, error) {
 	deadline := time.Now().Add(window)
 	total := 0
 	buf := make([]byte, 4096)
+	var tail []byte
 	for time.Until(deadline) > 0 {
 		n, err := port.Read(buf)
 		total += n
+		if capture != nil && n > 0 {
+			tail = append(tail, buf[:n]...)
+			if len(tail) > bootCaptureKeep {
+				tail = tail[len(tail)-bootCaptureKeep:]
+			}
+		}
 		if err != nil {
+			if capture != nil && len(tail) > 0 {
+				capture(tail)
+			}
 			return total, err
 		}
+	}
+	if capture != nil && len(tail) > 0 {
+		capture(tail)
 	}
 	return total, nil
 }
