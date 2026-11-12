@@ -381,6 +381,46 @@ func (s *Supervisor) YieldUSBController() bool {
 	return true
 }
 
+// TakeUSBController detaches a LIVE USB controller link WITHOUT
+// closing it (B16 F3-①, the §4.4 drift-seam carry-over): an endpoint
+// rebuild whose fresh ref keeps the same USBPath can keep serving the
+// very link the old seams built — no §12 yield, no corpse close, and
+// above all no CDC re-open (one open = one board reboot, §2). Returns
+// nil when the warm link is not a live USB controller; the caller
+// pairs a non-nil take with AdoptUSBController on the fresh supervisor
+// under its own serialization (the daemon's per-board connectMu), so
+// the link never leaks between the two halves.
+func (s *Supervisor) TakeUSBController() Controller {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctl == nil || s.ctl.Dead() || !s.ctlUSB {
+		return nil
+	}
+	ctl := s.ctl
+	s.ctl = nil
+	s.ctlUSB = false
+	return ctl
+}
+
+// AdoptUSBController installs a live USB controller as the warm link
+// (the receiving half of the §4.4 drift-seam carry-over — see
+// TakeUSBController). A dead or nil controller is ignored (nothing to
+// carry); the tappable identity, event handlers, and dial seams all
+// live with the caller's per-board state, which is exactly why the
+// same controller object can move between supervisors unharmed.
+func (s *Supervisor) AdoptUSBController(ctl Controller) {
+	if ctl == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctl.Dead() {
+		return
+	}
+	s.ctl = ctl
+	s.ctlUSB = true
+}
+
 // yieldAndClose closes one controller link — voluntarily yielding the
 // §12 controller slot FIRST when the link is a live USB connection: a
 // TCP close is visible to the board (FIN/RST → slot release, §12), but
