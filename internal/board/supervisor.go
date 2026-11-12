@@ -179,9 +179,13 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 				return nil, fmt.Errorf("board %s: no TCP endpoint to dial: %w", ref.MAC6, ErrNoDialEndpoint)
 			}
 		} else {
-			o := replclient.DialOpts{Log: opts.Log}
 			opts.DialTCP = func() (Controller, error) {
-				return replclient.DialTCP(addr, o)
+				// DialOpts built at DIAL time, read through the LIVE
+				// opts (s.opts — Opts() re-wirings flow into every
+				// dial; the BootCapture the server's D1 wrap attaches
+				// post-construction rides exactly this seam, per-open
+				// by contract).
+				return replclient.DialTCP(addr, replclient.DialOpts{Log: s.opts.Log})
 			}
 		}
 	}
@@ -191,9 +195,9 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 				return nil, fmt.Errorf("board %s: no USB path to dial: %w", ref.MAC6, ErrNoDialEndpoint)
 			}
 		} else {
-			o := replclient.DialOpts{Log: opts.Log, BootCapture: opts.BootCapture}
 			opts.DialUSB = func() (Controller, error) {
-				return replclient.DialUSB(ref.USBPath, o)
+				return replclient.DialUSB(ref.USBPath, replclient.DialOpts{
+					Log: s.opts.Log, BootCapture: s.opts.BootCapture})
 			}
 		}
 	}

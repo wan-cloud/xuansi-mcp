@@ -507,23 +507,21 @@ func New(o Opts) (*Server, error) {
 	}
 	// B16-T6 D1: the USB dial seam grows the boot-banner capture hook —
 	// the drain window's tail is the open-reboot's banner (the
-	// zero-false-positive source, spec §4D). An injected seam that
+	// zero-false-positive source, spec §4D). The hook attaches to the
+	// LIVE Opts (the dial closure reads it per dial); an Opts that
 	// already carries a BootCapture (a test's own capture probe) keeps
-	// full authority; every other seam is wrapped so the capture face
-	// is uniform. The wrap rebuilds each supervisor's DialUSB via its
-	// Opts() seam (no board contact at wire time).
+	// full authority.
 	o.NewSupervisor = func(ref board.BoardRef) *board.Supervisor {
 		sup := prevNewSupervisor(ref)
-		if so := sup.Opts(); so.DialUSB != nil && so.BootCapture == nil {
-			inner := so.DialUSB
-			capture := s.bootCaptured(ref.MAC6)
-			so.DialUSB = func() (board.Controller, error) {
-				so.BootCapture = capture // rides the dial's DialOpts (refreshed per open)
-				return inner()
-			}
+		if so := sup.Opts(); so.BootCapture == nil {
+			so.BootCapture = s.bootCaptured(ref.MAC6)
 		}
 		return sup
 	}
+	// s.opts was value-copied from o BEFORE the wrap — rebind the copy
+	// or supervisor() keeps dialing through the unwrapped factory (the
+	// HIL's empty-receipt red proved exactly this).
+	s.opts.NewSupervisor = o.NewSupervisor
 	s.leases = lease.NewManager(lease.Policy{
 		GraceTTL: o.GraceTTL,
 		Log:      o.Log,
@@ -1936,6 +1934,11 @@ var opAllowlist = map[string]bool{
 	"lua.check": true,
 	"diag.pins": true, "diag.heapinfo": true, "diag.stats": true,
 	"diag.i2cslave": true,
+	// B16-T6: the 0x02 synthetic-stream test seam (ch=254) — the
+	// module-free producer for the subscription face (the ring/gap
+	// account's HIL and an agent's own end-to-end check ride it;
+	// non-ro on the board, lease-gated here like every op).
+	"diag.streamtest": true,
 }
 
 // AllowlistedOps renders the ops face's allowlisted op names, sorted —
