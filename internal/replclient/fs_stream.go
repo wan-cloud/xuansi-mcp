@@ -40,6 +40,18 @@ const uplinkCh = 253
 // client-side pacing choice.
 const FsStreamChunk = 32768
 
+// uplinkWindowTCP is the flight window for TCP sources (T7-④ daemon
+// shaping): frames kept in flight before an ack must come back,
+// refilled ack-driven. The fw's T9 pipeline absorbs frames into a
+// 256KB PSRAM ring (the per-frame ack fires on ring entry, not on
+// flash write), so 6×32KB=192KB of in-flight data stays under the
+// ring — acks remain fast and the pump rides the writer task's drain
+// rate instead of a full stop-and-wait round trip per frame (daemon
+// TCP leg measured 84-97KB/s strict vs the fw-direct 154-158KB/s
+// blast; windowed closes the gap, b16-t11 evidence). USB sources are
+// exempt — see FsStreamWrite.
+const uplinkWindowTCP = 6
+
 // uplinkFrame builds one host→board data frame:
 // [u32 BE len][0x02][ch=253][u32 BE seq][payload] — the §16 header
 // minus idx/total (stream is sequence); len counts type+header+payload.
@@ -132,6 +144,16 @@ func (c *Client) FsStreamWrite(ctx context.Context, path string, data []byte, sh
 
 	sent := 0
 	seq := uint32(0)
+	// The pump discipline is per source (T7-④): TCP windows (uplinkWindowTCP
+	// frames in flight, ack-driven refill — the fw's 256KB ring absorbs them
+	// and TCP itself never reorders), CDC stays STRICT stop-and-wait — the
+	// board's 12KB RX ring drops bytes past it, so one un-acked frame is the
+	// most a USB link may ever have on the wire. The wire contract is
+	// unchanged either way: frames in order, per-frame {received} acks
+	// consumed, the final frame's reply the commit.
+	if c.link.Kind() == "tcp" {
+		return c.fsStreamPumpWindowed(ctx, ch, path, data, sha256hex, budget)
+	}
 	for sent < len(data) {
 		end := sent + FsStreamChunk
 		if end > len(data) {
@@ -167,6 +189,72 @@ func (c *Client) FsStreamWrite(ctx context.Context, path string, data []byte, sh
 		if got, _ := res["received"].(int64); got != int64(sent) {
 			return fmt.Errorf("replclient: fs.stream_write %s: ack received=%d, want %d", path, got, sent)
 		}
+	}
+	// All frames acked {received} without a commit: the fw's contract
+	// auto-commits at expected_len — silence here is a protocol breach.
+	return fmt.Errorf("replclient: fs.stream_write %s: frames exhausted without a commit reply", path)
+}
+
+// fsStreamPumpWindowed is the TCP-source pump: keep up to
+// uplinkWindowTCP frames in flight, refill on every ack. Acks are
+// cumulative ({received} = bytes accepted so far) and arrive strictly
+// in frame order (one TCP byte stream, the fw replies per frame), so
+// the inflight ledger of frame-end offsets both validates each ack
+// (exactly the next frame's end) and knows when the commit is legal:
+// the final frame's reply replaces its {received} ack, so a commit is
+// only accepted while exactly the last frame remains in flight. A
+// write failure, an ack gap, or a mid-stream error reply surfaces
+// exactly like the strict pump — the caller redials once and reruns
+// the whole upload (off=0 truncate restart, idempotent).
+func (c *Client) fsStreamPumpWindowed(ctx context.Context, ch <-chan map[string]any, path string, data []byte, sha256hex string, budget func() time.Duration) error {
+	sent := 0
+	seq := uint32(0)
+	var inflight []int // frame-end offsets, oldest first
+	for {
+		for sent < len(data) && len(inflight) < uplinkWindowTCP {
+			end := sent + FsStreamChunk
+			if end > len(data) {
+				end = len(data)
+			}
+			if _, err := c.write(uplinkFrame(seq, data[sent:end])); err != nil {
+				c.markDead("link write failed: " + err.Error())
+				return fmt.Errorf("%w: fs.stream_write %s pump: %v", ErrDead, path, err)
+			}
+			sent = end
+			seq++
+			inflight = append(inflight, sent)
+		}
+		if len(inflight) == 0 {
+			break // everything acked; the commit must have been the exit
+		}
+		msg, err := c.streamWait(ctx, ch, fmt.Sprintf("fs.stream_write frame ack (%d/%dB)", sent, len(data)), budget())
+		if err != nil {
+			return err
+		}
+		if e, ok := msg["error"].(map[string]any); ok {
+			return opErrOf("fs.stream_write", e) // mid-stream api refusal (overflow / append failure)
+		}
+		res, _ := msg["result"].(map[string]any)
+		if v, ok := res["committed"].(bool); ok && v {
+			// the final frame's auto-commit — legal only as the last
+			// outstanding frame's reply (earlier acks consumed first)
+			if inflight[0] != len(data) {
+				return fmt.Errorf("replclient: fs.stream_write %s: commit at %dB with %dB un-acked", path, len(data), inflight[0])
+			}
+			if want, _ := res["len"].(int64); want != int64(len(data)) {
+				return fmt.Errorf("replclient: fs.stream_write %s: committed len %d, want %d", path, want, len(data))
+			}
+			if sha256hex != "" {
+				if ok, _ := res["sha_ok"].(bool); !ok {
+					return fmt.Errorf("replclient: fs.stream_write %s: commit lacks sha_ok", path)
+				}
+			}
+			return nil
+		}
+		if got, _ := res["received"].(int64); got != int64(inflight[0]) {
+			return fmt.Errorf("replclient: fs.stream_write %s: ack received=%d, want %d", path, got, inflight[0])
+		}
+		inflight = inflight[1:]
 	}
 	// All frames acked {received} without a commit: the fw's contract
 	// auto-commits at expected_len — silence here is a protocol breach.

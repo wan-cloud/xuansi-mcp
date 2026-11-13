@@ -14,6 +14,11 @@ import (
 // subscribers, and fatal conditions to the client's dead mark. It never
 // blocks on delivery: reply channels are buffered and unknown ids are
 // dropped, so a slow or vanished waiter cannot stall the loop.
+
+// replyBuf is one id's reply buffer: the upload lane's ack burst (see
+// register).
+const replyBuf = uplinkWindowTCP + 2
+
 type router struct {
 	link   Link
 	reader *frameReader
@@ -126,8 +131,12 @@ func (r *router) dispatchReply(msg map[string]any) bool {
 	r.mu.Unlock()
 	if ch != nil {
 		select {
-		case ch <- msg: // buffered(1): one reply per id, never blocks
-		default:
+		case ch <- msg: // replyBuf: several replies may queue for one id
+			// (the v8 upload lane's per-frame acks bunch behind a
+			// windowed pump — T7-④) without the router ever blocking
+			// on an abandoned waiter.
+		default: // the overflow valve: a board spamming one id past the
+			// buffer drops (the waiter's next read rightly fails fast)
 		}
 	}
 	return false
@@ -161,9 +170,14 @@ func (r *router) dispatchEvent(msg map[string]any) {
 }
 
 // register reserves the reply slot for id before the request is written
-// (the reply can race the write's return).
+// (the reply can race the write's return). The buffer holds the upload
+// lane's ack burst: a windowed pump (uplinkWindowTCP frames in flight)
+// can leave up to that many un-read acks plus the commit queued behind
+// one id while it processes the first — buffered(1) would DROP them
+// (the router never blocks on a waiter), and a dropped ack fails the
+// upload. Strict one-reply ops never notice the capacity.
 func (r *router) register(id int64) <-chan map[string]any {
-	ch := make(chan map[string]any, 1)
+	ch := make(chan map[string]any, replyBuf)
 	r.mu.Lock()
 	r.replies[id] = ch
 	r.mu.Unlock()

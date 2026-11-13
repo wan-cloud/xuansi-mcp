@@ -14,15 +14,27 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // streamRecording captures what the mock board saw on the uplink lane.
+// mu guards the appends (the serve goroutine) against concurrent flight
+// polling from test goroutines (the window tests watch frames arrive
+// while the pump is still mid-upload).
 type streamRecording struct {
+	mu       sync.Mutex
 	frames   [][]byte // concatenated payload bytes per data frame
 	chs      []byte
 	fatalMsg string
+}
+
+// count reports how many frames arrived so far (safe while the pump runs).
+func (r *streamRecording) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.frames)
 }
 
 // scriptStream arms the mock board's upload lane for path: the open
@@ -145,6 +157,129 @@ func TestFsStreamWriteOpenRefused(t *testing.T) {
 	}
 }
 
+// usbKindLink masks the mock's pipe as a CDC source (Kind "usb") — the
+// pump discipline is per source and the strict leg must hold there.
+type usbKindLink struct{ Link }
+
+func (usbKindLink) Kind() string { return "usb" }
+
+// parkAcks_ arms a stream's reply parking (see deliverStreamReply).
+func (b *mockBoard) parkAcks_(st *mockUpstream) {
+	b.mu.Lock()
+	st.parkAcks = true
+	b.mu.Unlock()
+}
+
+// TestFsStreamWriteTCPWindowFlight: the TCP pump keeps
+// uplinkWindowTCP frames on the wire with ZERO acks returned — the
+// flight window is real (strict stop-and-wait would park at 1) — and
+// never exceeds it; releasing the parked acks completes the upload
+// byte-exact with every per-frame ack consumed in order.
+func TestFsStreamWriteTCPWindowFlight(t *testing.T) {
+	b := newMockBoard(t)
+	c := NewClient(b.Link)
+	defer c.Close()
+
+	const frames = 20
+	data := make([]byte, frames*FsStreamChunk)
+	for i := range data {
+		data[i] = byte(i*11 + 5)
+	}
+	st := &mockUpstream{path: "/lua/w.tmp", rec: &streamRecording{}}
+	b.setUplink(st)
+	b.parkAcks_(st)
+
+	type res struct {
+		err error
+	}
+	done := make(chan res, 1)
+	go func() { done <- res{c.FsStreamWrite(context.Background(), "/lua/w.tmp", data, "")} }()
+
+	// zero acks sent, yet the window fills: exactly uplinkWindowTCP
+	// frames arrive at the board (parked replies prove none came back).
+	waitFor(t, func() bool { return st.rec.count() >= uplinkWindowTCP })
+	time.Sleep(60 * time.Millisecond) // give a would-be 7th frame time to misbehave
+	if n := st.rec.count(); n != uplinkWindowTCP {
+		t.Fatalf("flight depth with zero acks = %d, want exactly %d", n, uplinkWindowTCP)
+	}
+	b.unparkStreamAcks(st)
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("FsStreamWrite: %v", r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("upload did not finish after ack release")
+	}
+	got := st.rec.countFrames()
+	if len(got) != frames {
+		t.Fatalf("board saw %d frames, want %d", len(got), frames)
+	}
+	var all []byte
+	for _, f := range got {
+		all = append(all, f...)
+	}
+	if string(all) != string(data) {
+		t.Fatalf("uplink bytes diverge: %dB vs %dB", len(all), len(data))
+	}
+}
+
+// TestFsStreamWriteUSBStrictPacing: the CDC pump stays strict
+// stop-and-wait — with the first frame's ack parked, a second frame
+// must NOT reach the board (the 12KB RX ring discipline: one un-acked
+// frame is the most a USB link may have on the wire).
+func TestFsStreamWriteUSBStrictPacing(t *testing.T) {
+	b := newMockBoard(t)
+	c := NewClient(usbKindLink{b.Link})
+	defer c.Close()
+
+	data := make([]byte, 3*FsStreamChunk)
+	st := &mockUpstream{path: "/lua/u.tmp", rec: &streamRecording{}}
+	b.setUplink(st)
+	b.parkAcks_(st)
+
+	done := make(chan error, 1)
+	go func() { done <- c.FsStreamWrite(context.Background(), "/lua/u.tmp", data, "") }()
+
+	waitFor(t, func() bool { return st.rec.count() >= 1 })
+	time.Sleep(80 * time.Millisecond)
+	if n := st.rec.count(); n != 1 {
+		t.Fatalf("strict source put %d frames on the wire before the first ack, want 1", n)
+	}
+	b.unparkStreamAcks(st)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("FsStreamWrite: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("upload did not finish after ack release")
+	}
+	if n := st.rec.count(); n != 3 {
+		t.Fatalf("board saw %d frames, want 3", n)
+	}
+}
+
+// TestFsStreamWriteWindowAckGap: an ack that does not name exactly the
+// next in-flight frame's end is refused — the ledger is strict even
+// with a window open (a cumulative count skipping ahead or lagging is
+// a protocol breach, not something to resync around).
+func TestFsStreamWriteWindowAckGap(t *testing.T) {
+	b := newMockBoard(t)
+	c := NewClient(b.Link)
+	defer c.Close()
+
+	data := make([]byte, 4*FsStreamChunk)
+	st := &mockUpstream{path: "/lua/g.tmp", rec: &streamRecording{}, skew: 7}
+	b.setUplink(st)
+
+	err := c.FsStreamWrite(context.Background(), "/lua/g.tmp", data, "")
+	if err == nil || !strings.Contains(err.Error(), "ack received=") {
+		t.Fatalf("err = %v, want the ack-ledger refusal", err)
+	}
+}
+
 func TestUplinkFrameShape(t *testing.T) {
 	p := []byte{1, 2, 3}
 	f := uplinkFrame(7, p)
@@ -179,6 +314,10 @@ type mockUpstream struct {
 	id             any
 	killAfterFrame int // 0 = never; 1+ = kill the link after N frames
 	kill           *mockBoard
+
+	parkAcks bool             // park replies instead of sending (flight tests)
+	pending  []map[string]any // parked replies (under mockBoard.mu)
+	skew     int              // report received+N in acks (the ack-gap test)
 }
 
 // setUplink arms (or with nil clears) the board's upload lane; the
@@ -232,16 +371,19 @@ func (b *mockBoard) consumeUplink(body []byte) bool {
 		return false
 	}
 	payload := body[5:]
+	st.rec.mu.Lock()
 	st.rec.frames = append(st.rec.frames, append([]byte{}, payload...))
 	st.rec.chs = append(st.rec.chs, body[0])
+	st.rec.mu.Unlock()
 	st.received += len(payload)
-	if st.killAfterFrame > 0 && len(st.rec.frames) >= st.killAfterFrame && st.kill != nil {
+	if st.killAfterFrame > 0 && len(st.rec.countFrames()) >= st.killAfterFrame && st.kill != nil {
 		st.kill.conn.Close()
 		return true // consumed but the link is dying
 	}
 	if int64(st.received) < st.expected {
-		b.send(map[string]any{"op": "reply", "id": st.id,
-			"result": map[string]any{"received": int64(st.received)}})
+		rep := map[string]any{"op": "reply", "id": st.id,
+			"result": map[string]any{"received": int64(st.received + st.skew)}}
+		b.deliverStreamReply(st, rep)
 		return true
 	}
 	// auto-commit (the fw's frozen §17 verdict shape)
@@ -251,13 +393,62 @@ func (b *mockBoard) consumeUplink(body []byte) bool {
 		res["sha_ok"] = true
 	}
 	if st.failCommit {
-		b.send(map[string]any{"op": "reply", "id": st.id,
+		b.deliverStreamReply(st, map[string]any{"op": "reply", "id": st.id,
 			"error": map[string]any{"class": "api",
 				"msg": "stream commit failed (scripted)"}})
 		return true
 	}
-	b.send(map[string]any{"op": "reply", "id": st.id, "result": res})
+	b.deliverStreamReply(st, map[string]any{"op": "reply", "id": st.id, "result": res})
 	return true
+}
+
+// countFrames snapshots the frame slice under the recording's lock.
+func (r *streamRecording) countFrames() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([][]byte, len(r.frames))
+	copy(out, r.frames)
+	return out
+}
+
+// deliverStreamReply sends one lane reply now, or parks it when the
+// stream's acks are parked (the flight tests hold replies back to
+// observe how many frames the client puts on the wire un-acked).
+func (b *mockBoard) deliverStreamReply(st *mockUpstream, rep map[string]any) {
+	b.mu.Lock()
+	park := st.parkAcks
+	if park {
+		st.pending = append(st.pending, rep)
+	}
+	b.mu.Unlock()
+	if !park {
+		b.send(rep)
+	}
+}
+
+// unparkStreamAcks releases every parked reply in order and lets later
+// replies flow direct. The whole flush holds the write mutex so the
+// ordered pending sequence can never interleave with a newer reply
+// (the client would read a later ack first and rightly refuse it).
+func (b *mockBoard) unparkStreamAcks(st *mockUpstream) {
+	b.wmu.Lock()
+	defer b.wmu.Unlock()
+	b.mu.Lock()
+	st.parkAcks = false
+	pending := st.pending
+	st.pending = nil
+	b.mu.Unlock()
+	for _, m := range pending {
+		payload, err := encodeMessage(m)
+		if err != nil {
+			continue
+		}
+		f, err := frame(payload)
+		if err != nil {
+			continue
+		}
+		b.conn.Write(f)
+	}
 }
 
 var _ = time.Second
