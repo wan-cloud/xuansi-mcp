@@ -8,7 +8,9 @@ package server
 // corruption shapes are the bench's own history, not inventions.
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -360,5 +362,62 @@ func TestBootRecordPersistence(t *testing.T) {
 	rec2 := NewBootRecordStore(dir)
 	if n := len(rec2.Receipts("d75884")); n != 8 {
 		t.Fatalf("durable receipts: %d", n)
+	}
+}
+
+// TestFamiliesConcurrentRecordNoRace: F2 — two boards capturing in the
+// same window (dual-board USB dial) plus concurrent Families() readers
+// must not race the family map. Pre-fix, Record handed Classify the
+// LIVE table and SeedFamily wrote it outside s.mu — a runtime fatal
+// under -race. Post-fix: Families hands out snapshot copies, growth
+// re-enters via absorbFamilies under mu, and the shared table still
+// ends up holding every family both boards seeded (fleet knowledge
+// survives the copy-out).
+func TestFamiliesConcurrentRecordNoRace(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewBootRecordStore(dir)
+
+	// Two boards, distinct unseen families: ROM-anchored captures that
+	// seed the table via Classify (T0 first captures).
+	boardRaw := func(family string) []byte {
+		return []byte("ESP-ROM:" + family + "-20250101\r\nI (1) app_init: x\r\n")
+	}
+	const rounds = 32
+	var wg sync.WaitGroup
+	for b := 0; b < 2; b++ {
+		mac := fmt.Sprintf("aaaa%02d", b)
+		fam := "esp32x" + string(rune('a'+b))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := 0; k < rounds; k++ {
+				if err := rec.Record(mac, boardRaw(fam), "confirmed"); err != nil {
+					t.Errorf("record: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	// The reader leg: list_boards-style table reads concurrent with the
+	// writers (the shape the pre-fix live-map handout raced).
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < rounds*4; i++ {
+			fams := rec.Families()
+			if _, ok := fams["esp32s3"]; !ok {
+				t.Errorf("seed family missing from snapshot")
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	<-done
+
+	fams := rec.Families()
+	for _, fam := range []string{"esp32xa", "esp32xb"} {
+		if got, ok := fams[fam]; !ok || got != "20250101" {
+			t.Fatalf("family %s not absorbed into the shared table: %#v", fam, fams)
+		}
 	}
 }

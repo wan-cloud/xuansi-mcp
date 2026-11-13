@@ -443,7 +443,9 @@ const baselineBound = 128
 // (bounded last-8; banner verdicts adopt the capture's skeleton — drift
 // adoption). arbiter is the epoch verdict (confirmed/corruption/baseline).
 func (s *BootRecordStore) Record(mac6 string, raw []byte, arbiter string) error {
-	v := Classify(raw, s.Baseline(mac6), s.Families())
+	fams := s.Families() // caller-owned snapshot copy (see Families)
+	v := Classify(raw, s.Baseline(mac6), fams)
+	s.absorbFamilies(fams) // merge any capture-seeded growth back, under mu
 	return s.recordVerdict(mac6, v, raw, arbiter)
 }
 
@@ -511,13 +513,51 @@ func (s *BootRecordStore) Baseline(mac6 string) [][]string {
 
 // Families returns the daemon's family table (seeded; grown by capture
 // seeding via Classify). One shared table per store — fleet knowledge.
+//
+// F2 (final review): the returned map is a SNAPSHOT COPY — no reference
+// to the live table escapes the store. The pre-fix shape handed out
+// s.families itself while Classify's SeedFamily wrote into it outside
+// s.mu, so two boards capturing in the same window (new silicon
+// shipping + a dual-board USB dial) raced the map — a Go runtime fatal,
+// not an error. Record pairs this copy-out with absorbFamilies, which
+// re-enters under s.mu to merge the snapshot's growth back: the table
+// stays shared fleet knowledge, SeedFamily's idempotent-first
+// semantics survive (the first capture of a family wins), and Classify
+// stays a pure function over its arguments.
 func (s *BootRecordStore) Families() map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureFamiliesLocked()
+	out := make(map[string]string, len(s.families))
+	for k, v := range s.families {
+		out[k] = v
+	}
+	return out
+}
+
+// absorbFamilies merges a classified snapshot's growth (SeedFamily ran
+// on the caller-owned copy Record handed to Classify) back into the
+// shared table under mu — first-write-wins per family, the same
+// idempotent-first contract SeedFamily applies in place.
+func (s *BootRecordStore) absorbFamilies(snapshot map[string]string) {
+	if len(snapshot) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureFamiliesLocked()
+	for k, v := range snapshot {
+		if _, ok := s.families[k]; !ok {
+			s.families[k] = v
+		}
+	}
+}
+
+// ensureFamiliesLocked lazily seeds the table (caller holds mu).
+func (s *BootRecordStore) ensureFamiliesLocked() {
 	if s.families == nil {
 		s.families = NewFamilyTable()
 	}
-	return s.families
 }
 
 // nowRFC3339 is a seam (tests could inject; production uses time.Now).
