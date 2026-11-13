@@ -204,6 +204,14 @@ func (f *fakeCtl) OnEvent(prefix string, fn func(replclient.Event)) (cancel func
 
 // OnStream stores the connection's 0x02 sink (nil clears; the fake has
 // no router, the frames tests' op scripting drives it synchronously).
+// FsStreamWrite satisfies the v8 upload-lane face (B16-T7 C2); the
+// supervisor tests never exercise it — a loud refusal keeps any
+// accidental routing visible.
+func (f *fakeCtl) FsStreamWrite(ctx context.Context, path string, data []byte, sha256hex string) error {
+	return &replclient.OpError{Op: "fs.stream_write", Class: "api",
+		Msg: "upload lane not scripted (board tests)"}
+}
+
 func (f *fakeCtl) OnStream(sink replclient.StreamSink) {
 	f.mu.Lock()
 	f.sink = sink
