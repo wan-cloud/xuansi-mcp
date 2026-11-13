@@ -39,17 +39,18 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeCtl struct {
-	mu       sync.Mutex
-	dead     bool
-	ops      map[string]func(args map[string]any) (map[string]any, *replclient.OpError)
-	calls    []mockCall
-	handlers map[int]evHandler
-	nextHID  int
-	hellos   int
-	sink     replclient.StreamSink // the connection's current 0x02 sink (frames-face scripting drives it synchronously)
-	dieOnOp  string                // the half-open death script (dieOn): this op's next call fails ErrDead
-	onDie    func()                // …after running this hook
-	gen      int                   // test bookkeeping: which dial-generation this fake belongs to (supervisor rebuild tests)
+	mu           sync.Mutex
+	dead         bool
+	ops          map[string]func(args map[string]any) (map[string]any, *replclient.OpError)
+	calls        []mockCall
+	handlers     map[int]evHandler
+	nextHID      int
+	hellos       int
+	sink         replclient.StreamSink                            // the connection's current 0x02 sink (frames-face scripting drives it synchronously)
+	streamUpload func(path string, data []byte, sha string) error // the B16-T7 C2 lane hook
+	dieOnOp      string                                           // the half-open death script (dieOn): this op's next call fails ErrDead
+	onDie        func()                                           // …after running this hook
+	gen          int                                              // test bookkeeping: which dial-generation this fake belongs to (supervisor rebuild tests)
 	// failOnceOp: a ONE-SHOT raw error for the op's next call (the
 	// same-link-retry tests script the §6-timeout shape here; the canned
 	// handlers resume afterwards).
@@ -161,6 +162,30 @@ func (f *fakeCtl) dieOn(op string, fn func()) {
 }
 
 // OnStream stores the connection's 0x02 sink (nil clears).
+// FsStreamWrite runs the scripted upload-lane hook (the B16-T7 C2
+// face); unscripted it refuses — tests that exercise the stream lane
+// arm streamUpload, everything else proves it is NOT reached (the
+// pre-v8 trio must ride the write_part lane unchanged).
+func (f *fakeCtl) FsStreamWrite(ctx context.Context, path string, data []byte, sha256hex string) error {
+	f.mu.Lock()
+	fn := f.streamUpload
+	die := f.dieOnOp == "fs.stream_write"
+	f.mu.Unlock()
+	if die {
+		f.markDead()
+		return replclient.ErrDead
+	}
+	if fn == nil {
+		return &replclient.OpError{Op: "fs.stream_write", Class: "api",
+			Msg: "upload lane not scripted"}
+	}
+	f.mu.Lock()
+	f.calls = append(f.calls, mockCall{op: "fs.stream_write", args: map[string]any{
+		"path": path, "expected_len": len(data), "sha256": sha256hex}})
+	f.mu.Unlock()
+	return fn(path, data, sha256hex)
+}
+
 func (f *fakeCtl) OnStream(sink replclient.StreamSink) {
 	f.mu.Lock()
 	f.sink = sink
@@ -269,6 +294,9 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 				h.ResetHistory = append(h.ResetHistory, s)
 			}
 		}
+	}
+	if pl, ok := res["panic_last"].(map[string]any); ok { // B16-T7 D2 (parseHello's twin)
+		h.PanicLast = pl
 	}
 	if h.ResetReason == "" {
 		h.ResetReason = h.Reset

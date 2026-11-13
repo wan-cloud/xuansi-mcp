@@ -73,6 +73,13 @@ func (f *cmdFake) Close() error                                       { return n
 func (f *cmdFake) OnEvent(p string, fn func(replclient.Event)) func() { return func() {} }
 func (f *cmdFake) OnStream(sink replclient.StreamSink)                {}
 
+// FsStreamWrite satisfies the v8 upload-lane face (B16-T7 C2);
+// unscripted refusal — the cmd tests do not exercise the lane.
+func (f *cmdFake) FsStreamWrite(ctx context.Context, path string, data []byte, sha256hex string) error {
+	return &replclient.OpError{Op: "fs.stream_write", Class: "api",
+		Msg: "upload lane not scripted (cmd tests)"}
+}
+
 // startMockDaemon serves one fake board on a temp sock; returns the path.
 func startMockDaemon(t *testing.T) string {
 	sock, _ := startMockDaemonUSB(t)

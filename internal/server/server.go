@@ -1353,6 +1353,9 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 		if b.Hello.Chip != "" {                 // P3-T13: the pairing source rides the same sighting
 			v["chip"] = b.Hello.Chip
 		}
+		if b.Hello.PanicLast != nil { // B16-T7 D2: the last-panic summary, verbatim passthrough
+			v["panic_last"] = b.Hello.PanicLast
+		}
 	}
 	v["fw"] = fw
 	v["fw_version"] = fwVer
@@ -2120,6 +2123,23 @@ func (s *Server) hFsWrite(ctx context.Context, cc *clientConn, req *Request) (an
 		sum := sha256.Sum256(req.Data)
 		shaHex = hex.EncodeToString(sum[:])
 	}
+	// B16-T7 C2: the v8 upload lane. A board sighted at protocol_ver>=8
+	// takes fs.stream_write + the ack-paced 0x02 pump for the
+	// large/verified writes; pre-v8 boards (and never-sighted ones —
+	// conservative like the read window) keep the write_part trio
+	// unchanged. The unverified small path (plain fs.write above) is
+	// era-independent by design.
+	if s.streamLaneCapable(b.MAC6) {
+		err := s.withController(ctx, b, func(ctl board.Controller) error {
+			return ctl.FsStreamWrite(ctx, req.Path, req.Data, shaHex)
+		})
+		if err != nil {
+			return nil, err
+		}
+		// The lane's commit IS the fs.write_commit verdict (the fw's
+		// frozen §17 face) — the reply shape the trio returned: {size}.
+		return map[string]any{"size": int64(len(req.Data))}, nil
+	}
 	var res map[string]any
 	err := s.withController(ctx, b, func(ctl board.Controller) error {
 		for off := 0; off < len(req.Data); off += fsFileMax {
@@ -2189,6 +2209,20 @@ var sha256HexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // fs_read (diagnostics, pull-back), so only the read window bends per
 // era. Pinned from both sides in fs_chunked_test.go
 // (TestFsReadWindowClampsByProtocolVer / TestFsWriteChunkEraAgnostic).
+// streamLaneCapable reports whether fs_write's large/verified path
+// rides the v8 upload lane for this board: a hello sighting of
+// protocol_ver>=8 (the same registry cache fsReadWindow rides — an
+// era change surfaces on the next reconnect's re-tap). Absent or
+// pre-v8 sightings keep the write_part trio: fs.stream_write on an
+// old fw is an unknown op, and a field fw on 0.4.0 must still take
+// verified writes (the trio era-agnostic ruling, W1.T4).
+func (s *Server) streamLaneCapable(mac6 string) bool {
+	if b, ok := s.lookupExact(mac6); ok && b.Hello != nil && b.Hello.ProtocolVer >= 8 {
+		return true
+	}
+	return false
+}
+
 func (s *Server) fsReadWindow(mac6 string) int {
 	if b, ok := s.lookupExact(mac6); ok && b.Hello != nil && b.Hello.ProtocolVer >= 7 {
 		return fsReadMax
@@ -2945,6 +2979,13 @@ func (s *Server) noteBootSighting(mac6 string, db *daemonBoard, h *replclient.He
 	if h.FwVersion != prev.fwVersion { // B10-T8c: same pattern — pair only on change (reflash across a wave bump)
 		data["fw_version_prev"] = prev.fwVersion
 		data["fw_version"] = h.FwVersion
+	}
+	// B16-T7 D2: the last-panic summary rides the reboot event when the
+	// fresh hello carries one (a panic-driven reboot is the case the
+	// event exists for; the summary's boot_epoch says which boot it
+	// was). Verbatim map — the fw's own parser is the ground truth.
+	if h.PanicLast != nil {
+		data["panic_last"] = h.PanicLast
 	}
 	// reasons (B12-P2 T6): an epoch delta > 1 means boots whose causes
 	// the single reset_reason cannot carry — the v6 fw's NVS last-8
