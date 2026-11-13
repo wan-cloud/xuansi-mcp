@@ -94,6 +94,11 @@ type Controller interface {
 	// is asserted around each streaming op, so a redial retry
 	// re-asserts it on the new link).
 	OnStream(sink replclient.StreamSink)
+	// FsStreamWrite (B16-T7 C2) uploads one file over the v8 stream
+	// lane (fs.stream_write + ack-paced 0x02 frames + auto-commit).
+	// Production is *replclient.Client (method set satisfies this
+	// interface verbatim); unit tests script a fake.
+	FsStreamWrite(ctx context.Context, path string, data []byte, sha256hex string) error
 }
 
 // SupOpts parameterize a Supervisor; zero values get defaults.

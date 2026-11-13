@@ -45,6 +45,15 @@ type HelloInfo struct {
 	// a previously seen one fill in the boot-causes an epoch delta > 1
 	// would otherwise lose.
 	ResetHistory []string
+
+	// PanicLast (protocol v8, B16-T7 D2) is the fw's NVS last-panic
+	// summary, verbatim wire map {reason, task, pc, boot_epoch,
+	// bt_corrupted?} — the boot-time triage of the flash coredump.
+	// Nil on fw/boards without a panic history (the key is absent
+	// there); carried to the board record and the board.reboot event
+	// as-is (ground truth from the fw's own parser — no daemon-side
+	// reinterpretation).
+	PanicLast map[string]any
 }
 
 // parseHello tolerates missing keys (older protocol faces): absent
@@ -83,6 +92,10 @@ func parseHello(res map[string]any) *HelloInfo {
 	}
 	if c, ok := res["caps"].(map[string]any); ok {
 		h.Caps = c
+	}
+	// v8 D2: the panic summary rides as a faithful map (keys verbatim).
+	if pl, ok := res["panic_last"].(map[string]any); ok {
+		h.PanicLast = pl
 	}
 	return h
 }

@@ -60,6 +60,7 @@ type mockBoard struct {
 	zeroLen  bool             // prefix replies with a len==0 empty frame (§1)
 	silent   bool             // consume requests, answer nothing
 	dead     bool             // fatal emitted: CS_DEAD, input discarded (§7)
+	uplink   *mockUpstream    // B16-T7 C2: the armed upload lane (nil = host→board 0x02 stays the §7 fatal)
 }
 
 // newMockBoard starts a fresh mock board and closes it on cleanup.
@@ -164,8 +165,15 @@ func (b *mockBoard) serve() {
 			return
 		}
 		if f.Type == frameTypeData {
-			// Data frames are board→host only: from the host a 0x02 is
-			// still a fatal violation (§7) — play the real board.
+			// B16-T7 C2: an armed upload lane consumes host→board 0x02
+			// frames (§7's receive-state carve-out, v8); outside it the
+			// data frame stays the fatal violation — play the real board.
+			b.mu.Lock()
+			st := b.uplink
+			b.mu.Unlock()
+			if st != nil && b.consumeUplink(f.Payload) {
+				continue
+			}
 			b.goFatal("frame type 0x02 from host")
 			b.drain()
 			return
