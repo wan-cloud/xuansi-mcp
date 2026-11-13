@@ -300,6 +300,55 @@ func TestBootBannerCaptureToReceipt(t *testing.T) {
 	}
 }
 
+// TestBootReceiptsSkeletonLinesBoundedView: T6-① — the view's
+// skeleton_lines and skeleton are ONE view. A >128-line skeleton
+// (off-contract input: a capture whose normalized form exceeds the
+// persistence bound; real skeletons run 40-60 lines) must report the
+// TRUNCATED count beside the truncated text, never the full count
+// beside a cut text.
+func TestBootReceiptsSkeletonLinesBoundedView(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	f := e.fakes["d75884"]
+	f.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"protocol_ver": int64(8), "role": "controller",
+			"fw": "x", "fw_build": "b", "fs": true, "boot_epoch": int64(151)}, nil
+	})
+	db := e.srv.supervisor(mkBoard("d75884", "xuansi-d75884.local"))
+
+	// An anchored capture with >baselineBound distinct skeleton lines:
+	// T0 banner verdict → the capture's normalized form IS adopted as
+	// the baseline, unbounded at adoption (the bound is a view/persist
+	// leg). Distinct letter runs survive digit fuzzing unchanged.
+	var sb strings.Builder
+	sb.WriteString("ESP-ROM:esp32s3-20210327\r\n")
+	for i := 0; i < baselineBound+40; i++ {
+		sb.WriteString("I (xx) boot: filler ")
+		sb.WriteString(strings.Repeat("x", i/26+1))
+		sb.WriteByte(byte('a' + i%26))
+		sb.WriteString("\r\n")
+	}
+	e.srv.bootCaptured("d75884")([]byte(sb.String()))
+	h, _ := f.Hello(false, "xuansi-daemon")
+	e.srv.resolvePendingBanner("d75884", db, nil, h) // first sighting: baseline arbiter
+
+	if sk := e.srv.bootRecords().Skeleton("d75884"); len(sk) <= baselineBound {
+		t.Fatalf("fixture sanity: adopted skeleton = %d lines, want > %d (the off-contract input)", len(sk), baselineBound)
+	}
+
+	w := dialSock(t, e.sock)
+	rep, _ := w.call(2, map[string]any{"type": "boot_receipts", "board": "d75884"})
+	res := asMap(rep["result"])
+	lines, _ := res["skeleton_lines"].(float64)
+	sk, ok := res["skeleton"].([]any)
+	if !ok || len(sk) == 0 {
+		t.Fatalf("view skeleton text absent: %#v", res["skeleton"])
+	}
+	if int(lines) != baselineBound || len(sk) != baselineBound {
+		t.Fatalf("skeleton_lines/skeleton diverge on the bounded view: lines=%v skeleton=%d (both want %d)",
+			res["skeleton_lines"], len(sk), baselineBound)
+	}
+}
+
 // TestBootBannerCorruptionDowngradeOnFlatEpoch: the capture's "banner"
 // the board's own epoch counter disowns (unchanged epoch — no reboot
 // happened) downgrades honestly to corruption.

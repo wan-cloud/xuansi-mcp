@@ -222,17 +222,22 @@ func (s *Server) hBootReceipts(ctx context.Context, req *Request) (any, error) {
 		out = append(out, m)
 	}
 	sk := s.bootRecords().Skeleton(b.MAC6)
+	// The adopted baseline's own text (the "what this board usually
+	// looks like" leg — bounded by the same persistence bound). The
+	// bound applies BEFORE skeleton_lines is derived, so the count and
+	// the text are the SAME view (T6-①: a >128-line skeleton —
+	// off-contract input the bound exists for — must not report the
+	// full count beside a truncated text; real skeletons run 40-60
+	// lines and never touch this).
+	if len(sk) > baselineBound {
+		sk = sk[:baselineBound]
+	}
 	view := map[string]any{
 		"board":          b.MAC6,
 		"receipts":       out,
 		"skeleton_lines": len(sk),
 	}
-	// The adopted baseline's own text (the "what this board usually
-	// looks like" leg — bounded by the same persistence bound).
 	if len(sk) > 0 {
-		if len(sk) > baselineBound {
-			sk = sk[:baselineBound]
-		}
 		view["skeleton"] = sk
 	}
 	return view, nil
