@@ -70,8 +70,16 @@ func TestFsWriteStreamLaneRouting(t *testing.T) {
 // (same policy shape as the read window).
 func TestFsWriteStreamLaneNeverSighted(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
-	cf := newChunkedFake(t, e, "d75884")
-	cf.inner.hellos = 1 // era stays unsighted: the hello handler exists but the registry cache is cold
+	// The unsighted branch, pinned directly on the gate (fix-round M5):
+	// no hello sighting yet -> the lane must answer incapable.
+	if e.srv.streamLaneCapable("d75884") {
+		t.Fatal("streamLaneCapable must answer false with no hello sighting")
+	}
+	// A truly never-sighted board is unreachable through this seam (the
+	// lease's hello tap sights the era before fs_write runs), so the
+	// nearest reachable end-to-end shape — a pv7 sighting — pins that
+	// the trio rides and the lane is never reached.
+	cf := newChunkedFake(t, e, "d75884") // scripted at pv7 (the fake's default era)
 	armStreamLane(cf)
 	data := make([]byte, 3*65472)
 	runFsWriteSha(t, e, "/lua/cold.tmp", data, "")
@@ -81,7 +89,9 @@ func TestFsWriteStreamLaneNeverSighted(t *testing.T) {
 			saw = true
 		}
 	}
-	_ = saw // the era source is the registry's cached sighting; the fake's hello IS tapped on lease — the trio side needs no pin here
+	if saw {
+		t.Fatal("the upload lane must not be reached on a pre-v8 sighting")
+	}
 }
 
 // TestFsWriteStreamLaneVerifiedSmall: on a pv8 board even a SMALL
