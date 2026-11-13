@@ -33,12 +33,26 @@ import (
 // only ch legal in the receive state; anything else is a fatal frame.
 const uplinkCh = 253
 
-// FsStreamChunk is the per-frame payload bound of the upload lane:
-// 32768B — the measured USB optimum (207KB/s vs 187 at the 65526
-// fs-layer cap; b16t7-c2-perf2, board #1, 1MiB sha-verified). The
-// fw accepts up to 65526 (=XS_FILE_MAX) per frame; this is a pure
+// FsStreamChunk is the WINDOWED (TCP) pump's per-frame payload bound:
+// 32768B — the TCP window's measured optimum (b16-t11 evidence, board
+// #1 fresh-fs: windowed 1MiB medians 160KB/s at 32KB frames vs
+// 154KB/s at 16KB; the fw-direct strict comparator measured ~90KB/s
+// at 32KB, so the window is what carries the 32KB frame). The fw
+// accepts up to 65526 (=XS_FILE_MAX) per frame; this is a pure
 // client-side pacing choice.
 const FsStreamChunk = 32768
+
+// usbStreamChunk is the STRICT (CDC) pump's per-frame payload bound:
+// 8192B — the whole frame must FIT the fw's CDC driver RX ring
+// (12288B; the driver ISR DROPS packets past a full ring — drops, not
+// NAKs). A 32768B host write bursts into that ring faster than the
+// conn task's 128B read loop drains it, so the burst's tail is gone
+// and the fw's 2s intra-frame gap fatal kills the connection (T11
+// b16-t7-rerun evidence: deterministic mid-frame truncation at 32768B
+// frames on fw 24b6f13, identically on the pre-T11 daemon tree; at
+// 8192B the frame fits the ring whole and the upload completes at
+// ~95KB/s — parity with the fw's own USB tool on the same build).
+const usbStreamChunk = 8192
 
 // uplinkWindowTCP is the flight window for TCP sources (T7-④ daemon
 // shaping): frames kept in flight before an ack must come back,
@@ -155,7 +169,7 @@ func (c *Client) FsStreamWrite(ctx context.Context, path string, data []byte, sh
 		return c.fsStreamPumpWindowed(ctx, ch, path, data, sha256hex, budget)
 	}
 	for sent < len(data) {
-		end := sent + FsStreamChunk
+		end := sent + usbStreamChunk
 		if end > len(data) {
 			end = len(data)
 		}

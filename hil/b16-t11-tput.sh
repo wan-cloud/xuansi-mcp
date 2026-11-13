@@ -12,4 +12,4 @@ if [ -n "$LOG" ]; then
   mkdir -p "$(dirname "$LOG")"
   exec > >(tee "$LOG") 2>&1
 fi
-go run ./hil -scenario b16t11tput
+go run ./hil -scenario b16t11tput ${T11_TPUT_ARGS:-}
