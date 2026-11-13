@@ -14,8 +14,8 @@ package mcp
 //     daemon connection is gone" from "the daemon refused this";
 //   - fs_write's former client-side 16 KiB cap refusal is GONE (B10-T1):
 //     the daemon now rides the v5 chunked transport for bigger payloads,
-//     so the MCP face forwards them whole (bounded only by the internal
-//     wire's 1 MiB frame cap).
+//     so the MCP face forwards them whole (bounded by the internal
+//     request cap: ~770KB decoded per call after base64 inflation).
 
 import (
 	"context"

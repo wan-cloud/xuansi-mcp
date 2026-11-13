@@ -154,7 +154,7 @@ type scriptStopIn struct {
 type fsWriteIn struct {
 	Board   string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
 	Path    string `json:"path" jsonschema:"absolute file path on the board's filesystem"`
-	DataB64 string `json:"data_b64" jsonschema:"the file's full CONTENTS, standard base64 — decoded before sending; any size up to the internal wire's 1 MiB frame cap crosses (the daemon chunks >64KB payloads onto the board automatically)"`
+	DataB64 string `json:"data_b64" jsonschema:"the file's full CONTENTS, standard base64 — decoded before sending; one request carries at most ~770KB of decoded payload (the daemon's internal 1 MiB request cap after base64 inflation — the wire's 1 MiB frame cap is NOT reachable end-to-end from this seat); the daemon chunks >64KB payloads onto the board automatically"`
 	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
 
@@ -462,7 +462,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_fs_write",
-		Description: "Write a whole file to the board's filesystem under the lease. data_b64 decodes client-side; payloads above the board's 64KB chunk cap ride the chunked transport transparently (fs.write_part chunks of 64KB + a sha256-verifying commit — B10-T1, 64KB since B15 §4.5), bounded only by the internal wire's 1 MiB frame cap. Holder semantics: " + holderDesc + ".",
+		Description: "Write a whole file to the board's filesystem under the lease. data_b64 decodes client-side; payloads above the board's 64KB chunk cap ride the chunked transport transparently (fs.write_part chunks of 64KB + a sha256-verifying commit on older fw; the v8 upload lane's ack-paced 32KB frames on protocol_ver>=8 boards), so the size limit you actually hit is the daemon's internal request cap: one call carries at most ~770KB of decoded payload (1 MiB of request JSON after base64 inflation — the wire's 1 MiB frame cap never binds first from this seat). Larger files must be split across calls into several paths. Holder semantics: " + holderDesc + ".",
 	}, ts.fsWrite)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
