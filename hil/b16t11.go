@@ -364,8 +364,8 @@ func runB16T11Abort() int {
 	fh, ferr := main.Hello(false, "t11m9-main")
 
 	h.check(timeouts == 0, fmt.Sprintf("×100 loop: %d timeout(s) across %d ops-shapes (the T9-② incident face)", timeouts, rounds*5))
-	h.check(busyRefusals == rounds-aborted-timeouts && aborted+timeouts == rounds,
-		fmt.Sprintf("M9 legs: %d path-busy refusals, %d holder aborts (%d rounds)", busyRefusals, aborted, rounds))
+	h.check(busyRefusals == rounds-timeouts && aborted == rounds-timeouts,
+		fmt.Sprintf("M9 legs: %d path-busy refusals, %d holder aborts (%d rounds, %d degraded)", busyRefusals, aborted, rounds, timeouts))
 	h.check(retakes < rounds, fmt.Sprintf("seat retakes: %d retry re-hellos beyond the first (detach-race window)", retakes))
 	h.check(ferr == nil && fh.BootEpoch == epoch0,
 		fmt.Sprintf("board identity stable: epoch %d → %d (no reboot slipped in), hello err=%v", epoch0, numEpoch(fh), ferr))
