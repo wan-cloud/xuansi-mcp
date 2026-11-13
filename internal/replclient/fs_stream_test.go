@@ -225,6 +225,20 @@ func TestFsStreamWriteTCPWindowFlight(t *testing.T) {
 	}
 }
 
+// TestFsStreamWriteUSBFrameFitsDriverRing: the CDC frame bound keeps
+// each frame whole inside the fw's 12288B driver RX ring (the ISR
+// drops past-full packets — a burst bigger than the ring loses its
+// tail however strict the pacing; pinned against regression to the
+// old 32768B USB bound).
+func TestFsStreamWriteUSBFrameFitsDriverRing(t *testing.T) {
+	if usbStreamChunk+uplinkFrameOverhead >= 12288 {
+		t.Fatalf("usb frame %dB + overhead does not fit the 12288B driver ring", usbStreamChunk)
+	}
+}
+
+// uplinkFrameOverhead is the wire bytes around a frame's payload.
+const uplinkFrameOverhead = 10
+
 // TestFsStreamWriteUSBStrictPacing: the CDC pump stays strict
 // stop-and-wait — with the first frame's ack parked, a second frame
 // must NOT reach the board (the 12KB RX ring discipline: one un-acked
@@ -234,7 +248,7 @@ func TestFsStreamWriteUSBStrictPacing(t *testing.T) {
 	c := NewClient(usbKindLink{b.Link})
 	defer c.Close()
 
-	data := make([]byte, 3*FsStreamChunk)
+	data := make([]byte, 3*usbStreamChunk)
 	st := &mockUpstream{path: "/lua/u.tmp", rec: &streamRecording{}}
 	b.setUplink(st)
 	b.parkAcks_(st)
