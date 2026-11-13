@@ -2,8 +2,9 @@ package server
 
 // bootbanner_test.go — B16-T6 D1: the boot-banner death classifier's
 // deterministic layers (spec §4D). Real samples are transcribed from the
-// fw evidence corpus (mgmt evidence/xuansi-daemon/2026-11-08-b10-t8-*.log
-// raw previews + fw results/2026-11-12-b16-t1-cdc-diag.log) — the
+// bench's own evidence corpus (raw previews captured 2026-11-08 + the
+// CDC-frame corruption diagnostics of 2026-11-12; the private mgmt repo
+// is the canonical evidence home — this public repo carries none) — the
 // corruption shapes are the bench's own history, not inventions.
 
 import (
