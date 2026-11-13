@@ -113,6 +113,12 @@ func main() {
 		os.Exit(runB16T7Cmd())
 	case "b16t7d2":
 		os.Exit(runB16T7D2Cmd())
+	case "b16t11inject":
+		os.Exit(runB16T11InjectCmd())
+	case "b16t11abort":
+		os.Exit(runB16T11AbortCmd())
+	case "b16t11tput":
+		os.Exit(runB16T11TputCmd())
 	default:
 		fmt.Fprintln(os.Stderr, "usage: hil -scenario usb|tcp|discover|lease|full|b6mcp|b7mcp|b8t1|b8t2|b9camera|b10t5|b10t7aim|b10t7|b10t8b|spawnidle|b11toolchain|mdnsprobe|b15w1t2|b15w1t5|b16t3drift|b16t6 [-deadlink auto|iptables|wifioff|all] [-creds PATH] [-attempt N] [-daemon BIN] [-run DIR] [-round N] [-outdir DIR] [-ref x,y,w,h] [-tol PX] [-b15sock SOCK] [-b15board MAC6] [-b15endpoint IP:PORT] [-b15holder H] [-w5sock SOCK] [-w5board2 MAC6] [-w5fw2 BUILD] [-w5remote MAC6@IP:PORT] [-w5usbif IFACE] [-w5holder H]")
 		os.Exit(2)
