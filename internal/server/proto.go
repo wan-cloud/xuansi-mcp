@@ -410,6 +410,25 @@ type Request struct {
 	// the reply echoes the joined endpoint).
 	IP   string `json:"ip,omitempty"`
 	Port int    `json:"port,omitempty"`
+
+	// The LA wave's fields (protocol v9, T7). LaPort/LaPin/Baud/RingKB
+	// arm the listen engine (la_capture): LaPort selects the hw UART
+	// (1..2), LaPin the explicit GPIO, Baud the int 1200..5000000 or
+	// the string "auto", RingKB the on-board ring (0 = fw default);
+	// MaxSeconds rides la_capture as the time bound (seconds → the
+	// fw's max_ms, clamped 1..600 like capture's) and stretches this
+	// request's OWN ceiling past the 60s default (Server.process). CaptureID addresses one landed object
+	// (la_info/la_frames/la_repeat/la_decode_uart). IdleNS overrides
+	// la_frames' idle threshold (0 = the capture's own). Baud (int
+	// only there) and Parity ("" | "E" | "O") are la_decode_uart's
+	// params. Mode gates la_capture's wave domain — "listen" this wave.
+	Mode   string `json:"mode,omitempty"`
+	LaPort int    `json:"la_port,omitempty"`
+	LaPin  int    `json:"la_pin,omitempty"`
+	Baud   any    `json:"baud,omitempty"`
+	RingKB int    `json:"ring_kb,omitempty"`
+	IdleNS uint64 `json:"idle_ns,omitempty"`
+	Parity string `json:"parity,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.

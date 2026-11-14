@@ -153,3 +153,35 @@ func TestLeaseUSBSourceGoneClass(t *testing.T) {
 		t.Fatalf("the fast refusal took %v — a dial spun", elapsed)
 	}
 }
+
+// TestBootSeenSnapshotReadRacesNoMore (T7 carried item 2): tap's
+// pre-open baseline read of db.bootSeen is now the LOCKED
+// bootSeenSnapshot — noteBootSighting writes the same field under
+// s.mu, and the B10-T8b-era bare read raced it. The hammer runs both
+// halves concurrently; under -race the pre-fix shape reports the data
+// race on db.bootSeen (a torn *bootSight read), the fix is clean.
+func TestBootSeenSnapshotReadRacesNoMore(t *testing.T) {
+	s := &Server{logf: func(string, ...any) {}}
+	db := &daemonBoard{}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() { // the sighting half: noteBootSighting under s.mu
+			defer wg.Done()
+			for j := 0; j < 300; j++ {
+				s.noteBootSighting("aa11bb", db, &replclient.HelloInfo{
+					BootEpoch: uint32(j), FwBuild: "b", FwVersion: "v", Chip: "ESP32-S3", ProtocolVer: 9,
+				})
+			}
+		}()
+		go func() { // the read half: tap's baseline snapshot
+			defer wg.Done()
+			for j := 0; j < 300; j++ {
+				if prev := s.bootSeenSnapshot(db); prev != nil && prev.epoch > 1<<30 {
+					t.Errorf("impossible epoch %d", prev.epoch)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}

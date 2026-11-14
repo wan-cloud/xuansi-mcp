@@ -410,6 +410,15 @@ var staticToolNames = []string{
 	// (32 now — appended, nothing renumbers).
 	"xuansi_stream_read",
 	"xuansi_boot_receipts",
+	// T7 (LA wave): the la_* first batch — the blocking listen
+	// capture + the object reads + the L1 analysis crossings (38 now
+	// — appended, nothing renumbers).
+	"xuansi_la_capture",
+	"xuansi_la_list",
+	"xuansi_la_info",
+	"xuansi_la_frames",
+	"xuansi_la_repeat",
+	"xuansi_la_decode_uart",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -569,6 +578,9 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	// B16-T6: the C1 subscription drain + the D1 receipt history view.
 	ts.registerStream(srv)
+
+	// T7 (LA wave): the la_* first batch.
+	ts.registerLA(srv)
 }
 
 // ---------------------------------------------------------------------------

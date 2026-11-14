@@ -32,6 +32,7 @@ import (
 
 	"xuansi/internal/board"
 	"xuansi/internal/discover"
+	"xuansi/internal/la"
 	"xuansi/internal/lease"
 	"xuansi/internal/paths"
 	"xuansi/internal/replclient"
@@ -279,6 +280,12 @@ type Server struct {
 	// file; tests swap a failing writer). Both read under mu.
 	captureRoot string
 	captureOpen func(path string) (io.WriteCloser, error)
+	// laStore is the LA capture-object store (T5/T7): a DAEMON-LIFETIME
+	// singleton built once in New — per-request construction would
+	// resurrect the retention TOCTOU the in-flight claim exists to
+	// close (carried item 1). Tests retarget Root before the first
+	// request (the la.Store's own documented seam).
+	laStore *la.Store
 
 	// idle-exit state (all under mu; Opts.IdleExit > 0 enables): the
 	// conn-register hook disarms, the last conn-delete / capture-remove
@@ -498,6 +505,7 @@ func New(o Opts) (*Server, error) {
 		watchers:    map[string]map[*clientConn]struct{}{},
 		captures:    map[string]*captureSession{},
 		captureRoot: o.CaptureRoot,
+		laStore:     la.NewStore(),
 		captureOpen: osCreateCapture,
 		idleExit:    o.IdleExit,
 		idleCh:      make(chan struct{}),
@@ -1182,7 +1190,15 @@ func (cc *clientConn) bindHolder(h string) *RPCError {
 
 // process runs one request to its reply.
 func (s *Server) process(cc *clientConn, req *Request) *Reply {
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.RequestTimeout)
+	// la_capture owns its own ceiling (T7): the blocking pull rides the
+	// arm's max_ms bound (seconds clamped, the 600s fw cap when
+	// omitted) plus the read-back slack — the generic 60s would kill
+	// every honest long capture mid-pull and land it incomplete.
+	timeout := s.opts.RequestTimeout
+	if req.Type == "la_capture" {
+		timeout = laCaptureCeil(req.MaxSeconds)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	if herr := cc.bindHolder(req.Holder); herr != nil {
@@ -1234,6 +1250,18 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hBoardsPin(req)
 	case "boards_unpin":
 		result, err = s.hBoardsUnpin(req)
+	case "la_capture": // T7: the blocking listen capture (own ceiling, above)
+		result, err = s.hLaCapture(ctx, cc, req)
+	case "la_list": // T7: the landed-object reads + L1 crossings (local)
+		result, err = s.hLaList()
+	case "la_info":
+		result, err = s.hLaInfo(req)
+	case "la_frames":
+		result, err = s.hLaFrames(req)
+	case "la_repeat":
+		result, err = s.hLaRepeat(req)
+	case "la_decode_uart":
+		result, err = s.hLaDecodeUART(req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1671,6 +1699,9 @@ func (s *Server) hRelease(cc *clientConn, req *Request) (any, error) {
 	// arming was the holder's explicit intent, release ends it (spec
 	// §4.1). Best-effort board disarm + bookkeeping clear.
 	s.streamDisarmAll(context.Background(), b.MAC6, "release")
+	// T7 carried item 3: the same intent-end sweeps the la listen
+	// engine's residual captures (the streamDisarmAll precedent).
+	s.laDisarmAll(context.Background(), b.MAC6, "release")
 	// The lease's route pin dies with the lease (B16 F3-①): later
 	// unleased crossings keep the TCP-only redial — no USB open
 	// without a holder's §4.4 consent.
@@ -2937,10 +2968,21 @@ func (s *Server) tap(mac6 string, db *daemonBoard, ctl board.Controller) {
 	})
 	if h, err := ctl.Hello(false, "xuansi-daemon"); err == nil {
 		s.reg.Enrich(mac6, h)
-		prev := db.bootSeen // the pre-open sighting (D1's epoch backstop baseline)
+		// the locked read (carried fix, T7): noteBootSighting writes
+		// db.bootSeen under s.mu — the bare read here raced it.
+		prev := s.bootSeenSnapshot(db)
 		s.noteBootSighting(mac6, db, h)
 		s.resolvePendingBanner(mac6, db, prev, h)
 	}
+}
+
+// bootSeenSnapshot is the locked read of the board's last boot
+// sighting (tap's pre-open baseline). All db.bootSeen access rides
+// s.mu — noteBootSighting's write, protocolVer's read, this read.
+func (s *Server) bootSeenSnapshot(db *daemonBoard) *bootSight {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return db.bootSeen
 }
 
 // noteBootSighting (B10-T8b): every tapped hello is a boot sighting.
@@ -3232,6 +3274,10 @@ func (s *Server) leaseTeardown(ctx context.Context, mac6, holder string, session
 	// (streamDisarmAll→warmController takes the same mutex; the disarm's
 	// board ops are bounded and connect-serialized on their own).
 	s.streamDisarmAll(tctx, mac6, "lease teardown")
+	// T7 carried item 3: the la sweep rides the same seam, same shape
+	// (laDisarmAll→warmController takes the same mutex — keep it above
+	// the connectMu window too).
+	s.laDisarmAll(tctx, mac6, "lease teardown")
 	db.connectMu.Lock()
 	defer db.connectMu.Unlock()
 	err := db.sup.LeaseTeardown(tctx, mac6, holder, sessions)

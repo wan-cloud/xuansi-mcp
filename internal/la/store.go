@@ -171,6 +171,22 @@ func (s *Store) Info(id string) (Meta, error) {
 	return loadMeta(s.dir(id))
 }
 
+// Ref answers one object's full ref — the analysis seats' input (the
+// landed meta plus the two paths Frames/Repeat/DecodeUART read). The
+// same id rules as Info; a missing or malformed object is an error.
+func (s *Store) Ref(id string) (CaptureRef, error) {
+	if err := validID(id); err != nil {
+		return CaptureRef{}, err
+	}
+	m, err := loadMeta(s.dir(id))
+	if err != nil {
+		return CaptureRef{}, err
+	}
+	return CaptureRef{ID: id, Dir: s.dir(id),
+		DataPath: filepath.Join(s.dir(id), "data.bin"),
+		MetaPath: filepath.Join(s.dir(id), "meta.json"), Meta: m}, nil
+}
+
 // Delete removes one object (the whole directory, data.bin included).
 func (s *Store) Delete(id string) error {
 	if err := validID(id); err != nil {

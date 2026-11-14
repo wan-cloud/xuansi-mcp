@@ -697,6 +697,16 @@ var staticToolsRequiredAudit = map[string][]string{
 	// board, same as every board-addressed read).
 	"xuansi_stream_read":   {"board", "ch"},
 	"xuansi_boot_receipts": {"board"},
+
+	// T7 (LA wave): the la_* first batch — capture needs the wire's
+	// identity (board + the arm trio; mode/ring_kb/seconds/holder
+	// optional), the object reads need the id, list needs nothing.
+	"xuansi_la_capture":     {"board", "port", "pin", "baud"},
+	"xuansi_la_list":        {},
+	"xuansi_la_info":        {"capture_id"},
+	"xuansi_la_frames":      {"capture_id"},
+	"xuansi_la_repeat":      {"capture_id"},
+	"xuansi_la_decode_uart": {"capture_id"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
