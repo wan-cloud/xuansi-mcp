@@ -94,7 +94,9 @@ func captureFormatFor(source string) (captureFormat, *RPCError) {
 // unset — the same XDG data convention the MCP workspace uses; the
 // per-OS data-dir resolution lives in internal/paths (byte-identical
 // on Linux). Tests inject their root through Opts.CaptureRoot, never
-// the environment.
+// the environment. The LA capture-object root is this root's la/
+// subdirectory (DataDir()/captures/la — owned by internal/la.LARoot,
+// which freezes that path for the LA wave's object store).
 func capturesRoot() string {
 	return filepath.Join(paths.DataDir(), "captures")
 }

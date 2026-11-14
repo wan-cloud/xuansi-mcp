@@ -1,0 +1,494 @@
+package la
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"xuansi/internal/replclient"
+)
+
+// ---------------------------------------------------------------------------
+// scriptedBoard: a fake Board scripting the v9 la.* quintet. It serves
+// la.read windows out of a scripted ring, pushes the "la" done event
+// at arm time (or never), and can die mid-pull or flip verify-pass
+// bytes — the shapes the pull's red cases pin.
+
+type rec struct {
+	op   string
+	args map[string]any
+}
+
+type evReg struct {
+	prefix string
+	fn     func(replclient.Event)
+}
+
+type scriptedBoard struct {
+	mu       sync.Mutex
+	calls    []rec
+	regs     map[int]evReg
+	nextHID  int
+	ring     []byte         // the stream la.read serves
+	capID    int64          // arm-assigned cap number
+	baud     int64          // arm reply's resolved baud
+	stopB    int64          // stop reply's bytes (payload ledger)
+	stopR    string         // stop reply's reason
+	infoMeta map[string]any // la.info's 12-column meta (nil = none)
+	armErr   error          // scripted arm refusal — crosses verbatim
+	dieAt    int            // Op calls ≥ dieAt (after recording) answer ErrDead (−1 = never)
+	flipAt   int            // la.read calls > flipAt serve a flipped byte (−1 = never)
+	ops      int            // total Op calls taken
+	pushDone bool           // push the done event inside the arm reply
+	pushJunk bool           // push a foreign-cap done + a progress first
+}
+
+func newBoard(ring []byte) *scriptedBoard {
+	return &scriptedBoard{
+		regs: map[int]evReg{}, ring: ring, capID: 7, baud: 115200,
+		stopB: 0, stopR: "stopped", dieAt: -1, flipAt: -1,
+	}
+}
+
+func (b *scriptedBoard) snapshot() []rec {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]rec, len(b.calls))
+	copy(out, b.calls)
+	return out
+}
+
+func (b *scriptedBoard) opNames() []string {
+	var out []string
+	for _, c := range b.snapshot() {
+		out = append(out, c.op)
+	}
+	return out
+}
+
+func (b *scriptedBoard) push(source string, data map[string]any) {
+	b.mu.Lock()
+	regs := make([]evReg, 0, len(b.regs))
+	for _, r := range b.regs {
+		regs = append(regs, r)
+	}
+	b.mu.Unlock()
+	for _, r := range regs {
+		if strings.HasPrefix(source, r.prefix) {
+			r.fn(replclient.Event{Source: source, Data: data})
+		}
+	}
+}
+
+func argU(v any) int64 {
+	switch v := v.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	}
+	return -1
+}
+
+func (b *scriptedBoard) Op(ctx context.Context, op string, args map[string]any) (map[string]any, error) {
+	b.mu.Lock()
+	b.ops++
+	n := b.ops
+	b.calls = append(b.calls, rec{op: op, args: args})
+	die := b.dieAt >= 0 && n >= b.dieAt
+	b.mu.Unlock()
+	if die {
+		return nil, fmt.Errorf("%w: link gone mid-pull", replclient.ErrDead)
+	}
+	switch op {
+	case "events.subscribe":
+		return map[string]any{"ok": true}, nil
+	case "la.listen_arm":
+		if b.armErr != nil {
+			return nil, b.armErr
+		}
+		if b.pushJunk {
+			b.push("la", map[string]any{"event": "progress", "cap": b.capID, "bytes": int64(1024)})
+			b.push("la", map[string]any{"event": "done", "cap": int64(99), "bytes": int64(1), "reason": "full"})
+		}
+		if b.pushDone {
+			b.push("la", map[string]any{"event": "done", "cap": b.capID, "bytes": b.stopB, "reason": b.stopR})
+		}
+		return map[string]any{"cap": b.capID, "baud": b.baud}, nil
+	case "la.stop":
+		return map[string]any{"bytes": b.stopB, "reason": b.stopR}, nil
+	case "la.info":
+		meta := b.infoMeta
+		if meta == nil {
+			meta = map[string]any{}
+		}
+		return map[string]any{"caps": []any{map[string]any{
+			"cap": b.capID, "mode": "listen", "port": int64(1), "pin": int64(38),
+			"state": "stopped", "bytes": b.stopB, "total": int64(len(b.ring)),
+			"meta": meta,
+		}}}, nil
+	case "la.read":
+		b.mu.Lock()
+		flip := b.flipAt >= 0 && n > b.flipAt
+		b.mu.Unlock()
+		off := argU(args["off"])
+		ln := argU(args["len"])
+		if off < 0 || ln < 0 || off > int64(len(b.ring)) {
+			return nil, &replclient.OpError{Op: op, Class: "api", Msg: "la.read: bad window"}
+		}
+		end := off + ln
+		if end > int64(len(b.ring)) {
+			end = int64(len(b.ring))
+		}
+		data := append([]byte(nil), b.ring[off:end]...)
+		if flip && len(data) > 0 {
+			data[7] ^= 0xFF // transient corruption: pass-2 bytes differ
+		}
+		return map[string]any{"data": data, "total": int64(len(b.ring)), "eof": end >= int64(len(b.ring))}, nil
+	case "la.disarm":
+		return map[string]any{"cap": b.capID}, nil
+	}
+	return nil, &replclient.OpError{Op: op, Class: "api", Msg: "unknown op " + op}
+}
+
+func (b *scriptedBoard) OnEvent(sourcePrefix string, fn func(replclient.Event)) (cancel func()) {
+	b.mu.Lock()
+	id := b.nextHID
+	b.nextHID++
+	b.regs[id] = evReg{prefix: sourcePrefix, fn: fn}
+	b.mu.Unlock()
+	return func() {
+		b.mu.Lock()
+		delete(b.regs, id)
+		b.mu.Unlock()
+	}
+}
+
+func (b *scriptedBoard) Dead() bool { return false }
+
+var _ Board = (*scriptedBoard)(nil)
+
+// ---------------------------------------------------------------------------
+// golden ring: 3 chunks crossing the read window (stream 65587 >
+// 2×32640 → three windows), the big one at the u16 ceiling — the
+// continuation shape the fw's fix1 lands.
+
+var (
+	ringA   = []byte("hello-listen")
+	ringBig = make([]byte, 65535)
+	ringC   = []byte("tail-bytes")
+)
+
+func goldenRing() []byte {
+	for i := range ringBig {
+		ringBig[i] = byte('A' + i%26)
+	}
+	s := append(encChunk(1_000_000, ringA), encChunk(2_000_000, ringBig)...)
+	return append(s, encChunk(3_000_000, ringC)...)
+}
+
+func goldenPayload() int64 { return int64(len(ringA) + len(ringBig) + len(ringC)) }
+
+func TestPullCaptureHappyPath(t *testing.T) {
+	ring := goldenRing()
+	sum := sha256.Sum256(ring)
+	b := newBoard(ring)
+	b.stopB = goldenPayload()
+	b.stopR = "limit"
+	b.pushDone = true
+	b.pushJunk = true // foreign-cap done + progress must not end the wait
+	b.infoMeta = map[string]any{
+		"baud": int64(115200), "auto": false, "ring_kb": int64(128), "idle_syms": int64(4),
+		"max_ms": int64(5000), "chunks": int64(3), "chunks_dropped": int64(0),
+		"bytes_dropped": int64(0), "hw_ovf": int64(0), "reason": "limit",
+		"armed_ns": int64(111), "stopped_ns": int64(222),
+	}
+	s := testStore(t)
+
+	ref, err := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: b}, ArmArgs{
+		Port: 1, Pin: 38, Baud: "auto", RingKB: 128, IdleSyms: 4, MaxMS: 5000,
+	})
+	if err != nil {
+		t.Fatalf("PullCapture: %v", err)
+	}
+
+	// op sequence + verbatim arm args: subscribe precedes arm (miss-no-
+	// done discipline), stop/info after the done, read windows in both
+	// passes, disarm last.
+	wantSeq := []rec{
+		{"events.subscribe", map[string]any{"source": "la"}},
+		{"la.listen_arm", map[string]any{"port": 1, "pin": 38, "baud": "auto", "ring_kb": 128, "idle_syms": 4, "max_ms": 5000}},
+		{"la.stop", map[string]any{"cap": int64(7)}},
+		{"la.info", map[string]any{"cap": int64(7)}},
+		{"la.read", map[string]any{"cap": int64(7), "off": int64(0), "len": int64(ReadWindow)}},
+		{"la.read", map[string]any{"cap": int64(7), "off": int64(ReadWindow), "len": int64(ReadWindow)}},
+		{"la.read", map[string]any{"cap": int64(7), "off": int64(2 * ReadWindow), "len": int64(ReadWindow)}},
+		{"la.read", map[string]any{"cap": int64(7), "off": int64(0), "len": int64(ReadWindow)}},
+		{"la.read", map[string]any{"cap": int64(7), "off": int64(ReadWindow), "len": int64(ReadWindow)}},
+		{"la.read", map[string]any{"cap": int64(7), "off": int64(2 * ReadWindow), "len": int64(ReadWindow)}},
+		{"la.disarm", map[string]any{"cap": int64(7)}},
+	}
+	got := b.snapshot()
+	if !reflect.DeepEqual(got, wantSeq) {
+		t.Fatalf("op sequence:\n got %+v\nwant %+v", got, wantSeq)
+	}
+
+	// landed object: data.bin byte-identical to the ring
+	if ref.ID != "20261115T101530-aa11bb-la-listen-1" {
+		t.Errorf("ID = %q", ref.ID)
+	}
+	if ref.Dir != filepath.Join(s.Root, ref.ID) || ref.DataPath != filepath.Join(ref.Dir, "data.bin") ||
+		ref.MetaPath != filepath.Join(ref.Dir, "meta.json") {
+		t.Errorf("ref paths = %+v", ref)
+	}
+	disk, err := os.ReadFile(ref.DataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(disk, ring) {
+		t.Fatalf("data.bin ≠ ring: %d vs %d bytes", len(disk), len(ring))
+	}
+
+	// meta.json: the full column account
+	wantMeta := Meta{
+		CapID: ref.ID, Board: "aa11bb", Mode: "listen", Port: 1, Pin: 38,
+		Baud: 115200, IdleSyms: 4,
+		TStartNS: 1_000_000, TEndNS: 3_000_000,
+		Bytes: goldenPayload(), Chunks: 3, Reason: "limit",
+		RingKB: 128, MaxMS: 5000,
+		StreamBytes: int64(len(ring)),
+		ArmedNS:     111, StoppedNS: 222,
+		SHA256:   hex.EncodeToString(sum[:]),
+		PulledAt: fixedNow,
+	}
+	if !reflect.DeepEqual(ref.Meta, wantMeta) {
+		t.Fatalf("ref.Meta:\n got %+v\nwant %+v", ref.Meta, wantMeta)
+	}
+	loaded, err := s.Info(ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded, wantMeta) {
+		t.Fatalf("meta.json round trip:\n got %+v\nwant %+v", loaded, wantMeta)
+	}
+}
+
+func TestPullCaptureArmRefusalPassthrough(t *testing.T) {
+	coach := "la.listen_arm: ring budget 4096KB exceeded: active 3968KB + request 512KB (caps la_ring_budget_kb) — stop or disarm an armed capture first, or shrink ring_kb"
+	b := newBoard(nil)
+	b.armErr = &replclient.OpError{Op: "la.listen_arm", Class: "api", Msg: coach}
+	s := testStore(t)
+
+	ref, err := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: b}, ArmArgs{Port: 1, Pin: 38, Baud: 9600, RingKB: 512})
+	if err == nil {
+		t.Fatal("arm refusal: no error")
+	}
+	var oe *replclient.OpError
+	if !errors.As(err, &oe) || oe.Msg != coach || oe.Class != "api" {
+		t.Fatalf("refusal not verbatim: %v", err)
+	}
+	if ref.ID != "" {
+		t.Errorf("refusal left a capture object: %q", ref.ID)
+	}
+	// nothing beyond subscribe+arm touched the board
+	if names := b.opNames(); !reflect.DeepEqual(names, []string{"events.subscribe", "la.listen_arm"}) {
+		t.Errorf("ops after refusal = %v", names)
+	}
+	ents, _ := os.ReadDir(s.Root)
+	if len(ents) != 0 {
+		t.Errorf("refusal left %d entries under the store root", len(ents))
+	}
+}
+
+func TestPullCaptureMidPullDisconnectLandsIncomplete(t *testing.T) {
+	ring := goldenRing()
+	b := newBoard(ring)
+	b.stopB = goldenPayload()
+	b.stopR = "full"
+	b.pushDone = true
+	b.dieAt = 6 // ops 1-5 (subscribe/arm/stop/info/read w1) live; read w2 dies
+	s := testStore(t)
+
+	ref, err := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: b}, ArmArgs{Port: 1, Pin: 38, Baud: 115200, RingKB: 128})
+	if err == nil {
+		t.Fatal("mid-pull death: no error")
+	}
+	if !errors.Is(err, ErrIncomplete) || !errors.Is(err, replclient.ErrDead) {
+		t.Fatalf("err = %v, want ErrIncomplete wrapping ErrDead", err)
+	}
+	if ref.ID == "" {
+		t.Fatal("no partial object landed")
+	}
+	m, err := s.Info(ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Incomplete {
+		t.Error("meta.incomplete not set")
+	}
+	// the partial stream: window 1's 32640 bytes landed, tolerant parse
+	// counted only the clean chunks inside it (ringA whole; ringBig torn)
+	if m.StreamBytes != ReadWindow {
+		t.Errorf("stream_bytes = %d, want %d", m.StreamBytes, ReadWindow)
+	}
+	if m.Chunks != 1 || m.Bytes != int64(len(ringA)) || m.TStartNS != 1_000_000 || m.TEndNS != 1_000_000 {
+		t.Errorf("partial account = %+v", m)
+	}
+	disk, err := os.ReadFile(ref.DataPath)
+	if err != nil || len(disk) != ReadWindow {
+		t.Fatalf("data.bin = %d bytes (err %v), want %d", len(disk), err, ReadWindow)
+	}
+	if !reflect.DeepEqual(disk, ring[:ReadWindow]) {
+		t.Error("partial data.bin ≠ ring prefix")
+	}
+}
+
+func TestPullCaptureChecksumMismatchIsError(t *testing.T) {
+	ring := goldenRing()
+	b := newBoard(ring)
+	b.stopB = goldenPayload()
+	b.stopR = "limit"
+	b.pushDone = true
+	b.flipAt = 7 // pass 2's windows (calls 8-10) serve flipped bytes
+	s := testStore(t)
+
+	ref, perr := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: b}, ArmArgs{Port: 1, Pin: 38, Baud: 115200, RingKB: 128})
+	if !errors.Is(perr, ErrChecksum) {
+		t.Fatalf("err = %v, want ErrChecksum", perr)
+	}
+	if ref.ID == "" {
+		t.Fatal("tainted object missing")
+	}
+	m, err := s.Info(ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Incomplete {
+		t.Error("checksum failure meta not marked incomplete")
+	}
+	if !strings.Contains(perr.Error(), "sha256") {
+		t.Errorf("error lacks the digest account: %v", perr)
+	}
+}
+
+func TestPullCaptureStopLedgerShortfallFailsIdentity(t *testing.T) {
+	ring := goldenRing()
+	b := newBoard(ring)
+	b.stopB = goldenPayload() - 3 // ledger disagrees with the ring stream
+	b.stopR = "full"
+	b.pushDone = true
+	s := testStore(t)
+	_, err := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: b}, ArmArgs{Port: 1, Pin: 38, Baud: 115200, RingKB: 128})
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("err = %v, want ErrChecksum (payload accounting identity)", err)
+	}
+}
+
+func TestPullCaptureEmptyCapture(t *testing.T) {
+	b := newBoard(nil)
+	b.stopB = 0
+	b.stopR = "stopped"
+	b.pushDone = true
+	s := testStore(t)
+	ref, err := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: b}, ArmArgs{Port: 2, Pin: 39, Baud: 9600, RingKB: 64})
+	if err != nil {
+		t.Fatalf("empty capture: %v", err)
+	}
+	m := ref.Meta
+	if m.Bytes != 0 || m.Chunks != 0 || m.TStartNS != 0 || m.TEndNS != 0 || m.Reason != "stopped" || m.StreamBytes != 0 {
+		t.Fatalf("empty meta = %+v", m)
+	}
+	if m.SHA256 != hex.EncodeToString(sha256Sum(nil)) {
+		t.Errorf("empty sha256 = %q", m.SHA256)
+	}
+	// arm args cross omitted optionals at zero
+	arm := b.snapshot()[1]
+	if _, ok := arm.args["idle_syms"]; ok {
+		t.Errorf("idle_syms crossed at zero: %v", arm.args)
+	}
+	if _, ok := arm.args["max_ms"]; ok {
+		t.Errorf("max_ms crossed at zero: %v", arm.args)
+	}
+}
+
+func TestPullCaptureNoDoneWaitsThenCtxCancelLandsIncomplete(t *testing.T) {
+	b := newBoard(nil) // no pushDone: the capture never ends
+	b.stopB = 0
+	b.stopR = "stopped"
+	s := testStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	ref, err := s.PullCapture(ctx, PullBoard{ID: "aa11bb", Conn: b}, ArmArgs{Port: 1, Pin: 38, Baud: 115200, RingKB: 64})
+	if !errors.Is(err, ErrIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want ErrIncomplete wrapping DeadlineExceeded", err)
+	}
+	m, err := s.Info(ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Incomplete {
+		t.Error("cancel landing not marked incomplete")
+	}
+	// end-of-intent: the still-armed capture was stopped best-effort
+	names := b.opNames()
+	if !containsOp(names, "la.stop") {
+		t.Errorf("cancel path left the capture armed: %v", names)
+	}
+}
+
+func TestPullCaptureDeadLinkDuringWaitLandsIncomplete(t *testing.T) {
+	b := newBoard(nil)
+	b.pushDone = false
+	b.stopB = 0
+	b.stopR = "stopped"
+	b.dieAt = 3 // subscribe+arm live; every later op dies (the link is gone)
+	s := testStore(t)
+
+	// Dead() is polled in the wait: a link that reports dead ends the
+	// wait without a done event — no hang until ctx.
+	dead := &deadBoard{scriptedBoard: b}
+	dead.on = true
+
+	ref, err := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: dead}, ArmArgs{Port: 1, Pin: 38, Baud: 115200, RingKB: 64})
+	if !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("err = %v, want ErrIncomplete", err)
+	}
+	m, err := s.Info(ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Incomplete {
+		t.Error("dead-link landing not marked incomplete")
+	}
+}
+
+type deadBoard struct {
+	*scriptedBoard
+	on bool
+}
+
+func (d *deadBoard) Dead() bool { return d.on }
+
+func containsOp(names []string, op string) bool {
+	for _, n := range names {
+		if n == op {
+			return true
+		}
+	}
+	return false
+}
+
+func sha256Sum(b []byte) []byte {
+	s := sha256.Sum256(b)
+	return s[:]
+}
