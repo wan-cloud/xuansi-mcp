@@ -43,6 +43,8 @@ type scriptedBoard struct {
 	baud     int64          // arm reply's resolved baud
 	stopB    int64          // stop reply's bytes (payload ledger)
 	stopR    string         // stop reply's reason
+	stopGate chan struct{}  // non-nil: la.stop signals stopHere then blocks until closed
+	stopHere chan struct{}  // closed once la.stop is parked at the gate
 	infoMeta map[string]any // la.info's 12-column meta (nil = none)
 	armErr   error          // scripted arm refusal — crosses verbatim
 	dieAt    int            // Op calls ≥ dieAt (after recording) answer ErrDead (−1 = never)
@@ -125,6 +127,10 @@ func (b *scriptedBoard) Op(ctx context.Context, op string, args map[string]any) 
 		}
 		return map[string]any{"cap": b.capID, "baud": b.baud}, nil
 	case "la.stop":
+		if b.stopGate != nil {
+			close(b.stopHere)
+			<-b.stopGate
+		}
 		return map[string]any{"bytes": b.stopB, "reason": b.stopR}, nil
 	case "la.info":
 		meta := b.infoMeta
@@ -443,6 +449,106 @@ func TestPullCaptureNoDoneWaitsThenCtxCancelLandsIncomplete(t *testing.T) {
 	names := b.opNames()
 	if !containsOp(names, "la.stop") {
 		t.Errorf("cancel path left the capture armed: %v", names)
+	}
+}
+
+// pullRes carries one goroutine's PullCapture outcome.
+type pullRes struct {
+	ref CaptureRef
+	err error
+}
+
+// TestRetentionSweepsLitterNotInFlightPull pins the fix-round-1 TOCTOU:
+// between reserveID and writeMeta a live pull's dir is meta-less —
+// indistinguishable from litter to a concurrent Retention(). Pull B
+// parks at la.stop (deterministically inside that window, via the
+// fake's gate); a direct sweep and a completing pull A's embedded
+// sweep both run while B is parked. True litter (a dead process's
+// meta-less dir) must go; B's dir must survive and B must land
+// complete — zero phantoms.
+func TestRetentionSweepsLitterNotInFlightPull(t *testing.T) {
+	s := testStore(t)
+
+	// Pull B: done pushes at arm, then la.stop parks — dir + data.bin
+	// on disk, meta not yet written.
+	bB := newBoard(nil)
+	bB.stopB = 0
+	bB.stopR = "stopped"
+	bB.pushDone = true
+	bB.stopGate = make(chan struct{})
+	bB.stopHere = make(chan struct{})
+	bDone := make(chan pullRes, 1)
+	go func() {
+		ref, err := s.PullCapture(context.Background(), PullBoard{ID: "bb22cc", Conn: bB}, ArmArgs{Port: 1, Pin: 38, Baud: 9600, RingKB: 64})
+		bDone <- pullRes{ref, err}
+	}()
+	select {
+	case <-bB.stopHere:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pull B never reached la.stop")
+	}
+
+	bID := "20261115T101530-bb22cc-la-listen-1"
+	bDir := filepath.Join(s.Root, bID)
+	if fi, err := os.Stat(bDir); err != nil || !fi.IsDir() {
+		t.Fatalf("pre-condition: in-flight dir missing at the window: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(bDir, "meta.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pre-condition: meta.json already present (%v) — the window was not hit", err)
+	}
+
+	// True litter — a dead process's abandoned pull dir — must still
+	// sweep while B is in flight.
+	if err := os.MkdirAll(filepath.Join(s.Root, "dead-pull-litter"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := s.Retention()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != "dead-pull-litter" {
+		t.Fatalf("direct sweep removed = %v, want exactly the dead-pull litter", removed)
+	}
+	if _, err := os.Stat(bDir); err != nil {
+		t.Fatalf("direct sweep deleted the in-flight pull's dir: %v", err)
+	}
+
+	// A completing pull on the shared store runs its embedded retention
+	// sweep while B is still parked — same guarantee.
+	bA := newBoard(nil)
+	bA.stopB = 0
+	bA.stopR = "stopped"
+	bA.pushDone = true
+	if _, err := s.PullCapture(context.Background(), PullBoard{ID: "aa11bb", Conn: bA}, ArmArgs{Port: 1, Pin: 38, Baud: 9600, RingKB: 64}); err != nil {
+		t.Fatalf("pull A: %v", err)
+	}
+	if _, err := os.Stat(bDir); err != nil {
+		t.Fatalf("pull A's embedded sweep deleted the in-flight pull's dir: %v", err)
+	}
+
+	// Release B: it must land complete — the raced window left no hole.
+	close(bB.stopGate)
+	res := <-bDone
+	if res.err != nil {
+		t.Fatalf("pull B after the race window: %v", res.err)
+	}
+	if res.ref.ID != bID {
+		t.Fatalf("pull B id = %q, want %q", res.ref.ID, bID)
+	}
+	ms, err := s.ListCaptures()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 2 {
+		t.Fatalf("ListCaptures = %d objects, want exactly A and B", len(ms))
+	}
+	// zero phantoms: every listed object has both files on disk
+	for _, m := range ms {
+		for _, f := range []string{"data.bin", "meta.json"} {
+			if _, err := os.Stat(filepath.Join(s.Root, m.CapID, f)); err != nil {
+				t.Errorf("phantom listing %s/%s: %v", m.CapID, f, err)
+			}
+		}
 	}
 }
 

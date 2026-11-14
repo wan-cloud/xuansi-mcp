@@ -142,6 +142,10 @@ func (s *Store) PullCapture(ctx context.Context, board PullBoard, armArgs ArmArg
 		endOfIntent(board.Conn, capNum)
 		return CaptureRef{}, fmt.Errorf("la: reserve capture dir: %v", err)
 	}
+	// The reservation ends with this pull, whichever way it lands:
+	// once released, an unlanded dir is honest litter to the next
+	// sweep again.
+	defer s.unreserve(id)
 	ref := CaptureRef{ID: id, Dir: dir,
 		DataPath: filepath.Join(dir, "data.bin"),
 		MetaPath: filepath.Join(dir, "meta.json")}

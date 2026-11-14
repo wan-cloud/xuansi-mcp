@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"xuansi/internal/paths"
@@ -93,6 +94,19 @@ type Store struct {
 	Root  string
 	Quota int64
 	now   func() time.Time
+
+	// inFlight tracks reserved-but-not-yet-landed object dirs,
+	// refcounted against same-second id collisions: Retention's litter
+	// sweep skips them, because between reserveID and writeMeta a live
+	// pull's dir is meta-less and would otherwise read as litter to a
+	// concurrent sweep (fix round 1's TOCTOU — one pull's finishing
+	// sweep unlinked another's data.bin mid-read). In-memory by
+	// design: a process death leaves no marker behind, so the orphaned
+	// dir reverts to ordinary litter the next sweep collects — a
+	// durable pending marker would need an age rule to tell
+	// crash-litter from live, and buys nothing on a single host.
+	mu       sync.Mutex
+	inFlight map[string]int
 }
 
 // NewStore answers the default store: the frozen LARoot and the 512MB
@@ -189,10 +203,11 @@ func (s *Store) Retention() ([]string, error) {
 
 	// Pass 1: litter — a dir without a loadable meta is a crashed or
 	// severed pull; it sweeps regardless of age and never counts
-	// against the quota math.
+	// against the quota math. A RESERVED dir is not litter: it is a
+	// live pull inside its reserve→writeMeta window (fix round 1).
 	var metas []Meta
 	for _, e := range ents {
-		if !e.IsDir() {
+		if !e.IsDir() || s.reserved(e.Name()) {
 			continue
 		}
 		m, err := loadMeta(filepath.Join(s.Root, e.Name()))
@@ -237,7 +252,10 @@ func (s *Store) Retention() ([]string, error) {
 
 // reserveID carves the object's directory under Root: <UTC ts>-<board>
 // -la-<mode>-<n>, n stepping past same-second collisions (the dir's
-// exclusive create is the reservation).
+// exclusive create is the reservation). The claim and the create ride
+// one lock hold so a concurrent Retention can never observe the dir
+// meta-less-but-unclaimed; a failed create rolls the claim back
+// (refcount-aware — a colliding pull's claim stays).
 func (s *Store) reserveID(board, mode string) (id string, dir string, err error) {
 	if err := os.MkdirAll(s.Root, 0o700); err != nil {
 		return "", "", err
@@ -246,14 +264,55 @@ func (s *Store) reserveID(board, mode string) (id string, dir string, err error)
 	for n := 1; ; n++ {
 		id = fmt.Sprintf("%s-%s-la-%s-%d", ts, board, mode, n)
 		dir = filepath.Join(s.Root, id)
+		s.mu.Lock()
+		s.claim(id)
 		err := os.Mkdir(dir, 0o700)
-		if err == nil {
-			return id, dir, nil
+		if err != nil {
+			s.unclaim(id)
+			s.mu.Unlock()
+			if !errors.Is(err, os.ErrExist) {
+				return "", "", err
+			}
+			continue // same-second collision: step n past the landed object
 		}
-		if !errors.Is(err, os.ErrExist) {
-			return "", "", err
-		}
+		s.mu.Unlock()
+		return id, dir, nil
 	}
+}
+
+// claim marks id in-flight (refcounted: concurrent same-id reserves
+// share the marker until the last exits). Caller holds mu.
+func (s *Store) claim(id string) {
+	if s.inFlight == nil {
+		s.inFlight = map[string]int{}
+	}
+	s.inFlight[id]++
+}
+
+// unclaim rolls one claim back (the floor is zero — an unclaim of an
+// unclaimed id, e.g. a collision loser, takes nothing). Caller holds mu.
+func (s *Store) unclaim(id string) {
+	if s.inFlight[id] > 1 {
+		s.inFlight[id]--
+	} else {
+		delete(s.inFlight, id)
+	}
+}
+
+// unreserve releases a landed (or abandoned) pull's claim — PullCapture's
+// defer; after this an unlanded dir is honest litter again.
+func (s *Store) unreserve(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unclaim(id)
+}
+
+// reserved reports whether id belongs to a pull still inside the
+// reserve→writeMeta window.
+func (s *Store) reserved(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inFlight[id] > 0
 }
 
 // writeMeta lands meta.json inside the object dir (exclusive create —
