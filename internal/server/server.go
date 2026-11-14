@@ -1942,6 +1942,15 @@ var opAllowlist = map[string]bool{
 	// account's HIL and an agent's own end-to-end check ride it;
 	// non-ro on the board, lease-gated here like every op).
 	"diag.streamtest": true,
+	// LA wave T3 (logic-analyzer listen): the passive UART capture
+	// face — arm/stop/read/disarm drive the listener lifecycle, info
+	// observes it. Forwarded for the wave's board HIL (the CH340→
+	// GPIO38 fixture) and for agent-side protocol analysis.
+	"la.listen_arm": true,
+	"la.stop":       true,
+	"la.read":       true,
+	"la.info":       true,
+	"la.disarm":     true,
 }
 
 // AllowlistedOps renders the ops face's allowlisted op names, sorted —

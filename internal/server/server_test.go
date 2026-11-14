@@ -2126,11 +2126,16 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // with the W2-T4 fix1 ruling — the ro syntax ground truth the lint
 // Desc names needed a real seat path (12 ops now); diag.streamtest
 // joined with B16-T6 — the 0x02 synthetic producer the stream
-// subscription's HIL and an agent's own end-to-end check ride (13).
+// subscription's HIL and an agent's own end-to-end check ride (13);
+// the la.* listen quintet joined with the LA wave T3 — the passive
+// UART capture face (arm/stop/read/info/disarm; the CH340→GPIO38
+// fixture's HIL and agent-side protocol analysis ride it, 18).
 var opsFaceAllowlistV1 = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
-	"diag.pins", "diag.stats", "diag.streamtest", "log.read", "lua.check",
+	"diag.pins", "diag.stats", "diag.streamtest",
+	"la.disarm", "la.info", "la.listen_arm", "la.read", "la.stop",
+	"log.read", "lua.check",
 	"wifi.off", "wifi.setup", "wifi.status",
 }
 
