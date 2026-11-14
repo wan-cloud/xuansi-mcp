@@ -12,6 +12,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -197,15 +198,43 @@ func (ts *toolset) closeLA() {
 	}
 }
 
+// callLALane crosses one la_* request on the dedicated lane with the
+// lane's disposable-identity rule (T7 fix round 1): a class-"holder"
+// refusal means the LANE's daemon-side binding disagrees with the
+// holder this process stamped — a mid-session grace-adopt with an
+// explicit holder bound the lane to the adopter, while the holder
+// mirror is first-wins and never follows, so every later holder-less
+// capture would be refused on that lane FOREVER. The lane is
+// disposable (the shared connection is not): drop it, redial fresh
+// (the fresh binding takes whatever the mirror now stamps), retry the
+// crossing ONCE. A second refusal is the honest error. Concurrent
+// captures on the dropped lane surface as a lost-connection error and
+// self-heal on their next call — noted, accepted (two concurrent
+// blocking captures adopting different holders is the edge of the
+// edge).
+func (ts *toolset) callLALane(ctx context.Context, req server.Request) (map[string]any, error) {
+	c, err := ts.laClient()
+	if err != nil {
+		return nil, err
+	}
+	res, err := ts.callHeldOn(ctx, c, req)
+	var rerr *server.RPCError
+	if !errors.As(err, &rerr) || rerr.Class != "holder" {
+		return res, err // not the binding wedge: cross as-is
+	}
+	ts.closeLA() // the mis-bound lane goes; the shared conn keeps its identity
+	c, err = ts.laClient()
+	if err != nil {
+		return nil, err
+	}
+	return ts.callHeldOn(ctx, c, req)
+}
+
 func (ts *toolset) laCapture(ctx context.Context, _ *mcpsdk.CallToolRequest, in laCaptureIn) (*mcpsdk.CallToolResult, laCaptureOut, error) {
 	// the dedicated lane: this call blocks up to seconds + pull time —
 	// the shared connection keeps serving every other tool meanwhile
 	// (drive a stimulus board on it mid-capture; that is the workflow)
-	c, err := ts.laClient()
-	if err != nil {
-		return nil, laCaptureOut{}, err
-	}
-	res, err := ts.callHeldOn(ctx, c, server.Request{
+	res, err := ts.callLALane(ctx, server.Request{
 		Type: "la_capture", Board: in.Board, Holder: in.Holder,
 		Mode: in.Mode, LaPort: in.Port, LaPin: in.Pin, Baud: in.Baud,
 		RingKB: in.RingKB, MaxSeconds: in.Seconds,

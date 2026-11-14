@@ -12,6 +12,7 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"reflect"
 	"strings"
@@ -435,5 +436,183 @@ func TestLADescCoachingAudit(t *testing.T) {
 				t.Errorf("%s Desc lacks %q", name, want)
 			}
 		}
+	}
+}
+
+// laneDiag records what each fake-daemon connection saw (the wedge
+// test's evidence: which holder crossed which wire).
+type laneDiag struct {
+	mu    sync.Mutex
+	conns [][]string // per connection: the holders of requests it served or refused
+}
+
+func (d *laneDiag) note(conn int, holder string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for len(d.conns) <= conn {
+		d.conns = append(d.conns, nil)
+	}
+	d.conns[conn] = append(d.conns[conn], holder)
+}
+
+func (d *laneDiag) holders(conn int) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if conn >= len(d.conns) {
+		return nil
+	}
+	return append([]string(nil), d.conns[conn]...)
+}
+
+// serveBoundConn emulates the daemon's per-connection holder contract
+// (bindHolder): the first request carrying a holder binds the
+// connection; a later DIFFERENT holder is a class-"holder" refusal.
+// Replies: lease → {board,holder}; la_capture → a canned capture.
+func serveBoundConn(t *testing.T, conn net.Conn, connIdx int, diag *laneDiag) {
+	var bound string
+	for {
+		var req server.Request
+		if err := server.ReadMsg(conn, &req); err != nil {
+			return
+		}
+		diag.note(connIdx, req.Holder)
+		if req.Holder != "" {
+			if bound == "" {
+				bound = req.Holder
+			} else if bound != req.Holder {
+				// the daemon's verbatim shape: class holder, one reply
+				if err := server.WriteMsg(conn, &server.Reply{Type: "reply", ID: req.ID,
+					Error: &server.RPCError{Class: "holder",
+						Msg: fmt.Sprintf("connection already bound to holder %s (refusing %s)", bound, req.Holder)}}); err != nil {
+					t.Errorf("fake daemon holder refusal: %v", err)
+				}
+				continue
+			}
+		}
+		switch req.Type {
+		case "lease":
+			replyCapture(t, conn, req.ID, map[string]any{"board": req.Board, "holder": req.Holder})
+		case "la_capture":
+			replyCapture(t, conn, req.ID, map[string]any{
+				"capture_id": fmt.Sprintf("cap-conn%d", connIdx), "path": "/p",
+				"meta": map[string]any{"cap_id": fmt.Sprintf("cap-conn%d", connIdx)}})
+		default:
+			t.Errorf("conn %d saw unexpected %s", connIdx, req.Type)
+			return
+		}
+	}
+}
+
+// TestLACaptureLaneHolderWedgeRedials (T7 fix round 1): a mid-session
+// grace-adopt with an explicit holder binds the LANE to the adopter
+// (the mirror is first-wins and never follows); every later holder-less
+// la_capture then stamps the process holder onto the mis-bound lane —
+// a class-holder refusal on EVERY capture until restart. The lane is
+// disposable: on a holder refusal it is dropped, redialed fresh (which
+// rebinds to the mirror's holder) and the crossing retried once.
+func TestLACaptureLaneHolderWedgeRedials(t *testing.T) {
+	fd := newFakeDaemon(t)
+	diag := &laneDiag{}
+	// conn #1 = the shared wire (the lease binds it to the process
+	// holder X); conn #2 = the lane (the adopter's Y capture binds it
+	// Y); conn #3 = the redialed lane (binds back to X).
+	go func() {
+		for i := 0; i < 3; i++ {
+			c, err := fd.ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveBoundConn(t, c, i, diag)
+		}
+	}()
+	e := wireMCP(t, fd, Options{Holder: "mcp-fixed01"})
+
+	// 1. the shared conn binds the process holder (X)
+	if res := e.call("xuansi_lease", map[string]any{"board": "b1"}); res.IsError {
+		t.Fatalf("lease: %s", resultText(t, res))
+	}
+	// 2. a mid-session adopt-shaped capture: explicit holder Y rides a
+	// FRESH lane (the lane's first crossing) and binds it Y
+	res := e.call("xuansi_la_capture", map[string]any{
+		"board": "b2", "port": 1, "pin": 38, "baud": 115200, "holder": "mcp-adopter"})
+	if res.IsError {
+		t.Fatalf("adopter capture failed: %s", resultText(t, res))
+	}
+	if got := diag.holders(1); len(got) != 1 || got[0] != "mcp-adopter" {
+		t.Fatalf("lane binding holders = %v, want the adopter only", got)
+	}
+	// 3. the wedge: a holder-less capture stamps the process holder X
+	// onto the Y-bound lane — the lane must be dropped and redialed,
+	// not a refusal
+	res = e.call("xuansi_la_capture", map[string]any{
+		"board": "b2", "port": 1, "pin": 38, "baud": 115200})
+	if res.IsError {
+		t.Fatalf("holder-less capture after the adopt wedge: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	if m["capture_id"] != "cap-conn2" {
+		t.Errorf("capture_id = %v, want the REDIALED lane's answer (cap-conn2)", m["capture_id"])
+	}
+	// the wedge's shape, on the record: the old lane saw the refused X
+	// crossing before it was dropped
+	if got := diag.holders(1); len(got) != 2 || got[1] != "mcp-fixed01" {
+		t.Errorf("old lane holders = %v, want [mcp-adopter mcp-fixed01] (the refused rebind attempt)", got)
+	}
+	if got := diag.holders(2); len(got) != 1 || got[0] != "mcp-fixed01" {
+		t.Errorf("redialed lane holders = %v, want the process holder", got)
+	}
+}
+
+// TestLACaptureLaneDeathRedials (the disclosed unpinned item): a lane
+// that died between calls is re-dialed on the next capture — the next
+// crossing succeeds on the fresh wire.
+func TestLACaptureLaneDeathRedials(t *testing.T) {
+	fd := newFakeDaemon(t)
+	diag := &laneDiag{}
+	laneClosed := make(chan struct{})
+	go func() {
+		// conn #1: the shared wire (idle, quiet)
+		c1, err := fd.ln.Accept()
+		if err != nil {
+			return
+		}
+		// conn #2: the lane — serves ONE capture, then dies
+		c2, err := fd.ln.Accept()
+		if err != nil {
+			c1.Close()
+			return
+		}
+		go func() { serveBoundConn(t, c1, 0, diag) }()
+		var req server.Request
+		if err := server.ReadMsg(c2, &req); err != nil {
+			return
+		}
+		diag.note(1, req.Holder)
+		replyCapture(t, c2, req.ID, map[string]any{
+			"capture_id": "cap-before-death", "path": "/p", "meta": map[string]any{"cap_id": "cap-before-death"}})
+		c2.Close()
+		close(laneClosed)
+		// conn #3: the redialed lane
+		c3, err := fd.ln.Accept()
+		if err != nil {
+			return
+		}
+		serveBoundConn(t, c3, 2, diag)
+	}()
+	e := wireMCP(t, fd, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_la_capture", map[string]any{"board": "b", "port": 1, "pin": 38, "baud": 9600})
+	if res.IsError {
+		t.Fatalf("first capture: %s", resultText(t, res))
+	}
+	<-laneClosed
+	time.Sleep(150 * time.Millisecond) // let the apiclient read loop observe the death
+
+	res = e.call("xuansi_la_capture", map[string]any{"board": "b", "port": 1, "pin": 38, "baud": 9600})
+	if res.IsError {
+		t.Fatalf("capture after lane death did not redial: %s", resultText(t, res))
+	}
+	if m := structured(t, res); m["capture_id"] != "cap-conn2" {
+		t.Errorf("capture_id = %v, want the redialed lane's answer", m["capture_id"])
 	}
 }
