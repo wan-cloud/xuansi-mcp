@@ -1,0 +1,17 @@
+{
+  "cap_id": "20260101T000000-aa11bb-la-listen-1",
+  "board": "aa11bb",
+  "mode": "listen",
+  "port": 1,
+  "pin": 38,
+  "baud": 115200,
+  "idle_syms": 4,
+  "t_start_ns": 0,
+  "t_end_ns": 0,
+  "bytes": 0,
+  "chunks": 0,
+  "reason": "stopped",
+  "stream_bytes": 0,
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "pulled_at": "2026-01-01T00:00:00Z"
+}
