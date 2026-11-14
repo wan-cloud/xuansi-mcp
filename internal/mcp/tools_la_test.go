@@ -12,8 +12,10 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,9 +24,161 @@ import (
 	"xuansi/internal/server"
 )
 
+// newEnvLA wires the two-connection fake daemon the LA face needs.
+// Accept order is made DETERMINISTIC (one goroutine accepts both, in
+// order): wireMCP's ts.c dial is connection #1 — the shared wire,
+// which must stay QUIET (any request on it fails loudly: the pin that
+// la_capture never rides the shared conn) — and the lane's lazy dial
+// is connection #2, carrying the capture script.
+func newEnvLA(t *testing.T, laneScript []step) (*env, chan server.Request) {
+	t.Helper()
+	fd := newFakeDaemon(t)
+	laneReqs := make(chan server.Request, 16)
+	go func() {
+		shared, err := fd.ln.Accept()
+		if err != nil {
+			return
+		}
+		lane, err := fd.ln.Accept()
+		if err != nil {
+			shared.Close()
+			return
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); scriptConn(t, shared, nil, nil) }() // empty: loud on any request
+		go func() { defer wg.Done(); scriptConn(t, lane, laneScript, laneReqs) }()
+		wg.Wait()
+	}()
+	return wireMCP(t, fd, Options{Holder: "mcp-fixed01"}), laneReqs
+}
+
+// scriptConn serves serveScript's contract on one specific connection.
+func scriptConn(t *testing.T, conn net.Conn, script []step, reqs chan server.Request) {
+	for i := 0; ; i++ {
+		var req server.Request
+		if err := server.ReadMsg(conn, &req); err != nil {
+			return // client close / broken pipe: expected shutdown path
+		}
+		if reqs != nil {
+			select {
+			case reqs <- req:
+			default:
+				t.Errorf("fake daemon: unexpected extra request %+v", req)
+			}
+		}
+		if i >= len(script) {
+			t.Errorf("fake daemon: request %d (%s) beyond the %d-step script", i, req.Type, len(script))
+			return
+		}
+		st := script[i]
+		rep := &server.Reply{Type: "reply", ID: req.ID, Result: st.result}
+		if st.rerr != nil {
+			rep = &server.Reply{Type: "reply", ID: req.ID, Error: st.rerr}
+		}
+		if err := server.WriteMsg(conn, rep); err != nil {
+			t.Errorf("fake daemon reply: %v", err)
+		}
+	}
+}
+
+// TestLACaptureRidesItsOwnLane: while la_capture blocks on the
+// dedicated lane, a call on the SHARED connection answers — the
+// seat-check red (the stimulus lease landed only when the capture
+// ended: one daemon connection serves its requests serially, so a
+// blocking capture on the shared wire head-of-line blocked every other
+// tool). The shared wire must also never see the la_capture request.
+func TestLACaptureRidesItsOwnLane(t *testing.T) {
+	fd := newFakeDaemon(t)
+	laneSeen := make(chan server.Request, 1)
+	releaseLane := make(chan struct{})
+	shared := make(chan server.Request, 1)
+	go func() {
+		c1, err := fd.ln.Accept()
+		if err != nil {
+			return
+		}
+		c2, err := fd.ln.Accept()
+		if err != nil {
+			c1.Close()
+			return
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { // the shared wire: answers list_boards, fails on anything else
+			defer wg.Done()
+			for {
+				var req server.Request
+				if err := server.ReadMsg(c1, &req); err != nil {
+					return
+				}
+				shared <- req
+				if req.Type != "list_boards" {
+					t.Errorf("shared wire saw %s — the capture must ride the lane", req.Type)
+					return
+				}
+				replyCapture(t, c1, req.ID, map[string]any{"boards": []any{}})
+			}
+		}()
+		go func() { // the lane: holds the la_capture reply until released
+			defer wg.Done()
+			for {
+				var req server.Request
+				if err := server.ReadMsg(c2, &req); err != nil {
+					return
+				}
+				if req.Type != "la_capture" {
+					t.Errorf("lane saw unexpected %s", req.Type)
+					return
+				}
+				select {
+				case laneSeen <- req:
+				default:
+				}
+				<-releaseLane
+				replyCapture(t, c2, req.ID, map[string]any{
+					"capture_id": "lane-1", "path": "/p", "meta": map[string]any{"cap_id": "lane-1"}})
+			}
+		}()
+		wg.Wait()
+	}()
+	e := wireMCP(t, fd, Options{Holder: "mcp-fixed01"})
+
+	capDone := e.callAsync("xuansi_la_capture", map[string]any{
+		"board": "b", "port": 1, "pin": 38, "baud": 115200})
+	select {
+	case req := <-laneSeen:
+		if req.Holder != "mcp-fixed01" {
+			t.Errorf("lane request holder = %q, want the process holder", req.Holder)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the la_capture request never reached the lane")
+	}
+
+	// the shared wire answers WHILE the capture holds the lane
+	sharedDone := e.callAsync("xuansi_list_boards", map[string]any{})
+	select {
+	case res := <-sharedDone:
+		if res.IsError {
+			t.Fatalf("list_boards failed while the capture held the lane: %s", resultText(t, res))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("list_boards blocked behind la_capture — the lane discipline regressed")
+	}
+
+	close(releaseLane)
+	res := waitResult(t, capDone, "la_capture")
+	if res.IsError {
+		t.Fatalf("la_capture failed: %s", resultText(t, res))
+	}
+	if got := len(shared); got != 1 {
+		t.Errorf("shared wire saw %d request(s), want exactly the one list_boards", got)
+	}
+}
+
 // TestLACaptureCrossingAndReply: the tool crosses ONE holder-stamped
-// la_capture carrying the arm trio + bounds, and answers
-// {capture_id, path, meta} with the daemon's meta verbatim.
+// la_capture ON THE DEDICATED LANE carrying the arm trio + bounds, and
+// answers {capture_id, path, meta} with the daemon's meta verbatim.
 func TestLACaptureCrossingAndReply(t *testing.T) {
 	meta := map[string]any{
 		"cap_id": "20261115T101112-38f2c1-la-listen-1", "board": "38f2c1",
@@ -32,11 +186,11 @@ func TestLACaptureCrossingAndReply(t *testing.T) {
 		"baud": float64(115200), "bytes": float64(21), "chunks": float64(4),
 		"reason": "full", "sha256": "abc123", "stream_bytes": float64(61),
 	}
-	e, reqs := newEnv(t, []step{{result: map[string]any{
+	e, reqs := newEnvLA(t, []step{{result: map[string]any{
 		"capture_id": "20261115T101112-38f2c1-la-listen-1",
 		"path":       "/data/captures/la/20261115T101112-38f2c1-la-listen-1/data.bin",
 		"meta":       meta,
-	}}}, Options{Holder: "mcp-fixed01"})
+	}}})
 
 	res := e.call("xuansi_la_capture", map[string]any{
 		"board": "bench2", "port": 1, "pin": 38, "baud": "auto",
@@ -66,8 +220,8 @@ func TestLACaptureCrossingAndReply(t *testing.T) {
 // TestLACaptureModeCrossesAndOmittedDefaults: an explicit mode rides
 // the crossing; omitted crosses empty (the daemon's "listen" default).
 func TestLACaptureModeCrossesAndOmittedDefaults(t *testing.T) {
-	e, reqs := newEnv(t, []step{{result: map[string]any{"capture_id": "x", "path": "/p", "meta": map[string]any{"cap_id": "x"}}},
-		{result: map[string]any{"capture_id": "y", "path": "/q", "meta": map[string]any{"cap_id": "y"}}}}, Options{Holder: "mcp-fixed01"})
+	e, reqs := newEnvLA(t, []step{{result: map[string]any{"capture_id": "x", "path": "/p", "meta": map[string]any{"cap_id": "x"}}},
+		{result: map[string]any{"capture_id": "y", "path": "/q", "meta": map[string]any{"cap_id": "y"}}}})
 
 	res := e.call("xuansi_la_capture", map[string]any{
 		"board": "b", "mode": "listen", "port": 2, "pin": 5, "baud": 9600,
@@ -92,7 +246,7 @@ func TestLACaptureModeCrossesAndOmittedDefaults(t *testing.T) {
 // layer survives the crossing.
 func TestLACaptureArmRefusalCrossesCoach(t *testing.T) {
 	coach := "la.listen_arm: ring budget 4096KB exceeded: active 3968KB + request 512KB (caps la_ring_budget_kb) — stop or disarm an armed capture first, or shrink ring_kb"
-	e, _ := newEnv(t, []step{{rerr: &server.RPCError{Class: "api", Msg: coach}}}, Options{Holder: "mcp-fixed01"})
+	e, _ := newEnvLA(t, []step{{rerr: &server.RPCError{Class: "api", Msg: coach}}})
 
 	res := e.call("xuansi_la_capture", map[string]any{"board": "b", "port": 1, "pin": 38, "baud": 115200})
 	if !res.IsError {
@@ -107,8 +261,8 @@ func TestLACaptureArmRefusalCrossesCoach(t *testing.T) {
 // answers an error that NAMES the landed object and its forensics
 // status — the seat can still reach the object.
 func TestLACaptureIncompleteLandingCoaches(t *testing.T) {
-	e, _ := newEnv(t, []step{{rerr: &server.RPCError{Class: "server",
-		Msg: "la_capture 20261115T101112-38f2c1-la-listen-1: la: capture landed incomplete: context canceled — the object landed INCOMPLETE (meta incomplete:true, no verified sha256): forensics only, readable via la_info/la_frames, never a lossless capture"}}}, Options{Holder: "mcp-fixed01"})
+	e, _ := newEnvLA(t, []step{{rerr: &server.RPCError{Class: "server",
+		Msg: "la_capture 20261115T101112-38f2c1-la-listen-1: la: capture landed incomplete: context canceled — the object landed INCOMPLETE (meta incomplete:true, no verified sha256): forensics only, readable via la_info/la_frames, never a lossless capture"}}})
 
 	res := e.call("xuansi_la_capture", map[string]any{"board": "b", "port": 1, "pin": 38, "baud": 115200})
 	if !res.IsError {

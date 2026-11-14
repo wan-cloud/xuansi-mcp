@@ -12,9 +12,11 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"xuansi/internal/apiclient"
 	"xuansi/internal/server"
 )
 
@@ -113,7 +115,7 @@ func (ts *toolset) registerLA(srv *mcpsdk.Server) {
 		Name: "xuansi_la_capture",
 		Description: "Arm the board's LA LISTEN ENGINE (protocol v9) and BLOCK until the capture ends AND the on-board ring is pulled back VERIFIED (two-pass sha256 identity) — the answer is a capture OBJECT the other la_* tools analyze. " + laAntiConfusion + ": xuansi_capture records an event source to a file; THIS arms the hardware UART as a passive protocol listener (RX-only by construction — no TX path exists, fw-frozen) that timestamps every byte, then lands captures/la/<capture_id>/{data.bin,meta.json} on the daemon host. " +
 			"THE WIRE: connect the line under study to pin (a free GPIO on the listening board — its pin map; the fw refuses banned pins with the list), port selects the hw UART (1/2), baud the line's integer rate 1200..5000000 or \"auto\" (measured; meta.baud carries what it measured). ring_kb sizes the on-board ring (admission vs la_ring_budget_kb=4096 — read caps; ring full ends reason \"full\"), seconds the time bound (1..600; ends reason \"limit\"). " +
-			"BLOCKING: the call holds until the pull-back is verified — budget seconds plus read-back time. " +
+			"BLOCKING: the call holds until the pull-back is verified — budget seconds plus read-back time. The block rides a DEDICATED daemon lane: every other xuansi tool keeps answering while it holds (drive a stimulus board on another lease mid-capture — that is the workflow). " +
 			"THE VERDICT IS IN THE REPLY: meta.incomplete ABSENT = the lossless promise HELD (sha256 verified); an ERROR naming the capture id = the pull broke (cancel, link death, checksum) and the incomplete object landed as FORENSICS — readable via xuansi_la_info/xuansi_la_frames, never a trustworthy capture. " +
 			"Mutual exclusion: the same hw UART cannot run bench uart primitives and the listener at once (the board refuses, naming the conflict — both directions). " +
 			"FIRST LOOK after a capture: xuansi_la_frames (the idle framing — the protocol's sentence structure), xuansi_la_repeat when the traffic looks periodic (poll loops, heartbeats), xuansi_la_decode_uart for a per-frame parity verdict. Holder semantics: " + holderDesc + ".",
@@ -161,8 +163,49 @@ func (ts *toolset) registerLA(srv *mcpsdk.Server) {
 // ---------------------------------------------------------------------------
 // handlers — thin crossings over the daemon's la_* requests
 
+// laClient answers the LA face's dedicated long-call lane, dialing it
+// lazily (most processes never capture; the lane exists exactly for
+// the blocking pull). A dead lane is re-dialed on the next call — the
+// daemon's per-connection holder binding rides each request anyway.
+func (ts *toolset) laClient() (*apiclient.Client, error) {
+	ts.laMu.Lock()
+	defer ts.laMu.Unlock()
+	if ts.laCli != nil {
+		select {
+		case <-ts.laCli.Done():
+			ts.laCli.Close() // the dead lane's teardown is idempotent
+		default:
+			return ts.laCli, nil // still live: reuse the lane
+		}
+	}
+	c, err := apiclient.Dial(ts.c.Path())
+	if err != nil {
+		return nil, fmt.Errorf("la capture lane: %w", err)
+	}
+	ts.laCli = c
+	return c, nil
+}
+
+// closeLA tears the LA lane down (the test env's cleanup seam;
+// production exits with the process).
+func (ts *toolset) closeLA() {
+	ts.laMu.Lock()
+	defer ts.laMu.Unlock()
+	if ts.laCli != nil {
+		ts.laCli.Close()
+		ts.laCli = nil
+	}
+}
+
 func (ts *toolset) laCapture(ctx context.Context, _ *mcpsdk.CallToolRequest, in laCaptureIn) (*mcpsdk.CallToolResult, laCaptureOut, error) {
-	res, err := ts.callHeld(ctx, server.Request{
+	// the dedicated lane: this call blocks up to seconds + pull time —
+	// the shared connection keeps serving every other tool meanwhile
+	// (drive a stimulus board on it mid-capture; that is the workflow)
+	c, err := ts.laClient()
+	if err != nil {
+		return nil, laCaptureOut{}, err
+	}
+	res, err := ts.callHeldOn(ctx, c, server.Request{
 		Type: "la_capture", Board: in.Board, Holder: in.Holder,
 		Mode: in.Mode, LaPort: in.Port, LaPin: in.Pin, Baud: in.Baud,
 		RingKB: in.RingKB, MaxSeconds: in.Seconds,
@@ -182,9 +225,9 @@ func (ts *toolset) laList(ctx context.Context, _ *mcpsdk.CallToolRequest, _ stru
 	if err != nil {
 		return nil, nil, err
 	}
-	// the daemon's listing crosses VERBATIM (the meta shape is frozen
-	// at capture — the seat does not re-shape ground truth).
-	return nil, res["captures"], nil
+	// the daemon's {captures:[…]} view crosses VERBATIM (the meta shape
+	// is frozen at capture — the seat does not re-shape ground truth).
+	return nil, res, nil
 }
 
 func (ts *toolset) laInfo(ctx context.Context, _ *mcpsdk.CallToolRequest, in laInfoIn) (*mcpsdk.CallToolResult, any, error) {

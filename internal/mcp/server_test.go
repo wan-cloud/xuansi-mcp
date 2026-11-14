@@ -165,6 +165,7 @@ func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.Cli
 	t.Cleanup(func() {
 		stop()          // the refresh loop goes down before the connection it rides
 		ts.stopEvents() // the event face's feed + notifier (no-op for the loop's own stop)
+		ts.closeLA()    // the LA face's dedicated long-call lane (no-op when never dialed)
 		cl.Close()
 		ss.Close()
 		c.Close()

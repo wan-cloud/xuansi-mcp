@@ -51,6 +51,17 @@ type toolset struct {
 
 	feedMu   sync.Mutex
 	feedStop func() // the ONE apiclient event feed's cancel (nil = not armed)
+
+	// laMu/laCli is the LA face's dedicated long-call lane (T7): the
+	// daemon serves one connection's requests SERIALLY, so the
+	// BLOCKING la_capture (up to seconds + pull time) must not ride
+	// the shared connection — it would head-of-line block every other
+	// tool for the whole capture (first seat-check red: the stimulus
+	// lease landed the instant the capture ended, 8s of silence).
+	// Dialed lazily from ts.c.Path(); the same holder rides it (the
+	// daemon binds holders per connection; one process, one identity).
+	laMu  sync.Mutex
+	laCli *apiclient.Client
 }
 
 // call sends a request the proto types holder-less (list_boards,
@@ -71,8 +82,15 @@ func (ts *toolset) call(ctx context.Context, req server.Request) (map[string]any
 // winner's success would pin the loser as the identity; review round
 // 1), so it never settles.
 func (ts *toolset) callHeld(ctx context.Context, req server.Request) (map[string]any, error) {
+	return ts.callHeldOn(ctx, ts.c, req)
+}
+
+// callHeldOn is callHeld over a specific client (the LA face's
+// dedicated long-call lane): same holder stamping, same settle
+// discipline, a different wire.
+func (ts *toolset) callHeldOn(ctx context.Context, c *apiclient.Client, req server.Request) (map[string]any, error) {
 	req.Holder = ts.holders.effective(req.Holder)
-	res, err := invoke(ctx, ts.c, req)
+	res, err := invoke(ctx, c, req)
 	var rerr *server.RPCError
 	switch {
 	case errors.As(err, &rerr) && rerr.Class == "holder":

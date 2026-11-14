@@ -104,6 +104,11 @@ func (r *capReg) stop() {
 	r.closeOnce.Do(func() { close(r.quit) })
 }
 
+// Path answers the daemon socket this client rides (the LA face dials
+// a second connection to it — the blocking la_capture must not
+// head-of-line block this process's shared connection).
+func (c *Client) Path() string { return c.path }
+
 // Dial connects to the daemon's unix socket and starts the background
 // read loop. An unreachable daemon gets the same actionable message
 // the CLI prints (mirror of cmd/xuansi/client.go).
