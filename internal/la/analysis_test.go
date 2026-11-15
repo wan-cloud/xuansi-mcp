@@ -1,7 +1,6 @@
 package la
 
 import (
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -185,8 +184,9 @@ func TestFramesTruncationBounds(t *testing.T) {
 }
 
 func TestFramesModeAndBaudGuards(t *testing.T) {
-	if _, err := Frames(synthRef(t, Meta{Mode: "edge", Baud: 9600}, nil), 0, 0); !errors.Is(err, ErrFormatNotLanded) {
-		t.Errorf("edge mode err = %v, want ErrFormatNotLanded", err)
+	if _, err := Frames(synthRef(t, Meta{Mode: "edge", Baud: 9600}, nil), 0, 0); err == nil ||
+		!strings.Contains(err.Error(), "LISTEN") {
+		t.Errorf("edge mode err = %v, want the LISTEN-captures coach", err)
 	}
 	if _, err := Frames(synthRef(t, Meta{Mode: "garbage", Baud: 9600}, nil), 0, 0); err == nil || strings.Contains(err.Error(), "not landed") {
 		t.Errorf("garbage mode err = %v, want a plain unknown-mode error", err)

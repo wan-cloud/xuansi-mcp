@@ -577,8 +577,8 @@ var opsFaceAllowlistPinned = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
 	"diag.pins", "diag.stats", "diag.streamtest",
-	"la.disarm", "la.edge_arm", "la.info", "la.listen_arm", "la.read", "la.stop",
-	"log.read", "lua.check",
+	"la.disarm", "la.edge_arm", "la.info", "la.listen_arm", "la.read",
+	"la.sample_arm", "la.stop", "log.read", "lua.check",
 	"wifi.off", "wifi.setup", "wifi.status",
 }
 
@@ -717,6 +717,7 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_la_measure":     {"capture_id", "a", "b"},
 	"xuansi_la_diff":        {"capture_a", "capture_b"},
 	"xuansi_la_decode_wire": {"capture_id", "proto"},
+	"xuansi_la_decode_bus":  {"capture_id", "proto"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static

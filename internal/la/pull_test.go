@@ -58,12 +58,18 @@ type scriptedBoard struct {
 	edge     bool
 	edgeMeta map[string]any
 	edgePins []any
+
+	// the samples face (T13): sample=true serves la.sample_arm/
+	// {cap,rate_hz} and la.info's sample shape (sampleMeta).
+	sample     bool
+	sampleMeta map[string]any
+	rateHz     int64
 }
 
 func newBoard(ring []byte) *scriptedBoard {
 	return &scriptedBoard{
 		regs: map[int]evReg{}, ring: ring, capID: 7, baud: 115200,
-		stopB: 0, stopR: "stopped", dieAt: -1, flipAt: -1,
+		stopB: 0, stopR: "stopped", dieAt: -1, flipAt: -1, rateHz: 1_000_000,
 	}
 }
 
@@ -140,6 +146,14 @@ func (b *scriptedBoard) Op(ctx context.Context, op string, args map[string]any) 
 			b.push("la", map[string]any{"event": "done", "cap": b.capID, "bytes": b.stopB, "reason": b.stopR})
 		}
 		return map[string]any{"cap": b.capID, "res_hz": int64(80_000_000)}, nil
+	case "la.sample_arm":
+		if b.armErr != nil {
+			return nil, b.armErr
+		}
+		if b.pushDone {
+			b.push("la", map[string]any{"event": "done", "cap": b.capID, "bytes": b.stopB, "reason": b.stopR})
+		}
+		return map[string]any{"cap": b.capID, "rate_hz": b.rateHz}, nil
 	case "la.stop":
 		if b.stopGate != nil {
 			close(b.stopHere)
@@ -147,6 +161,17 @@ func (b *scriptedBoard) Op(ctx context.Context, op string, args map[string]any) 
 		}
 		return map[string]any{"bytes": b.stopB, "reason": b.stopR}, nil
 	case "la.info":
+		if b.sample {
+			meta := b.sampleMeta
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			return map[string]any{"caps": []any{map[string]any{
+				"cap": b.capID, "mode": "sample", "state": "stopped",
+				"bytes": b.stopB, "total": int64(len(b.ring)),
+				"meta": meta,
+			}}}, nil
+		}
 		if b.edge {
 			meta := b.edgeMeta
 			if meta == nil {

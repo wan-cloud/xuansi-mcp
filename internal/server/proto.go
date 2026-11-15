@@ -455,6 +455,23 @@ type Request struct {
 	B          *la.MeasurePoint `json:"b,omitempty"`
 	CaptureIDB string           `json:"capture_id_b,omitempty"`
 	Proto      string           `json:"proto,omitempty"`
+
+	// The samples face (T13). RateHz arms the sample engine
+	// (la_capture mode "samples": one of the six notches
+	// {1,2,5,10,20,40}MHz); Trig's samples vocabulary rides Ch
+	// (0..7 = D0..D7) and the kind "bits" window (Mask/Value/Width).
+	// BusMode/Cpol/Cpha/CSMask cross la_decode_bus's spi params
+	// (BusMode 0..3, 0 = the default; the pointers carry presence —
+	// one member of the pair given must agree with a nonzero mode);
+	// SdaCh/SclCh cross the i2c channel override (nil = the 2/1
+	// defaults).
+	RateHz int   `json:"rate_hz,omitempty"`
+	BusMode int  `json:"bus_mode,omitempty"`
+	Cpol    *int `json:"cpol,omitempty"`
+	Cpha    *int `json:"cpha,omitempty"`
+	CSMask  int  `json:"cs_mask,omitempty"`
+	SdaCh   *int `json:"sda_ch,omitempty"`
+	SclCh   *int `json:"scl_ch,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.

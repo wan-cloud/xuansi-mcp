@@ -11,7 +11,6 @@ package la
 
 import (
 	"encoding/binary"
-	"errors"
 	"strings"
 	"testing"
 )
@@ -286,9 +285,9 @@ func TestEdgeSeatsModeGuards(t *testing.T) {
 	if _, err := Edges(noT0, 0, 0, 0); err == nil || !strings.Contains(err.Error(), "t0_ns") {
 		t.Errorf("t0-less meta err = %v, want the t0_ns coach", err)
 	}
-	// Frames still refuses edge captures with ErrFormatNotLanded's seat
-	if _, err := Frames(noT0, 0, 0); !errors.Is(err, ErrFormatNotLanded) {
-		t.Errorf("Frames on edge err = %v, want ErrFormatNotLanded", err)
+	// Frames still refuses edge captures with the listen-seat coach
+	if _, err := Frames(noT0, 0, 0); err == nil || !strings.Contains(err.Error(), "LISTEN") {
+		t.Errorf("Frames on edge err = %v, want the LISTEN-captures coach", err)
 	}
 }
 

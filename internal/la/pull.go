@@ -112,13 +112,7 @@ func (s *Store) PullCapture(ctx context.Context, board PullBoard, armArgs ArmArg
 	// 2. The local handler rides BEFORE arm for the same reason: a
 	// done pushed during the arm op's own round trip is already
 	// queued when the wait starts.
-	evCh := make(chan replclient.Event, evQueue)
-	cancelEv := board.Conn.OnEvent("la", func(ev replclient.Event) {
-		select {
-		case evCh <- ev:
-		default: // never block the connection's read goroutine
-		}
-	})
+	evCh, cancelEv := subscribeLA(board.Conn)
 	defer cancelEv()
 
 	// 3. Arm. The board's refusal (coach message included) crosses
@@ -258,6 +252,21 @@ func (s *Store) PullCapture(ctx context.Context, board PullBoard, armArgs ArmArg
 	return ref, nil
 }
 
+// subscribeLA arms the pull families' local "la" event handler (the
+// shared step 2: registered BEFORE arm — a done pushed during the arm
+// op's own round trip is already queued when the wait starts; the
+// handler itself never blocks the connection's read goroutine).
+func subscribeLA(conn Board) (chan replclient.Event, func()) {
+	evCh := make(chan replclient.Event, evQueue)
+	cancel := conn.OnEvent("la", func(ev replclient.Event) {
+		select {
+		case evCh <- ev:
+		default: // never block the connection's read goroutine
+		}
+	})
+	return evCh, cancel
+}
+
 // landIncomplete is the broken-pull landing: parse what landed
 // tolerantly (a torn tail is expected, not fatal), mark the meta
 // incomplete, attempt the end-of-intent stop+disarm (idempotent both),
@@ -272,6 +281,18 @@ func (s *Store) landIncomplete(ref CaptureRef, meta Meta, conn Board, capNum int
 			if meta.T0NS > 0 { // the axis is absolute only when the ledger landed
 				meta.TStartNS = uint64(meta.T0NS)
 				meta.TEndNS = uint64(meta.T0NS) + st.SpanNS
+			}
+		}
+	} else if meta.Mode == "samples" {
+		// the byte form's tolerant account: no records to parse —
+		// whatever landed is that many samples (a short pull is the
+		// incompleteness itself, stated by the flag).
+		if fi, err := os.Stat(ref.DataPath); err == nil {
+			meta.Bytes = fi.Size()
+			meta.Samples = fi.Size()
+			if meta.T0NS > 0 && meta.RateHz > 0 {
+				meta.TStartNS = uint64(meta.T0NS)
+				meta.TEndNS = uint64(meta.T0NS) + uint64(fi.Size())*tickOf(meta.RateHz)
 			}
 		}
 	} else if st, err := parseStats(ref.DataPath, true); err == nil {

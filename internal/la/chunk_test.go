@@ -2,7 +2,6 @@ package la
 
 import (
 	"encoding/binary"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,10 +114,11 @@ func TestParseStatsTolerantStopsAtTear(t *testing.T) {
 }
 
 // The T10 run format landed with T11's reader (TestReadRunsGoldenAndTorn
-// in analysis_edges_test.go pins it); samples stays an honest stub until
-// the T12 wave freezes its record model.
+// in analysis_edges_test.go pins it); the T12 samples format landed
+// with T13's (TestReadSamplesGolden in decode_bus_test.go pins the
+// flat packed-u8 stream).
 func TestFormatStubsHonest(t *testing.T) {
-	if _, err := ReadSamples("whatever"); !errors.Is(err, ErrFormatNotLanded) {
-		t.Errorf("ReadSamples err = %v, want ErrFormatNotLanded", err)
+	if got, err := ReadSamples("nonexistent-data.bin"); err == nil || len(got) != 0 {
+		t.Errorf("ReadSamples on a missing file = %d bytes err=%v, want the os error", len(got), err)
 	}
 }

@@ -85,13 +85,21 @@ type Meta struct {
 	PulledAt   time.Time `json:"pulled_at"`
 }
 
-// TrigMeta is the edge capture's trigger as the fw's la.info mirror
-// carries it: the pin (a pins[] member), the frozen kind vocabulary,
+// TrigMeta is the trigger as the fw's la.info mirror carries it: the
+// edge capture's pin (a pins[] member), the frozen kind vocabulary,
 // the level (kind "level" only), and the pre-trigger window depth.
+// The samples capture's mirror rides the same shape with the CHANNEL
+// vocabulary: Ch names D0..D7 (bit i of every sample byte; the fw's
+// trig map key "ch"), and kind "bits" adds the bit-window match's
+// Mask/Value/Width (T12's addition to the language).
 type TrigMeta struct {
-	Pin   int    `json:"pin"`
-	Kind  string `json:"kind"`            // "edge_r" | "edge_f" | "level"
+	Pin   int    `json:"pin,omitempty"` // edge: a pins[] member
+	Ch    int    `json:"ch,omitempty"`  // samples: 0..7 = D0..D7
+	Kind  string `json:"kind"`          // "edge_r" | "edge_f" | "level" | "bits" (samples)
 	Level *int   `json:"level,omitempty"` // 0|1, kind "level" only (a pointer: presence is part of the request domain — an omitted level refuses)
+	Mask  uint8  `json:"mask,omitempty"`  // kind "bits" (samples) only: the window mask
+	Value uint8  `json:"value,omitempty"` // kind "bits" (samples) only: the window value
+	Width int    `json:"width,omitempty"` // kind "bits" (samples) only: consecutive samples
 	PreKB int    `json:"pre_kb"`          // pre-trigger window KB (0 = no history)
 }
 

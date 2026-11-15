@@ -16,8 +16,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"xuansi/internal/replclient"
 )
 
 // edgeResHzPinned is the fw's frozen edge resolution (XS_LA_EDGE_RES_HZ,
@@ -85,13 +83,7 @@ func (s *Store) PullEdge(ctx context.Context, board PullBoard, args EdgeArmArgs)
 	if _, err := board.Conn.Op(ctx, "events.subscribe", map[string]any{"source": "la"}); err != nil {
 		return CaptureRef{}, err
 	}
-	evCh := make(chan replclient.Event, evQueue)
-	cancelEv := board.Conn.OnEvent("la", func(ev replclient.Event) {
-		select {
-		case evCh <- ev:
-		default: // never block the connection's read goroutine
-		}
-	})
+	evCh, cancelEv := subscribeLA(board.Conn)
 	defer cancelEv()
 
 	// 3. Arm — the board's refusal (coach message included) crosses

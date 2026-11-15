@@ -20,12 +20,6 @@ type Chunk struct {
 	Data    []byte
 }
 
-// ErrFormatNotLanded is the honest stub reply of the reader families
-// whose capture formats land with their own waves (the samples
-// format: T12): the signature is frozen here so the analysis seats
-// consume one shape, the implementation is not.
-var ErrFormatNotLanded = errors.New("la: capture format not landed yet (samples: T12 wave)")
-
 // chunkHdr is the frozen per-record header: u64 start_ns + u16 n,
 // little-endian.
 const chunkHdr = 10
@@ -122,10 +116,13 @@ func ReadRuns(dataPath string) ([]Run, error) {
 	}
 }
 
-// ReadSamples parses a sample capture's records — the T12 format (the
-// record model is T12's to freeze; this signature is the seat).
-func ReadSamples(dataPath string) ([][]byte, error) {
-	return nil, ErrFormatNotLanded
+// ReadSamples loads the T12 sample stream whole: packed u8, one tick
+// one byte = the 8-channel bitmap (bit i = D_i), no record structure
+// — the file is the samples (the T5 frozen signature's honest landing:
+// the record-free form answers one flat slice, and the bus decode —
+// its one consumer — reads exactly that shape).
+func ReadSamples(dataPath string) ([]byte, error) {
+	return os.ReadFile(dataPath)
 }
 
 // runStats is the edge pull's parse account: run count, the stream's

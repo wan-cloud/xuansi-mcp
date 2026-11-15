@@ -204,7 +204,7 @@ type boardOpIn struct {
 	// Op's tag list is hand-maintained (a struct tag cannot render
 	// from the daemon's table) and pinned to server.AllowlistedOps()
 	// by TestBoardOpAllowlistSingleSource — update both together.
-	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats, diag.streamtest, la.disarm, la.edge_arm, la.info, la.listen_arm, la.read, la.stop, log.read, lua.check, wifi.off, wifi.setup, wifi.status (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools). lua.check is the fw's ro SYNTAX ground truth {code}→{ok, line?, msg?} — the authority xuansi_lua_lint's advisory findings defer to; diag.streamtest is the 0x02 synthetic producer (ch=254) — the module-free way to exercise the v8 stream subscription face (arm via xuansi_stream_read, then produce here); the la.* quintet is the LA wave's passive UART listen face (la.listen_arm{port,pin,baud,ring_kb,...}→{cap,baud}, completion via the \"la\" event source — RX-only by construction, no TX path exists)"`
+	Op     string         `json:"op" jsonschema:"one board op: budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave, diag.pins, diag.stats, diag.streamtest, la.disarm, la.edge_arm, la.info, la.listen_arm, la.read, la.sample_arm, la.stop, log.read, lua.check, wifi.off, wifi.setup, wifi.status (the daemon enforces this allowlist; eval/submit/fs/script/session ops are NOT reachable this way — use their own tools). lua.check is the fw's ro SYNTAX ground truth {code}→{ok, line?, msg?} — the authority xuansi_lua_lint's advisory findings defer to; diag.streamtest is the 0x02 synthetic producer (ch=254) — the module-free way to exercise the v8 stream subscription face (arm via xuansi_stream_read, then produce here); the la.* ops are the LA wave's capture faces: la.listen_arm{port,pin,baud,ring_kb,...}→{cap,baud} (passive UART listen, RX-only by construction) and la.sample_arm{rate_hz∈{1,2,5,10,20,40}MHz,ring_kb,trig?}→{cap,rate_hz} (the LCD_CAM 8-channel sampler), completion via the \"la\" event source — the object pulls prefer their MCP seats (xuansi_la_capture)"`
 	Args   map[string]any `json:"args,omitempty" jsonschema:"the op's parameters as a JSON object; numbers must be integers with absolute value below 2^53 (validated daemon-side with an \"api\" error); every other value shape crosses verbatim — the board is the authority"`
 	Holder string         `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
 }
@@ -437,6 +437,7 @@ var staticToolNames = []string{
 	"xuansi_la_frames",
 	"xuansi_la_repeat",
 	"xuansi_la_decode_uart",
+	"xuansi_la_decode_bus", // T13: the samples capture's i2c/spi decode
 	// T11 (LA edge wave): the edge analysis seats — the transition/
 	// run-length views, the deterministic statistics, the two-point
 	// measurement, the two-capture diff, and the wire decoders
@@ -611,6 +612,9 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 	ts.registerLA(srv)
 
 	ts.registerLAEdges(srv)
+
+	// T13 (samples wave): the bus decode + the samples capture mode.
+	ts.registerLASample(srv)
 }
 
 // ---------------------------------------------------------------------------

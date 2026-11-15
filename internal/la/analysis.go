@@ -261,7 +261,7 @@ func guardListen(ref CaptureRef, ch int) error {
 	switch ref.Meta.Mode {
 	case "listen":
 	case "edge", "samples":
-		return fmt.Errorf("la: capture %s is mode %q: %w", ref.ID, ref.Meta.Mode, ErrFormatNotLanded)
+		return fmt.Errorf("la: capture %s is mode %q — the framing seats read LISTEN captures (the edge seats are la_edges/la_runs/…; samples decode with la_decode_bus)", ref.ID, ref.Meta.Mode)
 	default:
 		return fmt.Errorf("la: capture %s has unknown mode %q", ref.ID, ref.Meta.Mode)
 	}

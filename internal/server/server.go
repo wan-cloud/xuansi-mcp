@@ -1274,6 +1274,8 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hLaDiff(req)
 	case "la_decode_wire":
 		result, err = s.hLaDecodeWire(req)
+	case "la_decode_bus": // T13: the samples capture's i2c/spi decode
+		result, err = s.hLaDecodeBus(req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}

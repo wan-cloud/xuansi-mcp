@@ -137,10 +137,10 @@ func laArmArgs(req *Request) (la.ArmArgs, error) {
 // names it: forensics are reachable, never silently lost.
 func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	switch req.Mode {
-	case "", "listen", "edge":
+	case "", "listen", "edge", "samples":
 	default:
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf(
-			"la_capture: mode %q — this wave lands \"listen\" and \"edge\" (the samples mode arrives with its own wave)", req.Mode)}
+			"la_capture: mode %q — this wave lands \"listen\", \"edge\", and \"samples\" (the LCD_CAM 8-channel sampler)", req.Mode)}
 	}
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -151,6 +151,9 @@ func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (
 	}
 	if req.Mode == "edge" {
 		return s.hLaCaptureEdge(ctx, req, b)
+	}
+	if req.Mode == "samples" {
+		return s.hLaCaptureSample(ctx, req, b)
 	}
 	// the request-shape gate first (zero-contact, era-independent):
 	// garbage is refused before any board fact matters.
@@ -268,6 +271,101 @@ func (s *Server) hLaCaptureEdge(ctx context.Context, req *Request, b discover.Bo
 		}
 		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
 			"la_capture %s: %v — the object landed INCOMPLETE (meta incomplete:true, no verified sha256): forensics only, readable via la_info/la_edges, never a lossless capture", ref.ID, perr)}
+	}
+	s.noteBoardContact(b.MAC6)
+	return map[string]any{"capture_id": ref.ID, "path": ref.DataPath, "meta": ref.Meta}, nil
+}
+
+// The samples arm's daemon-side domain (the cheap zero-contact
+// refusals; the board owns the rest — the six-notch rate table, the
+// DVP/camera mutex, the ring-budget admission arithmetic). The trig
+// mirrors the fw's frozen language: ch names the CHANNEL (0..7 =
+// D0..D7, the sample byte's bit), kind "bits" adds the bit-window
+// match (mask/value u8, width 1..64 — ch unused there, the mask spans
+// all eight channels).
+func laSampleArgs(req *Request) (la.SampleArmArgs, error) {
+	if req.LaPort != 0 || req.Baud != nil || len(req.Pins) > 0 {
+		return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: port/baud/pins are the LISTEN/EDGE arms' columns — the samples arm rides the fixed 8-channel DVP bus (got port=%d baud=%v pins=%v; omit them for mode \"samples\")", req.LaPort, req.Baud, req.Pins)}
+	}
+	if req.RateHz == 0 {
+		return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: "la_capture: rate_hz is required for mode \"samples\" — one of the six notches {1000000, 2000000, 5000000, 10000000, 20000000, 40000000} (exact 160MHz integer divisions)"}
+	}
+	if !la.SampleRateOK(req.RateHz) {
+		return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: rate_hz %d is not one of the six notches {1000000, 2000000, 5000000, 10000000, 20000000, 40000000} — the engine's clock is a 160MHz integer division, no other rate exists", req.RateHz)}
+	}
+	if req.RingKB < 64 || req.RingKB > laRingKBMax {
+		return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: ring_kb %d out of domain 64..%d — the samples arm has NO fw default (the ring is the capture's whole history bound; admission vs la_ring_budget_kb)", req.RingKB, laRingKBMax)}
+	}
+	arm := la.SampleArmArgs{RateHz: req.RateHz, RingKB: req.RingKB}
+	if req.MaxSeconds > 0 {
+		s := req.MaxSeconds
+		if s > laSecondsCap {
+			s = laSecondsCap
+		}
+		arm.MaxMS = int(s) * 1000
+	}
+	if t := req.Trig; t != nil {
+		switch t.Kind {
+		case "edge_r", "edge_f":
+		case "level":
+			if t.Level == nil {
+				return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: "la_capture: trig.level is REQUIRED for kind \"level\" (0|1 — which level to match)"}
+			}
+			if *t.Level != 0 && *t.Level != 1 {
+				return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+					"la_capture: trig.level %d — want 0|1", *t.Level)}
+			}
+		case "bits":
+			if t.Mask == 0 {
+				return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: "la_capture: kind \"bits\" needs mask and value (u8 — the window match sample&mask==value&mask; a zero mask matches everything trivially and is refused)"}
+			}
+			if t.Width < 0 || t.Width > 64 {
+				return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+					"la_capture: trig.width %d — want 1..64 consecutive samples (0/omitted = 1)", t.Width)}
+			}
+		default:
+			return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: trig.kind %q — want \"edge_r\"|\"edge_f\"|\"level\"|\"bits\"", t.Kind)}
+		}
+		if t.Kind != "bits" && (t.Ch < 0 || t.Ch > 7) {
+			return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: trig.ch %d — want 0..7 (= D0..D7, the sample byte's bit)", t.Ch)}
+		}
+		if t.PreKB < 0 || t.PreKB >= req.RingKB {
+			return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: trig.pre_kb %d must be < ring_kb %d (post-trigger needs room)", t.PreKB, req.RingKB)}
+		}
+		arm.Trig = &la.SampleTrig{Ch: t.Ch, Kind: t.Kind, Level: t.Level,
+			Mask: t.Mask, Value: t.Value, Width: t.Width, PreKB: t.PreKB}
+	}
+	return arm, nil
+}
+
+// hLaCaptureSample is la_capture's mode "samples" half: the same
+// gates, then PullSample owns the sample quintet.
+func (s *Server) hLaCaptureSample(ctx context.Context, req *Request, b discover.Board) (any, error) {
+	arm, aerr := laSampleArgs(req)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if v := s.protocolVer(b.MAC6); v > 0 && v < 9 {
+		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
+			"la_capture: board %s reports protocol_ver=%d — the la.* samples face is a v9 overlay (the T12 engine); the board fw must be upgraded first", b.MAC6, v)}
+	}
+	ctl, err := s.warmController(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+	ref, perr := s.laStore.PullSample(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	if perr != nil {
+		if ref.ID == "" {
+			return nil, perr
+		}
+		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
+			"la_capture %s: %v — the object landed INCOMPLETE (meta incomplete:true, no verified sha256): forensics only, readable via la_info/la_decode_bus, never a lossless capture", ref.ID, perr)}
 	}
 	s.noteBoardContact(b.MAC6)
 	return map[string]any{"capture_id": ref.ID, "path": ref.DataPath, "meta": ref.Meta}, nil
@@ -411,6 +509,20 @@ func (s *Server) hLaDecodeWire(req *Request) (any, error) {
 		return nil, laStoreRPC("la_decode_wire", req.CaptureID, err)
 	}
 	return la.DecodeWire(ref, req.Proto)
+}
+
+// hLaDecodeBus answers the samples capture's bus decode (the i2c/spi
+// transaction list — internal/la owns the semantics, frozen this
+// wave; daemon-local like the other analysis seats).
+func (s *Server) hLaDecodeBus(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_decode_bus", req.CaptureID, err)
+	}
+	return la.DecodeBus(ref, req.Proto, la.DecodeBusParams{
+		Mode: req.BusMode, Cpol: req.Cpol, Cpha: req.Cpha,
+		CSMask: uint8(req.CSMask), SDA: req.SdaCh, SCL: req.SclCh,
+	})
 }
 
 // laDisarmAll sweeps the board's residual la captures at the lease's
