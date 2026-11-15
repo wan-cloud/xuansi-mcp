@@ -206,7 +206,16 @@ func decodeWS2812(runs []Run, abs []uint64) WireResult {
 		appendTxn(&res, row)
 		open, latch = false, false
 	}
-	for i := 0; i < len(runs); i++ {
+	// The bit walk starts at run 1 — the run-0 doctrine Diff
+	// established this wave: run 0's WIDTH is an arm artifact (the
+	// time from arm to the first edge) and never carries signal. A
+	// line that sits HIGH at arm makes run 0 a high run whose width
+	// is meaningless as a bit (an idle-high arm gap would emit a
+	// phantom 1-bit frame; an arm merging with the first bit's high
+	// would force its value) — run 0 never opens a row, never latches
+	// one, never becomes a bit. Its LEVEL is still signal (a low run 0
+	// was a reset tail or idle — nothing either way, no row is open).
+	for i := 1; i < len(runs); i++ {
 		r := runs[i]
 		if r.Level != 1 {
 			if r.WidthNS >= wsResetLowNS {

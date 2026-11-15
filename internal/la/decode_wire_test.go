@@ -144,3 +144,78 @@ func TestDecodeWireGuards(t *testing.T) {
 		t.Errorf("multi-pin err = %v, want the ONE-line refusal", err)
 	}
 }
+
+// The run-0 doctrine (the one Diff established this wave): run 0's
+// WIDTH is an arm artifact — the time from arm to the first edge — and
+// never carries signal. WS2812 lines that sit HIGH at arm make this
+// load-bearing for the decoder: a HIGH run 0 must never become a bit.
+//
+// Case A — armed on idle-high, the frame's reset low follows: run 0
+// (the high arm-gap) must NOT emit a phantom 1-bit latched frame
+// before the real one.
+func TestDecodeWireWS2812Run0ArmGapHigh(t *testing.T) {
+	var out []srun
+	out = append(out, srun{1, 5_000_000})           // the HIGH arm gap (idle-high line)
+	out = append(out, srun{0, 300_000})             // the frame's reset low
+	for _, b := range []byte{0x12, 0x34, 0x56, 0xab, 0xcd, 0xef} {
+		for i := 7; i >= 0; i-- {
+			out = wsBits(out, int(b>>uint(i)&1))
+		}
+	}
+	out = append(out, srun{0, 300_000}) // the latch gap
+	ref := synthEdge(t, edgeMeta("wsA", []int{6}, 8_000_000_000), encRuns(out...))
+
+	got, err := DecodeWire(ref, "ws2812")
+	if err != nil {
+		t.Fatalf("DecodeWire case A: %v", err)
+	}
+	if len(got.Txns) != 1 {
+		t.Fatalf("case A txns = %d (%+v), want 1 — run 0's arm-gap high must not open a phantom frame", len(got.Txns), got.Txns)
+	}
+	tx := got.Txns[0]
+	if tx.NBits != 48 || tx.Bytes != "123456abcdef" || tx.Latched == nil || !*tx.Latched {
+		t.Errorf("case A frame = %+v, want the real 48-bit frame latched", tx)
+	}
+}
+
+// Case B — the arm lands so the idle-high RUN 0 MERGES with the first
+// bit's high (no edge between them): run 0's width is the artifact
+// and the first bit is honestly UNKNOWABLE — skipped, not guessed.
+// The frame's first true bit here is 0 (0x12's MSB); run 0's ms-scale
+// width would force it to 1 without the exclusion.
+func TestDecodeWireWS2812Run0MergedWithFirstBit(t *testing.T) {
+	var out []srun
+	// run 0 = 5ms idle-high fused with the first bit's T0H (350ns):
+	// the engine sees ONE high run — its width is meaningless as a bit
+	out = append(out, srun{1, 5_000_350})
+	out = append(out, srun{0, 900}) // the first bit's T0L
+	for _, b := range []byte{0x12, 0x34, 0x56, 0xab, 0xcd, 0xef} {
+		for i := 7; i >= 0; i-- {
+			if b == 0x12 && i == 7 {
+				continue // the first bit already rode run 0's merge
+			}
+			out = wsBits(out, int(b>>uint(i)&1))
+		}
+	}
+	out = append(out, srun{0, 300_000})
+	ref := synthEdge(t, edgeMeta("wsB", []int{6}, 8_000_000_000), encRuns(out...))
+
+	got, err := DecodeWire(ref, "ws2812")
+	if err != nil {
+		t.Fatalf("DecodeWire case B: %v", err)
+	}
+	if len(got.Txns) != 1 {
+		t.Fatalf("case B txns = %d, want 1", len(got.Txns))
+	}
+	tx := got.Txns[0]
+	if tx.NBits != 47 || tx.NLEDs != 1 || tx.RemainderBits != 23 {
+		t.Errorf("case B counts = %+v, want 47 bits / 1 LED / remainder 23 (the first bit is honestly gone)", tx)
+	}
+	// the surviving bits are the frame's bits 1..47, MSB-first per byte
+	if tx.Bytes != "2468ad579b" {
+		t.Errorf("case B bytes = %q, want the shifted assembly 2468ad579b", tx.Bytes)
+	}
+	if tx.Latched == nil || !*tx.Latched {
+		t.Errorf("case B latched = %v, want true (the reset gap closed it)", tx.Latched)
+	}
+}
