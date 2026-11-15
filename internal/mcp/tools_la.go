@@ -41,8 +41,9 @@ type laCaptureIn struct {
 	// Trig is the edge/sample arm's optional trigger (the frozen
 	// small language — a line-level match, no protocol semantics).
 	Trig *laTrigIn `json:"trig,omitempty" jsonschema:"EDGE/SAMPLES only: optional trigger. EDGE: {pin (a pins[] member), kind \"edge_r\"|\"edge_f\"|\"level\", level 0|1 (kind \"level\"), pre_kb < ring_kb} — the ring runs CIRCULAR (keeping pre_kb of history) until the match, then fills linearly (reason \"trig\"). SAMPLES: {ch 0..7 (= D0..D7) or kind \"bits\" {mask, value, width?}, pre_kb} — same circular→linear shape over the sample stream; without one it fills linearly from arm (reason \"full\")"`
-	// RingKB sizes the on-board ring; 0 (omitted) = the fw default.
-	RingKB int `json:"ring_kb,omitempty" jsonschema:"on-board ring buffer KB. LISTEN: 0 = fw default. EDGE/SAMPLES: REQUIRED, 64..4096 (no default exists — the ring is the capture's whole history bound). Admission: active rings + this request must fit la_ring_budget_kb=4096 (read caps) — the board's refusal itemizes the account. The capture ends reason \"full\" (no trig) when the ring fills"`
+	// RingKB sizes the on-board ring; REQUIRED 64..4096 in every mode
+	// — no fw default exists on any arm (LA final review C1).
+	RingKB int `json:"ring_kb,omitempty" jsonschema:"on-board ring buffer KB. REQUIRED in every mode, 64..4096 — no fw default exists (LISTEN included; the ring is the capture's whole history bound). Admission: active rings + this request must fit la_ring_budget_kb=4096 (read caps) — the board's refusal itemizes the account. The capture ends reason \"full\" (no trig) when the ring fills"`
 	// RateHz arms the SAMPLES engine.
 	RateHz int `json:"rate_hz,omitempty" jsonschema:"SAMPLES only (mode \"samples\"): the sample rate — one of the six notches {1000000, 2000000, 5000000, 10000000, 20000000, 40000000} (exact 160MHz integer divisions, no other rate exists; ≤20MHz is the lossless band — 40MHz carries a documented ~0.1-0.2% tear cost)"`
 	// Seconds is the time bound → the fw's max_ms (the arm crosses

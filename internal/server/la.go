@@ -112,9 +112,9 @@ func laArmArgs(req *Request) (la.ArmArgs, error) {
 	if berr != nil {
 		return la.ArmArgs{}, berr
 	}
-	if req.RingKB < 0 || req.RingKB > laRingKBMax {
+	if req.RingKB < 64 || req.RingKB > laRingKBMax {
 		return la.ArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
-			"la_capture: ring_kb %d out of domain 0..%d (0 = the fw default; the admission cap la_ring_budget_kb counts active rings + request — read caps)", req.RingKB, laRingKBMax)}
+			"la_capture: ring_kb %d out of domain 64..%d — the listen arm has NO fw default (the ring is the capture's whole history bound; admission vs la_ring_budget_kb)", req.RingKB, laRingKBMax)}
 	}
 	arm := la.ArmArgs{Port: req.LaPort, Pin: req.LaPin, Baud: baud, RingKB: req.RingKB}
 	if req.MaxSeconds > 0 {

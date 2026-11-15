@@ -416,7 +416,8 @@ type Request struct {
 	// The LA wave's fields (protocol v9, T7). LaPort/LaPin/Baud/RingKB
 	// arm the listen engine (la_capture): LaPort selects the hw UART
 	// (1..2), LaPin the explicit GPIO, Baud the int 1200..5000000 or
-	// the string "auto", RingKB the on-board ring (0 = fw default);
+	// the string "auto", RingKB the on-board ring (REQUIRED
+	// 64..4096 — no fw default on any arm, the edge/samples shape);
 	// MaxSeconds rides la_capture as the time bound (seconds → the
 	// fw's max_ms, clamped 1..600 like capture's) and stretches this
 	// request's OWN ceiling past the 60s default (Server.process). CaptureID addresses one landed object

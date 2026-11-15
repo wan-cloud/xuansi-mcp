@@ -199,7 +199,7 @@ func TestLaCaptureV8GateRefuses(t *testing.T) {
 		t.Fatalf("op: %#v", rep)
 	}
 	rep, _ := c.call(3, map[string]any{"type": "la_capture", "board": mac, "holder": "h1",
-		"la_port": 1, "la_pin": 38, "baud": 9600})
+		"la_port": 1, "la_pin": 38, "baud": 9600, "ring_kb": 64})
 	rerr := errOf(t, rep)
 	if asStr(rerr["class"]) != "server" || !strings.Contains(asStr(rerr["msg"]), "protocol_ver=8") {
 		t.Errorf("v8 gate error = %#v, want the honest v9-overlay refusal", rerr)
@@ -242,6 +242,63 @@ func TestLaCaptureDomainRefusalsZeroContact(t *testing.T) {
 	}
 	if got := e.dialedTCP(mac); got != dials {
 		t.Errorf("domain refusals dialed %d→%d — the gate must be zero-contact", dials, got)
+	}
+}
+
+// TestLaListenRingDomainNoFwDefault (LA final review C1): the listen
+// arm's ring domain is 64..4096 REQUIRED — the fw face's
+// la.listen_arm op comment has NO listen ring default, so the daemon
+// must not promise one. 0
+// (also the omitted crossing) and out-of-range refuse zero-contact
+// with the no-default coach; the 64/4096 boundaries answer
+// arm-shaped (la.ArmArgs carries them — the same shape edge/samples
+// gate with).
+func TestLaListenRingDomainNoFwDefault(t *testing.T) {
+	const mac = "38f2c1"
+	e := newEnv(t, nil, mkBoard(mac, "bench2.local"))
+	e.srv.laStore.Root = filepath.Join(t.TempDir(), "la")
+	scriptLABoard(e.fakes[mac], nil, 0)
+	c := dialSock(t, e.sock)
+	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "h1"}); rep["error"] != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	dials := e.dialedTCP(mac)
+	// the corrected coach on the 0 seat (the old text promised a fw
+	// default that does not exist) and on the omitted crossing
+	for i, args := range []map[string]any{
+		{"la_port": 1, "la_pin": 38, "baud": 9600, "ring_kb": 0},
+		{"la_port": 1, "la_pin": 38, "baud": 9600}, // omitted = 0, same lie removed
+		{"la_port": 1, "la_pin": 38, "baud": 9600, "ring_kb": 32},
+		{"la_port": 1, "la_pin": 38, "baud": 9600, "ring_kb": 4097},
+	} {
+		r := map[string]any{"type": "la_capture", "board": mac, "holder": "h1"}
+		for k, v := range args {
+			r[k] = v
+		}
+		rep, _ := c.call(int64(30+i), r)
+		er := asMap(rep["error"])
+		if er == nil || asStr(er["class"]) != "api" {
+			t.Errorf("case %d (%v): error = %#v, want a zero-contact api refusal", i, args, er)
+			continue
+		}
+		msg := asStr(er["msg"])
+		if !strings.Contains(msg, "out of domain 64..4096") || !strings.Contains(msg, "listen arm has NO fw default") {
+			t.Errorf("case %d (%v): msg = %q, want the no-default 64..4096 coach", i, args, msg)
+		}
+	}
+	if got := e.dialedTCP(mac); got != dials {
+		t.Errorf("ring domain refusals dialed %d→%d — the gate must be zero-contact", dials, got)
+	}
+	// the boundaries cross arm-shaped: laArmArgs answers them verbatim
+	for _, kb := range []int{64, 4096} {
+		arm, aerr := laArmArgs(&Request{LaPort: 1, LaPin: 38, Baud: 9600, RingKB: kb})
+		if aerr != nil {
+			t.Errorf("ring_kb %d: laArmArgs refused: %v", kb, aerr)
+			continue
+		}
+		if arm.RingKB != kb {
+			t.Errorf("ring_kb %d crossed as %d — the boundary must survive the arm shape", kb, arm.RingKB)
+		}
 	}
 }
 
