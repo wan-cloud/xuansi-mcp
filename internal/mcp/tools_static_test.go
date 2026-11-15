@@ -577,7 +577,7 @@ var opsFaceAllowlistPinned = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
 	"diag.pins", "diag.stats", "diag.streamtest",
-	"la.disarm", "la.info", "la.listen_arm", "la.read", "la.stop",
+	"la.disarm", "la.edge_arm", "la.info", "la.listen_arm", "la.read", "la.stop",
 	"log.read", "lua.check",
 	"wifi.off", "wifi.setup", "wifi.status",
 }

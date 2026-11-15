@@ -2129,13 +2129,15 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // subscription's HIL and an agent's own end-to-end check ride (13);
 // the la.* listen quintet joined with the LA wave T3 — the passive
 // UART capture face (arm/stop/read/info/disarm; the CH340→GPIO38
-// fixture's HIL and agent-side protocol analysis ride it, 18).
+// fixture's HIL and agent-side protocol analysis ride it, 18); la.edge_arm
+// joined with the LA wave T10 — the RMT edge-capture face (80MHz group
+// pinned; the board HIL's op seat rides it, 19).
 var opsFaceAllowlistV1 = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
 	"diag.pins", "diag.stats", "diag.streamtest",
-	"la.disarm", "la.info", "la.listen_arm", "la.read", "la.stop",
-	"log.read", "lua.check",
+	"la.disarm", "la.edge_arm", "la.info", "la.listen_arm", "la.read",
+	"la.stop", "log.read", "lua.check",
 	"wifi.off", "wifi.setup", "wifi.status",
 }
 

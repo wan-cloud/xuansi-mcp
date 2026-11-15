@@ -1978,6 +1978,10 @@ var opAllowlist = map[string]bool{
 	// observes it. Forwarded for the wave's board HIL (the CH340→
 	// GPIO38 fixture) and for agent-side protocol analysis.
 	"la.listen_arm": true,
+	// LA wave T10 (edge capture): the RMT group-pinned edge engine —
+	// same lifecycle family as listen_arm (T3 seam precedent: the op
+	// seat is required by board HIL; the MCP/object face is T11's).
+	"la.edge_arm": true,
 	"la.stop":       true,
 	"la.read":       true,
 	"la.info":       true,
