@@ -48,10 +48,19 @@ type DecodeBusParams struct {
 // MISO, RemainderBits) ride spi rows; the i2c columns (Addr, RW, Rep,
 // Bytes, Acks) ride i2c rows — each family's absent columns are
 // omitted, not zeroed.
+//
+// The omitempty shape quirk (frozen, documented — T13 minor): the
+// omitted-vs-zero ambiguity is REAL here and accepted — spi mode 0
+// (the default) and an i2c address 0x00 both ride OMITTED, so an
+// absent mode column means "mode 0", not "unresolved", and an absent
+// addr column means "address 0", not "no address phase" (a row with
+// no address phase cannot exist — the first phase after START is
+// always the address phase). Changing the tags now would break the
+// frozen reply shape; the Desc's jsonschema wording is the contract.
 type BusTxn struct {
 	TNS  uint64 `json:"t_ns"` // spi: the txn's FIRST SCK edge (not the CS fall); i2c: the START instant
 	CS   uint8  `json:"cs,omitempty"`
-	Addr int    `json:"addr,omitempty"` // i2c: the 7-bit address
+	Addr int    `json:"addr,omitempty"` // i2c: the 7-bit address (0x00 rides omitted — omitempty shape, see above)
 	RW   string `json:"rw,omitempty"`   // i2c: "w" | "r"
 	Rep  bool   `json:"rep,omitempty"`  // i2c: began with a repeated START
 
@@ -68,7 +77,7 @@ type BusTxn struct {
 // DecodeBusResult is the bounded bus decode reply.
 type DecodeBusResult struct {
 	Proto     string   `json:"proto"`
-	Mode      int      `json:"mode,omitempty"` // spi only (cpol/cpha folded)
+	Mode      int      `json:"mode,omitempty"` // spi only (cpol/cpha folded); mode 0 rides omitted — the omitempty shape, see BusTxn
 	CSMask    uint8    `json:"cs_mask,omitempty"`
 	RateHz    int      `json:"rate_hz"`
 	T0NS      int64    `json:"t0_ns"`
@@ -189,10 +198,19 @@ func spiParams(p DecodeBusParams, res *DecodeBusResult) error {
 	return nil
 }
 
-// i2cParams validates the i2c form — the spi-only params refuse.
+// i2cParams validates the i2c form — the spi-only params refuse, the
+// channel domain is 0..7 (a channel outside it has no bit in the
+// sample byte: bit i of a u8 — shifting past reads a constant-0 line,
+// a silent garbage decode, never an error-free answer).
 func i2cParams(p DecodeBusParams, sda, scl int) error {
 	if p.Mode != 0 || p.Cpol != nil || p.Cpha != nil || p.CSMask != 0 {
 		return fmt.Errorf("la: decode_bus mode/cpol/cpha/cs_mask are spi-only params — the i2c form is {sda?, scl?}")
+	}
+	if sda < 0 || sda > 7 {
+		return fmt.Errorf("la: decode_bus sda %d — want channel 0..7 (= D0..D7, the sample byte's bit)", sda)
+	}
+	if scl < 0 || scl > 7 {
+		return fmt.Errorf("la: decode_bus scl %d — want channel 0..7 (= D0..D7, the sample byte's bit)", scl)
 	}
 	if sda == scl {
 		return fmt.Errorf("la: decode_bus sda and scl are both channel %d — two lines, two channels", sda)
@@ -211,6 +229,14 @@ func tickOf(rateHz int) uint64 { return uint64(1_000_000_000 / rateHz) }
 // period earlier). t_ns rides the txn's first SCK transition of
 // EITHER direction (對 SCK 沿對齊 — never the CS fall: masters
 // legitimately wait ready with CS low before the first clock).
+//
+// Frame-boundary caveat when reading CS windows (T3.1 minor, the DMA
+// path's measured behavior): a master whose setup crosses a PSRAM
+// buffer allocation holds CS low across the alloc for tens of µs
+// (>64B windows) — the CS-low interval can contain host-prep jitter
+// that is NOT protocol idle time. Read the FIRST SCK edge for the
+// transaction's t_ns (this decoder already does) and do not infer
+// setup timing from CS-fall-to-first-clock spans on this fixture.
 func decodeSPI(samples []byte, res *DecodeBusResult) {
 	const sckCh, mosiCh, misoCh = 0, 1, 2
 	// sampleLevel: the level AT the sampling edge — rising for modes
@@ -268,7 +294,13 @@ func decodeSPI(samples []byte, res *DecodeBusResult) {
 		}
 		if firstEdge < 0 {
 			// no clock at all inside the CS pulse: nothing transacted.
-			// A pulse still open at EOF is the honest torn empty row.
+			// A CLOSED zero-clock pulse emits NO row — the debatable
+			// call, stated here: a master asserting CS without a single
+			// clock edge moved no bits, and an empty row would be
+			// indistinguishable from a decode fault; honest absence is
+			// the account (the CS pulse itself is visible in the raw
+			// stream). Only a pulse still open at EOF surfaces — the
+			// torn empty row (the capture, not the master, ended it).
 			if e == len(samples) {
 				res.Txns = append(res.Txns, BusTxn{TNS: t0 + uint64(s)*tick, CS: res.CSMask, Torn: true})
 			}

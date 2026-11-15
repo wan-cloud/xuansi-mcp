@@ -341,6 +341,35 @@ func TestLaDisarmAllQuietOnCleanBoard(t *testing.T) {
 	}
 }
 
+// TestLaDisarmAllSkipsPreV9Board (T7 minor②): the sweep's v8-skip
+// branch — a board the hello sighting places in protocol ver 8 has no
+// la.* ops at all, so the release must not even DIAL the la.info
+// probe (the quiet skip, not an unknown-op error log per release).
+func TestLaDisarmAllSkipsPreV9Board(t *testing.T) {
+	const mac = "38f2c1"
+	e := newEnv(t, nil, mkBoard(mac, "bench2.local"))
+	f := e.fakes[mac]
+	scriptLABoard(f, nil, 0)
+	// the same scripted board, one fact flipped: the hello sighting
+	// says protocol_ver 8 — the pre-la era.
+	f.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"protocol_ver": int64(8), "role": "controller",
+			"fw": "xuansi-fw v0.4.0", "fw_build": "v8bee", "fs": true}, nil
+	})
+	c := dialSock(t, e.sock)
+	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "h1"}); rep["error"] != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	if rep, _ := c.call(2, map[string]any{"type": "release", "board": mac, "holder": "h1"}); rep["error"] != nil {
+		t.Fatalf("release: %#v", rep)
+	}
+	for _, call := range f.got() {
+		if call.op == "la.info" || call.op == "la.stop" || call.op == "la.disarm" {
+			t.Errorf("pre-v9 board saw %s — the v8-skip must stay zero-contact on the la face", call.op)
+		}
+	}
+}
+
 // TestLaCaptureRequestCeiling: the la_capture request's own ceiling
 // derives from the arm bound (seconds → max_ms + slack), not the 60s
 // default — the unit pin; the integration behavior (a pull that runs

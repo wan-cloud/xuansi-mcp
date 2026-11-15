@@ -606,7 +606,7 @@ func TestLACaptureLaneDeathRedials(t *testing.T) {
 		t.Fatalf("first capture: %s", resultText(t, res))
 	}
 	<-laneClosed
-	time.Sleep(150 * time.Millisecond) // let the apiclient read loop observe the death
+	waitLALaneDead(t, e.ts) // the read loop's EOF observation — deterministic, no fixed sleep
 
 	res = e.call("xuansi_la_capture", map[string]any{"board": "b", "port": 1, "pin": 38, "baud": 9600})
 	if res.IsError {
@@ -615,4 +615,29 @@ func TestLACaptureLaneDeathRedials(t *testing.T) {
 	if m := structured(t, res); m["capture_id"] != "cap-conn2" {
 		t.Errorf("capture_id = %v, want the redialed lane's answer", m["capture_id"])
 	}
+}
+
+// waitLALaneDead blocks until the LA lane's apiclient reports death
+// (its read loop observed the EOF) — the deterministic replacement for
+// the death test's former fixed 150ms sleep (T7 fix1 re-review minor:
+// a theoretical flake window — a slow read loop would leave the lane
+// looking live and the next capture would fail instead of redialing).
+func waitLALaneDead(t *testing.T, ts *toolset) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ts.laMu.Lock()
+		c := ts.laCli
+		ts.laMu.Unlock()
+		if c == nil {
+			return
+		}
+		select {
+		case <-c.Done():
+			return
+		default:
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	t.Fatal("LA lane did not observe its death within 5s")
 }

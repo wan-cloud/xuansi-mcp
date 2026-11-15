@@ -2128,8 +2128,8 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // joined with B16-T6 — the 0x02 synthetic producer the stream
 // subscription's HIL and an agent's own end-to-end check ride (13);
 // the la.* listen quintet joined with the LA wave T3 — the passive
-// UART capture face (arm/stop/read/info/disarm; the CH340→GPIO38
-// fixture's HIL and agent-side protocol analysis ride it, 18); la.edge_arm
+// UART capture face (arm/stop/read/info/disarm; the board HIL of that
+// round and agent-side protocol analysis ride it, 18); la.edge_arm
 // joined with the LA wave T10 — the RMT edge-capture face (80MHz group
 // pinned; the board HIL's op seat rides it, 19); la.sample_arm joined
 // with the LA wave T12 — the LCD_CAM sampler's op seat (the board HIL

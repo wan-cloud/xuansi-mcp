@@ -18,8 +18,8 @@ import (
 )
 
 type laDecodeBusIn struct {
-	CaptureID string `json:"capture_id" jsonschema:"the landed SAMPLES capture's id (from xuansi_la_capture mode \"samples\" or xuansi_la_list)"`
-	Proto     string `json:"proto" jsonschema:"\"spi\" (the classic four-wire: SCK=D0 MOSI=D1 MISO=D2, CS named by cs_mask — transactions framed by CS, bits sampled at the mode's SCK edge) or \"i2c\" (SDA/SCL two-wire: START/STOP framed, 9-bit phases with per-byte ack verdicts)"`
+	CaptureID string             `json:"capture_id" jsonschema:"the landed SAMPLES capture's id (from xuansi_la_capture mode \"samples\" or xuansi_la_list)"`
+	Proto     string             `json:"proto" jsonschema:"\"spi\" (the classic four-wire: SCK=D0 MOSI=D1 MISO=D2, CS named by cs_mask — transactions framed by CS, bits sampled at the mode's SCK edge) or \"i2c\" (SDA/SCL two-wire: START/STOP framed, 9-bit phases with per-byte ack verdicts)"`
 	Params    *laDecodeBusParams `json:"params,omitempty" jsonschema:"optional per-proto params; omit for the defaults (spi: mode 0 + cs_mask 0x08; i2c: sda=bit2 scl=bit1)"`
 }
 
@@ -76,7 +76,8 @@ func (ts *toolset) registerLASample(srv *mcpsdk.Server) {
 	}, ts.laDecodeBus)
 }
 
-func (ts *toolset) laDecodeBus(ctx context.Context, _ *mcpsdk.CallToolRequest, in laDecodeBusIn) (*mcpsdk.CallToolResult, laDecodeBusOut, error) {	req := server.Request{Type: "la_decode_bus", CaptureID: in.CaptureID, Proto: in.Proto}
+func (ts *toolset) laDecodeBus(ctx context.Context, _ *mcpsdk.CallToolRequest, in laDecodeBusIn) (*mcpsdk.CallToolResult, laDecodeBusOut, error) {
+	req := server.Request{Type: "la_decode_bus", CaptureID: in.CaptureID, Proto: in.Proto}
 	if p := in.Params; p != nil {
 		req.BusMode = deref(p.Mode)
 		req.Cpol = p.Cpol

@@ -652,3 +652,112 @@ func sha256Sum(b []byte) []byte {
 	s := sha256.Sum256(b)
 	return s[:]
 }
+
+// ---------------------------------------------------------------------------
+// readAll's defensive branches + the evQueue drop discipline (T5
+// minor①): every identity the window walk checks on each reply, and
+// the never-block rule the event handler owes the connection's read
+// goroutine — none of these had a scripted test.
+
+// readFake scripts ONLY la.read: each call answers from page().
+type readFake struct {
+	mu    sync.Mutex
+	calls int
+	page  func(call int, off int64) (data []byte, total int64, eof bool)
+}
+
+func (f *readFake) Op(ctx context.Context, op string, args map[string]any) (map[string]any, error) {
+	if op != "la.read" {
+		return nil, fmt.Errorf("readFake: unexpected op %s", op)
+	}
+	f.mu.Lock()
+	f.calls++
+	n := f.calls
+	f.mu.Unlock()
+	data, total, eof := f.page(n, argU(args["off"]))
+	return map[string]any{"data": data, "total": total, "eof": eof}, nil
+}
+
+func (f *readFake) OnEvent(string, func(replclient.Event)) func() { return func() {} }
+func (f *readFake) Dead() bool                                    { return false }
+
+var _ Board = (*readFake)(nil)
+
+func TestReadAllTotalMutatedMidRead(t *testing.T) {
+	f := &readFake{page: func(call int, off int64) ([]byte, int64, bool) {
+		if call == 1 {
+			return make([]byte, 16), 100, false
+		}
+		return make([]byte, 16), 101, false // the ring "grew": not stopped
+	}}
+	_, err := readAll(context.Background(), f, 7, func(int64, []byte) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "mutated mid-read") {
+		t.Fatalf("err = %v, want the mutated-total refusal", err)
+	}
+}
+
+func TestReadAllEmptyWindowWithBytesToGo(t *testing.T) {
+	f := &readFake{page: func(call int, off int64) ([]byte, int64, bool) {
+		if call == 1 {
+			return make([]byte, 32), 100, false
+		}
+		return nil, 100, false // a stalled empty window, 68 bytes to go
+	}}
+	_, err := readAll(context.Background(), f, 7, func(int64, []byte) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "empty window") {
+		t.Fatalf("err = %v, want the empty-window refusal", err)
+	}
+}
+
+func TestReadAllEofLagConverges(t *testing.T) {
+	// the accounting identities converge at off==total while eof lags
+	// one reply — the walk answers done, not another spin.
+	f := &readFake{page: func(call int, off int64) ([]byte, int64, bool) {
+		return make([]byte, 40), 40, false
+	}}
+	var seen int
+	total, err := readAll(context.Background(), f, 7, func(int64, []byte) error { seen++; return nil })
+	if err != nil || total != 40 || seen != 1 {
+		t.Fatalf("readAll = (%d, %v) sink=%d, want (40, nil) sink=1 — eof lag must converge", total, err, seen)
+	}
+}
+
+func TestReadAllShortPullAtEof(t *testing.T) {
+	f := &readFake{page: func(call int, off int64) ([]byte, int64, bool) {
+		return make([]byte, 10), 100, true // eof claimed at 10 of 100
+	}}
+	_, err := readAll(context.Background(), f, 7, func(int64, []byte) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "short pull") {
+		t.Fatalf("err = %v, want the short-pull refusal", err)
+	}
+}
+
+// TestSubscribeLADropsRatherThanBlocks: the pull's local "la" handler
+// must NEVER block the connection's read goroutine — a full queue
+// drops (the default branch), it does not wait.
+func TestSubscribeLADropsRatherThanBlocks(t *testing.T) {
+	b := newBoard(nil)
+	_, cancel := subscribeLA(b)
+	defer cancel()
+	b.mu.Lock()
+	var fn func(replclient.Event)
+	for _, r := range b.regs {
+		fn = r.fn
+	}
+	b.mu.Unlock()
+	if fn == nil {
+		t.Fatal("no la handler registered")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < evQueue+64; i++ { // capacity plus overflow
+			fn(replclient.Event{Source: "la", Data: map[string]any{"event": "progress"}})
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler blocked on a full evQueue — the read goroutine would stall")
+	}
+}

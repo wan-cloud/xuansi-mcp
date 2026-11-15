@@ -1989,8 +1989,8 @@ var opAllowlist = map[string]bool{
 	"diag.streamtest": true,
 	// LA wave T3 (logic-analyzer listen): the passive UART capture
 	// face — arm/stop/read/disarm drive the listener lifecycle, info
-	// observes it. Forwarded for the wave's board HIL (the CH340→
-	// GPIO38 fixture) and for agent-side protocol analysis.
+	// observes it. Forwarded for the wave's board HIL (the bench
+	// wiring of that round) and for agent-side protocol analysis.
 	"la.listen_arm": true,
 	// LA wave T10 (edge capture): the RMT group-pinned edge engine —
 	// same lifecycle family as listen_arm (T3 seam precedent: the op
@@ -2000,10 +2000,10 @@ var opAllowlist = map[string]bool{
 	// same seat seam (board HIL rides the op face; the object/MCP
 	// face is T13's).
 	"la.sample_arm": true,
-	"la.stop":     true,
-	"la.read":     true,
-	"la.info":     true,
-	"la.disarm":   true,
+	"la.stop":       true,
+	"la.read":       true,
+	"la.info":       true,
+	"la.disarm":     true,
 }
 
 // AllowlistedOps renders the ops face's allowlisted op names, sorted —

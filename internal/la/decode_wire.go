@@ -94,6 +94,13 @@ func DecodeWire(ref CaptureRef, proto string) (WireResult, error) {
 // (the presence pulse is detected in the release window behind it),
 // every other low is a slot whose width carries the bit (LSB-first
 // assembly), and a long high or the next reset closes the bytes row.
+//
+// The walk starts at run 1 — the run-0 doctrine (the WS2812 fix1
+// precedent, one decoder over): run 0's WIDTH is an arm artifact (the
+// time from arm to the first edge) and never signal. A line armed
+// MID-SLOT makes run 0 a short low whose width would assemble a
+// phantom bit (and a reset straddling arm would read an arm-truncated
+// width) — run 0 never opens a reset row, never a slot row.
 func decodeOneWire(runs []Run, abs []uint64) WireResult {
 	res := WireResult{Proto: "onewire"}
 	var (
@@ -124,7 +131,8 @@ func decodeOneWire(runs []Run, abs []uint64) WireResult {
 		appendTxn(&res, row)
 		closed = true
 	}
-	for i, r := range runs {
+	for i := 1; i < len(runs); i++ {
+		r := runs[i]
 		if r.Level == 0 {
 			if r.WidthNS >= owResetLowNS {
 				flush()
@@ -148,7 +156,11 @@ func decodeOneWire(runs []Run, abs []uint64) WireResult {
 				continue
 			}
 			// a low inside the presence window behind a release is the
-			// presence pulse, not a slot
+			// presence pulse, not a slot — it is the slave's answer,
+			// already reported as the reset row's presence column;
+			// counting it as a slot would corrupt the byte stream
+			// (the 60µs floor separates it from write slots' ≤120µs
+			// only by the window; the window is the discriminator).
 			if lastRel > 0 && abs[i] <= lastRel+owPresenceWin && r.WidthNS >= owPresenceNS {
 				continue
 			}

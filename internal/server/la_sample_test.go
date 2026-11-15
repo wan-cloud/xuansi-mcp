@@ -40,7 +40,7 @@ func scriptLASampleBoard(f *fakeCtl, ring []byte, stopBytes int64) {
 			"cap": int64(1), "mode": "sample", "state": "stopped",
 			"bytes": stopBytes, "total": int64(len(ring)),
 			"meta": map[string]any{"rate_hz": int64(20_000_000), "samples": int64(len(ring)),
-				"trig": map[string]any{"ch": int64(3), "kind": "edge_f", "pre_kb": int64(4)},
+				"trig":       map[string]any{"ch": int64(3), "kind": "edge_f", "pre_kb": int64(4)},
 				"trig_fired": true, "hw_ovf": int64(0), "ring_kb": int64(256),
 				"max_ms": int64(6000), "reason": "trig", "armed_ns": int64(1),
 				"stopped_ns": int64(2), "t0_ns": int64(3_000_000_000)},

@@ -51,17 +51,24 @@ func SampleBusPins() []int {
 // match (sample&mask == value&mask for width consecutive samples —
 // T12's addition over the edge language).
 type SampleTrig struct {
-	Ch     int    // 0..7 (= D0..D7)
-	Kind   string // "edge_r" | "edge_f" | "level" | "bits"
-	Level  *int   // 0|1, kind "level" only
-	Mask   uint8  // kind "bits" only
-	Value  uint8  // kind "bits" only
-	Width  int    // 1..64, kind "bits" only (0 = 1)
-	PreKB  int    // pre-trigger history KB (< ring_kb; 0 = none)
+	Ch    int    // 0..7 (= D0..D7)
+	Kind  string // "edge_r" | "edge_f" | "level" | "bits"
+	Level *int   // 0|1, kind "level" only
+	Mask  uint8  // kind "bits" only
+	Value uint8  // kind "bits" only
+	Width int    // 1..64, kind "bits" only (0 = 1)
+	PreKB int    // pre-trigger history KB (< ring_kb; 0 = none)
 }
 
 func (t SampleTrig) wire() map[string]any {
-	m := map[string]any{"ch": int64(t.Ch), "kind": t.Kind}
+	// ch rides only the channel kinds — kind "bits" matches the whole
+	// sample byte (mask/value) and names no channel: the fw's arm face
+	// accepts bits without ch (its own coach says "ch not used"), and
+	// its la.info mirror then answers the no-channel sentinel ch=255.
+	m := map[string]any{"kind": t.Kind}
+	if t.Kind != "bits" {
+		m["ch"] = int64(t.Ch)
+	}
 	if t.Kind == "level" && t.Level != nil {
 		m["level"] = int64(*t.Level)
 	}

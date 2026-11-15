@@ -106,6 +106,12 @@ func TestFramesGoldenPeriodic(t *testing.T) {
 	if got.IdleNS != 347_220 { // 4 × (10e9/115200 = 86805)
 		t.Errorf("idle_ns = %d, want 347220", got.IdleNS)
 	}
+	// frame 0 too (T6 minor④): the whole axis is pinned, first stamp
+	// included — a regressed first-chunk t_ns would shift every
+	// downstream gap silently.
+	if f := got.Frames[0]; f.TNS != 5_000_000_000 || f.NBytes != 4 {
+		t.Errorf("frame 0 = t %d n %d, want t 5e9 n 4", f.TNS, f.NBytes)
+	}
 	for i := 1; i < 8; i++ {
 		f := got.Frames[i]
 		if w := uint64(i) * 1_041_660; f.TNS != 5_000_000_000+w {

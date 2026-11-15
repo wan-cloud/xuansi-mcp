@@ -231,7 +231,10 @@ func (s *Store) PullCapture(ctx context.Context, board PullBoard, armArgs ArmArg
 	// 11. Disarm — release the pin and the ring. The data is verified
 	// already, so a disarm failure fails the call without tainting
 	// the object (the lossless promise held; the fw-side ring is
-	// still held, honestly reported).
+	// still held, honestly reported). Consumer contract on this path
+	// (T5 minors): the returned ref is NON-zero and the error is NOT
+	// ErrIncomplete — read both: the object landed whole and verified,
+	// only the board-side cleanup is owed.
 	if _, err := board.Conn.Op(ctx, "la.disarm", map[string]any{"cap": capNum}); err != nil {
 		meta.PulledAt = s.clock()
 		ref.Meta = meta
@@ -397,8 +400,12 @@ func readAll(ctx context.Context, conn Board, capNum int64, sink func(off int64,
 	}
 }
 
-// mirrorLedger copies the fw's 12-column la.info meta into the meta's
-// ledger fields. Best-effort by design: the lossless promise needs
+// mirrorLedger copies the fw's 12-column la.info listen meta (baud,
+// auto, ring_kb, idle_syms, max_ms, chunks, chunks_dropped,
+// bytes_dropped, hw_ovf, reason, armed_ns, stopped_ns) into the meta's
+// ledger fields — the 8 honest-ledger columns this mirror carries;
+// baud/auto/chunks/reason ride other meta fields (stop's echo or the
+// arm's own facts). Best-effort by design: the lossless promise needs
 // only stop+read; a missing ledger leaves honest zeros.
 func mirrorLedger(ctx context.Context, conn Board, capNum int64, meta *Meta) {
 	res, err := conn.Op(ctx, "la.info", map[string]any{"cap": capNum})

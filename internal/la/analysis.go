@@ -171,14 +171,22 @@ func Repeat(ref CaptureRef) (RepeatResult, error) {
 	}
 
 	k, s, L := bestK, bestS, bestL
-	period := (segs[s+(k-1)*L].tNS - segs[s].tNS) / uint64(k-1)
-	res.PeriodNS = &period
-	res.Repeats = k
-	var run int64
-	for i := s; i < s+k*L; i++ {
-		run += int64(len(segs[i].data))
+	// The period rides the run's span end-minus-start. Timestamps are
+	// nominally monotonic (one writer), but the fw's start_ns is its
+	// READ of a chunk's first batch — jitter can hand the walker a
+	// non-monotonic pair, and a u64 underflow would wrap to ~1.8e19.
+	// Guard: end < start means the span is not honestly measurable —
+	// decline the period (the honest zero), keep the counts.
+	if end := segs[s+(k-1)*L].tNS; end >= segs[s].tNS {
+		period := (end - segs[s].tNS) / uint64(k-1)
+		res.PeriodNS = &period
+		res.Repeats = k
+		var run int64
+		for i := s; i < s+k*L; i++ {
+			run += int64(len(segs[i].data))
+		}
+		res.TailBytes = total - run
 	}
-	res.TailBytes = total - run
 	return res, nil
 }
 
@@ -196,7 +204,12 @@ type segFrame struct {
 // at baud: the 10-bit char (start + 8 data + stop) of the listen
 // engine's fixed 8N1 seat. A 7E1/7O1 line carries the same 10-bit char
 // (start + 7 data + parity + stop), so a parity claim never shifts
-// timing. Integer ns arithmetic, floored.
+// timing. Integer ns arithmetic, floored — the rounding model: the
+// true symbol time is 10e9/baud ns; the floor drops the fractional
+// part (error < 1ns per symbol, so a 4-symbol idle threshold is off by
+// < 4ns — far under the fw's own BYTE-time granularity, never a
+// boundary the segmentation could ride). 1200..5M all divide 1e9 within
+// these bounds; a baud that did not would still floor deterministically.
 func symNS(baud int) uint64 { return 10_000_000_000 / uint64(baud) }
 
 // defaultIdleNS derives the idle threshold from the capture's own

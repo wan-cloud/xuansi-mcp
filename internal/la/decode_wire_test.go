@@ -132,6 +132,33 @@ func TestDecodeWireOneWire(t *testing.T) {
 	}
 }
 
+// The run-0 doctrine, onewire case (the T11-review deferred exposure):
+// run 0's WIDTH is an arm artifact and never signal. A line armed
+// MID-SLOT makes run 0 a short LOW whose width (<32µs) would assemble a
+// phantom 1-bit ahead of the real transaction — unreachable via a
+// normal idle-high arm, but the same one-decoder-over fix WS2812 took
+// in fix round 1. Run 0 must never open a row, never be a bit, never
+// reset-detect on its arm-truncated width.
+func TestDecodeWireOneWireRun0ArmArtifact(t *testing.T) {
+	// arm mid-slot: a 20µs LOW run 0 (arm-truncated write-1 slot tail),
+	// then the real traffic — reset + 0x0A's eight slots (LSB first).
+	stream := append([]srun{{0, 20_000}}, onewireStream(0, 1, 0, 1, 0, 0, 0, 0)...)
+	ref := synthEdge(t, edgeMeta("owr0", []int{5}, 2_000_000_000), encRuns(stream...))
+	got, err := DecodeWire(ref, "onewire")
+	if err != nil {
+		t.Fatalf("DecodeWire onewire run-0: %v", err)
+	}
+	if len(got.Txns) != 2 || got.Txns[0].Kind != "reset" || got.Txns[1].Kind != "bytes" {
+		t.Fatalf("txns = %+v, want reset + one bytes row (no run-0 phantom)", got)
+	}
+	if got.Txns[1].NBits != 8 || got.Txns[1].Bytes != "0a" {
+		t.Errorf("bytes txn = %+v, want exactly the 8 real slots assembling 0x0a (the arm-artifact run 0 contributes nothing)", got.Txns[1])
+	}
+	// a reset-shaped run 0 (line low at arm THROUGH a reset): the width
+	// is arm-truncated and must not open a reset row either — the first
+	// honest row is the presence-windowed slot traffic after it.
+}
+
 // The domain guards: unknown proto, and multi-pin captures refuse (a
 // wire protocol rides ONE line).
 func TestDecodeWireGuards(t *testing.T) {
@@ -155,8 +182,8 @@ func TestDecodeWireGuards(t *testing.T) {
 // before the real one.
 func TestDecodeWireWS2812Run0ArmGapHigh(t *testing.T) {
 	var out []srun
-	out = append(out, srun{1, 5_000_000})           // the HIGH arm gap (idle-high line)
-	out = append(out, srun{0, 300_000})             // the frame's reset low
+	out = append(out, srun{1, 5_000_000}) // the HIGH arm gap (idle-high line)
+	out = append(out, srun{0, 300_000})   // the frame's reset low
 	for _, b := range []byte{0x12, 0x34, 0x56, 0xab, 0xcd, 0xef} {
 		for i := 7; i >= 0; i-- {
 			out = wsBits(out, int(b>>uint(i)&1))

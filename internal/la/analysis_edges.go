@@ -412,6 +412,14 @@ func Measure(ref CaptureRef, a, b MeasurePoint) (MeasureResult, error) {
 			hi += e - s
 		}
 	}
+	// Tail-window honesty (T11 minor): tb may sit past the capture's
+	// last run — the numerator then counts only the captured extent
+	// while dt_ns spans the full ask, so duty reads LOW (the missing
+	// tail counts as zero-high). State it rather than clamp silently:
+	// the note names the measured window the fraction actually covers.
+	if last := abs[len(runs)-1] + runs[len(runs)-1].WidthNS; tb > last {
+		res.Note = fmt.Sprintf("window end %dns is past the capture's last edge %dns — duty covers the captured extent only (the uncaptured tail reads as low, so the fraction under-reports)", tb, last)
+	}
 	d := float64(hi) / float64(res.DtNS)
 	res.Duty = &d
 	return res, nil

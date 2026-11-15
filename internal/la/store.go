@@ -1,11 +1,13 @@
 // Package la lands the LA (logic-analyzer) capture objects on the
-// daemon host and pulls them back losslessly from the board's listen
-// ring. One capture is a directory captures/la/<cap_id>/ holding the
-// frozen-format data.bin plus a meta.json account; PullCapture drives
-// the v9 la.* op quintet (arm → done event → stop → info → read
-// windows → verify → disarm) with the checksum-identity assertion as
-// part of the pull itself — a pull that cannot prove the landed bytes
-// equal the ring's is an error, never a warning.
+// daemon host and pulls them back losslessly from the board. One
+// capture is a directory captures/la/<cap_id>/ holding the
+// frozen-format data.bin plus a meta.json account. Three engines share
+// the one discipline (listen T3's UART ring, edge T10's RMT runs,
+// samples T12's LCD_CAM byte stream): each pull drives its arm op's
+// lifecycle — arm → done event → stop → info (the ledger mirror) →
+// read windows → verify → disarm — with the checksum-identity
+// assertion as part of the pull itself; a pull that cannot prove the
+// landed bytes equal the ring's is an error, never a warning.
 package la
 
 import (
@@ -42,7 +44,7 @@ func LARoot() string { return filepath.Join(paths.DataDir(), "captures", "la") }
 type Meta struct {
 	CapID    string `json:"cap_id"` // the daemon-side object id (directory name)
 	Board    string `json:"board"`  // mac6 identity recorded by the puller
-	Mode     string `json:"mode"`   // "listen" (this wave; "edge"/"samples" land with T10/T12)
+	Mode     string `json:"mode"`   // "listen" | "edge" | "samples"
 	Port     int    `json:"port"`
 	Pin      int    `json:"pin"`
 	Pins     []int  `json:"pins,omitempty"`
@@ -93,9 +95,9 @@ type Meta struct {
 // trig map key "ch"), and kind "bits" adds the bit-window match's
 // Mask/Value/Width (T12's addition to the language).
 type TrigMeta struct {
-	Pin   int    `json:"pin,omitempty"` // edge: a pins[] member
-	Ch    int    `json:"ch,omitempty"`  // samples: 0..7 = D0..D7
-	Kind  string `json:"kind"`          // "edge_r" | "edge_f" | "level" | "bits" (samples)
+	Pin   int    `json:"pin,omitempty"`   // edge: a pins[] member
+	Ch    int    `json:"ch,omitempty"`    // samples: 0..7 = D0..D7; 255 = the no-channel sentinel a kind "bits" arm mirrors (bits matches the whole byte — no channel exists to name)
+	Kind  string `json:"kind"`            // "edge_r" | "edge_f" | "level" | "bits" (samples)
 	Level *int   `json:"level,omitempty"` // 0|1, kind "level" only (a pointer: presence is part of the request domain — an omitted level refuses)
 	Mask  uint8  `json:"mask,omitempty"`  // kind "bits" (samples) only: the window mask
 	Value uint8  `json:"value,omitempty"` // kind "bits" (samples) only: the window value
@@ -396,12 +398,15 @@ func loadMeta(dir string) (Meta, error) {
 }
 
 // objSize sums one object directory's file sizes (data.bin + meta.json
-// — the honest disk account Retention budgets against).
+// — the honest disk account Retention budgets against). WalkDir, not
+// the deprecated Walk (no os.Stat per entry).
 func objSize(dir string) int64 {
 	var total int64
-	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && info.Mode().IsRegular() {
-			total += info.Size()
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			if fi, err := d.Info(); err == nil {
+				total += fi.Size()
+			}
 		}
 		return nil
 	})

@@ -29,10 +29,14 @@ type tickBuf struct {
 	cur byte
 }
 
-func (b *tickBuf) set(m byte)   { b.cur |= m }
-func (b *tickBuf) clr(m byte)   { b.cur &^= m }
-func (b *tickBuf) hold(n int)   { for i := 0; i < n; i++ { b.buf = append(b.buf, b.cur) } }
-func (b *tickBuf) mark() int    { return len(b.buf) } // the index of the NEXT tick
+func (b *tickBuf) set(m byte) { b.cur |= m }
+func (b *tickBuf) clr(m byte) { b.cur &^= m }
+func (b *tickBuf) hold(n int) {
+	for i := 0; i < n; i++ {
+		b.buf = append(b.buf, b.cur)
+	}
+}
+func (b *tickBuf) mark() int { return len(b.buf) } // the index of the NEXT tick
 
 // spiIdle leaves SCK at the mode's idle level (cpol) with CS high.
 func spiIdle(b *tickBuf, mode int, n int) {
@@ -399,6 +403,20 @@ func TestDecodeBusI2CChannels(t *testing.T) {
 	if _, err := DecodeBus(ref, "i2c", DecodeBusParams{SDA: &same, SCL: &same}); err == nil ||
 		!strings.Contains(err.Error(), "sda") {
 		t.Errorf("sda==scl = %v, want the refusal", err)
+	}
+	// the channel domain: a channel outside 0..7 has no bit in the
+	// sample byte — before the guard it shifted past the byte and read
+	// a constant 0 line (a silent garbage decode, not an error).
+	for _, tc := range []struct {
+		sda, scl int
+		bad      string
+	}{
+		{9, 1, "sda"}, {-1, 1, "sda"}, {2, 8, "scl"}, {2, -2, "scl"},
+	} {
+		if _, err := DecodeBus(ref, "i2c", DecodeBusParams{SDA: &tc.sda, SCL: &tc.scl}); err == nil ||
+			!strings.Contains(err.Error(), tc.bad) {
+			t.Errorf("channel (%d,%d) = %v, want the 0..7 domain refusal naming %s", tc.sda, tc.scl, err, tc.bad)
+		}
 	}
 }
 

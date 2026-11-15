@@ -40,7 +40,7 @@ func TestPullSampleHappyPath(t *testing.T) {
 	b.pushDone = true
 	b.sampleMeta = map[string]any{
 		"rate_hz": int64(20_000_000), "samples": int64(len(ring)),
-		"trig": map[string]any{"ch": int64(3), "kind": "bits",
+		"trig": map[string]any{"ch": int64(255), "kind": "bits",
 			"mask": int64(8), "value": int64(0), "width": int64(2), "pre_kb": int64(8)},
 		"trig_fired": true, "hw_ovf": int64(0), "ring_kb": int64(512),
 		"max_ms": int64(8000), "reason": "trig", "armed_ns": int64(11),
@@ -50,7 +50,7 @@ func TestPullSampleHappyPath(t *testing.T) {
 
 	ref, err := s.PullSample(context.Background(), PullBoard{ID: "97c1ac", Conn: b}, SampleArmArgs{
 		RateHz: 20_000_000, RingKB: 512, MaxMS: 8000,
-		Trig: &SampleTrig{Ch: 3, Kind: "bits", Mask: 8, Value: 0, Width: 2, PreKB: 8},
+		Trig: &SampleTrig{Kind: "bits", Mask: 8, Value: 0, Width: 2, PreKB: 8},
 	})
 	if err != nil {
 		t.Fatalf("PullSample: %v", err)
@@ -63,7 +63,7 @@ func TestPullSampleHappyPath(t *testing.T) {
 		{"events.subscribe", map[string]any{"source": "la"}},
 		{"la.sample_arm", map[string]any{
 			"rate_hz": int64(20_000_000), "ring_kb": int64(512), "max_ms": int64(8000),
-			"trig": map[string]any{"ch": int64(3), "kind": "bits", "mask": int64(8),
+			"trig": map[string]any{"kind": "bits", "mask": int64(8),
 				"value": int64(0), "width": int64(2), "pre_kb": int64(8)}}},
 		{"la.stop", map[string]any{"cap": int64(7)}},
 		{"la.info", map[string]any{"cap": int64(7)}},
@@ -91,12 +91,12 @@ func TestPullSampleHappyPath(t *testing.T) {
 	tickNS := uint64(1_000_000_000 / 20_000_000)
 	wantMeta := Meta{
 		CapID: ref.ID, Board: "97c1ac", Mode: "samples",
-		Pins:    SampleBusPins(),
-		RateHz:  20_000_000,
+		Pins:     SampleBusPins(),
+		RateHz:   20_000_000,
 		TStartNS: 9_000_000_000,
-		TEndNS:  9_000_000_000 + uint64(len(ring))*tickNS,
-		Bytes:   int64(len(ring)), Samples: int64(len(ring)), Reason: "trig",
-		Trig:      &TrigMeta{Ch: 3, Kind: "bits", Mask: 8, Value: 0, Width: 2, PreKB: 8},
+		TEndNS:   9_000_000_000 + uint64(len(ring))*tickNS,
+		Bytes:    int64(len(ring)), Samples: int64(len(ring)), Reason: "trig",
+		Trig:      &TrigMeta{Ch: 255, Kind: "bits", Mask: 8, Value: 0, Width: 2, PreKB: 8},
 		TrigFired: true, T0NS: 9_000_000_000,
 		RingKB: 512, MaxMS: 8000,
 		StreamBytes: int64(len(ring)),

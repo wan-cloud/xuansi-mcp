@@ -465,7 +465,7 @@ type Request struct {
 	// one member of the pair given must agree with a nonzero mode);
 	// SdaCh/SclCh cross the i2c channel override (nil = the 2/1
 	// defaults).
-	RateHz int   `json:"rate_hz,omitempty"`
+	RateHz  int  `json:"rate_hz,omitempty"`
 	BusMode int  `json:"bus_mode,omitempty"`
 	Cpol    *int `json:"cpol,omitempty"`
 	Cpha    *int `json:"cpha,omitempty"`
