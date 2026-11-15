@@ -163,29 +163,13 @@ func (s *Store) PullCapture(ctx context.Context, board PullBoard, armArgs ArmArg
 		return s.landIncomplete(ref, meta, board.Conn, capNum, cause)
 	}
 
-	// 5. Wait the done event for OUR cap. Progress and foreign caps
-	// flow past; ctx cancellation ends the wait (landIncomplete's
-	// end-of-intent stop ends the board-side capture — it must not
-	// outlive a caller that gave up); a silently dead link surfaces
-	// on the poll tick.
-	tick := time.NewTicker(waitPoll)
-	defer tick.Stop()
-wait:
-	for {
-		select {
-		case ev := <-evCh:
-			if d := ev.Data; d["event"] == "done" {
-				if c, ok := anyI(d["cap"]); ok && c == capNum {
-					break wait
-				}
-			}
-		case <-ctx.Done():
-			return land(fmt.Errorf("%w: %w", ErrIncomplete, ctx.Err()))
-		case <-tick.C:
-			if board.Conn.Dead() {
-				return land(fmt.Errorf("%w: link died while waiting for the done event", ErrIncomplete))
-			}
-		}
+	// 5. Wait the done event for OUR cap (waitDone owns the loop:
+	// progress and foreign caps flow past; ctx cancellation ends the
+	// wait (landIncomplete's end-of-intent stop ends the board-side
+	// capture — it must not outlive a caller that gave up); a
+	// silently dead link surfaces on the poll tick).
+	if werr := waitDone(ctx, board.Conn, evCh, capNum); werr != nil {
+		return land(fmt.Errorf("%w: %w", ErrIncomplete, werr))
 	}
 
 	// 6. Stop: the idempotent, authoritative ledger. On a capture that
@@ -282,7 +266,15 @@ wait:
 // assertion's failures ride here too, cause carrying ErrChecksum.
 func (s *Store) landIncomplete(ref CaptureRef, meta Meta, conn Board, capNum int64, cause error) (CaptureRef, error) {
 	endOfIntent(conn, capNum)
-	if st, err := parseStats(ref.DataPath, true); err == nil {
+	if meta.Mode == "edge" {
+		if st, err := parseRunStats(ref.DataPath, true); err == nil {
+			meta.Bytes, meta.Runs = st.Stream, int(st.Runs)
+			if meta.T0NS > 0 { // the axis is absolute only when the ledger landed
+				meta.TStartNS = uint64(meta.T0NS)
+				meta.TEndNS = uint64(meta.T0NS) + st.SpanNS
+			}
+		}
+	} else if st, err := parseStats(ref.DataPath, true); err == nil {
 		meta.TStartNS, meta.TEndNS = st.TStartNS, st.TEndNS
 		meta.Bytes, meta.Chunks = st.Payload, st.Chunks
 	}
@@ -297,6 +289,32 @@ func (s *Store) landIncomplete(ref CaptureRef, meta Meta, conn Board, capNum int
 	}
 	_, _ = s.Retention()
 	return ref, cause
+}
+
+// waitDone is the pull families' done-event wait (PullCapture's step
+// 5, extracted for the edge pull): progress and foreign caps flow
+// past, ctx cancellation ends the wait, and a silently dead link
+// surfaces on the poll tick (a keepalive verdict ≈6s would otherwise
+// hang the wait on ctx alone).
+func waitDone(ctx context.Context, conn Board, evCh <-chan replclient.Event, capNum int64) error {
+	tick := time.NewTicker(waitPoll)
+	defer tick.Stop()
+	for {
+		select {
+		case ev := <-evCh:
+			if d := ev.Data; d["event"] == "done" {
+				if c, ok := anyI(d["cap"]); ok && c == capNum {
+					return nil
+				}
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+			if conn.Dead() {
+				return fmt.Errorf("link died while waiting for the done event")
+			}
+		}
+	}
 }
 
 // endOfIntent bounds a broken or refused pull's board-side cleanup:

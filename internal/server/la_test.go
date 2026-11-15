@@ -8,6 +8,7 @@ package server
 // item 3, the streamDisarmAll precedent).
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strings"
@@ -357,5 +358,176 @@ func TestLaCaptureRequestCeiling(t *testing.T) {
 		if got := laCaptureCeil(tc.seconds); got != tc.want {
 			t.Errorf("laCaptureCeil(%d) = %s, want %s", tc.seconds, got, tc.want)
 		}
+	}
+}
+
+// scriptEdgeBoard wires one fake board for the v9 EDGE face (T11):
+// la.edge_arm pushes the done on arm, la.info serves the 13-key edge
+// ledger, la.read serves the run ring (the identity: runs×9 == total
+// == stop bytes).
+func scriptEdgeBoard(f *fakeCtl, ring []byte, stopBytes int64) {
+	f.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"protocol_ver": int64(9), "role": "controller",
+			"fw": "xuansi-fw v0.5.0", "fw_build": "v9bee", "fs": true}, nil
+	})
+	f.on("la.edge_arm", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		f.push("la", map[string]any{"event": "done", "cap": int64(1), "bytes": stopBytes, "reason": "full"})
+		return map[string]any{"cap": int64(1), "res_hz": int64(80_000_000)}, nil
+	})
+	f.on("la.stop", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"bytes": stopBytes, "reason": "full"}, nil
+	})
+	f.on("la.info", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"caps": []any{map[string]any{
+			"cap": int64(1), "mode": "edge", "pins": []any{int64(2)},
+			"state": "stopped", "bytes": stopBytes, "total": int64(len(ring)),
+			"meta": map[string]any{
+				"res_hz": int64(80_000_000), "trig": nil, "trig_fired": false,
+				"runs": int64(len(ring) / 9), "runs_dropped": int64(0), "hw_ovf": int64(0),
+				"ring_kb": int64(64), "max_ms": int64(4000), "reason": "full",
+				"armed_ns": int64(111), "stopped_ns": int64(222), "t0_ns": int64(5_000_000_000)},
+		}}}, nil
+	})
+	f.on("la.read", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		off, total := asInt(args["off"]), int64(len(ring))
+		end := off + 32640
+		if end > total {
+			end = total
+		}
+		data := []byte{}
+		if off < total {
+			data = ring[off:end]
+		}
+		return map[string]any{"data": data, "total": total, "eof": end >= total}, nil
+	})
+	f.on("la.disarm", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{}, nil
+	})
+}
+
+// encSRun encodes one edge run record test-side ({u8 mask, u64 dur LE}).
+func encSRun(mask int, dur uint64) []byte {
+	b := make([]byte, 9)
+	b[0] = byte(mask)
+	binary.LittleEndian.PutUint64(b[1:], dur)
+	return b
+}
+
+// TestLaEdgeCaptureGreenPathAndAnalysis: the mode "edge" capture
+// through the real Server — the arm crosses pins (no port/baud), the
+// meta carries the edge ledger (pins/res_hz/t0_ns/runs), and every
+// edge analysis request reads the object back daemon-locally,
+// including the cross-board diff refusal.
+func TestLaEdgeCaptureGreenPathAndAnalysis(t *testing.T) {
+	const mac = "38f2c1"
+	e := newEnv(t, nil, mkBoard(mac, "bench2.local"))
+	e.srv.laStore.Root = filepath.Join(t.TempDir(), "la")
+	// 4 runs: idle 200µs, low 13µs, high 4.513ms, low 13µs
+	ring := append(append(append(encSRun(1, 200_000), encSRun(0, 13_000)...), encSRun(1, 4_513_000)...), encSRun(0, 13_000)...)
+	scriptEdgeBoard(e.fakes[mac], ring, int64(len(ring)))
+
+	c := dialSock(t, e.sock)
+	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "h1"}); rep["error"] != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ := c.call(2, map[string]any{"type": "la_capture", "board": mac, "holder": "h1",
+		"mode": "edge", "pins": []any{2}, "ring_kb": 64, "max_seconds": 4})
+	if rerr := asMap(rep["error"]); rerr != nil {
+		t.Fatalf("edge la_capture: %v", rerr)
+	}
+	res := asMap(rep["result"])
+	capID := asStr(res["capture_id"])
+	if !strings.Contains(capID, mac+"-la-edge-") {
+		t.Errorf("capture_id = %q, want the edge shape", capID)
+	}
+	meta := asMap(res["meta"])
+	if asStr(meta["mode"]) != "edge" || asInt(meta["t0_ns"]) != 5_000_000_000 || asInt(meta["runs"]) != 4 {
+		t.Errorf("edge meta = %#v, want the ledger columns", meta)
+	}
+	if pins, ok := meta["pins"].([]any); !ok || len(pins) != 1 || asInt(pins[0]) != 2 {
+		t.Errorf("meta pins = %#v, want [2]", meta["pins"])
+	}
+	// the arm crossed the edge shape verbatim
+	for _, call := range e.fakes[mac].got() {
+		if call.op == "la.edge_arm" {
+			if asInt(call.args["res_hz"]) != 80_000_000 || asInt(call.args["ring_kb"]) != 64 ||
+				asInt(call.args["max_ms"]) != 4000 {
+				t.Errorf("la.edge_arm args = %#v, want the pinned res_hz + bounds", call.args)
+			}
+			if pins, ok := call.args["pins"].([]any); !ok || len(pins) != 1 || asInt(pins[0]) != 2 {
+				t.Errorf("la.edge_arm pins = %#v, want [2]", call.args["pins"])
+			}
+		}
+	}
+
+	// the analysis seats read it back daemon-locally
+	rep, _ = c.call(3, map[string]any{"type": "la_runs", "capture_id": capID})
+	rm := asMap(rep["result"])
+	if asInt(rm["n_runs"]) != 4 || asInt(rm["span_ns"]) != 4_739_000 {
+		t.Errorf("la_runs = %#v, want n_runs 4 span 4726026", rm)
+	}
+	rows := rm["runs"].([]any)
+	if r0 := asMap(rows[0].(map[string]any)); asInt(r0["t_ns"]) != 5_000_000_000 || asInt(r0["dur_ns"]) != 200_000 {
+		t.Errorf("run row 0 = %#v", r0)
+	}
+	rep, _ = c.call(4, map[string]any{"type": "la_edges", "capture_id": capID, "max": 2})
+	if em := asMap(rep["result"]); asInt(em["n_runs"]) != 4 || len(em["edges"].([]any)) != 2 {
+		t.Errorf("la_edges = %#v, want the bounded 2-row view", em)
+	}
+	// la_diff same-board on itself: same=true
+	rep, _ = c.call(5, map[string]any{"type": "la_diff", "capture_id": capID, "capture_id_b": capID})
+	if dm := asMap(rep["result"]); dm["same"] != true {
+		t.Errorf("self diff = %#v, want same", dm)
+	}
+	// the mode guard: the edge seats refuse the LISTEN green-path
+	// object (TestLaCaptureGreenPathAndAnalysis' fixture family) —
+	// pinned at the package level (TestEdgeSeatsModeGuards); here the
+	// crossing-level shape: a bogus id coaches la_list.
+	rep, _ = c.call(6, map[string]any{"type": "la_edges", "capture_id": "gone-1"})
+	rerr := asMap(rep["error"])
+	if asStr(rerr["class"]) != "api" || !strings.Contains(asStr(rerr["msg"]), "la_list") {
+		t.Errorf("bogus-id edges err = %#v, want the la_list coach", rerr)
+	}
+}
+
+// TestLaEdgeDomainRefusalsZeroContact: the edge arm's cheap refusals
+// never dial the board.
+func TestLaEdgeDomainRefusalsZeroContact(t *testing.T) {
+	const mac = "38f2c1"
+	e := newEnv(t, nil, mkBoard(mac, "bench2.local"))
+	e.srv.laStore.Root = filepath.Join(t.TempDir(), "la")
+	scriptEdgeBoard(e.fakes[mac], nil, 0)
+	c := dialSock(t, e.sock)
+	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "h1"}); rep["error"] != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	cases := []map[string]any{
+		{"mode": "edge", "ring_kb": 64},                                                                                     // no pins
+		{"mode": "edge", "pins": []any{2, 3, 4, 5, 6}, "ring_kb": 64},                                                       // >4
+		{"mode": "edge", "pins": []any{2, 2}, "ring_kb": 64},                                                                // dup
+		{"mode": "edge", "pins": []any{-1}, "ring_kb": 64},                                                                  // negative
+		{"mode": "edge", "pins": []any{2}},                                                                                  // no ring (no default)
+		{"mode": "edge", "pins": []any{2}, "ring_kb": 32},                                                                   // under min
+		{"mode": "edge", "pins": []any{2}, "ring_kb": 64, "la_port": 1},                                                     // listen column
+		{"mode": "edge", "pins": []any{2}, "ring_kb": 64, "baud": 9600},                                                     // listen column
+		{"mode": "edge", "pins": []any{2}, "ring_kb": 64, "trig": map[string]any{"pin": 3, "kind": "edge_r"}},               // trig pin ∉ pins
+		{"mode": "edge", "pins": []any{2}, "ring_kb": 64, "trig": map[string]any{"pin": 2, "kind": "junk"}},                 // kind
+		{"mode": "edge", "pins": []any{2}, "ring_kb": 64, "trig": map[string]any{"pin": 2, "kind": "level"}},                // level missing
+		{"mode": "edge", "pins": []any{2}, "ring_kb": 64, "trig": map[string]any{"pin": 2, "kind": "edge_r", "pre_kb": 64}}, // pre_kb ≥ ring
+	}
+	dials := e.dialedTCP(mac)
+	for i, req := range cases {
+		r := map[string]any{"type": "la_capture", "board": mac, "holder": "h1"}
+		for k, v := range req {
+			r[k] = v
+		}
+		rep, _ := c.call(int64(10+i), r)
+		rerr := asMap(rep["error"])
+		if asStr(rerr["class"]) != "api" {
+			t.Errorf("case %d (%v): error = %#v, want api class", i, req, rerr)
+		}
+	}
+	if got := e.dialedTCP(mac); got != dials {
+		t.Errorf("edge refusals dialed %d→%d — the gate must be zero-contact", dials, got)
 	}
 }

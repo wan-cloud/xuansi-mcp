@@ -58,6 +58,16 @@ type Meta struct {
 	Samples  int64  `json:"samples,omitempty"`
 	Reason   string `json:"reason"` // full | stopped | limit
 
+	// The T10 edge columns (mode "edge"): the trigger armed (nil =
+	// none), whether it fired, the run stream's T0 (absolute — every
+	// run's absolute time is t0_ns + Σ preceding dur, the frozen
+	// single-source derivation), and the runs the engine dropped after
+	// the ring filled.
+	Trig        *TrigMeta `json:"trig,omitempty"`
+	TrigFired   bool      `json:"trig_fired,omitempty"`
+	T0NS        int64     `json:"t0_ns,omitempty"`
+	RunsDropped int64     `json:"runs_dropped,omitempty"`
+
 	// The fw-side ledger mirrored at pull time (la.stop / la.info);
 	// zeros are omitted — an incomplete landing carries only what the
 	// stopped engine could account.
@@ -73,6 +83,16 @@ type Meta struct {
 	SHA256     string    `json:"sha256"` // data.bin's digest (pass-1 == pass-2 identity)
 	Incomplete bool      `json:"incomplete,omitempty"`
 	PulledAt   time.Time `json:"pulled_at"`
+}
+
+// TrigMeta is the edge capture's trigger as the fw's la.info mirror
+// carries it: the pin (a pins[] member), the frozen kind vocabulary,
+// the level (kind "level" only), and the pre-trigger window depth.
+type TrigMeta struct {
+	Pin   int    `json:"pin"`
+	Kind  string `json:"kind"`            // "edge_r" | "edge_f" | "level"
+	Level *int   `json:"level,omitempty"` // 0|1, kind "level" only (a pointer: presence is part of the request domain — an omitted level refuses)
+	PreKB int    `json:"pre_kb"`          // pre-trigger window KB (0 = no history)
 }
 
 // CaptureRef is a landed (or partially landed) capture object: the id,

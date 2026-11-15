@@ -20,6 +20,7 @@ import (
 	"os"
 	"time"
 
+	"xuansi/internal/discover"
 	"xuansi/internal/la"
 )
 
@@ -126,17 +127,20 @@ func laArmArgs(req *Request) (la.ArmArgs, error) {
 	return arm, nil
 }
 
-// hLaCapture arms one listen capture and blocks until the pull-back
-// is verified (the xuansi_capture blocking precedent, one seat over):
-// lease-gated, v9-gated, then PullCapture owns the quintet. The
-// board's arm refusal (coach text included) crosses verbatim — nothing
-// landed. A pull that breaks AFTER arm lands the incomplete object
-// and answers an error that names it: forensics are reachable, never
-// silently lost.
+// hLaCapture arms one capture and blocks until the pull-back is
+// verified (the xuansi_capture blocking precedent, one seat over):
+// lease-gated, v9-gated, then the mode's pull owns its quintet —
+// listen (PullCapture, the UART listener) or edge (PullEdge, the
+// RMT run-length engine). The board's arm refusal (coach text
+// included) crosses verbatim — nothing landed. A pull that breaks
+// AFTER arm lands the incomplete object and answers an error that
+// names it: forensics are reachable, never silently lost.
 func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (any, error) {
-	if req.Mode != "" && req.Mode != "listen" {
+	switch req.Mode {
+	case "", "listen", "edge":
+	default:
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf(
-			"la_capture: mode %q — this wave lands \"listen\" only (the edge/samples modes arrive with later waves)", req.Mode)}
+			"la_capture: mode %q — this wave lands \"listen\" and \"edge\" (the samples mode arrives with its own wave)", req.Mode)}
 	}
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
@@ -144,6 +148,9 @@ func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (
 	}
 	if err := s.ensureLiveLease(cc, req, b.MAC6); err != nil {
 		return nil, err
+	}
+	if req.Mode == "edge" {
+		return s.hLaCaptureEdge(ctx, req, b)
 	}
 	// the request-shape gate first (zero-contact, era-independent):
 	// garbage is refused before any board fact matters.
@@ -153,7 +160,7 @@ func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (
 	}
 	if v := s.protocolVer(b.MAC6); v > 0 && v < 9 {
 		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
-			"la_capture: board %s reports protocol_ver=%d — the la.* listen face is a v9 overlay; the board fw must be upgraded first", b.MAC6, v)}
+			"la_capture: board %s reports protocol_ver=%d — the la.* face is a v9 overlay; the board fw must be upgraded first", b.MAC6, v)}
 	}
 	ctl, err := s.warmController(ctx, b)
 	if err != nil {
@@ -169,7 +176,98 @@ func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (
 		// after arm: the incomplete object IS the answer's forensics
 		// half — the error names it so the seat can still read it
 		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
-			"la_capture %s: %v — the object landed INCOMPLETE (meta incomplete:true, no verified sha256): forensics only, readable via la_info/la_frames, never a lossless capture", ref.ID, perr)}
+			"la_capture %s: %v — the object landed INCOMPLETE (meta incomplete:true, no verified sha256): forensics only, readable via la_info/la_edges, never a lossless capture", ref.ID, perr)}
+	}
+	s.noteBoardContact(b.MAC6)
+	return map[string]any{"capture_id": ref.ID, "path": ref.DataPath, "meta": ref.Meta}, nil
+}
+
+// The edge arm's daemon-side domain (the cheap zero-contact
+// refusals; the board owns the rest — pin bans, the pin-claim dance,
+// the RMT group mutex, the ring-budget admission arithmetic).
+func laEdgeArgs(req *Request) (la.EdgeArmArgs, error) {
+	if req.LaPort != 0 || req.Baud != nil {
+		return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: port/baud are the LISTEN arm's columns — the edge arm rides pins[] (got port=%d baud=%v; omit them for mode \"edge\")", req.LaPort, req.Baud)}
+	}
+	if len(req.Pins) < 1 || len(req.Pins) > 4 {
+		return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: pins must list 1..4 GPIOs (got %d) — the edge engine arms up to 4 RMT channels", len(req.Pins))}
+	}
+	seen := map[int]bool{}
+	for _, p := range req.Pins {
+		if p < 0 {
+			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: pin %d out of range (the GPIOs are 0..48; the fw's refusal lists the banned pins)", p)}
+		}
+		if seen[p] {
+			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: pin %d listed twice — each pin arms one RMT channel once", p)}
+		}
+		seen[p] = true
+	}
+	if req.RingKB < 64 || req.RingKB > laRingKBMax {
+		return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: ring_kb %d out of domain 64..%d — the edge arm has NO fw default (the ring is the capture's whole history bound; admission vs la_ring_budget_kb)", req.RingKB, laRingKBMax)}
+	}
+	arm := la.EdgeArmArgs{Pins: req.Pins, RingKB: req.RingKB}
+	if req.MaxSeconds > 0 {
+		s := req.MaxSeconds
+		if s > laSecondsCap {
+			s = laSecondsCap
+		}
+		arm.MaxMS = int(s) * 1000
+	}
+	if t := req.Trig; t != nil {
+		switch t.Kind {
+		case "edge_r", "edge_f":
+		case "level":
+			if t.Level == nil {
+				return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: "la_capture: trig.level is REQUIRED for kind \"level\" (0|1 — which level to match)"}
+			}
+			if *t.Level != 0 && *t.Level != 1 {
+				return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+					"la_capture: trig.level %d — want 0|1", *t.Level)}
+			}
+		default:
+			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: trig.kind %q — want \"edge_r\"|\"edge_f\"|\"level\"", t.Kind)}
+		}
+		if !seen[t.Pin] {
+			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: trig.pin %d must be one of the armed pins %v (the trigger rides a captured line)", t.Pin, req.Pins)}
+		}
+		if t.PreKB < 0 || t.PreKB >= req.RingKB {
+			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+				"la_capture: trig.pre_kb %d must be < ring_kb %d (post-trigger needs room)", t.PreKB, req.RingKB)}
+		}
+		arm.Trig = &la.EdgeTrig{Pin: t.Pin, Kind: t.Kind, Level: t.Level, PreKB: t.PreKB}
+	}
+	return arm, nil
+}
+
+// hLaCaptureEdge is la_capture's mode "edge" half: the same gates,
+// then PullEdge owns the edge quintet.
+func (s *Server) hLaCaptureEdge(ctx context.Context, req *Request, b discover.Board) (any, error) {
+	arm, aerr := laEdgeArgs(req)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if v := s.protocolVer(b.MAC6); v > 0 && v < 9 {
+		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
+			"la_capture: board %s reports protocol_ver=%d — the la.* edge face is a v9 overlay (the T10 engine); the board fw must be upgraded first", b.MAC6, v)}
+	}
+	ctl, err := s.warmController(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+	ref, perr := s.laStore.PullEdge(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	if perr != nil {
+		if ref.ID == "" {
+			return nil, perr
+		}
+		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
+			"la_capture %s: %v — the object landed INCOMPLETE (meta incomplete:true, no verified sha256): forensics only, readable via la_info/la_edges, never a lossless capture", ref.ID, perr)}
 	}
 	s.noteBoardContact(b.MAC6)
 	return map[string]any{"capture_id": ref.ID, "path": ref.DataPath, "meta": ref.Meta}, nil
@@ -254,6 +352,65 @@ func laStoreRPC(op, id string, err error) *RPCError {
 		return &RPCError{Class: "api", Msg: fmt.Sprintf("%s: no capture %q (la_list answers the landed ids)", op, id)}
 	}
 	return &RPCError{Class: "api", Msg: fmt.Sprintf("%s: %v", op, err)}
+}
+
+// ---- the edge analysis crossings (T11): thin — internal/la owns the
+// semantics, frozen this wave; every crossing is daemon-local (no
+// lease, no board contact — the objects outlive the board).
+
+func (s *Server) hLaEdges(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_edges", req.CaptureID, err)
+	}
+	return la.Edges(ref, req.FromNS, req.ToNS, int(req.Max))
+}
+
+func (s *Server) hLaRuns(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_runs", req.CaptureID, err)
+	}
+	return la.Runs(ref, req.FromNS, req.ToNS, int(req.Max))
+}
+
+func (s *Server) hLaHist(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_hist", req.CaptureID, err)
+	}
+	return la.Hist(ref, req.Kind, req.Bins)
+}
+
+func (s *Server) hLaMeasure(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_measure", req.CaptureID, err)
+	}
+	if req.A == nil || req.B == nil {
+		return nil, &RPCError{Class: "api", Msg: "la_measure: both points a and b are required ({t_ns} or {edge_i} each — exactly one form per point)"}
+	}
+	return la.Measure(ref, *req.A, *req.B)
+}
+
+func (s *Server) hLaDiff(req *Request) (any, error) {
+	refA, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_diff", req.CaptureID, err)
+	}
+	refB, err := s.laStore.Ref(req.CaptureIDB)
+	if err != nil {
+		return nil, laStoreRPC("la_diff", req.CaptureIDB, err)
+	}
+	return la.Diff(refA, refB)
+}
+
+func (s *Server) hLaDecodeWire(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_decode_wire", req.CaptureID, err)
+	}
+	return la.DecodeWire(ref, req.Proto)
 }
 
 // laDisarmAll sweeps the board's residual la captures at the lease's

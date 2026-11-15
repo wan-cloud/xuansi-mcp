@@ -1262,6 +1262,18 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hLaRepeat(req)
 	case "la_decode_uart":
 		result, err = s.hLaDecodeUART(req)
+	case "la_edges": // T11: the edge analysis crossings (daemon-local)
+		result, err = s.hLaEdges(req)
+	case "la_runs":
+		result, err = s.hLaRuns(req)
+	case "la_hist":
+		result, err = s.hLaHist(req)
+	case "la_measure":
+		result, err = s.hLaMeasure(req)
+	case "la_diff":
+		result, err = s.hLaDiff(req)
+	case "la_decode_wire":
+		result, err = s.hLaDecodeWire(req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1982,10 +1994,10 @@ var opAllowlist = map[string]bool{
 	// same lifecycle family as listen_arm (T3 seam precedent: the op
 	// seat is required by board HIL; the MCP/object face is T11's).
 	"la.edge_arm": true,
-	"la.stop":       true,
-	"la.read":       true,
-	"la.info":       true,
-	"la.disarm":     true,
+	"la.stop":     true,
+	"la.read":     true,
+	"la.info":     true,
+	"la.disarm":   true,
 }
 
 // AllowlistedOps renders the ops face's allowlisted op names, sorted —

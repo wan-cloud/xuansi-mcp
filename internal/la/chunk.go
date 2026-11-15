@@ -21,10 +21,10 @@ type Chunk struct {
 }
 
 // ErrFormatNotLanded is the honest stub reply of the reader families
-// whose capture formats land with their own waves (T10 edge, T12
-// samples): the signatures are frozen here so the analysis seats
-// consume one shape, the implementations are not.
-var ErrFormatNotLanded = errors.New("la: capture format not landed yet (edge: T10 wave; samples: T12 wave)")
+// whose capture formats land with their own waves (the samples
+// format: T12): the signature is frozen here so the analysis seats
+// consume one shape, the implementation is not.
+var ErrFormatNotLanded = errors.New("la: capture format not landed yet (samples: T12 wave)")
 
 // chunkHdr is the frozen per-record header: u64 start_ns + u16 n,
 // little-endian.
@@ -77,24 +77,114 @@ func ReadChunks(dataPath string) ([]Chunk, error) {
 	return out, nil
 }
 
-// Run is one edge-capture record (T10's frozen format lands then; the
-// reader signature is frozen now so T6/T11 consume one shape).
+// Run is one edge-capture record (T10's frozen format: {u8 mask,
+// u64 dur_ns LE}). StartNS rides the T0-RELATIVE axis — Σ the
+// preceding runs' dur (run 0 starts at 0); the analysis seats add
+// meta.t0_ns for the absolute axis (the fw's frozen single-source
+// derivation: absolute = t0_ns + Σ preceding dur).
 type Run struct {
 	Level   int
 	StartNS uint64
 	WidthNS uint64
 }
 
-// ReadRuns parses an edge capture's run records — the T10 format. The
-// signature is frozen this wave; the implementation lands with T10.
+// runRec is the frozen per-record size: u8 mask + u64 dur_ns,
+// little-endian (9 bytes — the fw's LA_EDGE_RUN).
+const runRec = 9
+
+// ReadRuns parses an edge capture's run records — the T10 format.
+// A torn tail (a record cut short) or trailing garbage is an error
+// naming the byte offset: a complete object parses to exact eof (the
+// pull asserted that at pull time; the fw's runs==total/9 invariant
+// makes every clean stream a whole number of records).
 func ReadRuns(dataPath string) ([]Run, error) {
-	return nil, ErrFormatNotLanded
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	var out []Run
+	var off int64
+	var rel uint64
+	rec := make([]byte, runRec)
+	for {
+		got, err := io.ReadFull(r, rec)
+		if errors.Is(err, io.EOF) && got == 0 {
+			return out, nil // clean eof — exact end of the run sequence
+		}
+		if err != nil {
+			return nil, fmt.Errorf("la: %s: torn run record at stream byte %d (%d of %d bytes)", dataPath, off, got, runRec)
+		}
+		out = append(out, Run{Level: int(rec[0]), StartNS: rel, WidthNS: binary.LittleEndian.Uint64(rec[1:])})
+		rel += binary.LittleEndian.Uint64(rec[1:])
+		off += runRec
+	}
 }
 
 // ReadSamples parses a sample capture's records — the T12 format (the
 // record model is T12's to freeze; this signature is the seat).
 func ReadSamples(dataPath string) ([][]byte, error) {
 	return nil, ErrFormatNotLanded
+}
+
+// runStats is the edge pull's parse account: run count, the stream's
+// byte total, and the T0-relative span (Σ dur — the meta's absolute
+// t_start_ns/t_end_ns are t0_ns and t0_ns+span). Tolerant mode stops
+// at the first torn record (an incomplete landing's partial stream);
+// strict mode errors on any tear or trailing garbage.
+type runStats struct {
+	Runs   int64
+	Stream int64
+	SpanNS uint64
+}
+
+func parseRunStats(dataPath string, tolerant bool) (runStats, error) {
+	var st runStats
+	err := WalkRuns(dataPath, func(r Run) error {
+		st.Runs++
+		st.SpanNS += r.WidthNS
+		return nil
+	})
+	if err != nil {
+		if tolerant {
+			st.Stream = st.Runs * runRec
+			return st, nil // the account covers every clean record before the tear
+		}
+		return runStats{}, err
+	}
+	st.Stream = st.Runs * runRec
+	return st, nil
+}
+
+// WalkRuns streams an edge capture's run records off disk, fn for
+// each, stopping silently at the first torn record (the tolerant
+// reader's walker — a strict reader errors instead).
+func WalkRuns(dataPath string, fn func(Run) error) error {
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	var off int64
+	var rel uint64
+	rec := make([]byte, runRec)
+	for {
+		got, err := io.ReadFull(r, rec)
+		if errors.Is(err, io.EOF) && got == 0 {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("la: %s: torn run record at stream byte %d (%d of %d bytes)", dataPath, off, got, runRec)
+		}
+		dur := binary.LittleEndian.Uint64(rec[1:])
+		if err := fn(Run{Level: int(rec[0]), StartNS: rel, WidthNS: dur}); err != nil {
+			return err
+		}
+		rel += dur
+		off += runRec
+	}
 }
 
 // chunkStats is the pull's parse account: chunk count, payload bytes,

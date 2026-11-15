@@ -332,6 +332,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"xuansi/internal/la"
 )
 
 // MaxMsgBytes caps one framed message (see the framing contract above).
@@ -421,7 +423,8 @@ type Request struct {
 	// (la_info/la_frames/la_repeat/la_decode_uart). IdleNS overrides
 	// la_frames' idle threshold (0 = the capture's own). Baud (int
 	// only there) and Parity ("" | "E" | "O") are la_decode_uart's
-	// params. Mode gates la_capture's wave domain — "listen" this wave.
+	// params. Mode gates la_capture's wave domain — "listen" (default)
+	// and "edge" (T11).
 	Mode   string `json:"mode,omitempty"`
 	LaPort int    `json:"la_port,omitempty"`
 	LaPin  int    `json:"la_pin,omitempty"`
@@ -429,6 +432,29 @@ type Request struct {
 	RingKB int    `json:"ring_kb,omitempty"`
 	IdleNS uint64 `json:"idle_ns,omitempty"`
 	Parity string `json:"parity,omitempty"`
+
+	// The edge face (T11). Pins arm the edge engine (la_capture mode
+	// "edge": 1..4 GPIOs, no port/baud); Trig is the optional trigger
+	// (pin ∈ pins, kind edge_r|edge_f|level, level for kind=level,
+	// pre_kb < ring_kb).
+	Pins []int        `json:"pins,omitempty"`
+	Trig *la.TrigMeta `json:"trig,omitempty"`
+
+	// The edge analysis crossings (T11): FromNS/ToNS bound la_edges/
+	// la_runs ([from, to) absolute ns, 0 = open); Max bounds their
+	// rows (default 256, hard cap 4096); Kind/Bins are la_hist's
+	// (kind pulse|period; bins 2..256, 0 = 32); A/B are la_measure's
+	// two points ({t_ns} or {edge_i}, exactly one each); CaptureIDB
+	// is la_diff's second capture; Proto is la_decode_wire's
+	// (onewire|ws2812).
+	FromNS     uint64           `json:"from_ns,omitempty"`
+	ToNS       uint64           `json:"to_ns,omitempty"`
+	Kind       string           `json:"kind,omitempty"`
+	Bins       int              `json:"bins,omitempty"`
+	A          *la.MeasurePoint `json:"a,omitempty"`
+	B          *la.MeasurePoint `json:"b,omitempty"`
+	CaptureIDB string           `json:"capture_id_b,omitempty"`
+	Proto      string           `json:"proto,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.

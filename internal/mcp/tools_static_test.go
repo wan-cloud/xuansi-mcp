@@ -701,12 +701,22 @@ var staticToolsRequiredAudit = map[string][]string{
 	// T7 (LA wave): the la_* first batch — capture needs the wire's
 	// identity (board + the arm trio; mode/ring_kb/seconds/holder
 	// optional), the object reads need the id, list needs nothing.
-	"xuansi_la_capture":     {"board", "port", "pin", "baud"},
+	// T11: mode "edge" arms on pins[] alone — port/pin/baud became
+	// listen-mode columns (optional; the daemon refuses a mode-mixed
+	// arm), and the six edge seats append (their ids required, the
+	// windows/kinds optional).
+	"xuansi_la_capture":     {"board"},
 	"xuansi_la_list":        {},
 	"xuansi_la_info":        {"capture_id"},
 	"xuansi_la_frames":      {"capture_id"},
 	"xuansi_la_repeat":      {"capture_id"},
 	"xuansi_la_decode_uart": {"capture_id"},
+	"xuansi_la_edges":       {"capture_id"},
+	"xuansi_la_runs":        {"capture_id"},
+	"xuansi_la_hist":        {"capture_id", "kind"},
+	"xuansi_la_measure":     {"capture_id", "a", "b"},
+	"xuansi_la_diff":        {"capture_a", "capture_b"},
+	"xuansi_la_decode_wire": {"capture_id", "proto"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static

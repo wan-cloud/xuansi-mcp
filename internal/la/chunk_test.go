@@ -114,10 +114,10 @@ func TestParseStatsTolerantStopsAtTear(t *testing.T) {
 	}
 }
 
+// The T10 run format landed with T11's reader (TestReadRunsGoldenAndTorn
+// in analysis_edges_test.go pins it); samples stays an honest stub until
+// the T12 wave freezes its record model.
 func TestFormatStubsHonest(t *testing.T) {
-	if _, err := ReadRuns("whatever"); !errors.Is(err, ErrFormatNotLanded) {
-		t.Errorf("ReadRuns err = %v, want ErrFormatNotLanded", err)
-	}
 	if _, err := ReadSamples("whatever"); !errors.Is(err, ErrFormatNotLanded) {
 		t.Errorf("ReadSamples err = %v, want ErrFormatNotLanded", err)
 	}

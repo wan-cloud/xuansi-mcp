@@ -18,6 +18,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"xuansi/internal/apiclient"
+	"xuansi/internal/la"
 	"xuansi/internal/server"
 )
 
@@ -28,16 +29,31 @@ const laAntiConfusion = "This is the LA capture-OBJECT face — NOT xuansi_captu
 
 type laCaptureIn struct {
 	Board string `json:"board" jsonschema:"board selector: mac6 / alias / hostname unique prefix (e.g. \"d75884\" or \"bench1\"), resolved daemon-side; an ambiguous or unknown prefix returns an error listing the candidates"`
-	Mode  string `json:"mode,omitempty" jsonschema:"capture mode; this wave lands \"listen\" only (passive UART listen — RX-only by construction, the engine has no TX path). The edge/samples modes arrive with later waves and refuse here. Omit = listen"`
-	Port  int    `json:"port" jsonschema:"the hw UART the listen engine rides: 1 (uart1) or 2 (uart2)"`
-	Pin   int    `json:"pin" jsonschema:"the GPIO the line under study is wired to — explicit, always: the ports' DEFAULT pins are board-specific traps this face never guesses, and the fw's refusal lists the banned pins"`
-	Baud  any    `json:"baud" jsonschema:"the line's baud: an integer 1200..5000000, or \"auto\" — the board measures it (RMT bit-width) and the reply's meta.baud carries the resolved value"`
+	Mode  string `json:"mode,omitempty" jsonschema:"capture mode: \"listen\" (default — passive UART listen on one pin, RX-only by construction) or \"edge\" (the RMT run-length engine: 1..4 pins, no port/baud — the line's every transition as {level, dur_ns} runs, 12.5ns resolution; two views of one signal compare with xuansi_la_diff). The samples mode arrives with its own wave"`
+	// Port/Baud/Pin arm the LISTEN engine (mode "listen");
+	// Pins/Trig arm the EDGE engine (mode "edge").
+	Port int `json:"port,omitempty" jsonschema:"LISTEN only: the hw UART the listen engine rides, 1 (uart1) or 2 (uart2)"`
+	Pin  int `json:"pin,omitempty" jsonschema:"LISTEN only: the GPIO the line under study is wired to — explicit, always: the ports' DEFAULT pins are board-specific traps this face never guesses, and the fw's refusal lists the banned pins"`
+	Baud any `json:"baud,omitempty" jsonschema:"LISTEN only: the line's baud: an integer 1200..5000000, or \"auto\" — the board measures it (RMT bit-width) and the reply's meta.baud carries the resolved value"`
+	// Pins arms the edge engine.
+	Pins []int `json:"pins,omitempty" jsonschema:"EDGE only (mode \"edge\"): 1..4 GPIOs whose lines' transitions record as run-length {mask, dur_ns} — mask bit i = pins[i]'s level; the RMT group runs at the pinned 80MHz/12.5ns"`
+	// Trig is the edge arm's optional trigger (the frozen small
+	// language — a line-level match, no protocol semantics).
+	Trig *laTrigIn `json:"trig,omitempty" jsonschema:"EDGE only: optional trigger {pin (a pins[] member), kind \"edge_r\"|\"edge_f\"|\"level\", level 0|1 (kind \"level\"), pre_kb < ring_kb (the pre-trigger history kept)} — armed with a trigger the ring runs CIRCULAR (overwriting, keeping pre_kb of history) until the match, then fills linearly (reason \"trig\"); without one it fills linearly from arm (reason \"full\")"`
 	// RingKB sizes the on-board ring; 0 (omitted) = the fw default.
-	RingKB int `json:"ring_kb,omitempty" jsonschema:"on-board ring buffer KB (0 = fw default). Admission: active rings + this request must fit la_ring_budget_kb=4096 (read caps) — the board's refusal itemizes the account. The capture ends reason \"full\" when the ring fills"`
+	RingKB int `json:"ring_kb,omitempty" jsonschema:"on-board ring buffer KB. LISTEN: 0 = fw default. EDGE: REQUIRED, 64..4096 (no default exists — the ring is the capture's whole history bound). Admission: active rings + this request must fit la_ring_budget_kb=4096 (read caps) — the board's refusal itemizes the account. The capture ends reason \"full\" (no trig) when the ring fills"`
 	// Seconds is the time bound → the fw's max_ms (the arm crosses
 	// ×1000, clamped at 600 like capture's own seconds rule).
 	Seconds int64  `json:"seconds,omitempty" jsonschema:"time bound in seconds (1..600 — the fw's max_ms cap is 600000ms): the capture ends reason \"limit\" when it passes; omit for the fw default. The call BLOCKS until the capture ends AND the verified pull-back lands"`
 	Holder  string `json:"holder,omitempty" jsonschema:"lease holder identity. Omit to ride this process's holder (a generated \"mcp-…\" id): the first holder used on the daemon connection binds it and every later call rides it. Supply your own ONLY to adopt a lease across sessions/processes (grace-adopt) — supply it on the FIRST call (e.g. xuansi_lease), not midway"`
+}
+
+// laTrigIn is the edge arm's trigger crossing.
+type laTrigIn struct {
+	Pin   int    `json:"pin" jsonschema:"the trigger pin — must be one of the armed pins[]"`
+	Kind  string `json:"kind" jsonschema:"\"edge_r\" (0→1) | \"edge_f\" (1→0) | \"level\" (the line sits at level — a level already true at arm fires immediately, pre-window empty)"`
+	Level *int   `json:"level,omitempty" jsonschema:"0|1, required for kind \"level\" (its PRESENCE is checked — an omitted level refuses)"`
+	PreKB int    `json:"pre_kb,omitempty" jsonschema:"pre-trigger history kept (KB, < ring_kb; 0 = no history — the capture starts at the trigger)"`
 }
 
 type laCaptureOut struct {
@@ -114,12 +130,12 @@ type laDecodeOut struct {
 func (ts *toolset) registerLA(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "xuansi_la_capture",
-		Description: "Arm the board's LA LISTEN ENGINE (protocol v9) and BLOCK until the capture ends AND the on-board ring is pulled back VERIFIED (two-pass sha256 identity) — the answer is a capture OBJECT the other la_* tools analyze. " + laAntiConfusion + ": xuansi_capture records an event source to a file; THIS arms the hardware UART as a passive protocol listener (RX-only by construction — no TX path exists, fw-frozen) that timestamps every byte, then lands captures/la/<capture_id>/{data.bin,meta.json} on the daemon host. " +
-			"THE WIRE: connect the line under study to pin (a free GPIO on the listening board — its pin map; the fw refuses banned pins with the list), port selects the hw UART (1/2), baud the line's integer rate 1200..5000000 or \"auto\" (measured; meta.baud carries what it measured). ring_kb sizes the on-board ring (admission vs la_ring_budget_kb=4096 — read caps; ring full ends reason \"full\"), seconds the time bound (1..600; ends reason \"limit\"). " +
-			"BLOCKING: the call holds until the pull-back is verified — budget seconds plus read-back time. The block rides a DEDICATED daemon lane: every other xuansi tool keeps answering while it holds (drive a stimulus board on another lease mid-capture — that is the workflow). " +
-			"THE VERDICT IS IN THE REPLY: meta.incomplete ABSENT = the lossless promise HELD (sha256 verified); an ERROR naming the capture id = the pull broke (cancel, link death, checksum) and the incomplete object landed as FORENSICS — readable via xuansi_la_info/xuansi_la_frames, never a trustworthy capture. " +
-			"Mutual exclusion: the same hw UART cannot run bench uart primitives and the listener at once (the board refuses, naming the conflict — both directions). " +
-			"FIRST LOOK after a capture: xuansi_la_frames (the idle framing — the protocol's sentence structure), xuansi_la_repeat when the traffic looks periodic (poll loops, heartbeats), xuansi_la_decode_uart for a per-frame parity verdict. Holder semantics: " + holderDesc + ".",
+		Description: "Arm one board's LA capture ENGINE (protocol v9) and BLOCK until the capture ends AND the on-board ring is pulled back VERIFIED (two-pass sha256 identity) — the answer is a capture OBJECT the la_* tools analyze. " + laAntiConfusion + ": xuansi_capture records an event source to a file; THIS arms real capture hardware. " +
+			"TWO MODES. mode \"listen\" (default): the hardware UART as a passive protocol listener (RX-only by construction — no TX path exists, fw-frozen) that timestamps every byte — connect the line to pin, port selects the hw UART (1/2), baud the integer rate 1200..5000000 or \"auto\" (measured; meta.baud carries it); analyze with xuansi_la_frames/repeat/decode_uart. mode \"edge\": the RMT run-length engine — 1..4 pins (NO port/baud) record every line transition as {mask, dur_ns} runs at the pinned 80MHz/12.5ns (mask bit i = pins[i]'s level); ring_kb is REQUIRED (64..4096 — the ring is the whole history bound; full = ring filled, limit = the seconds bound, trig = the optional trigger fired, stopped = ended early); optional trig {pin ∈ pins, kind edge_r|edge_f|level, level, pre_kb} arms a pre-trigger circular window; analyze with xuansi_la_edges/runs/hist/measure/diff/decode_wire — two captures of one signal (two probes, two views) compare with xuansi_la_diff (same-board only). " +
+			"BLOCKING: the call holds until the pull-back is verified — budget the capture's own bound plus read-back time. The block rides a DEDICATED daemon lane: every other xuansi tool keeps answering while it holds (drive a stimulus board on another lease mid-capture — that is the workflow). " +
+			"THE VERDICT IS IN THE REPLY: meta.incomplete ABSENT = the lossless promise HELD (sha256 verified); an ERROR naming the capture id = the pull broke (cancel, link death, checksum) and the incomplete object landed as FORENSICS — readable via xuansi_la_info/xuansi_la_edges, never a trustworthy capture. " +
+			"Mutual exclusion (listen): the same hw UART cannot run bench uart primitives and the listener at once (the board refuses, naming the conflict — both directions). Mutual exclusion (edge): the RMT group is exclusive against bench.rmt in both directions. " +
+			"FIRST LOOK after a listen capture: xuansi_la_frames (the idle framing — the protocol's sentence structure), xuansi_la_repeat when the traffic looks periodic (poll loops, heartbeats), xuansi_la_decode_uart for a per-frame parity verdict; after an edge capture: xuansi_la_edges (the transition view) then xuansi_la_hist (the timing units). Holder semantics: " + holderDesc + ".",
 	}, ts.laCapture)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -234,11 +250,19 @@ func (ts *toolset) laCapture(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	// the dedicated lane: this call blocks up to seconds + pull time —
 	// the shared connection keeps serving every other tool meanwhile
 	// (drive a stimulus board on it mid-capture; that is the workflow)
-	res, err := ts.callLALane(ctx, server.Request{
+	req := server.Request{
 		Type: "la_capture", Board: in.Board, Holder: in.Holder,
 		Mode: in.Mode, LaPort: in.Port, LaPin: in.Pin, Baud: in.Baud,
 		RingKB: in.RingKB, MaxSeconds: in.Seconds,
-	})
+	}
+	if len(in.Pins) > 0 {
+		req.Pins = in.Pins
+	}
+	if in.Trig != nil {
+		req.Trig = &la.TrigMeta{Pin: in.Trig.Pin, Kind: in.Trig.Kind,
+			Level: in.Trig.Level, PreKB: in.Trig.PreKB}
+	}
+	res, err := ts.callLALane(ctx, req)
 	if err != nil {
 		return nil, laCaptureOut{}, err
 	}

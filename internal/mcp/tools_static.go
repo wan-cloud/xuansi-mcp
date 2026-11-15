@@ -437,6 +437,16 @@ var staticToolNames = []string{
 	"xuansi_la_frames",
 	"xuansi_la_repeat",
 	"xuansi_la_decode_uart",
+	// T11 (LA edge wave): the edge analysis seats — the transition/
+	// run-length views, the deterministic statistics, the two-point
+	// measurement, the two-capture diff, and the wire decoders
+	// (44 now — appended, nothing renumbers).
+	"xuansi_la_edges",
+	"xuansi_la_runs",
+	"xuansi_la_hist",
+	"xuansi_la_measure",
+	"xuansi_la_diff",
+	"xuansi_la_decode_wire",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -599,6 +609,8 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	// T7 (LA wave): the la_* first batch.
 	ts.registerLA(srv)
+
+	ts.registerLAEdges(srv)
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +962,20 @@ func bol(m map[string]any, k string) bool {
 func num(m map[string]any, k string) int {
 	f, _ := m[k].(float64)
 	return int(f)
+}
+
+// i64 reads one signed field across the JSON float64 shape (t0_ns and
+// dt_ns are signed on the wire).
+func i64(m map[string]any, k string) int64 {
+	f, _ := m[k].(float64)
+	return int64(f)
+}
+
+// f64 reads one float field verbatim (freq/duty/est_baud — the real
+// fractions, never int-truncated).
+func f64(m map[string]any, k string) float64 {
+	f, _ := m[k].(float64)
+	return f
 }
 
 func strSlice(v any) []string {

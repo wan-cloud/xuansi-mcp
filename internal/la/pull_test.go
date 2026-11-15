@@ -52,6 +52,12 @@ type scriptedBoard struct {
 	ops      int            // total Op calls taken
 	pushDone bool           // push the done event inside the arm reply
 	pushJunk bool           // push a foreign-cap done + a progress first
+
+	// the edge face (T11): edge=true serves la.edge_arm/{cap,res_hz}
+	// and la.info's edge shape (edgeMeta + top-level pins).
+	edge     bool
+	edgeMeta map[string]any
+	edgePins []any
 }
 
 func newBoard(ring []byte) *scriptedBoard {
@@ -126,6 +132,14 @@ func (b *scriptedBoard) Op(ctx context.Context, op string, args map[string]any) 
 			b.push("la", map[string]any{"event": "done", "cap": b.capID, "bytes": b.stopB, "reason": b.stopR})
 		}
 		return map[string]any{"cap": b.capID, "baud": b.baud}, nil
+	case "la.edge_arm":
+		if b.armErr != nil {
+			return nil, b.armErr
+		}
+		if b.pushDone {
+			b.push("la", map[string]any{"event": "done", "cap": b.capID, "bytes": b.stopB, "reason": b.stopR})
+		}
+		return map[string]any{"cap": b.capID, "res_hz": int64(80_000_000)}, nil
 	case "la.stop":
 		if b.stopGate != nil {
 			close(b.stopHere)
@@ -133,6 +147,21 @@ func (b *scriptedBoard) Op(ctx context.Context, op string, args map[string]any) 
 		}
 		return map[string]any{"bytes": b.stopB, "reason": b.stopR}, nil
 	case "la.info":
+		if b.edge {
+			meta := b.edgeMeta
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			row := map[string]any{
+				"cap": b.capID, "mode": "edge", "state": "stopped",
+				"bytes": b.stopB, "total": int64(len(b.ring)),
+				"meta": meta,
+			}
+			if b.edgePins != nil {
+				row["pins"] = b.edgePins
+			}
+			return map[string]any{"caps": []any{row}}, nil
+		}
 		meta := b.infoMeta
 		if meta == nil {
 			meta = map[string]any{}
