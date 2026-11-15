@@ -1994,6 +1994,10 @@ var opAllowlist = map[string]bool{
 	// same lifecycle family as listen_arm (T3 seam precedent: the op
 	// seat is required by board HIL; the MCP/object face is T11's).
 	"la.edge_arm": true,
+	// LA wave T12 (sample capture): the LCD_CAM 8-channel sampler —
+	// same seat seam (board HIL rides the op face; the object/MCP
+	// face is T13's).
+	"la.sample_arm": true,
 	"la.stop":     true,
 	"la.read":     true,
 	"la.info":     true,
