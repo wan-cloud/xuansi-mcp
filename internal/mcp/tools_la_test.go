@@ -641,3 +641,51 @@ func waitLALaneDead(t *testing.T, ts *toolset) {
 	}
 	t.Fatal("LA lane did not observe its death within 5s")
 }
+
+// TestLACaptureTrigBitsDomainRefusedClientSide (LA 二輪審查
+// 2026-11-16 I-1): laTrigIn's Mask/Value ride as ints, but the
+// TrigMeta crossing is uint8 — out-of-domain values used to wrap
+// SILENTLY (mask 300→44, value 256→0) and arm a different window
+// than the caller asked for. The seat refuses them with ZERO daemon
+// contact (nothing may cross — the env's wires fail loud on any
+// request beyond the scripted one); the u8 boundaries cross intact.
+func TestLACaptureTrigBitsDomainRefusedClientSide(t *testing.T) {
+	e, reqs := newEnvLA(t, []step{{result: map[string]any{
+		"capture_id": "x", "path": "/p", "meta": map[string]any{"cap_id": "x"}}}})
+
+	for _, tc := range []struct {
+		name string
+		trig map[string]any
+	}{
+		{"mask 300", map[string]any{"kind": "bits", "mask": 300, "value": 1}},
+		{"value 256", map[string]any{"kind": "bits", "mask": 255, "value": 256}},
+		{"mask -1", map[string]any{"kind": "bits", "mask": -1, "value": 1}},
+	} {
+		res := e.call("xuansi_la_capture", map[string]any{
+			"board": "b", "mode": "samples", "rate_hz": 1000000, "ring_kb": 256,
+			"trig": tc.trig})
+		if !res.IsError {
+			t.Errorf("%s: captured — the u8 wrap must be refused client-side", tc.name)
+			continue
+		}
+		if got := resultText(t, res); !strings.Contains(got, "out of domain 0..255") || !strings.Contains(got, "refused client-side") {
+			t.Errorf("%s: error = %q, want the client-side u8 domain refusal", tc.name, got)
+		}
+	}
+	select {
+	case r := <-reqs:
+		t.Errorf("a refused trig crossed to the daemon: %+v", r)
+	default:
+	}
+	// the u8 boundary crosses intact: mask/value 255 arm the window asked
+	res := e.call("xuansi_la_capture", map[string]any{
+		"board": "b", "mode": "samples", "rate_hz": 1000000, "ring_kb": 256,
+		"trig": map[string]any{"kind": "bits", "mask": 255, "value": 255, "width": 2}})
+	if res.IsError {
+		t.Fatalf("mask/value 255 capture failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Trig == nil || req.Trig.Mask != 255 || req.Trig.Value != 255 || req.Trig.Width != 2 {
+		t.Errorf("crossed trig = %#v, want the u8 boundaries verbatim", req.Trig)
+	}
+}

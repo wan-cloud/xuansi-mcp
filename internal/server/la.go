@@ -513,8 +513,17 @@ func (s *Server) hLaDecodeWire(req *Request) (any, error) {
 
 // hLaDecodeBus answers the samples capture's bus decode (the i2c/spi
 // transaction list — internal/la owns the semantics, frozen this
-// wave; daemon-local like the other analysis seats).
+// wave; daemon-local like the other analysis seats). The cs_mask gate
+// sits HERE (the one crossing both the MCP seat and the raw socket
+// face share — Request.CSMask is an int, and the u8 conversion below
+// would wrap anything above 255 silently: 256→0 = the omitted
+// default, 264→0x08 = exactly the default. The wrap is refused, not
+// laundered).
 func (s *Server) hLaDecodeBus(req *Request) (any, error) {
+	if req.CSMask < 0 || req.CSMask > 255 {
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_decode_bus: cs_mask %d out of domain 0..255 — the CS lines are one sample byte's bits (a u8 bitmask; above 255 the u8 crossing would wrap silently: 256→0 = the omitted default), refused daemon-side", req.CSMask)}
+	}
 	ref, err := s.laStore.Ref(req.CaptureID)
 	if err != nil {
 		return nil, laStoreRPC("la_decode_bus", req.CaptureID, err)

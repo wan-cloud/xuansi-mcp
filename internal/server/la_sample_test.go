@@ -252,3 +252,58 @@ func TestLaDecodeBusCrossModeAndParamRefusals(t *testing.T) {
 		t.Errorf("proto can: %v, want the proto refusal", er)
 	}
 }
+
+// TestLaDecodeBusCSMaskDomainRefused (LA 二輪審查 2026-11-16 I-1):
+// cs_mask rides the Request as an int; the u8 conversion inside the
+// decode crossing used to wrap out-of-domain values SILENTLY (256→0 =
+// the omitted default, 264→0x08 = exactly the fixture default). The
+// domain gate in the handler refuses the outsides zero-contact (the
+// one gate both the MCP seat and the raw socket face share); 255
+// crosses it and dies on the spi form coach instead (bits 0..2 =
+// SCK/MOSI/MISO), and 0xF8 keeps the D3 framing green.
+func TestLaDecodeBusCSMaskDomainRefused(t *testing.T) {
+	const mac = "97c1ac"
+	e := newEnv(t, nil, mkBoard(mac, "bench2.local"))
+	e.srv.laStore.Root = filepath.Join(t.TempDir(), "la")
+	ring := lasampleRing()
+	scriptLASampleBoard(e.fakes[mac], ring, int64(len(ring)))
+	c := dialSock(t, e.sock)
+	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "h1"}); rep["error"] != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ := c.call(2, map[string]any{"type": "la_capture", "board": mac, "holder": "h1",
+		"mode": "samples", "rate_hz": 20_000_000, "ring_kb": 256})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("samples capture: %v", asMap(rep["error"]))
+	}
+	capID := asStr(asMap(rep["result"])["capture_id"])
+
+	for i, mask := range []int{256, 264, -1} {
+		rep, _ = c.call(int64(10+i), map[string]any{"type": "la_decode_bus", "capture_id": capID,
+			"proto": "spi", "cs_mask": mask})
+		er := asMap(rep["error"])
+		if er == nil {
+			t.Errorf("cs_mask %d: decoded — the u8 wrap must be refused, not laundered", mask)
+			continue
+		}
+		if asStr(er["class"]) != "api" || !strings.Contains(asStr(er["msg"]), "out of domain 0..255") {
+			t.Errorf("cs_mask %d: error = %#v, want the zero-contact u8 domain refusal", mask, er)
+		}
+	}
+	// 255 sits INSIDE the u8 domain: it crosses the gate and reaches the
+	// spi form coach (bits 0..2 belong to SCK/MOSI/MISO) — proof the
+	// domain gate passes everything it should.
+	rep, _ = c.call(20, map[string]any{"type": "la_decode_bus", "capture_id": capID,
+		"proto": "spi", "cs_mask": 255})
+	if er := asMap(rep["error"]); er == nil || !strings.Contains(asStr(er["msg"]), "overlaps") {
+		t.Errorf("cs_mask 255: error = %#v, want the spi form coach (the u8 gate must pass it through)", er)
+	}
+	// 0xF8 (bits 3..7) keeps the fixture's D3 framing: one green txn
+	// echoing the explicit mask
+	rep, _ = c.call(21, map[string]any{"type": "la_decode_bus", "capture_id": capID,
+		"proto": "spi", "cs_mask": 248})
+	d, rerr := asMap(rep["result"]), asMap(rep["error"])
+	if rerr != nil || asInt(d["n_txn"]) != 1 || asInt(d["cs_mask"]) != 248 {
+		t.Errorf("cs_mask 248: %#v (err %v), want one green txn echoing the mask", d, rerr)
+	}
+}

@@ -27,7 +27,7 @@ type laDecodeBusParams struct {
 	Mode   *int `json:"mode,omitempty" jsonschema:"spi: the clock shape 0..3 (cpol·2+cpha; default 0 — SCK idle low, bits sampled at the rising edge)"`
 	Cpol   *int `json:"cpol,omitempty" jsonschema:"spi: 0|1 — the alternative mode form (SCK idle level); must agree with mode when both given"`
 	Cpha   *int `json:"cpha,omitempty" jsonschema:"spi: 0|1 — the alternative mode form (which edge samples); must agree with mode when both given"`
-	CSMask int  `json:"cs_mask,omitempty" jsonschema:"spi: which sample bits are the CS line(s), ACTIVE LOW (a set bit = CS; default 0x08 = D3). All mask bits low = transaction open"`
+	CSMask int  `json:"cs_mask,omitempty" jsonschema:"spi: which sample bits are the CS line(s), ACTIVE LOW (a set bit = CS; a u8 bitmask 0..255, default 0x08 = D3). All mask bits low = transaction open"`
 	SDA    *int `json:"sda,omitempty" jsonschema:"i2c: the SDA channel 0..7 (default 2 = D2/GPIO8 — the bench.i2c bus pins)"`
 	SCL    *int `json:"scl,omitempty" jsonschema:"i2c: the SCL channel 0..7 (default 1 = D1/GPIO9)"`
 }

@@ -58,8 +58,8 @@ type laTrigIn struct {
 	Ch    int    `json:"ch,omitempty" jsonschema:"SAMPLES (kinds edge_r/edge_f/level): the trigger channel 0..7 (= D0..D7, the sample byte's bit)"`
 	Kind  string `json:"kind" jsonschema:"\"edge_r\" (0→1) | \"edge_f\" (1→0) | \"level\" (the line sits at level — a level already true at arm fires immediately, pre-window empty) | \"bits\" (SAMPLES only: the bit-window match sample&mask==value&mask for width consecutive samples)"`
 	Level *int   `json:"level,omitempty" jsonschema:"0|1, required for kind \"level\" (its PRESENCE is checked — an omitted level refuses)"`
-	Mask  int    `json:"mask,omitempty" jsonschema:"SAMPLES kind \"bits\": the window mask (u8, nonzero — a zero mask matches everything and refuses)"`
-	Value int    `json:"value,omitempty" jsonschema:"SAMPLES kind \"bits\": the window value (u8)"`
+	Mask  int    `json:"mask,omitempty" jsonschema:"SAMPLES kind \"bits\": the window mask 0..255 (u8 bitmask, nonzero — a zero mask matches everything and refuses)"`
+	Value int    `json:"value,omitempty" jsonschema:"SAMPLES kind \"bits\": the window value 0..255 (u8 bitmask — the window match is sample&mask==value&mask)"`
 	Width int    `json:"width,omitempty" jsonschema:"SAMPLES kind \"bits\": consecutive matching samples 1..64 (0/omitted = 1)"`
 	PreKB int    `json:"pre_kb,omitempty" jsonschema:"pre-trigger history kept (KB, < ring_kb; 0 = no history — the capture starts at the trigger)"`
 }
@@ -267,6 +267,18 @@ func (ts *toolset) laCapture(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 		req.Pins = in.Pins
 	}
 	if in.Trig != nil {
+		// the u8 pair's domain gate (LA 二輪審查 2026-11-16 I-1): the
+		// ints cross fine into this seat, but the TrigMeta crossing is
+		// uint8 — an out-of-domain value would wrap SILENTLY (300→44,
+		// 256→0) and arm a different window than the caller asked for.
+		// Refused HERE, zero daemon contact.
+		if in.Trig.Mask < 0 || in.Trig.Mask > 255 || in.Trig.Value < 0 || in.Trig.Value > 255 {
+			return nil, laCaptureOut{}, &server.RPCError{
+				Class: "api",
+				Msg: fmt.Sprintf("la_capture: trig mask/value are u8 bitmasks over the sample byte — mask %d, value %d out of domain 0..255 (the u8 crossing would wrap them silently: 300→44, 256→0), refused client-side",
+					in.Trig.Mask, in.Trig.Value),
+			}
+		}
 		req.Trig = &la.TrigMeta{Pin: in.Trig.Pin, Ch: in.Trig.Ch, Kind: in.Trig.Kind,
 			Level: in.Trig.Level, PreKB: in.Trig.PreKB,
 			Mask: uint8(in.Trig.Mask), Value: uint8(in.Trig.Value), Width: in.Trig.Width}
