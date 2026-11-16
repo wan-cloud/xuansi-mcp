@@ -53,6 +53,27 @@ func TestProvisionCoachDescsRideBoardTools(t *testing.T) {
 			t.Fatalf("%s's Desc must coach vault-error with the file-level remedy: %q", name, descs[name])
 		}
 	}
+	// the FOUR-state vocabulary rides both board tools (Batch A fix1:
+	// board_status's inline enum had lagged at three states — the
+	// exact miss this loop prevents recurring). provisionCoachDesc
+	// defines each state in place ("<state> = ...").
+	for _, name := range []string{"xuansi_list_boards", "xuansi_board_status"} {
+		for _, frag := range []string{
+			"ok = the board carries credentials",
+			"credless = it carries none",
+			"vault-empty = the board has none AND the host vault is empty",
+			"vault-error = the board has none AND the host vault read BROKEN",
+		} {
+			if !strings.Contains(descs[name], frag) {
+				t.Fatalf("%s's Desc must define the four-state provision vocabulary (missing %q): %q", name, frag, descs[name])
+			}
+		}
+	}
+	// the inline enum itself must be the full four-state form (the line
+	// that lagged).
+	if !strings.Contains(descs["xuansi_board_status"], "provision_state (ok | credless | vault-empty | vault-error;") {
+		t.Fatalf("xuansi_board_status's Desc inline enum must carry all four states: %q", descs["xuansi_board_status"])
+	}
 	// the op listing quotes the AGENT projection: no sec.* anywhere
 	for _, name := range want {
 		if strings.Contains(descs[name], "sec.psk") {
