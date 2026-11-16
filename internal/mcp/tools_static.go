@@ -474,6 +474,19 @@ var staticToolNames = []string{
 	// read (47 now — appended, nothing renumbers).
 	"xuansi_ota_push",
 	"xuansi_ota_status",
+	// LA 增強波 A (2026-11-17): the second analysis batch — the
+	// pattern search, the activity map, the universal bit decoder,
+	// the cross-channel accompaniment, the glitch account, the eye
+	// fold, the two-capture alignment, and the VCD export (55 now —
+	// appended, nothing renumbers).
+	"xuansi_la_search",
+	"xuansi_la_activity",
+	"xuansi_la_bits",
+	"xuansi_la_adjacent",
+	"xuansi_la_glitch",
+	"xuansi_la_eye",
+	"xuansi_la_align",
+	"xuansi_la_export",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -641,6 +654,10 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	// T13 (samples wave): the bus decode + the samples capture mode.
 	ts.registerLASample(srv)
+
+	// LA 增強波 A (2026-11-17): the second analysis batch — search/
+	// activity/bits/adjacent/glitch/eye/align/export.
+	ts.registerLAWave2(srv)
 
 	// T7 (OTA ops wave): the fleet push + the live state read.
 	ts.registerOTA(srv)

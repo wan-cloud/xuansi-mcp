@@ -725,6 +725,19 @@ var staticToolsRequiredAudit = map[string][]string{
 	// opt-in).
 	"xuansi_ota_push":   {"boards", "path"},
 	"xuansi_ota_status": {"board"},
+	// LA 增強波 A (2026-11-17): the wave-2 octet. search names its
+	// kind (the pattern rides the kind); adjacent names its SUBJECT
+	// channel (the account speaks its side); align names both
+	// captures; export names its fmt ("vcd" — the domain check sits
+	// daemon-side, but the field is part of the frozen ask).
+	"xuansi_la_search":   {"capture_id", "kind"},
+	"xuansi_la_activity": {"capture_id"},
+	"xuansi_la_bits":     {"capture_id"},
+	"xuansi_la_adjacent": {"capture_id", "ch"},
+	"xuansi_la_glitch":   {"capture_id"},
+	"xuansi_la_eye":      {"capture_id"},
+	"xuansi_la_align":    {"capture_a", "capture_b"},
+	"xuansi_la_export":   {"capture_id", "fmt"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static

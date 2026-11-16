@@ -509,6 +509,25 @@ type Request struct {
 	SdaCh   *int `json:"sda_ch,omitempty"`
 	SclCh   *int `json:"scl_ch,omitempty"`
 
+	// The LA wave-2 analysis fields (2026-11-17, LA 增強波 A). Pattern
+	// rides la_search (hex bytes for kind "bytes", a 0/1 string for
+	// kind "bits"); MinNS/MaxNS/Level are the timing kind's predicate
+	// (pointers: presence is the claim); WindowNS is la_adjacent's
+	// window; Ratio is la_glitch's threshold multiplier; BinMS/
+	// MaxBins are la_activity's; Fmt is la_export's ("vcd"). Ch (the
+	// stream_read field above) re-rides as the LA channel selector
+	// (0..7 samples / 0..len(pins)-1 edge); RateHz re-rides as
+	// la_bits' explicit bit rate; Max re-rides as the row bound.
+	Pattern  string   `json:"pattern,omitempty"`
+	MinNS    *uint64  `json:"min_ns,omitempty"`
+	MaxNS    *uint64  `json:"max_ns,omitempty"`
+	Level    *int     `json:"level,omitempty"`
+	WindowNS uint64   `json:"window_ns,omitempty"`
+	Ratio    *float64 `json:"ratio,omitempty"`
+	BinMS    int      `json:"bin_ms,omitempty"`
+	MaxBins  int      `json:"max_bins,omitempty"`
+	Fmt      string   `json:"fmt,omitempty"`
+
 	// The OTA wave's fields (T6, protocol v10). Boards lists ota.push's
 	// targets (selectors, resolved daemon-side; the reply's rows key by
 	// the RESOLVED mac6); Path is the host-side image file ota.push

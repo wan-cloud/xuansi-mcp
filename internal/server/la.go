@@ -550,6 +550,111 @@ func (s *Server) hLaDecodeBus(req *Request) (any, error) {
 	})
 }
 
+// ---- the LA wave-2 analysis crossings (2026-11-17, LA 增強波 A):
+// eight more daemon-local seats over the landed objects — thin like
+// the T11 batch: internal/la owns the semantics; the only daemon-side
+// gates are the crossings an int field would silently launder (the
+// u8-style wrap refusals live at laDecodeBus' precedent).
+
+// hLaSearch crosses la_search: kind bytes|bits|timing with the
+// pattern/predicate riding the grab-bag fields (the kind domain and
+// the pattern syntax refuse inside la.Search with the coach).
+func (s *Server) hLaSearch(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_search", req.CaptureID, err)
+	}
+	return la.Search(ref, la.SearchParams{
+		Kind: req.Kind, Pattern: req.Pattern,
+		Timing: la.SearchTiming{MinNS: req.MinNS, MaxNS: req.MaxNS, Level: req.Level},
+		Ch:     req.Ch,
+		FromNS: req.FromNS,
+		ToNS:   req.ToNS,
+		Max:    int(req.Max),
+	})
+}
+
+// hLaActivity crosses la_activity: the time-axis activity map.
+func (s *Server) hLaActivity(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_activity", req.CaptureID, err)
+	}
+	return la.Activity(ref, req.BinMS, req.FromNS, req.ToNS, req.MaxBins)
+}
+
+// hLaBits crosses la_bits: the universal resampling decoder.
+func (s *Server) hLaBits(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_bits", req.CaptureID, err)
+	}
+	return la.Bits(ref, req.Ch, req.RateHz)
+}
+
+// hLaAdjacent crosses la_adjacent: the cross-channel accompaniment.
+func (s *Server) hLaAdjacent(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_adjacent", req.CaptureID, err)
+	}
+	return la.Adjacent(ref, req.Ch, req.WindowNS)
+}
+
+// hLaGlitch crosses la_glitch: the sub-modal outlier account.
+func (s *Server) hLaGlitch(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_glitch", req.CaptureID, err)
+	}
+	ratio := 0.0
+	if req.Ratio != nil {
+		ratio = *req.Ratio
+	}
+	return la.Glitch(ref, req.Ch, ratio)
+}
+
+// hLaEye crosses la_eye: the folded alternation numbers.
+func (s *Server) hLaEye(req *Request) (any, error) {
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_eye", req.CaptureID, err)
+	}
+	return la.Eye(ref, req.Ch)
+}
+
+// hLaAlign crosses la_align: the two-capture alignment (same-board
+// only — the Diff rule, refused inside la.Align with the coach).
+func (s *Server) hLaAlign(req *Request) (any, error) {
+	refA, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_align", req.CaptureID, err)
+	}
+	refB, err := s.laStore.Ref(req.CaptureIDB)
+	if err != nil {
+		return nil, laStoreRPC("la_align", req.CaptureIDB, err)
+	}
+	return la.Align(refA, refB)
+}
+
+// hLaExport crosses la_export: the VCD writer. The format domain is
+// a zero-contact refusal HERE ("vcd" is the only format this wave
+// lands); the PATH is never a parameter on any face — the exporter
+// writes <capture dir>/export.vcd from the store's own ref, so
+// traversal has nothing to ride (the laDecodeBus precedent: the gate
+// the raw socket face shares).
+func (s *Server) hLaExport(req *Request) (any, error) {
+	if req.Fmt != "vcd" {
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_export: fmt %q — this wave lands \"vcd\" only (the level domain as a Value Change Dump every viewer opens)", req.Fmt)}
+	}
+	ref, err := s.laStore.Ref(req.CaptureID)
+	if err != nil {
+		return nil, laStoreRPC("la_export", req.CaptureID, err)
+	}
+	return la.ExportVCD(ref)
+}
+
 // laDisarmAll sweeps the board's residual la captures at the lease's
 // end — the streamDisarmAll precedent (release + lease teardown,
 // carried item 3): a pull that broke without its own cleanup (a

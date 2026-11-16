@@ -1329,6 +1329,22 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hLaDecodeWire(req)
 	case "la_decode_bus": // T13: the samples capture's i2c/spi decode
 		result, err = s.hLaDecodeBus(req)
+	case "la_search": // LA 增強波 A: the wave-2 analysis crossings (daemon-local)
+		result, err = s.hLaSearch(req)
+	case "la_activity":
+		result, err = s.hLaActivity(req)
+	case "la_bits":
+		result, err = s.hLaBits(req)
+	case "la_adjacent":
+		result, err = s.hLaAdjacent(req)
+	case "la_glitch":
+		result, err = s.hLaGlitch(req)
+	case "la_eye":
+		result, err = s.hLaEye(req)
+	case "la_align":
+		result, err = s.hLaAlign(req)
+	case "la_export":
+		result, err = s.hLaExport(req)
 	case "ota.push": // T6: the fleet push (own ceiling, above)
 		result, err = s.hOtaPush(ctx, req)
 	case "ota.status": // T6: the ro ota observation (no lease)
