@@ -156,18 +156,60 @@ func (c *Client) FsStreamWrite(ctx context.Context, path string, data []byte, sh
 		return fmt.Errorf("replclient: fs.stream_write %s: unexpected ack shape: %#v", path, msg)
 	}
 
-	sent := 0
-	seq := uint32(0)
 	// The pump discipline is per source (T7-④): TCP windows (uplinkWindowTCP
 	// frames in flight, ack-driven refill — the fw's 256KB ring absorbs them
 	// and TCP itself never reorders), CDC stays STRICT stop-and-wait — the
 	// board's 12KB RX ring drops bytes past it, so one un-acked frame is the
 	// most a USB link may ever have on the wire. The wire contract is
 	// unchanged either way: frames in order, per-frame {received} acks
-	// consumed, the final frame's reply the commit.
+	// consumed, the final frame's reply the commit. The shared pumps carry
+	// the lane's terminal-shape check (uploadLane below); ota_stream.go is
+	// the second cargo.
+	lane := uploadLane{name: "fs.stream_write", commit: fsCommitCheck(path, sha256hex)}
 	if c.link.Kind() == "tcp" {
-		return c.fsStreamPumpWindowed(ctx, ch, path, data, sha256hex, budget)
+		return c.pumpUplinkWindowed(ctx, ch, lane, data, budget)
 	}
+	return c.pumpUplinkStrict(ctx, ch, lane, data, budget())
+}
+
+// uploadLane names one cargo riding the shared uplink pump (the 0x02
+// receive state's two cargo types: B16-T7 C2's fs file and the OTA
+// wave's v10 image): the open op's name (error labels) and the
+// commit-shape check. The frames, the per-frame {received} ledger and
+// the source-shaped pacing are lane-independent — one pump, two cargo.
+type uploadLane struct {
+	name string
+	// commit inspects one reply result: done=true means this IS the
+	// lane's terminal reply (validated; err carries any shape breach);
+	// done=false means it was a mere {received} ack — keep pumping.
+	commit func(res map[string]any, total int) (done bool, err error)
+}
+
+// fsCommitCheck is the fs lane's terminal shape: {committed:true, len,
+// sha_ok?} — the auto-commit at expected_len (the direct-commit shape
+// of an expected_len==0 open is handled by the caller before the pump).
+func fsCommitCheck(path, sha256hex string) func(map[string]any, int) (bool, error) {
+	return func(res map[string]any, total int) (bool, error) {
+		if v, ok := res["committed"].(bool); !ok || !v {
+			return false, nil
+		}
+		if want, _ := res["len"].(int64); want != int64(total) {
+			return true, fmt.Errorf("replclient: fs.stream_write %s: committed len %d, want %d", path, want, total)
+		}
+		if sha256hex != "" {
+			if ok, _ := res["sha_ok"].(bool); !ok {
+				return true, fmt.Errorf("replclient: fs.stream_write %s: commit lacks sha_ok", path)
+			}
+		}
+		return true, nil
+	}
+}
+
+// pumpUplinkStrict is the CDC-source pump: strict stop-and-wait — one
+// un-acked frame on the wire at a time (the 12KB RX-ring discipline).
+func (c *Client) pumpUplinkStrict(ctx context.Context, ch <-chan map[string]any, lane uploadLane, data []byte, budget time.Duration) error {
+	sent := 0
+	seq := uint32(0)
 	for sent < len(data) {
 		end := sent + usbStreamChunk
 		if end > len(data) {
@@ -176,40 +218,32 @@ func (c *Client) FsStreamWrite(ctx context.Context, path string, data []byte, sh
 		chunk := data[sent:end]
 		if _, err := c.write(uplinkFrame(seq, chunk)); err != nil {
 			c.markDead("link write failed: " + err.Error())
-			return fmt.Errorf("%w: fs.stream_write %s pump: %v", ErrDead, path, err)
+			return fmt.Errorf("%w: %s %dB pump: %v", ErrDead, lane.name, len(data), err)
 		}
 		sent = end
 		seq++
-		msg, err = c.streamWait(ctx, ch, fmt.Sprintf("fs.stream_write frame ack (%d/%dB)", sent, len(data)), budget())
+		msg, err := c.streamWait(ctx, ch, fmt.Sprintf("%s frame ack (%d/%dB)", lane.name, sent, len(data)), budget)
 		if err != nil {
 			return err
 		}
 		if e, ok := msg["error"].(map[string]any); ok {
-			return opErrOf("fs.stream_write", e) // mid-stream api refusal (overflow / append failure)
+			return opErrOf(lane.name, e) // mid-stream api refusal (overflow / append failure / the ota commit verdict)
 		}
-		res, _ = msg["result"].(map[string]any)
-		if v, ok := res["committed"].(bool); ok && v {
-			// the final frame's auto-commit (no {received} precedes it)
-			if want, _ := res["len"].(int64); want != int64(len(data)) {
-				return fmt.Errorf("replclient: fs.stream_write %s: committed len %d, want %d", path, want, len(data))
-			}
-			if sha256hex != "" {
-				if ok, _ := res["sha_ok"].(bool); !ok {
-					return fmt.Errorf("replclient: fs.stream_write %s: commit lacks sha_ok", path)
-				}
-			}
-			return nil
+		res, _ := msg["result"].(map[string]any)
+		done, cerr := lane.commit(res, len(data))
+		if done {
+			return cerr // the final frame's auto-commit (no {received} precedes it)
 		}
 		if got, _ := res["received"].(int64); got != int64(sent) {
-			return fmt.Errorf("replclient: fs.stream_write %s: ack received=%d, want %d", path, got, sent)
+			return fmt.Errorf("replclient: %s: ack received=%d, want %d", lane.name, got, sent)
 		}
 	}
 	// All frames acked {received} without a commit: the fw's contract
 	// auto-commits at expected_len — silence here is a protocol breach.
-	return fmt.Errorf("replclient: fs.stream_write %s: frames exhausted without a commit reply", path)
+	return fmt.Errorf("replclient: %s: frames exhausted without a commit reply", lane.name)
 }
 
-// fsStreamPumpWindowed is the TCP-source pump: keep up to
+// pumpUplinkWindowed is the TCP-source pump: keep up to
 // uplinkWindowTCP frames in flight, refill on every ack. Acks are
 // cumulative ({received} = bytes accepted so far) and arrive strictly
 // in frame order (one TCP byte stream, the fw replies per frame), so
@@ -219,8 +253,9 @@ func (c *Client) FsStreamWrite(ctx context.Context, path string, data []byte, sh
 // only accepted while exactly the last frame remains in flight. A
 // write failure, an ack gap, or a mid-stream error reply surfaces
 // exactly like the strict pump — the caller redials once and reruns
-// the whole upload (off=0 truncate restart, idempotent).
-func (c *Client) fsStreamPumpWindowed(ctx context.Context, ch <-chan map[string]any, path string, data []byte, sha256hex string, budget func() time.Duration) error {
+// the whole upload (the fs off=0 truncate restart and the ota begin's
+// idempotent re-push are both safe restarts).
+func (c *Client) pumpUplinkWindowed(ctx context.Context, ch <-chan map[string]any, lane uploadLane, data []byte, budget func() time.Duration) error {
 	sent := 0
 	seq := uint32(0)
 	var inflight []int // frame-end offsets, oldest first
@@ -232,7 +267,7 @@ func (c *Client) fsStreamPumpWindowed(ctx context.Context, ch <-chan map[string]
 			}
 			if _, err := c.write(uplinkFrame(seq, data[sent:end])); err != nil {
 				c.markDead("link write failed: " + err.Error())
-				return fmt.Errorf("%w: fs.stream_write %s pump: %v", ErrDead, path, err)
+				return fmt.Errorf("%w: %s %dB pump: %v", ErrDead, lane.name, len(data), err)
 			}
 			sent = end
 			seq++
@@ -241,38 +276,31 @@ func (c *Client) fsStreamPumpWindowed(ctx context.Context, ch <-chan map[string]
 		if len(inflight) == 0 {
 			break // everything acked; the commit must have been the exit
 		}
-		msg, err := c.streamWait(ctx, ch, fmt.Sprintf("fs.stream_write frame ack (%d/%dB)", sent, len(data)), budget())
+		msg, err := c.streamWait(ctx, ch, fmt.Sprintf("%s frame ack (%d/%dB)", lane.name, sent, len(data)), budget())
 		if err != nil {
 			return err
 		}
 		if e, ok := msg["error"].(map[string]any); ok {
-			return opErrOf("fs.stream_write", e) // mid-stream api refusal (overflow / append failure)
+			return opErrOf(lane.name, e) // mid-stream api refusal (overflow / append failure / the ota commit verdict)
 		}
 		res, _ := msg["result"].(map[string]any)
-		if v, ok := res["committed"].(bool); ok && v {
+		done, cerr := lane.commit(res, len(data))
+		if done {
 			// the final frame's auto-commit — legal only as the last
 			// outstanding frame's reply (earlier acks consumed first)
 			if inflight[0] != len(data) {
-				return fmt.Errorf("replclient: fs.stream_write %s: commit at %dB with %dB un-acked", path, len(data), inflight[0])
+				return fmt.Errorf("replclient: %s: commit at %dB with %dB un-acked", lane.name, len(data), inflight[0])
 			}
-			if want, _ := res["len"].(int64); want != int64(len(data)) {
-				return fmt.Errorf("replclient: fs.stream_write %s: committed len %d, want %d", path, want, len(data))
-			}
-			if sha256hex != "" {
-				if ok, _ := res["sha_ok"].(bool); !ok {
-					return fmt.Errorf("replclient: fs.stream_write %s: commit lacks sha_ok", path)
-				}
-			}
-			return nil
+			return cerr
 		}
 		if got, _ := res["received"].(int64); got != int64(inflight[0]) {
-			return fmt.Errorf("replclient: fs.stream_write %s: ack received=%d, want %d", path, got, inflight[0])
+			return fmt.Errorf("replclient: %s: ack received=%d, want %d", lane.name, got, inflight[0])
 		}
 		inflight = inflight[1:]
 	}
 	// All frames acked {received} without a commit: the fw's contract
 	// auto-commits at expected_len — silence here is a protocol breach.
-	return fmt.Errorf("replclient: fs.stream_write %s: frames exhausted without a commit reply", path)
+	return fmt.Errorf("replclient: %s: frames exhausted without a commit reply", lane.name)
 }
 
 // opErrOf packs a board error reply as an *OpError.

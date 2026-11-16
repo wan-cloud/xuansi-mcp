@@ -54,6 +54,20 @@ type HelloInfo struct {
 	// as-is (ground truth from the fw's own parser — no daemon-side
 	// reinterpretation).
 	PanicLast map[string]any
+
+	// The OTA identity trio (protocol v10, OTA ops wave T3/T6): the
+	// RUNNING image's own app_desc, the same embedded bytes the ota
+	// receipts speak. OtaSlot is the running partition label
+	// ("ota_0"/"ota_1"), OtaImgState the esp_ota state's frozen name
+	// ("new"|"pending_verify"|"valid"|"aborted"|"undefined" —
+	// pending_verify arms the 45s rollback milestone), OtaSha the
+	// app_elf_sha256 hex64 (the build identity, NOT the transport
+	// digest). Empty trio on pre-v10 fw (the keys are absent); carried
+	// to list_boards/board_status and consumed by the push
+	// orchestration's identity triple match.
+	OtaSlot     string
+	OtaImgState string
+	OtaSha      string
 }
 
 // parseHello tolerates missing keys (older protocol faces): absent
@@ -97,6 +111,11 @@ func parseHello(res map[string]any) *HelloInfo {
 	if pl, ok := res["panic_last"].(map[string]any); ok {
 		h.PanicLast = pl
 	}
+	// v10: the ota identity trio (strings; absent keys stay empty —
+	// pre-v10 fw honestly reports none of the three).
+	h.OtaSlot, _ = res["ota_slot"].(string)
+	h.OtaImgState, _ = res["ota_img_state"].(string)
+	h.OtaSha, _ = res["ota_sha"].(string)
 	return h
 }
 

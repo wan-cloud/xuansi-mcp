@@ -317,7 +317,9 @@ func TestUplinkFrameShape(t *testing.T) {
 }
 
 // mockUpstream is the mock board's upload-lane state for one stream
-// (mirrors the fw: one active stream per connection).
+// (mirrors the fw: one active stream per connection). ota flips the
+// lane to the v10 cargo: the open op is ota.begin (no path, a slot
+// label instead) and the auto-commit reply is the staged shape.
 type mockUpstream struct {
 	path           string
 	wantSha        string
@@ -328,6 +330,9 @@ type mockUpstream struct {
 	id             any
 	killAfterFrame int // 0 = never; 1+ = kill the link after N frames
 	kill           *mockBoard
+
+	ota  bool   // the ota cargo: ota.begin opens, {staged:true,...} commits
+	slot string // the lane's slot label (ota only; default below)
 
 	parkAcks bool             // park replies instead of sending (flight tests)
 	pending  []map[string]any // parked replies (under mockBoard.mu)
@@ -342,6 +347,9 @@ func (b *mockBoard) setUplink(st *mockUpstream) {
 	b.uplink = st
 	b.mu.Unlock()
 	if st != nil {
+		if st.slot == "" {
+			st.slot = "ota_1"
+		}
 		prev := b.handlers["fs.stream_write"]
 		b.handlers["fs.stream_write"] = func(args map[string]any) (map[string]any, *boardError) {
 			if prev != nil {
@@ -366,6 +374,23 @@ func (b *mockBoard) setUplink(st *mockUpstream) {
 				"streaming": true, "path": st.path,
 				"expected_len": st.expected,
 			}, nil
+		}
+		if st.ota {
+			// the ota cargo's open: same id-capture dance, the ack carries
+			// the target slot instead of a path (the fw's frozen v10 shape)
+			b.handlers["ota.begin"] = func(args map[string]any) (map[string]any, *boardError) {
+				b.mu.Lock()
+				if n := len(b.requests); n > 0 {
+					st.id = b.requests[n-1].id
+				}
+				b.mu.Unlock()
+				ln, _ := args["len"].(int64)
+				st.expected = ln
+				st.received = 0
+				return map[string]any{
+					"streaming": true, "slot": st.slot, "expected_len": ln,
+				}, nil
+			}
 		}
 	}
 }
@@ -400,17 +425,22 @@ func (b *mockBoard) consumeUplink(body []byte) bool {
 		b.deliverStreamReply(st, rep)
 		return true
 	}
-	// auto-commit (the fw's frozen §17 verdict shape)
-	res := map[string]any{"committed": true, "path": st.path,
-		"len": st.expected}
-	if st.wantSha != "" {
-		res["sha_ok"] = true
-	}
+	// auto-commit: the lane's terminal shape (the fw's frozen §17 fs
+	// verdict / v10 ota staged verdict)
 	if st.failCommit {
 		b.deliverStreamReply(st, map[string]any{"op": "reply", "id": st.id,
 			"error": map[string]any{"class": "api",
 				"msg": "stream commit failed (scripted)"}})
 		return true
+	}
+	var res map[string]any
+	if st.ota {
+		res = map[string]any{"staged": true, "slot": st.slot, "len": st.expected, "sha_ok": st.wantSha != ""}
+	} else {
+		res = map[string]any{"committed": true, "path": st.path, "len": st.expected}
+		if st.wantSha != "" {
+			res["sha_ok"] = true
+		}
 	}
 	b.deliverStreamReply(st, map[string]any{"op": "reply", "id": st.id, "result": res})
 	return true

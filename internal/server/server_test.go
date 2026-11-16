@@ -48,6 +48,7 @@ type fakeCtl struct {
 	hellos       int
 	sink         replclient.StreamSink                            // the connection's current 0x02 sink (frames-face scripting drives it synchronously)
 	streamUpload func(path string, data []byte, sha string) error // the B16-T7 C2 lane hook
+	otaUpload    func(data []byte, sha string) (string, error)    // the v10 ota cargo hook (T6)
 	dieOnOp      string                                           // the half-open death script (dieOn): this op's next call fails ErrDead
 	onDie        func()                                           // …after running this hook
 	gen          int                                              // test bookkeeping: which dial-generation this fake belongs to (supervisor rebuild tests)
@@ -165,7 +166,8 @@ func (f *fakeCtl) dieOn(op string, fn func()) {
 // FsStreamWrite runs the scripted upload-lane hook (the B16-T7 C2
 // face); unscripted it refuses — tests that exercise the stream lane
 // arm streamUpload, everything else proves it is NOT reached (the
-// pre-v8 trio must ride the write_part lane unchanged).
+// pre-v8 trio must ride the write_part lane unchanged). OtaStreamWrite
+// is the same lane's v10 ota cargo (T6), same shape of hook.
 func (f *fakeCtl) FsStreamWrite(ctx context.Context, path string, data []byte, sha256hex string) error {
 	f.mu.Lock()
 	fn := f.streamUpload
@@ -184,6 +186,24 @@ func (f *fakeCtl) FsStreamWrite(ctx context.Context, path string, data []byte, s
 		"path": path, "expected_len": len(data), "sha256": sha256hex}})
 	f.mu.Unlock()
 	return fn(path, data, sha256hex)
+}
+
+// OtaStreamWrite stages over the v10 ota cargo; the otaUpload hook is
+// the test's lane script (answering the staged slot), recorded like any
+// op so the push legs can prove what crossed.
+func (f *fakeCtl) OtaStreamWrite(ctx context.Context, data []byte, sha256hex string) (string, error) {
+	f.mu.Lock()
+	fn := f.otaUpload
+	f.mu.Unlock()
+	if fn == nil {
+		return "", &replclient.OpError{Op: "ota.begin", Class: "api",
+			Msg: "ota upload lane not scripted"}
+	}
+	f.mu.Lock()
+	f.calls = append(f.calls, mockCall{op: "ota.begin+0x02", args: map[string]any{
+		"len": len(data), "sha256": sha256hex}})
+	f.mu.Unlock()
+	return fn(data, sha256hex)
 }
 
 func (f *fakeCtl) OnStream(sink replclient.StreamSink) {
@@ -298,6 +318,10 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	if pl, ok := res["panic_last"].(map[string]any); ok { // B16-T7 D2 (parseHello's twin)
 		h.PanicLast = pl
 	}
+	// v10 ota identity trio (T6, parseHello's twin)
+	h.OtaSlot, _ = res["ota_slot"].(string)
+	h.OtaImgState, _ = res["ota_img_state"].(string)
+	h.OtaSha, _ = res["ota_sha"].(string)
 	if h.ResetReason == "" {
 		h.ResetReason = h.Reset
 	}
@@ -2133,13 +2157,18 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // joined with the LA wave T10 — the RMT edge-capture face (80MHz group
 // pinned; the board HIL's op seat rides it, 19); la.sample_arm joined
 // with the LA wave T12 — the LCD_CAM sampler's op seat (the board HIL
-// rode it before T13 landed the object/MCP face, 20).
+// rode it before T13 landed the object/MCP face, 20); the ota quintet
+// joined with the OTA ops wave T6 — begin/abort drive the uplink
+// cargo's ota lane, status observes, activate/confirm run the boot
+// state machine (the fleet push keeps its own ota.push request type,
+// 21–25).
 var opsFaceAllowlistV1 = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
 	"diag.pins", "diag.stats", "diag.streamtest",
 	"la.disarm", "la.edge_arm", "la.info", "la.listen_arm", "la.read",
 	"la.sample_arm", "la.stop", "log.read", "lua.check",
+	"ota.abort", "ota.activate", "ota.begin", "ota.confirm", "ota.status",
 	"wifi.off", "wifi.setup", "wifi.status",
 }
 

@@ -206,10 +206,16 @@ func (f *fakeCtl) OnEvent(prefix string, fn func(replclient.Event)) (cancel func
 // no router, the frames tests' op scripting drives it synchronously).
 // FsStreamWrite satisfies the v8 upload-lane face (B16-T7 C2); the
 // supervisor tests never exercise it — a loud refusal keeps any
-// accidental routing visible.
+// accidental routing visible. OtaStreamWrite is the same lane's v10
+// ota cargo (T6), same discipline.
 func (f *fakeCtl) FsStreamWrite(ctx context.Context, path string, data []byte, sha256hex string) error {
 	return &replclient.OpError{Op: "fs.stream_write", Class: "api",
 		Msg: "upload lane not scripted (board tests)"}
+}
+
+func (f *fakeCtl) OtaStreamWrite(ctx context.Context, data []byte, sha256hex string) (string, error) {
+	return "", &replclient.OpError{Op: "ota.begin", Class: "api",
+		Msg: "ota upload lane not scripted (board tests)"}
 }
 
 func (f *fakeCtl) OnStream(sink replclient.StreamSink) {

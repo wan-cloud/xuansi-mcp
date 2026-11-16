@@ -579,6 +579,7 @@ var opsFaceAllowlistPinned = []string{
 	"diag.pins", "diag.stats", "diag.streamtest",
 	"la.disarm", "la.edge_arm", "la.info", "la.listen_arm", "la.read",
 	"la.sample_arm", "la.stop", "log.read", "lua.check",
+	"ota.abort", "ota.activate", "ota.begin", "ota.confirm", "ota.status",
 	"wifi.off", "wifi.setup", "wifi.status",
 }
 

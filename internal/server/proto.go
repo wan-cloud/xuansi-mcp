@@ -45,7 +45,7 @@
 //
 // # Requests
 //
-//	list_boards    {}                          → {boards:[{mac6,alias,sources,host,ip,port,usb_path,fw,fw_version,protocol_ver,boot_epoch?,reset_reason?,chip?,last_seen?,transport,last_seen_age_ms,stale}],mdns_error}
+//	list_boards    {}                          → {boards:[{mac6,alias,sources,host,ip,port,usb_path,fw,fw_version,protocol_ver,boot_epoch?,reset_reason?,chip?,ota_slot?,ota_img_state?,ota_sha?,last_seen?,transport,last_seen_age_ms,stale}],mdns_error}
 //	board_status   {board}                      → {board:{...}, connected, transport, last_seen_age_ms, stale, lease:{holder,since,session,grace_deadline}?|null, scripts?, scripts_error?}
 //	lease          {board, holder?, transport?} → {board, holder, session, transport:"tcp"|"usb", rebooted:bool, transport_note?}
 //	release        {board, holder?}             → {board, holder}
@@ -64,6 +64,8 @@
 //	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}
 //	boards_pin     {mac6, ip, port}              → {pinned, endpoint}  (⑨: declares the registry's pin source — see the pin section below)
 //	boards_unpin   {mac6}                        → {unpinned}       (removes exactly the pin declaration)
+//	ota.push       {boards[], path, sha256?, activate?, confirm?, force?} → {rows:[…]}  (the fleet push — see the OTA section below)
+//	ota.status     {board}                       → the board's ota.status verbatim + board  (ro, no lease — see the OTA section below)
 //
 // eval/submit/op args numbers: the fw args bridge is int-only (v3 §4),
 // so the daemon validates the args tree BEFORE any board contact — an
@@ -85,8 +87,10 @@
 // single source; every rendered listing is sorted from it):
 //
 //	budget.get, budget.set, caps, diag.heapinfo, diag.i2cslave,
-//	diag.pins, diag.stats, log.read, lua.check, wifi.off, wifi.setup,
-//	wifi.status
+//	diag.pins, diag.stats, diag.streamtest, la.disarm, la.edge_arm,
+//	la.info, la.listen_arm, la.read, la.sample_arm, la.stop,
+//	log.read, lua.check, ota.abort, ota.activate, ota.begin,
+//	ota.confirm, ota.status, wifi.off, wifi.setup, wifi.status
 //
 // diag.i2cslave toggles the board's INTERNAL I2C echo-slave loopback
 // fixture ({mode:-1..1} = status/off/on) — the b7 driver-pipeline
@@ -276,6 +280,37 @@
 // board cannot see a CDC close, so this is what lets the next TCP
 // lease take controller without any reboot ritual.
 // An unknown transport value is a "server" class error.
+//
+// # The OTA face (T6, protocol v10)
+//
+// ota.push stages one host-side image on every listed board in
+// parallel (each board over its own lane — the daemon NEVER opens CDC
+// for OTA: the 2026-11-15 ruling; a board whose live route is USB is
+// refused) and answers one row per board:
+// {board, from:{ver,slot,sha}, to:{ver,slot,sha}, outcome, detail,
+// seconds} with outcome ∈ pushed | no-op | rolled-back | refused |
+// failed. Identity is the image's OWN esp_app_desc (offset 0x20:
+// version + app_elf_sha256 — the same bytes the fw reads its running
+// header with); the activate leg's proof is the triple match host-
+// parse == activate-receipt == post-reboot hello. Preflight per board:
+// a running image already matching the bin's elf sha answers no-op;
+// running img_state=pending_verify refuses (the IDF refuses a new
+// begin — confirm or wait the 45s milestone); active leases / live LA
+// captures / running scripts refuse with the occupants listed unless
+// force (the reboot kills them); residual writing state is aborted
+// first; a staged image matching the bin (len + transport sha) skips
+// the transport. A bad image (wrong app_desc magic), a pinned-sha
+// mismatch or an over-slot size refuses the WHOLE push with zero board
+// contact. activate=false leaves the image staged (otadata untouched).
+// A rolled-back row is the DESIGN landing of a bad image: the
+// bootloader returned the previous version, still online — a verdict,
+// not a fault. The request carries its own ceiling above the 60s
+// default (the reboot-return wait alone is bounded at 60s; T5 measured
+// the TCP return at ~8s).
+//
+// ota.status is the ro observation request: the board's ota.status
+// result verbatim plus {board}, no lease (the op face's allowlisted
+// ota.status is the lease-gated direct control for the same op).
 //
 // # Holder semantics (the lease identity — read this twice)
 //
@@ -473,6 +508,21 @@ type Request struct {
 	CSMask  int  `json:"cs_mask,omitempty"`
 	SdaCh   *int `json:"sda_ch,omitempty"`
 	SclCh   *int `json:"scl_ch,omitempty"`
+
+	// The OTA wave's fields (T6, protocol v10). Boards lists ota.push's
+	// targets (selectors, resolved daemon-side; the reply's rows key by
+	// the RESOLVED mac6); Path is the host-side image file ota.push
+	// stages; Sha256 optionally pins its full-file digest (64 hex —
+	// a mismatch is a zero-contact api refusal); Activate carries the
+	// wire's default-true as a tri-state (nil = activate: push, reboot,
+	// verify; false = stage only); Confirm adds the post-activate
+	// ota.confirm (the 45s pending milestone, cleared now); Force
+	// overrides the occupants refusal (active leases / live LA captures
+	// / running scripts — listed in the non-forced row's detail).
+	Boards   []string `json:"boards,omitempty"`
+	Activate *bool    `json:"activate,omitempty"`
+	Confirm  bool     `json:"confirm,omitempty"`
+	Force    bool     `json:"force,omitempty"`
 }
 
 // RPCError is the structured error half of a reply.

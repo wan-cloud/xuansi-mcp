@@ -99,6 +99,11 @@ type Controller interface {
 	// Production is *replclient.Client (method set satisfies this
 	// interface verbatim); unit tests script a fake.
 	FsStreamWrite(ctx context.Context, path string, data []byte, sha256hex string) error
+	// OtaStreamWrite (OTA ops wave T6) stages one image over the same
+	// uplink lane's v10 ota cargo (ota.begin + the ack-paced 0x02
+	// frames + the staged auto-commit) and answers the target slot
+	// label. Same production shape; unit tests script a fake.
+	OtaStreamWrite(ctx context.Context, data []byte, sha256hex string) (slot string, err error)
 }
 
 // SupOpts parameterize a Supervisor; zero values get defaults.

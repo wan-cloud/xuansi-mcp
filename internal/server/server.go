@@ -1198,6 +1198,12 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 	if req.Type == "la_capture" {
 		timeout = laCaptureCeil(req.MaxSeconds)
 	}
+	if req.Type == "ota.push" {
+		// the activate leg's reboot-return wait alone is bounded at 60s
+		// (ota.ReturnWaitBound; T5 measured the TCP return at ~8s) — the
+		// default ceiling would kill every honest push mid-wait
+		timeout = s.opts.RequestTimeout + otaPushCeil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -1276,6 +1282,10 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hLaDecodeWire(req)
 	case "la_decode_bus": // T13: the samples capture's i2c/spi decode
 		result, err = s.hLaDecodeBus(req)
+	case "ota.push": // T6: the fleet push (own ceiling, above)
+		result, err = s.hOtaPush(ctx, req)
+	case "ota.status": // T6: the ro ota observation (no lease)
+		result, err = s.hOtaStatus(ctx, req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1397,6 +1407,11 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 		}
 		if b.Hello.PanicLast != nil { // B16-T7 D2: the last-panic summary, verbatim passthrough
 			v["panic_last"] = b.Hello.PanicLast
+		}
+		if b.Hello.OtaSlot != "" { // T6: the v10 ota identity trio, hello passthrough (absent on pre-v10 fw — honest nothing)
+			v["ota_slot"] = b.Hello.OtaSlot
+			v["ota_img_state"] = b.Hello.OtaImgState
+			v["ota_sha"] = b.Hello.OtaSha
 		}
 	}
 	v["fw"] = fw
@@ -2004,6 +2019,18 @@ var opAllowlist = map[string]bool{
 	"la.read":       true,
 	"la.info":       true,
 	"la.disarm":     true,
+	// OTA ops wave T6 (protocol v10): the ota control family —
+	// begin/abort drive the uplink cargo's ota lane, status is the ro
+	// observation, activate/confirm the boot-state machine (the 45s
+	// rollback milestone's accelerator). The orchestrated fleet push
+	// keeps its own request type (ota.push: preflight occupants,
+	// identity triple match, per-board rows); these five are the
+	// agent's direct controls, lease-gated like every op here.
+	"ota.begin":    true,
+	"ota.abort":    true,
+	"ota.status":   true,
+	"ota.activate": true,
+	"ota.confirm":  true,
 }
 
 // AllowlistedOps renders the ops face's allowlisted op names, sorted —

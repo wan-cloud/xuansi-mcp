@@ -80,6 +80,13 @@ func (f *cmdFake) FsStreamWrite(ctx context.Context, path string, data []byte, s
 		Msg: "upload lane not scripted (cmd tests)"}
 }
 
+// OtaStreamWrite satisfies the same lane's v10 ota cargo (T6);
+// unscripted refusal, same discipline.
+func (f *cmdFake) OtaStreamWrite(ctx context.Context, data []byte, sha256hex string) (string, error) {
+	return "", &replclient.OpError{Op: "ota.begin", Class: "api",
+		Msg: "ota upload lane not scripted (cmd tests)"}
+}
+
 // startMockDaemon serves one fake board on a temp sock; returns the path.
 func startMockDaemon(t *testing.T) string {
 	sock, _ := startMockDaemonUSB(t)
