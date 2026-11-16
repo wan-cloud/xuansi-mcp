@@ -448,6 +448,10 @@ var staticToolNames = []string{
 	"xuansi_la_measure",
 	"xuansi_la_diff",
 	"xuansi_la_decode_wire",
+	// T7 (OTA ops wave): the fleet push + the live per-board state
+	// read (47 now — appended, nothing renumbers).
+	"xuansi_ota_push",
+	"xuansi_ota_status",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -615,6 +619,9 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	// T13 (samples wave): the bus decode + the samples capture mode.
 	ts.registerLASample(srv)
+
+	// T7 (OTA ops wave): the fleet push + the live state read.
+	ts.registerOTA(srv)
 }
 
 // ---------------------------------------------------------------------------

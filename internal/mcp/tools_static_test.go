@@ -719,6 +719,12 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_la_diff":        {"capture_a", "capture_b"},
 	"xuansi_la_decode_wire": {"capture_id", "proto"},
 	"xuansi_la_decode_bus":  {"capture_id", "proto"},
+	// T7 (OTA ops wave): boards+path required (the daemon refuses an
+	// empty fleet / a pathless push); every knob optional (activate's
+	// omission IS the wire default true; sha256/confirm/force are
+	// opt-in).
+	"xuansi_ota_push":   {"boards", "path"},
+	"xuansi_ota_status": {"board"},
 }
 
 // TestStaticToolsRequiredCoverage (B7 minors item 9): every static
