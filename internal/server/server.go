@@ -548,6 +548,12 @@ func New(o Opts) (*Server, error) {
 		PSK:    func() (string, error) { return creds.EnsurePSK(s.vaultDir) },
 		Logf:   s.logf,
 		Emit:   s.emitProvisioned,
+		// Final-review fix (finding 2): the kill-switch is TWO layers —
+		// the sweep's early return AND the provisioner's own Disabled
+		// gate. A future caller reaching Consider around the sweep
+		// (or a test driving the provisioner directly) stays stood-down
+		// under Opts.DisableProvision, not just swept-around.
+		Disabled: o.DisableProvision,
 	}
 	if o.ProvisionWait > 0 {
 		d.AssocWait = o.ProvisionWait

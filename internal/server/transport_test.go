@@ -388,6 +388,12 @@ func newTransportEnv(t *testing.T, usbBoards, mdnsBoards []discover.Board) *tran
 		GraceTTL:        10 * time.Second,
 		RefreshInterval: -1,
 		Log:             newTestLogf(t, "srv: "),
+		// 憑證波 T2 (final-review fix): not this env's subject — stand
+		// the provisioner down and pin the vault AWAY from the host's
+		// real one (an armed real vault made the sweep cross the fake
+		// credless USB board, breaking dial/reboot accounting).
+		DisableProvision: true,
+		VaultDir:         filepath.Join(testutil.ShortSockDir(t), "vault"),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
 				Log: newTestLogf(t, "sup: "),

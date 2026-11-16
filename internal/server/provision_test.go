@@ -533,3 +533,17 @@ func findCall(cs []mockCall, op string) map[string]any {
 	}
 	return nil
 }
+
+// the kill-switch's SECOND layer (final-review fix finding 2): the
+// Opts flag wires into the provisioner's own Deps.Disabled — a
+// Consider reached AROUND the sweep (a future caller, a direct drive)
+// stays stood-down too, not just swept around.
+func TestProvisionKillSwitchWiredIntoDeps(t *testing.T) {
+	e := newProvEnv(t, t.TempDir(), true, nil, usbBoard("d75884"))
+	if out := e.srv.prov.Consider(context.Background(), "d75884", creds.Sight{Sighted: true}); out != creds.OutcomeSkip {
+		t.Fatalf("direct Consider under DisableProvision = %s, want skip (Deps.Disabled must be wired from Opts)", out)
+	}
+	if n := e.dialedUSB("d75884"); n != 0 {
+		t.Fatalf("usb dials = %d, want 0", n)
+	}
+}
