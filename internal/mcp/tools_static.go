@@ -307,8 +307,14 @@ type boardInfo struct {
 	// shows an ssid, or the board is WiFi-live); credless = the sighting
 	// shows none (the daemon's zero-ritual provisioner is armed for it);
 	// vault-empty = credless AND the host vault is empty — the daemon
-	// wanted to provision but couldn't. Absent before any sighting.
-	ProvisionState string `json:"provision_state,omitempty" jsonschema:"the board's wifi-credential provisioning verdict: ok (carries credentials), credless (none — the daemon's zero-ritual provisioner arms for it), or vault-empty (none AND the host vault is empty: direct the USER to run 'xuansi creds set' or 'xuansi creds import <file>' on the HOST — credentials never cross the agent channel, and the device PSK is daemon-generated so the user provides nothing beyond WiFi); absent before the daemon's first sighting of the board"`
+	// wanted to provision but couldn't; vault-error = credless AND the
+	// host vault read BROKEN (malformed creds.json or a corrupt psk.hex)
+	// — NOT the same as empty: direct the USER to the FILE-level remedy
+	// the daemon log's vault-unreadable line names (a malformed
+	// creds.json is rewritten by 'xuansi creds set' or import; a corrupt
+	// psk.hex must be DELETED — 'creds set' never touches it, so that
+	// coach would be a no-op). Absent before any sighting.
+	ProvisionState string `json:"provision_state,omitempty" jsonschema:"the board's wifi-credential provisioning verdict: ok (carries credentials), credless (none — the daemon's zero-ritual provisioner arms for it), vault-empty (none AND the host vault is empty: direct the USER to run 'xuansi creds set' or 'xuansi creds import <file>' on the HOST — credentials never cross the agent channel, and the device PSK is daemon-generated so the user provides nothing beyond WiFi), or vault-error (none AND the host vault read BROKEN — malformed creds.json or a corrupt psk.hex: NOT empty; the remedy is file-level — 'xuansi creds set' rewrites a malformed creds.json, but a corrupt psk.hex must be DELETED by the user, which re-arms the daemon's generation; 'creds set' never touches psk.hex); absent before the daemon's first sighting of the board"`
 }
 
 type listBoardsOut struct {

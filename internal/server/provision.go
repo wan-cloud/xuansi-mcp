@@ -80,11 +80,14 @@ func (s *Server) sightOf(b discover.Board) creds.Sight {
 
 // provisionStateOf derives the board face's provision_state (spec §5b)
 // from the zero-contact sight and the LIVE vault (the CLI can arm it
-// any moment). "" = honestly absent (never sighted).
+// any moment). "" = honestly absent (never sighted). A vault read
+// failure is vault-error once the sighting is cred-less — NOT
+// vault-empty: `creds set` is a no-op against a corrupt psk.hex (the
+// remedy is deleting the file; the log's vault-unreadable line names
+// it).
 func (s *Server) provisionStateOf(b discover.Board) creds.State {
 	v, err := creds.Load(s.vaultDir)
-	wifi := err == nil && v.WiFiPresent()
-	return creds.StateOf(s.sightOf(b), wifi)
+	return creds.StateOf(s.sightOf(b), creds.VaultHealth{WiFi: err == nil && v.WiFiPresent(), Err: err})
 }
 
 // provisionLane answers the board's USB lane — the gentle CDC open

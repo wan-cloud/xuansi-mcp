@@ -1483,9 +1483,9 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 		v["last_seen"] = last.UTC().Format(time.RFC3339)
 	}
 	// provision_state (憑證波 T2, spec §5b): state + coaching only —
-	// ok | credless | vault-empty, absent before any sighting (the
-	// daemon cannot know a never-crossed board's credentials without
-	// the crossing this view must never trigger).
+	// ok | credless | vault-empty | vault-error, absent before any
+	// sighting (the daemon cannot know a never-crossed board's
+	// credentials without the crossing this view must never trigger).
 	if st := s.provisionStateOf(b); st != "" {
 		v["provision_state"] = string(st)
 	}

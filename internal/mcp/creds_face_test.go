@@ -45,6 +45,13 @@ func TestProvisionCoachDescsRideBoardTools(t *testing.T) {
 		if !strings.Contains(descs[name], "credentials never cross the agent channel") {
 			t.Fatalf("%s's Desc must state the channel rule: %q", name, descs[name])
 		}
+		// the vault-error coach rides the same tools (minors 清掃波
+		// Batch A): a broken vault names the FILE-level remedy — the
+		// psk.hex deletion half must be there, or the agent would send
+		// the owner to a no-op `creds set`.
+		if !strings.Contains(descs[name], "vault-error") || !strings.Contains(descs[name], "psk.hex must be DELETED") {
+			t.Fatalf("%s's Desc must coach vault-error with the file-level remedy: %q", name, descs[name])
+		}
 	}
 	// the op listing quotes the AGENT projection: no sec.* anywhere
 	for _, name := range want {

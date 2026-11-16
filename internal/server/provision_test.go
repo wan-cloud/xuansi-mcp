@@ -12,6 +12,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -271,6 +272,36 @@ func TestProvisionStateInView(t *testing.T) {
 	e4 := newProvEnv(t, t.TempDir(), true, nil, usbBoard("d75884"))
 	if _, ok := e4.srv.boardView(e4.srv.reg.Snapshot()[0])["provision_state"]; ok {
 		t.Fatal("provision_state must be absent before any sighting (the daemon cannot know without a crossing)")
+	}
+}
+
+// TestProvisionStateVaultErrorNotVaultEmpty (minors 清掃波 Batch A, the
+// 憑證波 final-review triage item): a vault that READS BROKEN is not an
+// empty vault. A corrupt psk.hex beside a healthy creds.json must
+// render vault-error — NOT vault-empty, whose coach sends the owner to
+// `xuansi creds set`, a NO-OP for this corruption (the PSK's lifecycle
+// is the daemon's alone; the remedy is deleting psk.hex, which re-arms
+// generation). The nil-deref-free derivation pins the split.
+func TestProvisionStateVaultErrorNotVaultEmpty(t *testing.T) {
+	vdir := t.TempDir()
+	if err := creds.SaveWiFi(vdir, provDummySSID, provDummyPSK); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vdir, "psk.hex"), []byte("corrupt-not-hex\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := newProvEnv(t, vdir, true, nil, usbBoard("d75884")) // kill-switch on: the view only, no sweep side effects
+	e.srv.reg.Enrich("d75884", &replclient.HelloInfo{Net: map[string]any{"state": "off", "ssid": ""}})
+	got, _ := e.srv.boardView(e.srv.reg.Snapshot()[0])["provision_state"].(string)
+	if got != "vault-error" {
+		t.Fatalf("provision_state = %q, want vault-error (a corrupt psk.hex is not an empty vault — the creds-set coach would be a no-op)", got)
+	}
+	// the ok verdict outranks a broken vault: a cred-showing sighting
+	// needs no vault read at all.
+	e5 := newProvEnv(t, vdir, true, nil, usbBoard("d75884"))
+	e5.srv.reg.Enrich("d75884", &replclient.HelloInfo{Net: map[string]any{"state": "up", "ssid": "set-already"}})
+	if got := e5.srv.boardView(e5.srv.reg.Snapshot()[0])["provision_state"]; got != "ok" {
+		t.Fatalf("provision_state = %v, want ok (a cred-showing sighting needs no vault)", got)
 	}
 }
 

@@ -10,6 +10,7 @@ package creds
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -243,20 +244,34 @@ func TestStateOf(t *testing.T) {
 	cases := []struct {
 		name  string
 		sight Sight
-		vault bool
+		vault VaultHealth
 		want  State
 	}{
-		{"wifi live is ok", Sight{Sighted: true, WifiLive: true}, false, StateOK},
-		{"sighted with ssid is ok", Sight{Sighted: true, SSID: "some-ssid"}, false, StateOK},
-		{"credless + vault wifi = credless", Sight{Sighted: true}, true, StateCredless},
-		{"credless + empty vault = vault-empty", Sight{Sighted: true}, false, StateVaultEmpty},
-		{"never sighted = no state (honest absence)", Sight{}, false, ""},
-		{"never sighted even with vault = no state", Sight{}, true, ""},
+		{"wifi live is ok", Sight{Sighted: true, WifiLive: true}, VaultHealth{}, StateOK},
+		{"sighted with ssid is ok", Sight{Sighted: true, SSID: "some-ssid"}, VaultHealth{}, StateOK},
+		{"credless + vault wifi = credless", Sight{Sighted: true}, VaultHealth{WiFi: true}, StateCredless},
+		{"credless + empty vault = vault-empty", Sight{Sighted: true}, VaultHealth{}, StateVaultEmpty},
+		{"never sighted = no state (honest absence)", Sight{}, VaultHealth{}, ""},
+		{"never sighted even with vault = no state", Sight{}, VaultHealth{WiFi: true}, ""},
+		// the Load-error split (minors 清掃波 Batch A): a BROKEN vault
+		// read is vault-error once the sighting is cred-less — never
+		// vault-empty (the coach there names a remedy that cannot fix
+		// a corrupt psk.hex).
+		{"credless + broken vault = vault-error", Sight{Sighted: true},
+			VaultHealth{Err: errors.New("creds: psk.hex is not 64 hex chars")}, StateVaultError},
+		{"credless + broken vault even with wifi read = vault-error", Sight{Sighted: true},
+			VaultHealth{WiFi: true, Err: errors.New("creds: psk.hex is not 64 hex chars")}, StateVaultError},
+		{"wifi-live outranks a broken vault", Sight{Sighted: true, WifiLive: true},
+			VaultHealth{Err: errors.New("creds: malformed creds.json")}, StateOK},
+		{"cred-showing sighting outranks a broken vault", Sight{Sighted: true, SSID: "set"},
+			VaultHealth{Err: errors.New("creds: malformed creds.json")}, StateOK},
+		{"never sighted + broken vault = still absent", Sight{},
+			VaultHealth{Err: errors.New("creds: read")}, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if got := StateOf(c.sight, c.vault); got != c.want {
-				t.Fatalf("StateOf(%+v, vault=%v) = %q, want %q", c.sight, c.vault, got, c.want)
+				t.Fatalf("StateOf(%+v, vault=%+v) = %q, want %q", c.sight, c.vault, got, c.want)
 			}
 		})
 	}

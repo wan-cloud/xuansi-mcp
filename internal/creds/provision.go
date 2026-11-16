@@ -54,6 +54,18 @@ const (
 	// the daemon wanted to provision but couldn't; the coach line
 	// points the user at the host-side CLI.
 	StateVaultEmpty State = "vault-empty"
+	// StateVaultError: the board is cred-less and the vault read BROKEN
+	// (a malformed creds.json, a corrupt psk.hex, an unreadable file) —
+	// the daemon can neither provision nor honestly call the vault
+	// empty (憑證波 final-review triage: Load errors were conflated
+	// into vault-empty, whose coach sends the owner to `creds set` — a
+	// NO-OP for a corrupt psk.hex, whose only remedy is DELETING the
+	// file; the PSK's lifecycle is the daemon's alone). The remedy is
+	// file-level and the daemon log's vault-unreadable line names the
+	// file: a malformed creds.json is rewritten by `xuansi creds set`
+	// (or import); a corrupt psk.hex is deleted by the owner, which
+	// re-arms generation.
+	StateVaultError State = "vault-error"
 )
 
 // Sight is everything the daemon knows about one board WITHOUT
@@ -69,7 +81,10 @@ type Sight struct {
 // StateOf derives the board face's provision_state. A never-sighted
 // board answers "" (honest absence — the key stays out of the view;
 // the daemon cannot know without a crossing it has no license to make).
-func StateOf(s Sight, vaultWiFi bool) State {
+// The vault only weighs once the sighting is cred-less, and a BROKEN
+// vault read is vault-error there — never vault-empty (the coach would
+// name the wrong remedy).
+func StateOf(s Sight, vh VaultHealth) State {
 	if s.WifiLive {
 		return StateOK
 	}
@@ -79,10 +94,23 @@ func StateOf(s Sight, vaultWiFi bool) State {
 	if s.SSID != "" {
 		return StateOK
 	}
-	if vaultWiFi {
+	if vh.Err != nil {
+		return StateVaultError
+	}
+	if vh.WiFi {
 		return StateCredless
 	}
 	return StateVaultEmpty
+}
+
+// VaultHealth is the vault input to the state derivation: the WiFi
+// pair's presence on a healthy read, or the error a broken read
+// returned. The error distinguishes vault-error from vault-empty; it
+// never crosses to the agent face (the state string is the whole
+// verdict).
+type VaultHealth struct {
+	WiFi bool
+	Err  error
 }
 
 // Outcome labels one Consider run (logs and tests; not a wire shape).
