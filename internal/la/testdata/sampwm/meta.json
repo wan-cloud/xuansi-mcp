@@ -1,0 +1,16 @@
+{
+  "board": "97c1ac",
+  "bytes": 0,
+  "cap_id": "20261117T000002-97c1ac-la-samples-1",
+  "chunks": 0,
+  "mode": "samples",
+  "pulled_at": "2026-11-17T00:00:00Z",
+  "rate_hz": 1000000,
+  "reason": "full",
+  "samples": 80,
+  "sha256": "fixture-sampwm-not-a-pull",
+  "stream_bytes": 80,
+  "t0_ns": 7000000000,
+  "t_end_ns": 7000079000,
+  "t_start_ns": 7000000000
+}

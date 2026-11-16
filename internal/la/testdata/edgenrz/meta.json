@@ -1,0 +1,19 @@
+{
+  "board": "97c1ac",
+  "bytes": 0,
+  "cap_id": "20261117T000001-97c1ac-la-edge-2",
+  "chunks": 0,
+  "mode": "edge",
+  "pins": [
+    39
+  ],
+  "pulled_at": "2026-11-17T00:00:00Z",
+  "reason": "full",
+  "res_hz": 80000000,
+  "runs": 27,
+  "sha256": "fixture-edgenrz-not-a-pull",
+  "stream_bytes": 243,
+  "t0_ns": 6000000000,
+  "t_end_ns": 6003680000,
+  "t_start_ns": 6000000000
+}

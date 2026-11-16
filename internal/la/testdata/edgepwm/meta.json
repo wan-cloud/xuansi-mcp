@@ -1,0 +1,19 @@
+{
+  "board": "97c1ac",
+  "bytes": 0,
+  "cap_id": "20261117T000000-97c1ac-la-edge-1",
+  "chunks": 0,
+  "mode": "edge",
+  "pins": [
+    40
+  ],
+  "pulled_at": "2026-11-17T00:00:00Z",
+  "reason": "full",
+  "res_hz": 80000000,
+  "runs": 40,
+  "sha256": "fixture-edgepwm-not-a-pull",
+  "stream_bytes": 360,
+  "t0_ns": 4000000000,
+  "t_end_ns": 4019250000,
+  "t_start_ns": 4000000000
+}
