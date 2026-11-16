@@ -284,6 +284,14 @@ type boardInfo struct {
 	// caps table exist on this board. Rides the same sighting as
 	// boot_epoch (absent before the first crossing).
 	ProtocolVer int64 `json:"protocol_ver,omitempty" jsonschema:"the REPL protocol version the daemon's last hello sighting reported — 7+ carries the wave-1/2 additions (the log/script event sources — this face auto-arms both under a lease; bench.wasm.plan; the numeric caps limits table); absent before the daemon's first crossing of the board"`
+	// OTA identity trio (OTA ops wave T6 hello passthrough; the MCP
+	// seat's typed decode followed in the final-review fix — the
+	// ota_status Desc's LIVE-vs-SNAPSHOT coaching names these
+	// columns). omitempty keeps each honestly absent on pre-v10
+	// firmware (the boot_epoch precedent).
+	OtaSlot     string `json:"ota_slot,omitempty" jsonschema:"the slot the RUNNING image booted from at the last hello sighting (ota_0 | ota_1) — SNAPSHOT value (the sighting's, not the live truth); the live read is xuansi_ota_status; absent on pre-v10 firmware"`
+	OtaImgState string `json:"ota_img_state,omitempty" jsonschema:"the running image's bootloader state at the last sighting (valid | pending_verify | new | aborted | undefined — pending_verify arms the 45s rollback milestone) — SNAPSHOT value; judge a push's aftermath with xuansi_ota_status"`
+	OtaSha      string `json:"ota_sha,omitempty" jsonschema:"the running image's app_desc elf sha hex64 at the last sighting — the build identity (the same sha xuansi_ota_push judges no-ops by); SNAPSHOT value; the live read is xuansi_ota_status"`
 	// Freshness face (B15 §4.1⑥): the current ACTUAL route, the numeric
 	// contact age, and the staleness verdict. transport is ALWAYS
 	// present (B16, the W1.T1 review asymmetry fixed): the empty
@@ -464,7 +472,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source. Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -519,7 +527,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_op",
-		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AllowlistedOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. caps reads as a NUMERIC TABLE: limits carries the full 19-key numeric account (wasm_memory_budget_bytes, lua_heap, lua_heap_max, timers_max, pending_jobs_max, event_subs_max, event_queue_depth, eval_budget_ms/event_budget_ms [live, budget.set's domain], psram_cap_kb, aot_psram_exec_budget_bytes, resident_max, eval_budget_max_ms, event_next_timeout_ms, name_max_bytes, tag_max_bytes, wasm_inst_slots, la_ring_budget_kb [the LA listen-ring PSRAM admission cap — la.listen_arm refuses when active rings + request exceed it], plus the adc2_note status string) — same keys, same values, same order across the three exits (Lua bench.caps / msgpack caps op / console); the full key list with each key's live/frozen note rides xuansi_abi_reference's caps_keys section. wifi.off honesty note: over TCP, turning the radio off drops the board's own network BEFORE the reply can leave — expect the op to surface as a dead-link/timeout error rather than a success; that error IS the expected outcome (verify later via list_boards staleness, a board.reboot sighting, or the USB route). Holder semantics: " + holderDesc + ".",
+		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AllowlistedOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. caps reads as a NUMERIC TABLE: limits carries the full 21-key account (20 numeric keys: wasm_memory_budget_bytes, lua_heap, lua_heap_max, timers_max, pending_jobs_max, event_subs_max, event_queue_depth, eval_budget_ms/event_budget_ms [live, budget.set's domain], psram_cap_kb, aot_psram_exec_budget_bytes, resident_max, eval_budget_max_ms, event_next_timeout_ms, name_max_bytes, tag_max_bytes, wasm_inst_slots, la_ring_budget_kb [the LA listen-ring PSRAM admission cap — la.listen_arm refuses when active rings + request exceed it], ota_slots/ota_slot_bytes [the v10 A/B dual-slot face: 2 slots frozen in partitions.csv; the slot byte capacity's reconciliation constant], plus the adc2_note status string) — same keys, same values, same order across the three exits (Lua bench.caps / msgpack caps op / console); the full key list with each key's live/frozen note rides xuansi_abi_reference's caps_keys section. wifi.off honesty note: over TCP, turning the radio off drops the board's own network BEFORE the reply can leave — expect the op to surface as a dead-link/timeout error rather than a success; that error IS the expected outcome (verify later via list_boards staleness, a board.reboot sighting, or the USB route). Holder semantics: " + holderDesc + ".",
 	}, ts.boardOp)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -657,6 +665,9 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			LastSeen:      str(m, "last_seen"),
 			Chip:          str(m, "chip"),
 			ProtocolVer:   int64(num(m, "protocol_ver")),
+			OtaSlot:       str(m, "ota_slot"),
+			OtaImgState:   str(m, "ota_img_state"),
+			OtaSha:        str(m, "ota_sha"),
 			Transport:     str(m, "transport"),
 			LastSeenAgeMS: age,
 			Stale:         bol(m, "stale"),

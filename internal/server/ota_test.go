@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,6 +89,13 @@ func scriptOtaIdle(f *fakeCtl, runningSha string) {
 // IS the sighting; making it deterministic is the helper's whole job).
 // The one fake instance serves every dial of the test.
 func newOtaEnv(t *testing.T, mac, host string, script func(*fakeCtl)) *env {
+	return newOtaEnvLog(t, mac, host, script, newTestLogf(t, "srv: "))
+}
+
+// newOtaEnvLog is newOtaEnv with the server's log seam injectable
+// (final review fix #3: the occupant-discovery disclosure test asserts
+// the daemon log lines).
+func newOtaEnvLog(t *testing.T, mac, host string, script func(*fakeCtl), logf func(format string, args ...any)) *env {
 	t.Helper()
 	e := &env{
 		t:         t,
@@ -107,7 +115,7 @@ func newOtaEnv(t *testing.T, mac, host string, script func(*fakeCtl)) *env {
 		Registry:        reg,
 		GraceTTL:        10 * time.Second,
 		RefreshInterval: -1,
-		Log:             newTestLogf(t, "srv: "),
+		Log:             logf,
 		BootRecordsDir:  filepath.Join(testutil.ShortSockDir(t), "bootrec"),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
@@ -384,5 +392,63 @@ func TestOpAllowlistOta(t *testing.T) {
 		if !hit {
 			t.Fatalf("allowlist missing %s (%v)", want, ops)
 		}
+	}
+}
+
+// TestOtaOccupantDiscoveryDisclosure (final review fix #3): when
+// script.list or la.info refuses during occupant discovery, the
+// daemon logs one line per broken leg — the under-disclosure edge (a
+// dying script could go unlisted in a refused row's detail) stays
+// visible in the log while the lease (daemon-side truth) still
+// refuses the push.
+func TestOtaOccupantDiscoveryDisclosure(t *testing.T) {
+	const mac = "97c1ac"
+	path, elf, _ := mkOtaBin(t, "0.7.0", strings.Repeat("cc", 32))
+	var mu sync.Mutex
+	var lines []string
+	logf := func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	e := newOtaEnvLog(t, mac, "bench-ota.local", func(f *fakeCtl) {
+		scriptOtaHello(f, 10, "ota_0", "valid", elf)
+		scriptOtaIdle(f, strings.Repeat("aa", 32)) // running the OLD build — reaches the occupants leg
+		f.on("script.list", func(args map[string]any) (map[string]any, *replclient.OpError) {
+			return nil, &replclient.OpError{Op: "script.list", Class: "api", Msg: "scripts view unavailable"}
+		})
+		f.on("la.info", func(args map[string]any) (map[string]any, *replclient.OpError) {
+			return nil, &replclient.OpError{Op: "la.info", Class: "api", Msg: "la view unavailable"}
+		})
+	}, logf)
+
+	c := dialSock(t, e.sock)
+	lrep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "bench-agent"})
+	if asMap(lrep["error"]) != nil {
+		t.Fatalf("lease: %#v", lrep)
+	}
+	rep, _ := c.call(2, map[string]any{"type": "ota.push", "boards": []string{mac}, "path": path})
+	if rerr := asMap(rep["error"]); rerr != nil {
+		t.Fatalf("ota.push: %v", rerr)
+	}
+	rows, _ := rep["result"].(map[string]any)["rows"].([]any)
+	r := asMap(rows[0])
+	if asStr(r["outcome"]) != "refused" || !strings.Contains(asStr(r["detail"]), "bench-agent") {
+		t.Fatalf("row = %#v, want refused with the lease (daemon-side truth) listed", r)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sawScript, sawLA := false, false
+	for _, l := range lines {
+		if strings.Contains(l, "script.list") {
+			sawScript = true
+		}
+		if strings.Contains(l, "la.info") {
+			sawLA = true
+		}
+	}
+	if !sawScript || !sawLA {
+		t.Errorf("occupant discovery disclosure: script.list logged=%v la.info logged=%v — a broken discovery leg must not pass silently (lines: %v)", sawScript, sawLA, lines)
 	}
 }

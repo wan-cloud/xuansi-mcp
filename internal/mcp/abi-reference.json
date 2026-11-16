@@ -3,7 +3,7 @@
     "header": "src/xuansi_host.h",
     "header_sha256": "3a3dc8c82f30f05cb14bd5cd96132f031ee48aa98e602ddb438af3a711731f23",
     "sidecar": "tools/gen-abi-reference/sidecar.json",
-    "sidecar_sha256": "7cc7d067499d9c081e4b474ad4aeeefcc6b20f4a15534c13924295d259b47c62",
+    "sidecar_sha256": "65839de0a578242f24080cc9ba115d9268840956b77337a92d92a4f48262b8b2",
     "generator": "tools/gen-abi-reference/gen.py",
     "note": "regenerate with tools/gen-abi-reference/gen.py; the checked-in outputs are the single source the daemon embeds (xuansi_abi_reference) — CI byte-compares"
   },
@@ -319,7 +319,7 @@
       }
     },
     "caps_keys": {
-      "note": "18 keys in caps.limits (17 numeric + adc2_note), identical across the three exits (Lua bench.caps / msgpack caps op / console CAP: lines). Same keys, same values, same order — any drift is a bug.",
+      "note": "21 keys in caps.limits (20 numeric + adc2_note), identical across the three exits (Lua bench.caps / msgpack caps op / console CAP: lines). Same keys, same values, same order — any drift is a bug.",
       "keys": [
         {
           "key": "resident_max",
@@ -422,6 +422,24 @@
           "value": 16,
           "live": false,
           "note": "instance-table mapper slots (the memory account is the governing limit; a full table is the mapper's last-line api refusal)"
+        },
+        {
+          "key": "la_ring_budget_kb",
+          "value": 4096,
+          "live": false,
+          "note": "the LA listen-ring PSRAM admission account — active rings + the request must fit it (la.listen_arm / la.sample_arm refuse on overflow, itemizing the account)"
+        },
+        {
+          "key": "ota_slots",
+          "value": 2,
+          "live": false,
+          "note": "the A/B dual ota app slots (frozen in partitions.csv)"
+        },
+        {
+          "key": "ota_slot_bytes",
+          "value": 3145728,
+          "live": false,
+          "note": "one ota slot's byte capacity — the reconciliation constant (ota.begin re-checks the live truth from the partition table)"
         },
         {
           "key": "adc2_note",

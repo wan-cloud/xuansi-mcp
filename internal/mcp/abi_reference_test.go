@@ -11,10 +11,15 @@ package mcp
 // env so the lock has teeth there too).
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"xuansi/internal/mcp/lualint"
 )
@@ -57,11 +62,12 @@ func TestAbiReferenceToolServesSections(t *testing.T) {
 			t.Errorf("full reply missing section %s", s)
 		}
 	}
-	// the caps_keys section carries the 18-key table
+	// the caps_keys section carries the 21-key account (final review
+	// fix #2: 20 numeric + adc2_note — the la/ota additions in)
 	ck, _ := content["caps_keys"].(map[string]any)
 	keys, _ := ck["keys"].([]any)
-	if len(keys) != 18 {
-		t.Errorf("caps_keys.keys = %d entries, want 18", len(keys))
+	if len(keys) != 21 {
+		t.Errorf("caps_keys.keys = %d entries, want 21", len(keys))
 	}
 
 	// filtered: exactly the named section
@@ -161,5 +167,71 @@ func TestAbiReferenceDriftLock(t *testing.T) {
 	}
 	if string(up) != string(abiReferenceJSON) {
 		t.Errorf("the embedded abi-reference.json drifted from the drivers repo's generated copy (upstream %d bytes vs embedded %d) — re-copy the generated file into internal/mcp/ (the drivers file is the single source)", len(up), len(abiReferenceJSON))
+	}
+}
+
+// TestCapsKeysAccount21 (final review fix #2): caps.limits is the
+// 21-key account (20 numeric + adc2_note) — the section carries the
+// three post-B15 additions (la_ring_budget_kb, ota_slots,
+// ota_slot_bytes) in the fw's frozen three-exit order between
+// wasm_inst_slots and adc2_note, the note states the count, and the
+// two coaching Descs (board_op's caps reading, abi_reference's
+// section list) say 21 — the whole MCP face agrees on the account.
+func TestCapsKeysAccount21(t *testing.T) {
+	raw, ok := abiReference().abiSectionRaw("caps_keys")
+	if !ok {
+		t.Fatal("no caps_keys section")
+	}
+	var ck struct {
+		Note string `json:"note"`
+		Keys []struct {
+			Key   string `json:"key"`
+			Value any    `json:"value"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(raw, &ck); err != nil {
+		t.Fatal(err)
+	}
+	if len(ck.Keys) != 21 {
+		t.Fatalf("caps_keys serves %d keys, want 21 (20 numeric + adc2_note)", len(ck.Keys))
+	}
+	byName := map[string]int{}
+	for i, k := range ck.Keys {
+		byName[k.Key] = i
+	}
+	for _, k := range []string{"la_ring_budget_kb", "ota_slots", "ota_slot_bytes"} {
+		if _, ok := byName[k]; !ok {
+			t.Errorf("caps_keys lacks %q (the fw's limits table carries it)", k)
+		}
+	}
+	// the fw's frozen order (xs_caps.c's three-exit single source):
+	// the additions ride between wasm_inst_slots and adc2_note.
+	if !(byName["wasm_inst_slots"] < byName["la_ring_budget_kb"] &&
+		byName["la_ring_budget_kb"] < byName["ota_slots"] &&
+		byName["ota_slots"] < byName["ota_slot_bytes"] &&
+		byName["ota_slot_bytes"] < byName["adc2_note"]) {
+		t.Errorf("caps_keys order drifted from the fw's three-exit order (indices: %v)", byName)
+	}
+	if !strings.Contains(ck.Note, "21 keys") || !strings.Contains(ck.Note, "20 numeric") {
+		t.Errorf("note = %q, want the 21-key / 20-numeric account", ck.Note)
+	}
+
+	// the two Descs agree on 21
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc := map[string]string{}
+	for _, tool := range lr.Tools {
+		desc[tool.Name] = tool.Description
+	}
+	if d := desc["xuansi_board_op"]; !strings.Contains(d, "21-key") || !strings.Contains(d, "ota_slots") {
+		t.Errorf("board_op Desc caps account drifted: want the 21-key account naming ota_slots")
+	}
+	if d := desc["xuansi_abi_reference"]; !strings.Contains(d, "21-key") {
+		t.Errorf("abi_reference Desc caps_keys line drifted: want 21-key")
 	}
 }

@@ -288,3 +288,61 @@ func TestOTADescCoachingAudit(t *testing.T) {
 		}
 	}
 }
+
+// TestListBoardsOTATrio (final review fix #1): the ota_status Desc's
+// LIVE-vs-SNAPSHOT claim names xuansi_list_boards' ota_slot/
+// ota_img_state/ota_sha columns — pinned TRUE here: the typed decode
+// maps the trio on a v10-sighted board, keeps it honestly absent on a
+// pre-v10 one (the boot_epoch precedent), and list_boards' own Desc
+// documents the columns + the live-read pointer.
+func TestListBoardsOTATrio(t *testing.T) {
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"boards": []any{
+			map[string]any{"mac6": "97c1ac", "transport": "tcp",
+				"ota_slot": "ota_1", "ota_img_state": "valid", "ota_sha": strings.Repeat("aa", 32)},
+			map[string]any{"mac6": "d75884", "transport": ""},
+		},
+	}}}, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_list_boards", map[string]any{})
+	if res.IsError {
+		t.Fatalf("list_boards failed: %s", resultText(t, res))
+	}
+	boards, _ := structured(t, res)["boards"].([]any)
+	if len(boards) != 2 {
+		t.Fatalf("boards = %v, want the two scripted rows", boards)
+	}
+	b0, _ := boards[0].(map[string]any)
+	if b0["ota_slot"] != "ota_1" || b0["ota_img_state"] != "valid" || b0["ota_sha"] != strings.Repeat("aa", 32) {
+		t.Errorf("v10 board trio = %v/%v/%v, want the hello passthrough mapped",
+			b0["ota_slot"], b0["ota_img_state"], b0["ota_sha"])
+	}
+	b1, _ := boards[1].(map[string]any)
+	for _, k := range []string{"ota_slot", "ota_img_state", "ota_sha"} {
+		if _, present := b1[k]; present {
+			t.Errorf("pre-v10 board carries %q = %v — the trio must be honestly absent, not zero-filled", k, b1[k])
+		}
+	}
+
+	// the column claim is documented where the seat serves it
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tool := range lr.Tools {
+		if tool.Name != "xuansi_list_boards" {
+			continue
+		}
+		found = true
+		for _, want := range []string{"ota_slot", "ota_img_state", "ota_sha", "xuansi_ota_status"} {
+			if !strings.Contains(tool.Description, want) {
+				t.Errorf("list_boards Desc lacks %q (the OTA trio columns + the live-read pointer)", want)
+			}
+		}
+	}
+	if !found {
+		t.Error("xuansi_list_boards not served")
+	}
+}

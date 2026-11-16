@@ -90,6 +90,11 @@ func (s *Server) otaOccupants(ctx context.Context, mac6 string, lane ota.Board) 
 		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if names, err := db.sup.ScriptList(sctx); err == nil && len(names) > 0 {
 			out = append(out, "running scripts: "+strings.Join(names, ", "))
+		} else if err != nil {
+			// the under-disclosure edge (final review fix #3): a dying
+			// script could go unlisted in the refusal's detail — one
+			// log line keeps the broken discovery leg visible.
+			s.logf("server: ota.push %s: occupant discovery: script.list failed (%v) — a refused row's detail may under-list running scripts", mac6, err)
 		}
 		cancel()
 	}
@@ -113,6 +118,10 @@ func (s *Server) otaOccupants(ctx context.Context, mac6 string, lane ota.Board) 
 				out = append(out, "la captures board-side: "+strings.Join(nums, ", "))
 			}
 		}
+	} else {
+		// same disclosure for the LA leg: a live capture the board
+		// could not enumerate stays visible in the log.
+		s.logf("server: ota.push %s: occupant discovery: la.info failed (%v) — a refused row's detail may under-list live captures", mac6, err)
 	}
 	cancel()
 	return out
