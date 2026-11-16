@@ -412,7 +412,7 @@ func TestLADescCoachingAudit(t *testing.T) {
 			"xuansi_la_frames", "xuansi_la_repeat", "xuansi_la_decode_uart",
 			"BLOCK", "holder",
 		},
-		"xuansi_la_list": {"NOT xuansi_capture", "512MB", "xuansi_la_info", "xuansi_la_frames", "incomplete"},
+		"xuansi_la_list": {"NOT xuansi_capture", "512MB", "xuansi_la_info", "xuansi_la_frames", "incomplete", "omit for every board's captures"},
 		"xuansi_la_info": {"sha256", "hw_ovf", "xuansi_la_frames", "no lease"},
 		"xuansi_la_frames": {
 			"BASE64", "truncated", "xuansi_la_repeat", "xuansi_la_decode_uart",
@@ -687,5 +687,31 @@ func TestLACaptureTrigBitsDomainRefusedClientSide(t *testing.T) {
 	req := wantReq(t, reqs)
 	if req.Trig == nil || req.Trig.Mask != 255 || req.Trig.Value != 255 || req.Trig.Width != 2 {
 		t.Errorf("crossed trig = %#v, want the u8 boundaries verbatim", req.Trig)
+	}
+}
+
+// TestLAListBoardFilterCrossing (LA 二輪審查 2026-11-16 I-2): the
+// optional board filter rides the la_list crossing; omitted crosses
+// empty (every board's captures — no behavior change on the seat).
+func TestLAListBoardFilterCrossing(t *testing.T) {
+	e, reqs := newEnv(t, []step{
+		{result: map[string]any{"captures": []any{map[string]any{"cap_id": "a", "board": "38f2c1"}}}},
+		{result: map[string]any{"captures": []any{}}},
+	}, Options{Holder: "mcp-fixed01"})
+
+	res := e.call("xuansi_la_list", map[string]any{"board": "38f2"})
+	if res.IsError {
+		t.Fatalf("xuansi_la_list failed: %s", resultText(t, res))
+	}
+	req := wantReq(t, reqs)
+	if req.Type != "la_list" || req.Board != "38f2" {
+		t.Errorf("la_list request = %+v, want the board filter crossing", req)
+	}
+	res = e.call("xuansi_la_list", map[string]any{})
+	if res.IsError {
+		t.Fatalf("bare xuansi_la_list failed: %s", resultText(t, res))
+	}
+	if req := wantReq(t, reqs); req.Board != "" {
+		t.Errorf("omitted filter crossed as %q, want empty", req.Board)
 	}
 }

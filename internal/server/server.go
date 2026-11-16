@@ -1306,7 +1306,7 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 	case "la_capture": // T7: the blocking listen capture (own ceiling, above)
 		result, err = s.hLaCapture(ctx, cc, req)
 	case "la_list": // T7: the landed-object reads + L1 crossings (local)
-		result, err = s.hLaList()
+		result, err = s.hLaList(req)
 	case "la_info":
 		result, err = s.hLaInfo(req)
 	case "la_frames":

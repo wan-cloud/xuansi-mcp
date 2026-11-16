@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"xuansi/internal/discover"
@@ -372,11 +373,26 @@ func (s *Server) hLaCaptureSample(ctx context.Context, req *Request, b discover.
 }
 
 // hLaList answers the landed objects, newest first — daemon-local,
-// no lease, no board contact (the store outlives the board).
-func (s *Server) hLaList() (any, error) {
+// no lease, no board contact (the store outlives the board). The
+// optional board filter narrows the rows by the meta's board column
+// (the puller-recorded mac6): exact or prefix match straight over the
+// store, NOT the live registry's selector resolution — a board the
+// daemon no longer discovers still lists its captures, and a selector
+// that matches no rows answers the honest empty list (the filter is a
+// row predicate, never a board claim). Empty/omitted = every board.
+func (s *Server) hLaList(req *Request) (any, error) {
 	metas, err := s.laStore.ListCaptures()
 	if err != nil {
 		return nil, laStoreRPC("la_list", "", err)
+	}
+	if sel := strings.ToLower(strings.TrimSpace(req.Board)); sel != "" {
+		kept := make([]la.Meta, 0, len(metas))
+		for _, m := range metas {
+			if m.Board == sel || strings.HasPrefix(m.Board, sel) {
+				kept = append(kept, m)
+			}
+		}
+		metas = kept
 	}
 	if metas == nil {
 		metas = []la.Meta{}

@@ -149,6 +149,7 @@ func (ts *toolset) registerLA(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "xuansi_la_list",
 		Description: "List the daemon's landed LA capture objects, newest first — every object the la_* analysis tools can read (the daemon-local store, every board's captures; no lease, no board contact — the board can be gone). " + laAntiConfusion + " (that face's spool files are not objects here). " +
+			"Optional board narrows the rows to one board's captures: the row's board column (the puller-recorded mac6, full or prefix — matched over the STORE, not the live registry, so a gone board's captures still list; omit for every board's captures). " +
 			"Each row is the object's full meta: identity (capture_id, board, mode, port/pin), the resolved baud, the payload account (bytes, chunks, t_start_ns/t_end_ns), how the capture ended (reason full|stopped|limit), the fw's arm ledger mirrored at pull time (ring_kb, max_ms, chunks_dropped, bytes_dropped, hw_ovf, armed_ns, stopped_ns — the honest loss columns), sha256 (the verified identity), and incomplete:true on a pull that broke (forensics only). " +
 			"Retention is FIFO over a 512MB quota — oldest objects delete first, the newest never alone. NEXT: pick a capture_id, read it with xuansi_la_info, then xuansi_la_frames for the framing view.",
 	}, ts.laList)
@@ -294,8 +295,16 @@ func (ts *toolset) laCapture(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 	}, nil
 }
 
-func (ts *toolset) laList(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
-	res, err := ts.call(ctx, server.Request{Type: "la_list"})
+// laListIn is la_list's optional row filter (LA 二輪審查 2026-11-16
+// I-2: the documented {board?} crossed nowhere — the tool took a zero
+// input and the daemon ignored the field. The filter lands on both
+// faces now).
+type laListIn struct {
+	Board string `json:"board,omitempty" jsonschema:"optional row filter: keep only the captures whose meta board column (the puller-recorded mac6) matches — full mac6 or a prefix, matched straight over the store (NOT the live registry's selector resolution: a board the daemon no longer discovers still lists its captures, and an alias matches nothing — read the mac6 off a row). Omit for every board's captures"`
+}
+
+func (ts *toolset) laList(ctx context.Context, _ *mcpsdk.CallToolRequest, in laListIn) (*mcpsdk.CallToolResult, any, error) {
+	res, err := ts.call(ctx, server.Request{Type: "la_list", Board: in.Board})
 	if err != nil {
 		return nil, nil, err
 	}

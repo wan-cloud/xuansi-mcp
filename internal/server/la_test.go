@@ -617,3 +617,61 @@ func TestLaEdgeDomainRefusalsZeroContact(t *testing.T) {
 		t.Errorf("edge refusals dialed %d→%d — the gate must be zero-contact", dials, got)
 	}
 }
+
+// TestLaListBoardFilter (LA 二輪審查 2026-11-16 I-2): the documented
+// optional board filter lands on the daemon face — a full mac6 keeps
+// only that board's rows, a mac6 prefix does the same, a board with
+// no captures answers the honest EMPTY list, and an omitted/empty
+// filter changes nothing (every board's rows, the pre-filter shape).
+// The match runs straight over the meta board column (the store
+// outlives the registry), never through selector resolution.
+func TestLaListBoardFilter(t *testing.T) {
+	macA, macB := "38f2c1", "97c1ac"
+	e := newEnv(t, nil, mkBoard(macA, "bench2.local"), mkBoard(macB, "bench3.local"))
+	e.srv.laStore.Root = filepath.Join(t.TempDir(), "la")
+	ring, err := os.ReadFile("../la/testdata/modbus/data.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptLABoard(e.fakes[macA], ring, 21)
+	scriptLABoard(e.fakes[macB], ring, 21)
+	c := dialSock(t, e.sock)
+	ids := map[string]string{}
+	for _, mac := range []string{macA, macB} {
+		if rep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "h"}); rep["error"] != nil {
+			t.Fatalf("lease %s: %#v", mac, rep)
+		}
+		rep, _ := c.call(2, map[string]any{"type": "la_capture", "board": mac, "holder": "h",
+			"mode": "listen", "la_port": 1, "la_pin": 38, "baud": "auto", "ring_kb": 64, "max_seconds": 5})
+		if rerr := asMap(rep["error"]); rerr != nil {
+			t.Fatalf("la_capture %s: %v", mac, rerr)
+		}
+		ids[mac] = asStr(asMap(rep["result"])["capture_id"])
+	}
+	rows := func(id int64, args map[string]any) []any {
+		t.Helper()
+		rep, _ := c.call(id, args)
+		if rerr := asMap(rep["error"]); rerr != nil {
+			t.Fatalf("la_list %v: %v", args, rerr)
+		}
+		list, _ := asMap(rep["result"])["captures"].([]any)
+		return list
+	}
+	if got := rows(3, map[string]any{"type": "la_list"}); len(got) != 2 {
+		t.Errorf("no filter = %d rows, want both boards' 2", len(got))
+	}
+	got := rows(4, map[string]any{"type": "la_list", "board": macA})
+	if len(got) != 1 || asStr(asMap(got[0])["cap_id"]) != ids[macA] {
+		t.Errorf("filter %s = %#v, want exactly its capture", macA, got)
+	}
+	got = rows(5, map[string]any{"type": "la_list", "board": "38f2"})
+	if len(got) != 1 || asStr(asMap(got[0])["cap_id"]) != ids[macA] {
+		t.Errorf("prefix filter 38f2 = %#v, want the same one row", got)
+	}
+	if got := rows(6, map[string]any{"type": "la_list", "board": "001122"}); len(got) != 0 {
+		t.Errorf("board with no captures = %d rows, want the honest empty list", len(got))
+	}
+	if got := rows(7, map[string]any{"type": "la_list", "board": ""}); len(got) != 2 {
+		t.Errorf("empty-string filter = %d rows, want all (no behavior change)", len(got))
+	}
+}
