@@ -81,15 +81,36 @@ func scriptOtaIdle(f *fakeCtl, runningSha string) {
 	})
 }
 
-// newOtaEnv builds the env with the board's fake SCRIPTED FROM BIRTH
-// (the DialTCP seam constructs it with script installed): the startup
-// audit's own crossing sights the same hello face the tests assert
-// with — no tap-race between the audit's default hello and the test's
-// scripting (tap dedupes per controller, so the first connect's hello
-// IS the sighting; making it deterministic is the helper's whole job).
-// The one fake instance serves every dial of the test.
+// newOtaEnv builds the env with the board's fake SCRIPTED FROM BIRTH —
+// created and scripted eagerly, BEFORE the server starts (the audit's
+// own crossing sights the same hello face the tests assert with — no
+// tap-race between the audit's default hello and the test's scripting,
+// and no lazy-install race against the test body either: tap dedupes
+// per controller, so the first connect's hello IS the sighting; making
+// it deterministic is the helper's whole job). The one fake instance
+// serves every dial of the test. The env also awaits the audit's TAP
+// (the boot sighting) — see the tail comment.
 func newOtaEnv(t *testing.T, mac, host string, script func(*fakeCtl)) *env {
-	return newOtaEnvLog(t, mac, host, script, newTestLogf(t, "srv: "))
+	e := newOtaEnvLog(t, mac, host, script, newTestLogf(t, "srv: "))
+	// Await the audit's TAP, not just the registry sweep (minors 清掃波
+	// Batch A, the env's second ordering window): the sweep lands the
+	// BOARD, but the boot SIGHTING the era gate and the hello
+	// passthroughs read (protocolVer) is the audit's tap hello — racing
+	// it let a loaded baseline's push cross unsighted (the gate read
+	// unknown-era, passed, and the row refused on occupants instead of
+	// the era; reproduced on BASE under load). newOtaEnvLog stays
+	// tap-free for envs that DELIBERATELY break a Resync leg (the
+	// audit stops at that error — no tap by design, the Disclosure
+	// test's premise); every newOtaEnv script keeps Resync healthy, so
+	// "sighted" (protocolVer != 0) always comes here.
+	deadline := time.Now().Add(5 * time.Second)
+	for e.srv.protocolVer(mac) == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if e.srv.protocolVer(mac) == 0 {
+		t.Fatalf("startup audit never tapped %s (no boot sighting after 5s) — the ota env's determinism premise broke", mac)
+	}
+	return e
 }
 
 // newOtaEnvLog is newOtaEnv with the server's log seam injectable
@@ -105,6 +126,18 @@ func newOtaEnvLog(t *testing.T, mac, host string, script func(*fakeCtl), logf fu
 		usbDialed: map[string]int{},
 	}
 	boards := []discover.Board{mkBoard(mac, host)}
+	// EAGER fake (minors 清掃波 Batch A — the second latent flake's
+	// mechanical fix): created and scripted BEFORE the server starts.
+	// The lazy DialTCP install raced the test body's fakeOf read —
+	// awaitSweep waits only for the REGISTRY sweep, never the audit's
+	// dial, so under load a body touching the fake first read nil (the
+	// SIGSEGV the clean-baseline flakes rode). "Scripted from birth"
+	// now means it literally; the one instance still serves every dial.
+	f := newFakeCtl()
+	if script != nil {
+		script(f)
+	}
+	e.fakes[mac] = f
 	reg := discover.NewRegistry(nil, nil,
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
 		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
@@ -129,12 +162,11 @@ func newOtaEnvLog(t *testing.T, mac, host string, script func(*fakeCtl), logf fu
 					e.dmu.Lock()
 					defer e.dmu.Unlock()
 					e.dialed[ref.MAC6]++
-					if e.fakes[ref.MAC6] == nil {
-						f := newFakeCtl()
-						script(f)
-						e.fakes[ref.MAC6] = f
+					f := e.fakes[ref.MAC6]
+					if f == nil {
+						return nil, fmt.Errorf("no fake for %s", ref.MAC6)
 					}
-					return e.fakes[ref.MAC6], nil
+					return f, nil
 				},
 				DialUSB: func() (board.Controller, error) {
 					return nil, fmt.Errorf("no usb fake (OTA policy: never dialed)")
@@ -154,12 +186,34 @@ func newOtaEnvLog(t *testing.T, mac, host string, script func(*fakeCtl), logf fu
 	return e
 }
 
-// fakeOf reads the env's fake under the dial lock (the audit's dial
-// goroutine may still be installing it when the test body runs).
+// fakeOf reads the env's fake under the dial lock. The fake is
+// installed EAGERLY at construction (the lazy install's nil window —
+// the second latent flake — is closed), so this never answers nil for
+// the env's own board.
 func (e *env) fakeOf(mac6 string) *fakeCtl {
 	e.dmu.Lock()
 	defer e.dmu.Unlock()
 	return e.fakes[mac6]
+}
+
+// TestOtaEnvFakeInstalledFromBirth (minors 清掃波 Batch A — the second
+// latent flake): the ota env's fake is EAGER — created and scripted
+// BEFORE the server starts. The lazy install (DialTCP creating the
+// fake on the first dial, the audit's goroutine) left a nil-deref
+// window: awaitSweep waits only for the REGISTRY sweep, never the
+// audit's dial, so a test body touching fakeOf before that dial landed
+// read nil (the load-dependent flake on clean baselines, the 憑證波
+// T2 report's concern ②). Pin: the fake exists the moment the env is
+// built — zero dials needed.
+func TestOtaEnvFakeInstalledFromBirth(t *testing.T) {
+	// the RAW env (no tap-await): the pin is the INSTALL ordering —
+	// zero dials needed, the fake exists the moment the env is built.
+	e := newOtaEnvLog(t, "97c1ac", "bench-ota.local", func(f *fakeCtl) {
+		scriptOtaHello(f, 10, "ota_1", "valid", strings.Repeat("aa", 32))
+	}, newTestLogf(t, "srv: "))
+	if e.fakeOf("97c1ac") == nil {
+		t.Fatal("the ota env's fake must exist from construction (eager install) — the lazy install is the nil-deref window")
+	}
 }
 
 // TestOtaPushNoOpRow: the daemon sights the board at v10, the preflight
