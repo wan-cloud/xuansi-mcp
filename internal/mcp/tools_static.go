@@ -301,6 +301,14 @@ type boardInfo struct {
 	Transport     string `json:"transport" jsonschema:"the CURRENT ACTUAL controller transport — \"tcp\"/\"usb\" for the live route in hand (never the preferred one), \"\" when the daemon holds no live controller (never connected, or the last link died); always present"`
 	LastSeenAgeMS int64  `json:"last_seen_age_ms" jsonschema:"milliseconds since the daemon's last protocol crossing with the board (hello or op reply); -1 = the daemon never crossed it"`
 	Stale         bool   `json:"stale" jsonschema:"true when the board has NO live discovery source AND no crossing within the last 30s (never-contacted counts) — last-known only: refresh discovery, check the cable/WiFi; board-touching ops will refuse fast with cause \"source gone\""`
+	// ProvisionState (憑證波 T2, spec §5b) is the credential-provisioning
+	// verdict: state and coaching ONLY, zero secret material, zero new
+	// tools. ok = the board carries WiFi credentials (hello sighting
+	// shows an ssid, or the board is WiFi-live); credless = the sighting
+	// shows none (the daemon's zero-ritual provisioner is armed for it);
+	// vault-empty = credless AND the host vault is empty — the daemon
+	// wanted to provision but couldn't. Absent before any sighting.
+	ProvisionState string `json:"provision_state,omitempty" jsonschema:"the board's wifi-credential provisioning verdict: ok (carries credentials), credless (none — the daemon's zero-ritual provisioner arms for it), or vault-empty (none AND the host vault is empty: direct the USER to run 'xuansi creds set' or 'xuansi creds import <file>' on the HOST — credentials never cross the agent channel, and the device PSK is daemon-generated so the user provides nothing beyond WiFi); absent before the daemon's first sighting of the board"`
 }
 
 type listBoardsOut struct {
@@ -472,12 +480,12 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). " + provisionCoachDesc + " Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_status",
-		Description: "One board's status: identity, connected — whether the daemon holds a live warm controller connection, a daemon-side LINK fact, not board liveness (false only means no contact yet or the last link died; a rebooted or unreachable board can still read true until the next crossing fails — judge survival from the board view's boot_epoch/reset_reason/last_seen/last_seen_age_ms/stale and board.reboot events instead) — plus the current lease (holder/session/grace deadline; absent when free) and its running scripts. Cache-first, NEVER dials: the scripts listing rides only an ALREADY-WARM controller link; an unreachable or stale board answers from cache. The board view carries transport (current actual route), last_seen_age_ms (-1 = never crossed) and stale (no live source AND no crossing within 30s). Read-only, no lease. " + boardDesc + ".",
+		Description: "One board's status: identity, connected — whether the daemon holds a live warm controller connection, a daemon-side LINK fact, not board liveness (false only means no contact yet or the last link died; a rebooted or unreachable board can still read true until the next crossing fails — judge survival from the board view's boot_epoch/reset_reason/last_seen/last_seen_age_ms/stale and board.reboot events instead) — plus the current lease (holder/session/grace deadline; absent when free) and its running scripts. Cache-first, NEVER dials: the scripts listing rides only an ALREADY-WARM controller link; an unreachable or stale board answers from cache. The board view carries transport (current actual route), last_seen_age_ms (-1 = never crossed) and stale (no live source AND no crossing within 30s), and provision_state (ok | credless | vault-empty; " + provisionCoachDesc + ") Read-only, no lease. " + boardDesc + ".",
 	}, ts.boardStatus)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -527,7 +535,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_op",
-		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AllowlistedOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. caps reads as a NUMERIC TABLE: limits carries the full 21-key account (20 numeric keys: wasm_memory_budget_bytes, lua_heap, lua_heap_max, timers_max, pending_jobs_max, event_subs_max, event_queue_depth, eval_budget_ms/event_budget_ms [live, budget.set's domain], psram_cap_kb, aot_psram_exec_budget_bytes, resident_max, eval_budget_max_ms, event_next_timeout_ms, name_max_bytes, tag_max_bytes, wasm_inst_slots, la_ring_budget_kb [the LA listen-ring PSRAM admission cap — la.listen_arm refuses when active rings + request exceed it], ota_slots/ota_slot_bytes [the v10 A/B dual-slot face: 2 slots frozen in partitions.csv; the slot byte capacity's reconciliation constant], plus the adc2_note status string) — same keys, same values, same order across the three exits (Lua bench.caps / msgpack caps op / console); the full key list with each key's live/frozen note rides xuansi_abi_reference's caps_keys section. wifi.off honesty note: over TCP, turning the radio off drops the board's own network BEFORE the reply can leave — expect the op to surface as a dead-link/timeout error rather than a success; that error IS the expected outcome (verify later via list_boards staleness, a board.reboot sighting, or the USB route). Holder semantics: " + holderDesc + ".",
+		Description: "Run ONE allowlisted board op under the lease: " + strings.Join(server.AgentOps(), ", ") + " — every op requires the lease, including the read-only diag/caps ones (the ops face's shape; the daemon-hidden sec.* PSK family is NOT agent-reachable — the zero-ritual provisioner owns it). " + opArgsDesc + ". The board's reply (or its error class/msg, verbatim) is the result. caps reads as a NUMERIC TABLE: limits carries the full 21-key account (20 numeric keys: wasm_memory_budget_bytes, lua_heap, lua_heap_max, timers_max, pending_jobs_max, event_subs_max, event_queue_depth, eval_budget_ms/event_budget_ms [live, budget.set's domain], psram_cap_kb, aot_psram_exec_budget_bytes, resident_max, eval_budget_max_ms, event_next_timeout_ms, name_max_bytes, tag_max_bytes, wasm_inst_slots, la_ring_budget_kb [the LA listen-ring PSRAM admission cap — la.listen_arm refuses when active rings + request exceed it], ota_slots/ota_slot_bytes [the v10 A/B dual-slot face: 2 slots frozen in partitions.csv; the slot byte capacity's reconciliation constant], plus the adc2_note status string) — same keys, same values, same order across the three exits (Lua bench.caps / msgpack caps op / console); the full key list with each key's live/frozen note rides xuansi_abi_reference's caps_keys section. wifi.off honesty note: over TCP, turning the radio off drops the board's own network BEFORE the reply can leave — expect the op to surface as a dead-link/timeout error rather than a success; that error IS the expected outcome (verify later via list_boards staleness, a board.reboot sighting, or the USB route). Holder semantics: " + holderDesc + ".",
 	}, ts.boardOp)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -652,25 +660,26 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			age = int64(v)
 		}
 		out.Boards = append(out.Boards, boardInfo{
-			MAC6:          str(m, "mac6"),
-			Alias:         str(m, "alias"),
-			Sources:       strSlice(m["sources"]),
-			Host:          str(m, "host"),
-			Port:          num(m, "port"),
-			USBPath:       str(m, "usb_path"),
-			Fw:            str(m, "fw"),
-			FwVersion:     str(m, "fw_version"),
-			BootEpoch:     int64(num(m, "boot_epoch")),
-			ResetReason:   str(m, "reset_reason"),
-			LastSeen:      str(m, "last_seen"),
-			Chip:          str(m, "chip"),
-			ProtocolVer:   int64(num(m, "protocol_ver")),
-			OtaSlot:       str(m, "ota_slot"),
-			OtaImgState:   str(m, "ota_img_state"),
-			OtaSha:        str(m, "ota_sha"),
-			Transport:     str(m, "transport"),
-			LastSeenAgeMS: age,
-			Stale:         bol(m, "stale"),
+			MAC6:           str(m, "mac6"),
+			Alias:          str(m, "alias"),
+			Sources:        strSlice(m["sources"]),
+			Host:           str(m, "host"),
+			Port:           num(m, "port"),
+			USBPath:        str(m, "usb_path"),
+			Fw:             str(m, "fw"),
+			FwVersion:      str(m, "fw_version"),
+			BootEpoch:      int64(num(m, "boot_epoch")),
+			ResetReason:    str(m, "reset_reason"),
+			LastSeen:       str(m, "last_seen"),
+			Chip:           str(m, "chip"),
+			ProtocolVer:    int64(num(m, "protocol_ver")),
+			OtaSlot:        str(m, "ota_slot"),
+			OtaImgState:    str(m, "ota_img_state"),
+			OtaSha:         str(m, "ota_sha"),
+			Transport:      str(m, "transport"),
+			LastSeenAgeMS:  age,
+			Stale:          bol(m, "stale"),
+			ProvisionState: str(m, "provision_state"),
 		})
 	}
 	return nil, out, nil
@@ -957,6 +966,14 @@ func (ts *toolset) sessionReset(ctx context.Context, _ *mcpsdk.CallToolRequest, 
 }
 
 func (ts *toolset) boardOp(ctx context.Context, _ *mcpsdk.CallToolRequest, in boardOpIn) (*mcpsdk.CallToolResult, opResultOut, error) {
+	// 憑證波 T2 (owner ruling 2026-11-16): the sec.* PSK family is the
+	// daemon's alone — the AGENT channel refuses it here, client-side,
+	// before any daemon crossing (the internal ops face keeps the pair
+	// for the provisioner/HIL; the listings quote AgentOps, never the
+	// full table).
+	if strings.HasPrefix(in.Op, "sec.") {
+		return nil, opResultOut{}, fmt.Errorf("op %q is the daemon-owned PSK family — not reachable through the agent channel (the device PSK's lifecycle is the daemon's: generated, held, and pushed by the zero-ritual provisioner; nothing for an agent or a user to enter)", in.Op)
+	}
 	var args any
 	if in.Args != nil {
 		args = in.Args

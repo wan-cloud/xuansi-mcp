@@ -36,6 +36,7 @@ var commands = []command{
 	{"list", "list boards known to the daemon (USB + mDNS, mac6-joined)", runList},
 	{"status", "show one board's live status", runStatus},
 	{"boards", "boards pin/unpin MAC6 — declare a board's TCP endpoint (registry pin source, ⑨)", runBoards},
+	{"creds", "owner credential vault: set | import <file> | status (never prints secrets; arms the zero-ritual provisioner)", runCreds},
 	{"lease", "take the exclusive lease on one board", runLease},
 	{"release", "release a board lease", runRelease},
 	{"eval", "evaluate one expression on a board and print the result", runEval},

@@ -11,6 +11,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,9 @@ func TestLeaseUSBSourceGoneClass(t *testing.T) {
 		RequestTimeout:  2 * time.Second,
 		AuditTimeout:    200 * time.Millisecond,
 		Log:             newTestLogf(t, "srv: "),
+		// 憑證波 T2: not this env's subject — stand the provisioner down.
+		DisableProvision: true,
+		VaultDir:         filepath.Join(testutil.ShortSockDir(t), "vault"),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
 				Log: newTestLogf(t, "sup: "),

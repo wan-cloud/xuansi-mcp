@@ -8,6 +8,7 @@ package server
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -50,6 +51,9 @@ func newPinEnv(t *testing.T) *pinEnv {
 		GraceTTL:        10 * time.Second,
 		RefreshInterval: -1,
 		Log:             newTestLogf(t, "srv: "),
+		// 憑證波 T2: not this env's subject — stand the provisioner down.
+		DisableProvision: true,
+		VaultDir:         filepath.Join(testutil.ShortSockDir(t), "vault"),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			pe.mu.Lock()
 			pe.refs = append(pe.refs, ref)

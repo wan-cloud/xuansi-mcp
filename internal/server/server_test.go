@@ -322,6 +322,11 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	h.OtaSlot, _ = res["ota_slot"].(string)
 	h.OtaImgState, _ = res["ota_img_state"].(string)
 	h.OtaSha, _ = res["ota_sha"].(string)
+	// net section (parseHello's twin — the provision_state sighting's
+	// cred source; 憑證波 T2)
+	if v, ok := res["net"].(map[string]any); ok {
+		h.Net = v
+	}
 	if h.ResetReason == "" {
 		h.ResetReason = h.Reset
 	}
@@ -473,6 +478,13 @@ func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string
 		RefreshInterval: -1,   // no background loop; the initial sweep still runs
 		Log:             srvLog,
 		BootRecordsDir:  filepath.Join(testutil.ShortSockDir(t), "bootrec"), // B16-T6 D1: hermetic receipt book
+		// 憑證波 T2: the standard env stands the zero-ritual provisioner
+		// DOWN — these tests are not about provisioning, and the sweep's
+		// goroutines (plus its vault reads) would only add cross-test
+		// scheduler noise. The provisioner's own env is provision_test's
+		// newProvEnv (temp VaultDir, enabled).
+		DisableProvision: true,
+		VaultDir:         filepath.Join(testutil.ShortSockDir(t), "vault"),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
 				Log: supLog,
@@ -2161,7 +2173,10 @@ func TestOpAllowlistRefusal(t *testing.T) {
 // joined with the OTA ops wave T6 — begin/abort drive the uplink
 // cargo's ota lane, status observes, activate/confirm run the boot
 // state machine (the fleet push keeps its own ota.push request type,
-// 21–25).
+// 21–25); the sec PSK pair joined with the 憑證零儀式波 T2 — psk_write
+// is the daemon provisioner's write-only store, psk_status the ro
+// existence read (26–27; AGENT-HIDDEN — the MCP seat refuses the
+// family and its listings quote AgentOps, never this full set).
 var opsFaceAllowlistV1 = []string{
 	"budget.get", "budget.set",
 	"caps", "diag.heapinfo", "diag.i2cslave",
@@ -2169,6 +2184,7 @@ var opsFaceAllowlistV1 = []string{
 	"la.disarm", "la.edge_arm", "la.info", "la.listen_arm", "la.read",
 	"la.sample_arm", "la.stop", "log.read", "lua.check",
 	"ota.abort", "ota.activate", "ota.begin", "ota.confirm", "ota.status",
+	"sec.psk_status", "sec.psk_write",
 	"wifi.off", "wifi.setup", "wifi.status",
 }
 

@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"xuansi/internal/board"
+	"xuansi/internal/creds"
 	"xuansi/internal/discover"
 	"xuansi/internal/la"
 	"xuansi/internal/lease"
@@ -250,6 +251,22 @@ type Opts struct {
 	// per board, last-8 receipts + the adopted skeleton baseline).
 	// Tests inject a temp dir.
 	BootRecordsDir string
+
+	// VaultDir overrides the credential vault's landing spot (憑證波
+	// T2; default paths.StateDir() — creds.json + psk.hex, 0700/0600).
+	// Tests inject a temp dir.
+	VaultDir string
+
+	// DisableProvision is the zero-ritual provisioner's kill-switch
+	// (spec §5 ruling: 預設開 — provisioning ENABLED by default, so the
+	// kill-switch is this opt-OUT). Tests and the --no-provision serve
+	// flag set it.
+	DisableProvision bool
+
+	// ProvisionWait bounds the provisioner's post-setup association
+	// wait (0 = the 30s production default; tests inject a short window
+	// so a Consider goroutine never outlives its env).
+	ProvisionWait time.Duration
 }
 
 // Server is the daemon's API face. New binds the socket; Start serves;
@@ -301,6 +318,11 @@ type Server struct {
 	// open's captured banners, classified (T0/T1/T2) + epoch-arbitrated,
 	// persisted last-8 with the adopted skeleton baseline (bootbanner.go).
 	bootRec *BootRecordStore
+
+	// vaultDir is the credential vault's landing spot (憑證波 T2);
+	// prov is the zero-ritual provisioner over it (provision.go).
+	vaultDir string
+	prov     *creds.Provisioner
 
 	auditCancel context.CancelFunc
 
@@ -513,6 +535,25 @@ func New(o Opts) (*Server, error) {
 		done:        make(chan struct{}),
 		bootRec:     NewBootRecordStore(o.BootRecordsDir),
 	}
+	if o.VaultDir == "" {
+		o.VaultDir = paths.StateDir()
+	}
+	s.vaultDir = o.VaultDir
+	// The zero-ritual provisioner (憑證波 T2): the sweep (provision.go)
+	// feeds it CDC-sighted boards; the vault/PSK read through the LIVE
+	// landing spot so `xuansi creds set` arms it without a restart.
+	d := creds.Deps{
+		Source: usbSourceFunc(s.provisionLane),
+		Vault:  func() (creds.Vault, error) { return creds.Load(s.vaultDir) },
+		PSK:    func() (string, error) { return creds.EnsurePSK(s.vaultDir) },
+		Logf:   s.logf,
+		Emit:   s.emitProvisioned,
+	}
+	if o.ProvisionWait > 0 {
+		d.AssocWait = o.ProvisionWait
+		d.Poll = o.ProvisionWait / 75 // the production 30s/400ms ratio, shrunk with the window
+	}
+	s.prov = creds.NewProvisioner(d)
 	// B16-T6 D1: the USB dial seam grows the boot-banner capture hook —
 	// the drain window's tail is the open-reboot's banner (the
 	// zero-false-positive source, spec §4D). The hook attaches to the
@@ -1435,6 +1476,13 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 	if !last.IsZero() {
 		v["last_seen"] = last.UTC().Format(time.RFC3339)
 	}
+	// provision_state (憑證波 T2, spec §5b): state + coaching only —
+	// ok | credless | vault-empty, absent before any sighting (the
+	// daemon cannot know a never-crossed board's credentials without
+	// the crossing this view must never trigger).
+	if st := s.provisionStateOf(b); st != "" {
+		v["provision_state"] = string(st)
+	}
 	return v
 }
 
@@ -2031,6 +2079,15 @@ var opAllowlist = map[string]bool{
 	"ota.status":   true,
 	"ota.activate": true,
 	"ota.confirm":  true,
+	// 憑證零儀式波 T2 (protocol v10): the device-PSK sec family —
+	// psk_write is the write-only store (controller-only board-side),
+	// psk_status the ro existence read. Daemon-internal face: the
+	// provisioner pushes the PSK, HIL/diagnostics read existence.
+	// AGENT-HIDDEN by ruling (2026-11-16: the PSK lifecycle is the
+	// daemon's alone): the MCP seat refuses the family and lists only
+	// AgentOps — these two never enter an agent-visible listing.
+	"sec.psk_write":  true,
+	"sec.psk_status": true,
 }
 
 // AllowlistedOps renders the ops face's allowlisted op names, sorted —
@@ -2040,6 +2097,30 @@ var opAllowlist = map[string]bool{
 func AllowlistedOps() []string {
 	ops := make([]string, 0, len(opAllowlist))
 	for op := range opAllowlist {
+		ops = append(ops, op)
+	}
+	sort.Strings(ops)
+	return ops
+}
+
+// agentHiddenOps is the opAllowlist subset the AGENT channels never
+// see (the 憑證波 T2 ruling: the sec.* PSK family's lifecycle is the
+// daemon's alone — the MCP seat refuses these ops and its listings
+// quote AgentOps, never the full table). Internal/HIL/diagnostic faces
+// keep them; the daemon's own provisioner dials its own lane anyway.
+var agentHiddenOps = map[string]bool{
+	"sec.psk_write":  true,
+	"sec.psk_status": true,
+}
+
+// AgentOps renders the agent-visible allowlist (the full table minus
+// the hidden family) — the listing the MCP xuansi_board_op face quotes.
+func AgentOps() []string {
+	ops := make([]string, 0, len(opAllowlist))
+	for op := range opAllowlist {
+		if agentHiddenOps[op] {
+			continue
+		}
 		ops = append(ops, op)
 	}
 	sort.Strings(ops)
@@ -3380,6 +3461,10 @@ func (s *Server) startupAudit(ctx context.Context) {
 			s.tap(b.MAC6, db, ctl)
 		}
 	}
+	// 憑證波 T2: with the audit's sightings landed, the zero-ritual
+	// sweep considers the CDC-sighted boards (cred-less + armed vault
+	// → provisioned; known-credful → zero contact).
+	s.provisionSweep(ctx)
 }
 
 // refreshLoop keeps the registry fresh.
@@ -3397,6 +3482,9 @@ func (s *Server) refreshLoop(ctx context.Context) {
 			if err := s.reg.Refresh(ctx); err != nil {
 				s.logf("server: discovery refresh failed: %v", err)
 			}
+			// 憑證波 T2: each fresh sighting re-considers the CDC-sighted
+			// boards (a just-wiped board re-arms; a leased one is skipped).
+			s.provisionSweep(ctx)
 		}
 	}
 }

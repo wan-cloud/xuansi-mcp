@@ -117,6 +117,11 @@ func newOtaEnvLog(t *testing.T, mac, host string, script func(*fakeCtl), logf fu
 		RefreshInterval: -1,
 		Log:             logf,
 		BootRecordsDir:  filepath.Join(testutil.ShortSockDir(t), "bootrec"),
+		// 憑證波 T2: the ota envs stand the provisioner down (their
+		// subject is the push face; the sweep would only add scheduler
+		// noise — the same isolation newEnvFull applies).
+		DisableProvision: true,
+		VaultDir:         filepath.Join(testutil.ShortSockDir(t), "vault"),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
 				Log: newTestLogf(t, "sup: "),
@@ -357,7 +362,9 @@ func TestListBoardsOtaPassthrough(t *testing.T) {
 }
 
 // TestOpAllowlistOta: the five ota ops ride the op face under the lease
-// gate; the allowlist renders exactly 25 with all five present.
+// gate; the allowlist renders exactly 27 with all five present (憑證波
+// T2 added sec.psk_write/sec.psk_status — and the agent-visible
+// projection AgentOps renders exactly 25 without them).
 func TestOpAllowlistOta(t *testing.T) {
 	const mac = "97c1ac"
 	e := newOtaEnv(t, mac, "bench-ota.local", func(f *fakeCtl) {
@@ -379,10 +386,11 @@ func TestOpAllowlistOta(t *testing.T) {
 	}
 
 	ops := AllowlistedOps()
-	if len(ops) != 25 {
-		t.Fatalf("allowlist = %d ops (%v), want 25", len(ops), ops)
+	if len(ops) != 27 {
+		t.Fatalf("allowlist = %d ops (%v), want 27", len(ops), ops)
 	}
-	for _, want := range []string{"ota.begin", "ota.abort", "ota.status", "ota.activate", "ota.confirm"} {
+	for _, want := range []string{"ota.begin", "ota.abort", "ota.status", "ota.activate", "ota.confirm",
+		"sec.psk_write", "sec.psk_status"} {
 		var hit bool
 		for _, op := range ops {
 			if op == want {
@@ -391,6 +399,19 @@ func TestOpAllowlistOta(t *testing.T) {
 		}
 		if !hit {
 			t.Fatalf("allowlist missing %s (%v)", want, ops)
+		}
+	}
+	// the agent projection hides the sec family (the PSK lifecycle is
+	// the daemon's — the MCP seat refuses and never lists these)
+	agent := AgentOps()
+	if len(agent) != 25 {
+		t.Fatalf("AgentOps = %d ops (%v), want 25", len(agent), agent)
+	}
+	for _, hidden := range []string{"sec.psk_write", "sec.psk_status"} {
+		for _, op := range agent {
+			if op == hidden {
+				t.Fatalf("AgentOps lists the agent-hidden op %s (%v)", hidden, agent)
+			}
 		}
 	}
 }

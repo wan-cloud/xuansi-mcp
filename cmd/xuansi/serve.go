@@ -39,9 +39,10 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	graceTTL := fs.Duration("grace-ttl", lease.DefaultGraceTTL, "lease grace window after an agent disconnect (e.g. 300s, 10s)")
 	idleExit := fs.Duration("idle-exit", -1*time.Nanosecond, "self-exit after D with no clients and no live captures (-1ns = follow --grace-ttl, 0 = never)")
 	boardsFile := fs.String("boards-file", "", "boards.conf path (name=mac6 aliases; default user config dir xuansi/boards.conf, missing = zero-config)")
+	noProvision := fs.Bool("no-provision", false, "kill the zero-ritual provisioner: never auto-provision cred-less USB boards (default: on — plug in and it works)")
 	verbose := fs.Bool("verbose", false, "log at debug level (slog text handler)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: xuansi serve [--sock S] [--grace-ttl D] [--idle-exit D] [--boards-file F] [--verbose]\n")
+		fmt.Fprintf(fs.Output(), "Usage: xuansi serve [--sock S] [--grace-ttl D] [--idle-exit D] [--boards-file F] [--no-provision] [--verbose]\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -66,6 +67,12 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 		// fact through agent-idle wifi scans, and a dead CDC link is
 		// detected in one window instead of run3's 113s).
 		KeepaliveInterval: 3 * time.Second,
+	}
+	// 憑證波 T2: the zero-ritual kill-switch — the flag, or the env var
+	// (the env form survives the client auto-spawn, which passes no
+	// flags; any non-empty XUANSI_NO_PROVISION stands the flow down).
+	if *noProvision || os.Getenv("XUANSI_NO_PROVISION") != "" {
+		opts.DisableProvision = true
 	}
 	// --idle-exit resolution: the -1ns default (any negative) follows
 	// --grace-ttl; 0 opts out entirely; a positive value is the window.

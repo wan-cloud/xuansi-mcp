@@ -62,6 +62,9 @@ func TestKeepaliveKeepsLastSeenFreshThroughIdleAndScan(t *testing.T) {
 		RefreshInterval:   -1,
 		KeepaliveInterval: interval,
 		Log:               newTestLogf(t, "srv: "),
+		// 憑證波 T2: not this env's subject — stand the provisioner down.
+		DisableProvision: true,
+		VaultDir:         filepath.Join(testutil.ShortSockDir(t), "vault"),
 		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
 			return board.NewSupervisor(ref, board.SupOpts{
 				Log: newTestLogf(t, "sup: "),
