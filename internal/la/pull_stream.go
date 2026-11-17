@@ -160,6 +160,13 @@ func (s *Store) streamPull(ctx context.Context, board PullBoard,
 		endOfIntent(board.Conn, capNum)
 		return CaptureRef{}, merr
 	}
+	// R-D1: the id is streamPull's own — the newMeta wrappers cannot
+	// see it, and without it writeMeta lands the meta at the store ROOT
+	// (dir("")), the object dir reads as litter, and the NEXT stream
+	// pull dies on the root meta.json's exclusive create. The post-stop
+	// engines set it in their literals (pull.go/pull_edge.go/
+	// pull_sample.go); the shared core carries it here.
+	meta.CapID = id
 	land := func(cause error) (CaptureRef, error) {
 		bw.Flush()
 		file.Close()

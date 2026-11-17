@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -158,6 +159,115 @@ func TestPullCaptureStreamIncomplete(t *testing.T) {
 	}
 	if fi, ferr := os.Stat(ref.DataPath); ferr != nil || fi.Size() == 0 {
 		t.Errorf("data.bin should hold the streamed prefix (stat %v %v)", fi, ferr)
+	}
+}
+
+// TestPullCaptureStreamMetaCapID pins the R-D1 chain end to end: a
+// stream pull's meta must carry the object's own id. An empty CapID
+// lands the meta at the store ROOT (dir("")), the object dir reads as
+// litter (invisible to la_list, swept by Retention), and the NEXT
+// stream pull dies on the root meta.json's exclusive create. Two
+// listen pulls and one edge pull over one store: every object listed,
+// every meta inside its captures/la/<cap_id>/ dir, nothing in the
+// store root but object directories.
+func TestPullCaptureStreamMetaCapID(t *testing.T) {
+	ring := goldenRing()
+	s := testStore(t)
+
+	streamBoard := func() *scriptedBoard {
+		b := newBoard(ring)
+		b.stream = true
+		b.stopB = goldenPayload()
+		b.stopR = "limit"
+		b.infoMeta = map[string]any{
+			"baud": int64(115200), "ring_kb": int64(128),
+			"idle_syms": int64(4), "max_ms": int64(5000), "chunks": int64(3),
+			"reason": "limit", "armed_ns": int64(111), "stopped_ns": int64(222),
+		}
+		return b
+	}
+
+	// Pull 1 — the object must be visible and self-located: the meta
+	// inside captures/la/<cap_id>/, la_list answering it by that id.
+	ref1, err := s.PullCaptureStream(context.Background(),
+		PullBoard{ID: "aa11bb", Conn: streamBoard()}, ArmArgs{
+			Port: 1, Pin: 38, Baud: 115200, RingKB: 128, MaxMS: 5000,
+		})
+	if err != nil {
+		t.Fatalf("PullCaptureStream #1: %v", err)
+	}
+	if ref1.Meta.CapID != ref1.ID {
+		t.Errorf("meta.cap_id = %q, want the object id %q", ref1.Meta.CapID, ref1.ID)
+	}
+	if got, lerr := s.ListCaptures(); lerr != nil || len(got) != 1 || got[0].CapID != ref1.ID {
+		t.Errorf("la_list after pull 1 = %v (err %v) — the object must be visible as %s",
+			got, lerr, ref1.ID)
+	}
+	if _, serr := os.Stat(filepath.Join(s.Root, ref1.ID, "meta.json")); serr != nil {
+		t.Errorf("meta.json must land inside captures/la/<cap_id>/: %v", serr)
+	}
+
+	// Pull 2 — a second stream capture on the same board must land its
+	// own fresh id, not die on the root meta.json's O_EXCL.
+	ref2, err := s.PullCaptureStream(context.Background(),
+		PullBoard{ID: "aa11bb", Conn: streamBoard()}, ArmArgs{
+			Port: 1, Pin: 38, Baud: 115200, RingKB: 128, MaxMS: 5000,
+		})
+	if err != nil {
+		t.Fatalf("PullCaptureStream #2: %v (the second stream capture must land, not die on an exclusive-create collision)", err)
+	}
+	if ref2.ID == ref1.ID {
+		t.Errorf("pull 2 id = pull 1 id (%s) — a fresh capture needs a fresh id", ref2.ID)
+	}
+
+	// Pull 3 — the edge stream closure rides the same core; its meta
+	// carries the id too.
+	ering := edgeRing()
+	eb := newBoard(ering)
+	eb.edge = true
+	eb.edgePins = []any{int64(2)}
+	eb.stream = true
+	eb.stopB = int64(len(ering))
+	eb.stopR = "stopped"
+	eb.edgeMeta = map[string]any{
+		"res_hz": 80_000_000, "runs": int64(3), "runs_dropped": int64(0),
+		"hw_ovf": int64(0), "ring_kb": int64(64), "max_ms": int64(4000),
+		"reason": "stopped", "armed_ns": int64(111), "stopped_ns": int64(222),
+		"t0_ns": int64(5_000_000_000),
+	}
+	ref3, err := s.PullEdgeStream(context.Background(),
+		PullBoard{ID: "aa11bb", Conn: eb}, EdgeArmArgs{Pins: []int{2}, RingKB: 64, MaxMS: 4000})
+	if err != nil {
+		t.Fatalf("PullEdgeStream: %v", err)
+	}
+	if ref3.Meta.CapID != ref3.ID {
+		t.Errorf("edge meta.cap_id = %q, want %q", ref3.Meta.CapID, ref3.ID)
+	}
+
+	// The store at the end: three object dirs, la_list sees all three,
+	// and NOTHING else — no root meta.json garbage, no litter dirs.
+	if list, lerr := s.ListCaptures(); lerr != nil || len(list) != 3 {
+		t.Errorf("la_list = %d objects (err %v), want 3", len(list), lerr)
+	}
+	ents, rerr := os.ReadDir(s.Root)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	dirs := 0
+	for _, e := range ents {
+		if !e.IsDir() {
+			t.Errorf("store root garbage: %q is not an object directory (the R-D1 root meta.json)", e.Name())
+			continue
+		}
+		switch e.Name() {
+		case ref1.ID, ref2.ID, ref3.ID:
+			dirs++
+		default:
+			t.Errorf("unexpected dir %q under the store root", e.Name())
+		}
+	}
+	if dirs != 3 {
+		t.Errorf("store root holds %d object dirs, want 3", dirs)
 	}
 }
 
