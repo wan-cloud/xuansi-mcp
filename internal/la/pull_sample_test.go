@@ -139,6 +139,70 @@ func TestPullSampleStopIdentity(t *testing.T) {
 	}
 }
 
+// The E-window pair (wave B supp, F-REV1) mirrors across when the fw
+// emitted it — zone_sat:true + elapsed_ms land as the meta's columns
+// (and serialize into meta.json), present iff the RLE record zone
+// saturated before max_ms; a linear-fill full carries neither key.
+func TestPullSampleZoneSatMirror(t *testing.T) {
+	ring := sampleStream()
+	b := newBoard(ring)
+	b.sample = true
+	b.rateHz = 2_000_000
+	b.stopB = int64(len(ring))
+	b.stopR = "full"
+	b.pushDone = true
+	b.sampleMeta = map[string]any{
+		"rate_hz": int64(2_000_000), "samples": int64(len(ring)),
+		"trig": nil, "trig_fired": false, "hw_ovf": int64(0),
+		"ring_kb": int64(512), "max_ms": int64(5000),
+		"reason": "full", "armed_ns": int64(11),
+		"stopped_ns": int64(352_000_000), "t0_ns": int64(9_000_000_000),
+		"zone_sat": true, "elapsed_ms": int64(351),
+	}
+	s := testStore(t)
+	ref, err := s.PullSample(context.Background(), PullBoard{ID: "97c1ac", Conn: b}, SampleArmArgs{RateHz: 2_000_000, RingKB: 512, MaxMS: 5000})
+	if err != nil {
+		t.Fatalf("PullSample: %v", err)
+	}
+	if !ref.Meta.ZoneSat || ref.Meta.ElapsedMS != 351 {
+		t.Errorf("E-window mirror = zone_sat:%v elapsed_ms:%d, want true/351", ref.Meta.ZoneSat, ref.Meta.ElapsedMS)
+	}
+	if ref.Meta.Reason != "full" {
+		t.Errorf("reason = %q, want full", ref.Meta.Reason)
+	}
+	raw, rerr := os.ReadFile(ref.MetaPath)
+	if rerr != nil || !strings.Contains(string(raw), "\"zone_sat\": true") || !strings.Contains(string(raw), "\"elapsed_ms\": 351") {
+		t.Errorf("meta.json round-trip err=%v: %s", rerr, raw)
+	}
+
+	// absence is a legal linear-fill full: no keys, no mirror columns
+	// (omitempty keeps the frozen meta face for sparse captures).
+	b2 := newBoard(ring)
+	b2.sample = true
+	b2.rateHz = 1_000_000
+	b2.stopB = int64(len(ring))
+	b2.stopR = "full"
+	b2.pushDone = true
+	b2.sampleMeta = map[string]any{
+		"rate_hz": int64(1_000_000), "samples": int64(len(ring)),
+		"trig": nil, "trig_fired": false, "hw_ovf": int64(0),
+		"ring_kb": int64(64), "max_ms": int64(1000),
+		"reason": "full", "armed_ns": int64(11),
+		"stopped_ns": int64(260_000_000), "t0_ns": int64(9),
+	}
+	ref2, err := s.PullSample(context.Background(), PullBoard{ID: "97c1ac", Conn: b2}, SampleArmArgs{RateHz: 1_000_000, RingKB: 64, MaxMS: 1000})
+	if err != nil {
+		t.Fatalf("PullSample (linear fill): %v", err)
+	}
+	if ref2.Meta.ZoneSat || ref2.Meta.ElapsedMS != 0 {
+		t.Errorf("linear-fill mirror = zone_sat:%v elapsed_ms:%d, want false/0", ref2.Meta.ZoneSat, ref2.Meta.ElapsedMS)
+	}
+	raw2, _ := os.ReadFile(ref2.MetaPath)
+	if strings.Contains(string(raw2), "zone_sat") || strings.Contains(string(raw2), "elapsed_ms") {
+		t.Errorf("linear-fill meta.json must not carry the pair: %s", raw2)
+	}
+}
+
 // An arm refusal crosses verbatim with nothing landed; a mid-read
 // death lands the incomplete object.
 func TestPullSampleRefusalAndIncomplete(t *testing.T) {

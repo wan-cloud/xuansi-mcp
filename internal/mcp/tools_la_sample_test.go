@@ -176,4 +176,11 @@ func TestLASampleDescAudit(t *testing.T) {
 			t.Errorf("xuansi_la_capture Desc lacks %q", want)
 		}
 	}
+	// wave B supp (F-REV1): the capacity-semantics coach — the
+	// E-window pair and what to do when it bites
+	for _, want := range []string{"CAPACITY SEMANTICS", "zone_sat:true", "elapsed_ms", "lower rate_hz, raise ring_kb, or shorten the wait"} {
+		if !strings.Contains(desc["xuansi_la_capture"], want) {
+			t.Errorf("xuansi_la_capture Desc lacks %q", want)
+		}
+	}
 }

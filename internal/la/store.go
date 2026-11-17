@@ -95,6 +95,16 @@ type Meta struct {
 	// recycled it by design); the tail [tail, total) re-read verifies
 	// and the whole-file parse + stop-bytes identity hold as always.
 	Streamed bool `json:"streamed,omitempty"`
+	// ZoneSat/ElapsedMS (wave B supp, F-REV1) mirror the samples
+	// capture's E-window pair — present iff the RLE record zone
+	// saturated before max_ms (the fw emits the pair together on
+	// reason "full"): high-entropy input shortened the window below
+	// the time bound. The coach: lower rate_hz, raise ring_kb, or
+	// shorten the wait; samples < max_ms*rate is the coverage account
+	// (F-REV1's "in-frame dead lanes" were traffic falling outside an
+	// unaccounted window).
+	ZoneSat   bool `json:"zone_sat,omitempty"`
+	ElapsedMS int  `json:"elapsed_ms,omitempty"`
 
 	SHA256     string    `json:"sha256"` // data.bin's digest (pass-1 == pass-2 identity)
 	Incomplete bool      `json:"incomplete,omitempty"`

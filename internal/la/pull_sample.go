@@ -252,11 +252,13 @@ func (s *Store) PullSample(ctx context.Context, board PullBoard, args SampleArmA
 	return ref, nil
 }
 
-// mirrorSampleLedger copies the fw's sample meta (the 11-key form:
-// rate_hz, samples, trig, trig_fired, hw_ovf, ring_kb, max_ms,
-// reason, armed_ns, stopped_ns, t0_ns) into the meta's sample
-// columns. Best-effort by design; the columns that did not land stay
-// zero and the analysis seats refuse honestly on the missing facts.
+// mirrorSampleLedger copies the fw's sample meta (the 11-key base form:
+// rate_hz, samples, trig, trig_fired, hw_ovf, ring_kb, max_ms, reason,
+// armed_ns, stopped_ns, t0_ns — plus the wave B supp E-window pair
+// zone_sat/elapsed_ms, present iff the record zone saturated before
+// max_ms) into the meta's sample columns. Best-effort by design; the
+// columns that did not land stay zero and the analysis seats refuse
+// honestly on the missing facts.
 func mirrorSampleLedger(ctx context.Context, conn Board, capNum int64, meta *Meta) {
 	res, err := conn.Op(ctx, "la.info", map[string]any{"cap": capNum})
 	if err != nil {
@@ -295,6 +297,16 @@ func mirrorSampleLedger(ctx context.Context, conn Board, capNum int64, meta *Met
 		}
 		if b, ok := lm["trig_fired"].(bool); ok {
 			meta.TrigFired = b
+		}
+		// Wave B supp (F-REV1): the E-window pair mirrors across when
+		// the fw emitted it (zone saturated before max_ms — the keys
+		// appear together or not at all; absence is a legal linear-fill
+		// full, never an error).
+		if b, ok := lm["zone_sat"].(bool); ok {
+			meta.ZoneSat = b
+		}
+		if v, ok := anyI(lm["elapsed_ms"]); ok {
+			meta.ElapsedMS = int(v)
 		}
 		if tm, ok := lm["trig"].(map[string]any); ok {
 			t := TrigMeta{PreKB: 0}
