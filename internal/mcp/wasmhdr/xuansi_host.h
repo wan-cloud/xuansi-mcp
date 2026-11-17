@@ -1,15 +1,19 @@
 /*
  * PROVENANCE (daemon-side twin): copied VERBATIM from the
  * xuansi-drivers repo, src/xuansi_host.h, at commit
- * 1b688983c251a1a6d755113589505ecaa2dd6523 (the commit that last
- * touched it; repo HEAD at copy time cceab00). The wasm build (B11
+ * ed443bc5a56c2078b0bd7ceb99ad17f43a8c5401 (the commit that last
+ * touched it; repo HEAD at copy time 852d934). The wasm build (B11
  * task 4) expands this embedded copy into the compiler's include dir
  * so daemon-built modules compile against the SAME frozen host table
  * the drivers repo ships; T9's CI cross-leg (drivers modules rebuilt
  * through the daemon's frozen flags, hash-compared) locks the pair in
  * sync — P3-T12 re-synced the twin (the B12-T3 abi=2 i2c/cam block
  * had landed in the drivers repo after the daemon's last push; the
- * local parity leg surfaced the staleness). Edit policy: NEVER
+ * local parity leg surfaced the staleness); the 0.7.1 release wave
+ * re-synced again (LA wave-D's la_window_get/ABI-2 trigger face had
+ * landed in the drivers repo — the CI drivers-parity leg rebuilding
+ * trigpat@1.0.0 surfaced the staleness; local legs skip without
+ * XUANSI_DRIVERS_DIR). Edit policy: NEVER
  * hand-edit below this block — a sync is a fresh verbatim copy plus
  * an updated commit line here.
  */
@@ -44,6 +48,18 @@
  * include (the default stays 1). camera_frame_get/camera_info further
  * down are the retired abi=1 names, kept only so historical modules
  * still compile.
+ *
+ * B15 RECARVE (ruled 2026-11-11): the ABI number is 1 AGAIN — a clean
+ * recarve; the old abi=1/abi=2 values are retired with fw 0.5.0 (the
+ * wave-2 load gate still accepts {1,2}). The recarved 1 = this whole
+ * unified table (the abi=2 additions included, the retired camera
+ * names gone) + the initial==max linear-memory freeze (build.sh --next
+ * pins the pair; the fw loader refuses initial != max shapes with the
+ * bytes in the refusal). From the recarve on the version axis is
+ * single: module ABI and bench api_version are the SAME axis
+ * (master ruling 2026-11-17: api_version pulled up to 2 alongside the
+ * ABI 2 trigger-face ratification — the --@api driver gate requires 2
+ * from that fw on; the module load gate stays {1,2}).
  */
 #ifndef XUANSI_ABI
 #define XUANSI_ABI 1
@@ -203,3 +219,49 @@ extern void xuansi_camera_info(uint32_t *out);
 XUANSI_IMPORT("xuansi", "stream_send")
 extern void xuansi_stream_send(uint32_t *out, uint32_t buf_off, uint32_t len);
 #define stream_send xuansi_stream_send
+
+/* ABI 2 addition (LA wave D, 2026-11-17) — the trigger face.
+ * ABI 2 = the whole recarved ABI 1 table above PLUS this one host
+ * function and the trigger-module callback convention. The load gate
+ * accepts abi in {1,2}; an ABI 1 module never imports la_window_get
+ * and is unaffected. Number reuse note: the pre-recarve abi=2 (B12-T3
+ * camera migration era) had exactly this table minus this function —
+ * surviving old-2 artifacts are a semantic subset of ABI 2 and load
+ * unchanged. api_version = 2 (master ruling 2026-11-17, the axis
+ * alignment riding this ABI 2 ratification: the bench Lua face is
+ * unchanged, the --@api driver gate requires 2 from that fw on).
+ *
+ * The one mechanical-convention divergence: la_window_get returns u32
+ * DIRECTLY (the ABI 1 void+out-param convention stays frozen for the
+ * ABI 1 face). Callable only inside trigger_scan during an armed
+ * module-trigger capture (otherwise a wasm exception raises). The
+ * window is a run-length slice of the LAST records (oldest -> newest,
+ * open run included as the final record), wire-level primitives only:
+ *
+ *   la_window_get(buf_off, cap) -> u32 len
+ *     [0] u8  ver = 1          [1] u8  domain (1=edge, 2=sample)
+ *     [2] u16 rec_size (9|5)   [4] u32 avail (records in this round's
+ *                              window, pre-truncation — compare against
+ *                              what fits to detect cap truncation)
+ *     [8] u64 seq (domain 1: lifetime run index of the first record;
+ *                 domain 2: sample index of the first record's first
+ *                 sample — continuity/skip detection across rounds)
+ *     [16] records, oldest first: domain 1 {u8 mask, u64 dur_ns LE},
+ *                 domain 2 {u8 value, u32 run LE}. Truncation keeps the
+ *                 NEWEST whole records.
+ *   No absolute timestamps ride the window (relative durations only) —
+ *   module determinism = pure function of window content + init params;
+ *   trigger-latency accounting is the fw's fire/stop dual timestamps.
+ *
+ * The trigger module contract (exports):
+ *   xuansi_abi() -> 2            (gate)
+ *   xuansi_alloc(u32) -> u32     (marshalling convention, as ABI 1)
+ *   trigger_scan() -> i32        (0 = no fire, 1 = fire; anything else
+ *                                 or a trap = the capture stops with
+ *                                 reason=err. Called at a bounded
+ *                                 cadence by the capture task; MUST
+ *                                 return — a hung module stalls the
+ *                                 capture task into the watchdog). */
+XUANSI_IMPORT("xuansi", "la_window_get")
+extern uint32_t xuansi_la_window_get(uint32_t buf_off, uint32_t cap);
+#define la_window_get xuansi_la_window_get
