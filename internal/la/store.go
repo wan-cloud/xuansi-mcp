@@ -58,7 +58,11 @@ type Meta struct {
 	Chunks   int    `json:"chunks"`
 	Runs     int    `json:"runs,omitempty"`
 	Samples  int64  `json:"samples,omitempty"`
-	Reason   string `json:"reason"` // full | stopped | limit
+	// Reason is la.stop's ledger verbatim — the fw's full vocabulary
+	// crosses (wave D): full | stopped | limit | trig (edge/samples
+	// trigger fired) | err (kind=module module error — the honest
+	// wasm-failure ending). The daemon never whitelists it.
+	Reason string `json:"reason"`
 
 	// The T10 edge columns (mode "edge"): the trigger armed (nil =
 	// none), whether it fired, the run stream's T0 (absolute — every
@@ -81,6 +85,16 @@ type Meta struct {
 	HwOvf         int64 `json:"hw_ovf,omitempty"`
 	ArmedNS       int64 `json:"armed_ns,omitempty"`
 	StoppedNS     int64 `json:"stopped_ns,omitempty"`
+	// FireNS (kind=module captures) mirrors the wasm fire decision
+	// instant — guardrail ②'s fire/stop dual timestamp pairs it with
+	// stopped_ns (the TrigMeta mirror carries it too; the top-level
+	// column keeps it greppable next to its pair).
+	FireNS int64 `json:"fire_ns,omitempty"`
+	// Streamed (wave C live pulls) marks an object whose [0, tail)
+	// prefix crossed live (no ring-side second source — the ring
+	// recycled it by design); the tail [tail, total) re-read verifies
+	// and the whole-file parse + stop-bytes identity hold as always.
+	Streamed bool `json:"streamed,omitempty"`
 
 	SHA256     string    `json:"sha256"` // data.bin's digest (pass-1 == pass-2 identity)
 	Incomplete bool      `json:"incomplete,omitempty"`
@@ -93,16 +107,25 @@ type Meta struct {
 // The samples capture's mirror rides the same shape with the CHANNEL
 // vocabulary: Ch names D0..D7 (bit i of every sample byte; the fw's
 // trig map key "ch"), and kind "bits" adds the bit-window match's
-// Mask/Value/Width (T12's addition to the language).
+// Mask/Value/Width (T12's addition to the language). Kind "module"
+// (LA wave D, T1 wasm triggers) adds the module name and — present
+// iff it fired — the wasm fire-decision instant; its no-pin/no-channel
+// shape mirrors the 255 sentinel the bits arm established.
 type TrigMeta struct {
-	Pin   int    `json:"pin,omitempty"`   // edge: a pins[] member
+	Pin   int    `json:"pin,omitempty"`   // edge: a pins[] member; 255 = the kind "module" sentinel (no pin to name)
 	Ch    int    `json:"ch,omitempty"`    // samples: 0..7 = D0..D7; 255 = the no-channel sentinel a kind "bits" arm mirrors (bits matches the whole byte — no channel exists to name)
-	Kind  string `json:"kind"`            // "edge_r" | "edge_f" | "level" | "bits" (samples)
+	Kind  string `json:"kind"`            // "edge_r" | "edge_f" | "level" | "bits" (samples) | "module" (wave D)
 	Level *int   `json:"level,omitempty"` // 0|1, kind "level" only (a pointer: presence is part of the request domain — an omitted level refuses)
 	Mask  uint8  `json:"mask,omitempty"`  // kind "bits" (samples) only: the window mask
 	Value uint8  `json:"value,omitempty"` // kind "bits" (samples) only: the window value
 	Width int    `json:"width,omitempty"` // kind "bits" (samples) only: consecutive samples
-	PreKB int    `json:"pre_kb"`          // pre-trigger window KB (0 = no history)
+	// Module/FireNS ride kind "module" only (LA wave D): the loaded ABI 2
+	// trigger module's name, and — present iff fired — the wasm fire
+	// decision instant (guardrail ②: fire/stop latency accounting pairs
+	// it with meta stopped_ns; Meta.FireNS mirrors it top-level).
+	Module string `json:"module,omitempty"`
+	FireNS int64  `json:"fire_ns,omitempty"`
+	PreKB  int    `json:"pre_kb"` // pre-trigger window KB (0 = no history)
 }
 
 // CaptureRef is a landed (or partially landed) capture object: the id,

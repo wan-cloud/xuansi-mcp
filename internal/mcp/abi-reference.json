@@ -1,9 +1,9 @@
 {
   "provenance": {
     "header": "src/xuansi_host.h",
-    "header_sha256": "3a3dc8c82f30f05cb14bd5cd96132f031ee48aa98e602ddb438af3a711731f23",
+    "header_sha256": "997ae14563e605557df7dfb1e2ad4f1cbf7819fcbce2d9799382fa6349301fae",
     "sidecar": "tools/gen-abi-reference/sidecar.json",
-    "sidecar_sha256": "65839de0a578242f24080cc9ba115d9268840956b77337a92d92a4f48262b8b2",
+    "sidecar_sha256": "0ee9d84610bf876fdd049ab1abc0b4384c8a35a6bacc0e1793f561e33fdb9cec",
     "generator": "tools/gen-abi-reference/gen.py",
     "note": "regenerate with tools/gen-abi-reference/gen.py; the checked-in outputs are the single source the daemon embeds (xuansi_abi_reference) — CI byte-compares"
   },
@@ -13,13 +13,15 @@
     "fw_reference": "the 0.4.x wave-2 firmware (protocol_ver 7 era) — the host table this reference was curated against",
     "fw_header_source": "the firmware's tools/wasm/xuansi_host.h (signature source; mirrored module-side at src/xuansi_host.h in this repo — the mirror is what CI reads)",
     "load_gate_wave2": "{1,2} (fw < 0.5.0) — the wave-3 gate is {1} with the recarved semantics",
-    "memory_freeze": "a module's linear memory must declare max == initial (the static-footprint freeze; the fw loader refuses initial != max and max-absent shapes with the bytes in the refusal)"
+    "memory_freeze": "a module's linear memory must declare max == initial (the static-footprint freeze; the fw loader refuses initial != max and max-absent shapes with the bytes in the refusal)",
+    "load_gate": "{1,2} (LA wave D, fw >=0.8.0): 1 = the 2026-11-11 recarve (base table); 2 = 1 + the la_window_get trigger face. Number reuse, honest: pre-recarve abi=2 artifacts had exactly this table minus la_window_get (a semantic subset) and load unchanged. api_version stays 1 — the bench Lua face and the --@api driver gate are untouched (a module-side additive lane)",
+    "abi2_trigger_face": "ABI 2 = 1 + la_window_get + the trigger callback convention: exports xuansi_abi()->2, xuansi_alloc, trigger_scan()->i32 (0 = no fire, 1 = fire; anything else or a trap stops the capture with reason=err). The capture task calls trigger_scan at a bounded cadence (512 new run records, or >=200ms on slow streams); inside the callback the module pulls one run-length window via la_window_get (16B header: ver/domain/rec_size/avail/seq, then edge {u8 mask, u64 dur_ns} or sample {u8 value, u32 run} records oldest-first, truncation keeps the newest whole records, no absolute timestamps). Determinism requirement: trigger_scan is a pure function of (window content, init params). Consumed by la.edge_arm/la.sample_arm trig.kind=\"module\" (module name; the instance is pinned for the capture)"
   },
   "sections": {
     "host_table": {
       "namespace": "xuansi",
       "import_rule": "a module imports host functions only from the xuansi namespace; any import outside this table fails to link (loader api refusal)",
-      "error_channel": "every host function is void — results through out-parameters into linear memory; errors as wasm exceptions (prefix xuansi.<fn>), Lua face class=rt",
+      "error_channel": "ABI 1 host functions are void — results through out-parameters into linear memory; the ONE ABI 2 exception (la_window_get) returns u32 directly; errors as wasm exceptions (prefix xuansi.<fn>), Lua face class=rt",
       "symbols": [
         {
           "symbol": "millis",
@@ -116,6 +118,12 @@
           "prototype": "void xuansi_stream_send(uint32_t *out, uint32_t buf_off, uint32_t len)",
           "wasm": "(out u32* out, i32 buf_off, i32 len) -> void",
           "semantics": "Module-facing stream (host stamps the module name into the frame preamble); the accepted byte count is written to *out."
+        },
+        {
+          "symbol": "la_window_get",
+          "prototype": "uint32_t xuansi_la_window_get(uint32_t buf_off, uint32_t cap)",
+          "wasm": "(i32 buf_off, i32 cap) -> u32",
+          "semantics": "ABI 2 addition (LA wave D, 2026-11-17) — the trigger face. ABI 2 = the whole recarved ABI 1 table above PLUS this one host function and the trigger-module callback convention. The load gate accepts abi in {1,2}; an ABI 1 module never imports la_window_get and is unaffected. Number reuse note: the pre-recarve abi=2 (B12-T3 camera migration era) had exactly this table minus this function — surviving old-2 artifacts are a semantic subset of ABI 2 and load unchanged. api_version stays 1 (the bench Lua face and the --@api driver gate are untouched; this is a module-side additive lane).  The one mechanical-convention divergence: la_window_get returns u32 DIRECTLY (the ABI 1 void+out-param convention stays frozen for the ABI 1 face). Callable only inside trigger_scan during an armed module-trigger capture (otherwise a wasm exception raises). The window is a run-length slice of the LAST records (oldest -> newest, open run included as the final record), wire-level primitives only:  la_window_get(buf_off, cap) -> u32 len [0] u8  ver = 1          [1] u8  domain (1=edge, 2=sample) [2] u16 rec_size (9|5)   [4] u32 avail (records in this round's window, pre-truncation — compare against what fits to detect cap truncation) [8] u64 seq (domain 1: lifetime run index of the first record; domain 2: sample index of the first record's first sample — continuity/skip detection across rounds) [16] records, oldest first: domain 1 {u8 mask, u64 dur_ns LE}, domain 2 {u8 value, u32 run LE}. Truncation keeps the NEWEST whole records. No absolute timestamps ride the window (relative durations only) — module determinism = pure function of window content + init params; trigger-latency accounting is the fw's fire/stop dual timestamps.  The trigger module contract (exports): xuansi_abi() -> 2            (gate) xuansi_alloc(u32) -> u32     (marshalling convention, as ABI 1) trigger_scan() -> i32        (0 = no fire, 1 = fire; anything else or a trap = the capture stops with reason=err. Called at a bounded cadence by the capture task; MUST return — a hung module stalls the capture task into the watchdog)."
         }
       ],
       "retired": [
@@ -139,10 +147,11 @@
       "module_shape": "wasm32 (wasi-sdk, no WASI imports); exports xuansi_abi() -> u32 (the loader calls it at instantiate and refuses anything the gate does not accept), xuansi_alloc(u32 n) -> u32 (linear-memory offset for the host-written args; 0 = refusal), and entry functions fn(ptr: u32, len: u32) -> u64",
       "args": "the host serializes the caller's arguments as ONE msgpack array, calls xuansi_alloc, writes it, then calls fn(ptr, len)",
       "result": "the entry returns a single packed u64 = (result_ptr << 32) | result_len pointing at the module's own msgpack result (C has no multi-value returns — the pair rides one i64); len=0 -> Lua nil",
-      "out_params": "every host function returns void — results are written through out-parameters into the module's linear memory (the host bounds-checks and writes directly; the module reads back as ordinary wasm memory). Buffer parameters are linear-memory offsets (u32). Module authors: land out-params in .bss/heap, not wasm stack slots (portable across the interp and AOT lanes)",
+      "out_params": "every host function returns void — results are written through out-parameters into the module's linear memory (the host bounds-checks and writes directly; the module reads back as ordinary wasm memory). Buffer parameters are linear-memory offsets (u32). Module authors: land out-params in .bss/heap, not wasm stack slots (portable across the interp and AOT lanes). The ONE ABI 2 exception: la_window_get(buf_off, cap) returns its u32 length directly (the void+out-param convention stays frozen for the ABI 1 face)",
       "errors": "the host error channel is the wasm exception (message prefix xuansi.<fn>) — surfaced at the Lua face as class=rt",
       "alloc_convention": "the host calls xuansi_alloc on EVERY call-with-args; a bump-only allocator is a hidden per-call budget (~230 calls at small-args scale). Convention: allocations <= 128B reuse one fixed slot (safe — the fw host serializes all wasm calls); larger ones use the bump arena (see any module's ARGS_SLOT_SZ)",
-      "limits": "args/result msgpack <= 8192B each; container depth <= 8; module file <= 256KB; linear memory 256KB initial default (per-module pinnable), max == initial (the freeze)"
+      "limits": "args/result msgpack <= 8192B each; container depth <= 8; module file <= 256KB; linear memory 256KB initial default (per-module pinnable), max == initial (the freeze)",
+      "trigger_callback": "the ABI 2 trigger callback is RAW i32 — trigger_scan() -> i32, no msgpack marshalling (zero args, hot path); init params ride an ordinary exported fn via the msgpack convention (trigpat's config is the pattern)"
     },
     "value_domain": {
       "note": "the msgpack<->Lua value bridge, post-float revision (B15 W2-T1): binary64 is the single float caliber",

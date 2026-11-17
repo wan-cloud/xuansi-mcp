@@ -49,15 +49,17 @@ func SampleBusPins() []int {
 // SampleTrig is la.sample_arm's trigger: the frozen small language,
 // one channel of the eight (ch 0..7 = D0..D7). bits = the bit-window
 // match (sample&mask == value&mask for width consecutive samples —
-// T12's addition over the edge language).
+// T12's addition over the edge language). module = the wave D wasm
+// form (the whole run stream is the window — no channel to name).
 type SampleTrig struct {
 	Ch    int    // 0..7 (= D0..D7)
-	Kind  string // "edge_r" | "edge_f" | "level" | "bits"
+	Kind  string // "edge_r" | "edge_f" | "level" | "bits" | "module"
 	Level *int   // 0|1, kind "level" only
 	Mask  uint8  // kind "bits" only
 	Value uint8  // kind "bits" only
 	Width int    // 1..64, kind "bits" only (0 = 1)
 	PreKB int    // pre-trigger history KB (< ring_kb; 0 = none)
+	Module string // kind "module" only: the loaded ABI 2 trigger module's name
 }
 
 func (t SampleTrig) wire() map[string]any {
@@ -65,8 +67,10 @@ func (t SampleTrig) wire() map[string]any {
 	// sample byte (mask/value) and names no channel: the fw's arm face
 	// accepts bits without ch (its own coach says "ch not used"), and
 	// its la.info mirror then answers the no-channel sentinel ch=255.
+	// kind "module" is the same no-channel shape (the run window spans
+	// all eight lanes).
 	m := map[string]any{"kind": t.Kind}
-	if t.Kind != "bits" {
+	if t.Kind != "bits" && t.Kind != "module" {
 		m["ch"] = int64(t.Ch)
 	}
 	if t.Kind == "level" && t.Level != nil {
@@ -78,6 +82,9 @@ func (t SampleTrig) wire() map[string]any {
 		if t.Width > 1 {
 			m["width"] = int64(t.Width)
 		}
+	}
+	if t.Kind == "module" {
+		m["module"] = t.Module
 	}
 	if t.PreKB > 0 {
 		m["pre_kb"] = int64(t.PreKB)
@@ -309,6 +316,13 @@ func mirrorSampleLedger(ctx context.Context, conn Board, capNum int64, meta *Met
 			}
 			if v, ok := anyI(tm["width"]); ok {
 				t.Width = int(v)
+			}
+			if k, ok := tm["module"].(string); ok {
+				t.Module = k
+			}
+			if v, ok := anyI(tm["fire_ns"]); ok {
+				t.FireNS = v
+				meta.FireNS = v // guardrail ②: top-level dual-timestamp column
 			}
 			if v, ok := anyI(tm["pre_kb"]); ok {
 				t.PreKB = int(v)

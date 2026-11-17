@@ -23,15 +23,28 @@ import (
 const edgeResHzPinned = 80_000_000
 
 // EdgeTrig is the edge arm's trigger: the frozen small language (no
-// protocol semantics — a line-level match).
+// protocol semantics — a line-level match), plus kind "module" (LA
+// wave D): the wasm trigger module form — no pin, the module names
+// the loaded ABI 2 instance.
 type EdgeTrig struct {
-	Pin   int    // a pins[] member
-	Kind  string // "edge_r" | "edge_f" | "level"
-	Level *int   // 0|1, kind "level" only (pointer: presence is domain)
-	PreKB int    // pre-trigger window KB (0 = no history)
+	Pin    int    // a pins[] member
+	Kind   string // "edge_r" | "edge_f" | "level" | "module"
+	Level  *int   // 0|1, kind "level" only (pointer: presence is domain)
+	PreKB  int    // pre-trigger window KB (0 = no history)
+	Module string // kind "module" only: the loaded ABI 2 trigger module's name
 }
 
 func (t EdgeTrig) wire() map[string]any {
+	if t.Kind == "module" {
+		// the module form carries no pin — the fw's arm face takes the
+		// whole-window run stream (trig.pin=-1 internally; the info
+		// mirror answers the 255 sentinel).
+		m := map[string]any{"kind": t.Kind, "module": t.Module}
+		if t.PreKB > 0 {
+			m["pre_kb"] = int64(t.PreKB)
+		}
+		return m
+	}
 	m := map[string]any{"pin": int64(t.Pin), "kind": t.Kind}
 	if t.Kind == "level" && t.Level != nil {
 		m["level"] = int64(*t.Level)
@@ -278,6 +291,13 @@ func mirrorEdgeLedger(ctx context.Context, conn Board, capNum int64, meta *Meta)
 			if v, ok := anyI(tm["level"]); ok {
 				lv := int(v)
 				t.Level = &lv
+			}
+			if k, ok := tm["module"].(string); ok {
+				t.Module = k
+			}
+			if v, ok := anyI(tm["fire_ns"]); ok {
+				t.FireNS = v
+				meta.FireNS = v // guardrail ②: top-level dual-timestamp column
 			}
 			if v, ok := anyI(tm["pre_kb"]); ok {
 				t.PreKB = int(v)

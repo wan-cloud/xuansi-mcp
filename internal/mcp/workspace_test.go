@@ -2911,3 +2911,34 @@ func TestDriverFetchMetaLeg(t *testing.T) {
 		t.Errorf("refusal = %q, want the drift wording", txt)
 	}
 }
+
+// TestDriverFetchKindTriggerPassthrough pins wave D's index vocabulary
+// leg: a trigger module's index entry carries kind "trigger" — the
+// fetch path has NO kind enum (the seat never judges the value), so
+// it crosses verbatim into the reply, the workspace manifest, and the
+// ws_list rows. A future whitelist would fail here, loudly.
+func TestDriverFetchKindTriggerPassthrough(t *testing.T) {
+	e, reqs, root := newWsEnv(t, nil)
+	wbody := fetchWasmBody(64)
+	url, _ := newFetchIndex(t, []fetchModSpec{{
+		name: "trigpat", kind: "trigger", version: "1.0.0",
+		files: []fetchFileSpec{
+			fetchSpec(t, "modules/trigpat/1.0.0/trigpat.wasm", wbody, ""),
+		},
+	}})
+
+	res := e.call("xuansi_driver_fetch", map[string]any{
+		"name": "trigpat", "version": "1.0.0", "index_url": url,
+	})
+	if res.IsError {
+		t.Fatalf("driver_fetch failed: %s", resultText(t, res))
+	}
+	noContact(t, reqs)
+	if m := structured(t, res); m["kind"] != "trigger" {
+		t.Errorf("fetch reply kind = %v, want the index's verbatim trigger", m["kind"])
+	}
+	mf := wsManifest(t, root)
+	if ent := mf.Drivers["trigpat"]; ent.Kind != "trigger" {
+		t.Errorf("manifest Kind = %q, want trigger (no enum launders it)", ent.Kind)
+	}
+}
