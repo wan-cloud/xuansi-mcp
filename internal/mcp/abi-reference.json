@@ -3,7 +3,7 @@
     "header": "src/xuansi_host.h",
     "header_sha256": "4b100f02ed5a8d267f5f7807078a31e97b3f56fa8ed88b1acc5db200753deedc",
     "sidecar": "tools/gen-abi-reference/sidecar.json",
-    "sidecar_sha256": "3b303b74c644dfd303a1a38209938a72bd88b98421fc65aff2ef98e3a9f47997",
+    "sidecar_sha256": "93cc389401f7a85995b665fd652b240ac9cc051a5afbb6b03c1189869ad6b9e3",
     "generator": "tools/gen-abi-reference/gen.py",
     "note": "regenerate with tools/gen-abi-reference/gen.py; the checked-in outputs are the single source the daemon embeds (xuansi_abi_reference) — CI byte-compares"
   },
@@ -14,7 +14,7 @@
     "fw_header_source": "the firmware's tools/wasm/xuansi_host.h (signature source; mirrored module-side at src/xuansi_host.h in this repo — the mirror is what CI reads)",
     "load_gate_wave2": "{1,2} (fw < 0.5.0) — the wave-3 gate is {1} with the recarved semantics",
     "memory_freeze": "a module's linear memory must declare max == initial (the static-footprint freeze; the fw loader refuses initial != max and max-absent shapes with the bytes in the refusal)",
-    "load_gate": "{1,2} (LA wave D, fw >=0.7.0): 1 = the 2026-11-11 recarve (base table); 2 = 1 + the la_window_get trigger face. Number reuse, honest: pre-recarve abi=2 artifacts had exactly this table minus la_window_get (a semantic subset) and load unchanged. api_version = 2 (master ruling 2026-11-17, the axis alignment riding the ABI 2 ratification: the bench Lua face is unchanged, the --@api driver gate requires 2 from that fw on; old --@api 1 scripts are honestly refused)",
+    "load_gate": "{1,2} (LA wave D, fw >=0.7.1): 1 = the 2026-11-11 recarve (base table); 2 = 1 + the la_window_get trigger face. Number reuse, honest: pre-recarve abi=2 artifacts had exactly this table minus la_window_get (a semantic subset) and load unchanged. api_version = 2 (master ruling 2026-11-17, the axis alignment riding the ABI 2 ratification: the bench Lua face is unchanged, the --@api driver gate requires 2 from that fw on; old --@api 1 scripts are honestly refused)",
     "abi2_trigger_face": "ABI 2 = 1 + la_window_get + the trigger callback convention: exports xuansi_abi()->2, xuansi_alloc, trigger_scan()->i32 (0 = no fire, 1 = fire; anything else or a trap stops the capture with reason=err). The capture task calls trigger_scan at a bounded cadence (512 new run records, or >=200ms on slow streams); inside the callback the module pulls one run-length window via la_window_get (16B header: ver/domain/rec_size/avail/seq, then edge {u8 mask, u64 dur_ns} or sample {u8 value, u32 run} records oldest-first, truncation keeps the newest whole records, no absolute timestamps). Determinism requirement: trigger_scan is a pure function of (window content, init params). Consumed by la.edge_arm/la.sample_arm trig.kind=\"module\" (module name; the instance is pinned for the capture)"
   },
   "sections": {
