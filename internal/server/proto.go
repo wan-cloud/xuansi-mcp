@@ -365,11 +365,22 @@ package server
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
 	"xuansi/internal/la"
 )
+
+// ErrMsgOversize is WriteMsg's size refusal, distinguishable from an
+// IO failure with errors.Is: an outbound message above MaxMsgBytes is
+// a daemon-side construction bug (the writer built a reply the wire
+// refuses), NOT a dead peer — the connection must survive it (minors
+// wave P8: an eval reply embedding a full 1 MiB frames window once
+// rendered ~1.37 MiB after base64, and writeLoop treated the refusal
+// as a dead peer, tearing down a healthy connection instead of
+// answering — the caller never saw the stall's cause).
+var ErrMsgOversize = errors.New("server: message exceeds the frame cap")
 
 // MaxMsgBytes caps one framed message (see the framing contract above).
 const MaxMsgBytes = 1 << 20
@@ -637,7 +648,7 @@ func WriteMsg(w io.Writer, v any) error {
 		return fmt.Errorf("server: encode message: %w", err)
 	}
 	if len(payload) > MaxMsgBytes {
-		return fmt.Errorf("server: message %d bytes exceeds the %d limit", len(payload), MaxMsgBytes)
+		return fmt.Errorf("%w: message %d bytes exceeds the %d limit", ErrMsgOversize, len(payload), MaxMsgBytes)
 	}
 	hdr := make([]byte, 4, 4+len(payload))
 	binary.BigEndian.PutUint32(hdr, uint32(len(payload)))

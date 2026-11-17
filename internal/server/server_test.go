@@ -4474,6 +4474,100 @@ func TestEvalFramesByteBound(t *testing.T) {
 	}
 }
 
+// TestEvalFramesWireBoundReplyFits (minors wave P8): a window the
+// collector legitimately swallowed (raw ≤ 1 MiB — the swallow path is
+// proven to 2MB on-board) but whose base64 transport form exceeds the
+// daemon wire's MaxMsgBytes: the REPLY itself must stay writable — the
+// render cuts at framesWireMax, the cut counts in frames_dropped, the
+// kept frames stay byte-exact, and the connection SURVIVES (the
+// pre-fix behavior built an eval reply the writer refused, and
+// writeLoop tore down the healthy connection — the batch-stall the
+// board round caught as a 60s deadline with no cause).
+func TestEvalFramesWireBoundReplyFits(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "p8"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	// 2×450KB raw: the collector keeps both (900KB ≤ 1 MiB), but the
+	// base64 total (~1.2MB) crosses framesWireMax — the first frame
+	// rides, the second is the wire cut.
+	first := bytes.Repeat([]byte{7}, 450*1024)
+	second := bytes.Repeat([]byte{9}, 450*1024)
+	scriptEvalStream(e.fakes["d75884"], "p8mod", first, second)
+
+	rep, _ = c.call(2, map[string]any{"type": "eval", "board": "d75884", "code": "batch()"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("eval: %#v", rep)
+	}
+	res := asMap(rep["result"])
+	frames, _ := res["frames"].([]any)
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want 1 (the wire-bound cut)", len(frames))
+	}
+	got, _ := base64.StdEncoding.DecodeString(asStr(asMap(frames[0])["data_b64"]))
+	if !bytes.Equal(got, first) {
+		t.Fatalf("kept frame is not the first payload (len %d)", len(got))
+	}
+	if asInt(res["frames_dropped"]) != 1 {
+		t.Fatalf("frames_dropped = %#v, want 1 (the wire cut counted)", res["frames_dropped"])
+	}
+	// the single-frame overshoot: one 900KB frame fits the collector
+	// but its own base64 (~1.2MB) crosses the wire bound — the reply
+	// degrades to the honest drop count, still no frames key.
+	big := bytes.Repeat([]byte{3}, 900*1024)
+	scriptEvalStream(e.fakes["d75884"], "p8mod", big)
+	rep, _ = c.call(3, map[string]any{"type": "eval", "board": "d75884", "code": "fat()"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("fat eval: %#v", rep)
+	}
+	res = asMap(rep["result"])
+	if _, ok := res["frames"].([]any); ok {
+		t.Fatalf("overshoot frame rode the reply: %#v", res["frames"])
+	}
+	if asInt(res["frames_dropped"]) != 1 {
+		t.Fatalf("frames_dropped = %#v, want 1", res["frames_dropped"])
+	}
+	// the connection SURVIVED both bounded replies (the pre-fix write
+	// refusal tore it down): a follow-up eval still answers.
+	scriptEvalStream(e.fakes["d75884"], "p8mod", []byte("tail"))
+	rep, _ = c.call(4, map[string]any{"type": "eval", "board": "d75884", "code": "tail()"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("follow-up eval on the same connection: %#v (the conn must survive bounded replies)", rep["error"])
+	}
+	if res = asMap(rep["result"]); asStr(res["out"]) != "ok" {
+		t.Fatalf("follow-up out = %#v", res["out"])
+	}
+}
+
+// TestWriteLoopOversizeReplyHonestError (minors wave P8 safety net):
+// a reply SOME face still builds above MaxMsgBytes (here: the ops
+// passthrough relaying a board op's giant string — a face the frames
+// bound does not cover) must not tear down the connection: the caller
+// gets the same-id server-class refusal naming the cap, and the next
+// request answers on the same connection.
+func TestWriteLoopOversizeReplyHonestError(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	f := e.fakes["d75884"]
+	f.on("log.read", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"log": strings.Repeat("L", MaxMsgBytes+ (1<<20))}, nil
+	})
+	c := dialSock(t, e.sock)
+	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "p8b"}); rep["error"] != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	rep, _ := c.call(2, map[string]any{"type": "op", "board": "d75884", "holder": "p8b", "op": "log.read"})
+	rerr := asMap(rep["error"])
+	if rerr == nil || asStr(rerr["class"]) != "server" || !strings.Contains(asStr(rerr["msg"]), "message cap") {
+		t.Fatalf("oversize op reply error = %#v, want the honest server-class cap refusal", rerr)
+	}
+	// the connection survived: another request answers normally.
+	if rep, _ = c.call(3, map[string]any{"type": "list_boards"}); rep["error"] != nil {
+		t.Fatalf("list_boards after the oversize reply: %#v (the conn must survive)", rep["error"])
+	}
+}
+
 // TestEvalFramesChunkedOutOfOrder (case ④): one frame split across
 // chunks whose idx order scrambles reassembles as ONE reply frame with
 // the parts concatenated in idx order — the T2 reassembler semantics

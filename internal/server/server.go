@@ -975,11 +975,28 @@ func (s *Server) handleConn(c net.Conn) {
 }
 
 // writeLoop serializes every outbound message onto the connection.
+// An OVERSIZE message (ErrMsgOversize — a reply some face built above
+// MaxMsgBytes) is the daemon's own construction bug, never a dead
+// peer: a Reply gets the honest same-id server-class refusal (the
+// caller gets an answer naming the cap — never the silent stall a
+// dropped reply would leave, P8), anything else is dropped with
+// accounting. The connection survives either way.
 func (cc *clientConn) writeLoop() {
 	defer cc.srv.wg.Done()
 	for m := range cc.outbound {
 		if err := WriteMsg(cc.conn, m); err != nil {
-			break // dead peer: the reader's error path drops the conn
+			if !errors.Is(err, ErrMsgOversize) {
+				break // dead peer: the reader's error path drops the conn
+			}
+			cc.srv.logf("server: outbound message above the %d-byte cap (%v) — replaced/dropped, connection kept", MaxMsgBytes, err)
+			if rep, ok := m.(*Reply); ok {
+				if werr := WriteMsg(cc.conn, &Reply{Type: "reply", ID: rep.ID,
+					Error: &RPCError{Class: "server", Msg: fmt.Sprintf(
+						"reply exceeded the internal wire's %d-byte message cap — the call ran but its result cannot cross whole; narrow the ask (bounded views, windows, previews)", MaxMsgBytes)}}); werr == nil {
+					continue
+				}
+			}
+			continue
 		}
 	}
 	cc.conn.Close()
@@ -1973,11 +1990,16 @@ func (s *Server) hEval(ctx context.Context, cc *clientConn, req *Request, async 
 		out["value"] = v
 	}
 	if snap := col.Snapshot(); len(snap.Frames) > 0 || snap.Dropped > 0 {
-		if frames := wireFrames(snap); len(frames) > 0 {
+		// P8: the render is wire-bounded (framesWireMax) — a window
+		// the collector legitimately swallowed (≤1 MiB raw) can render
+		// past the message cap once base64 inflates it; the cut rides
+		// frames_dropped like every other bound.
+		frames, wireCut := wireFrames(snap)
+		if len(frames) > 0 {
 			out["frames"] = frames
 		}
-		if snap.Dropped > 0 {
-			out["frames_dropped"] = int64(snap.Dropped)
+		if dropped := snap.Dropped + wireCut; dropped > 0 {
+			out["frames_dropped"] = int64(dropped)
 		}
 	}
 	return out, nil
@@ -2990,26 +3012,50 @@ func (db *daemonBoard) drainJobFrames(ev *replclient.Event) {
 	if ev.Data == nil {
 		ev.Data = map[string]any{}
 	}
-	if frames := wireFrames(snap); len(frames) > 0 {
+	frames, wireCut := wireFrames(snap)
+	if len(frames) > 0 {
 		ev.Data["frames"] = frames
 	}
+	snap.Dropped += wireCut
 	if snap.Dropped > 0 {
 		ev.Data["frames_dropped"] = int64(snap.Dropped)
 	}
 }
 
+// framesWireMax bounds the frames array's base64 rendering inside ONE
+// outbound message (minors wave P8): the collector may legitimately
+// hold up to 1 MiB of RAW payload (the swallow path is proven to 2MB),
+// but base64 inflates ×4/3 and the wire refuses any message above
+// MaxMsgBytes — unbounded, a full window rendered ~1.37 MiB: a reply
+// the writer must refuse (the stall the board round caught). 960 KiB
+// of base64 leaves room for the value (≤~32KB bridged), the out text,
+// and the envelope under the cap; whatever does not fit is cut with
+// the count riding the same frames_dropped honesty the collection
+// bounds already carry.
+const framesWireMax = MaxMsgBytes - 64<<10
+
 // wireFrames renders one snapshot as the wire shape both the eval
-// reply and the job event carry (spec §5.6): [{ch, name, data_b64}].
-func wireFrames(snap board.FrameSnapshot) []any {
-	out := make([]any, 0, len(snap.Frames))
-	for _, f := range snap.Frames {
+// reply and the job event carry (spec §5.6): [{ch, name, data_b64}],
+// first-come-first-kept, at most framesWireMax base64 bytes — the
+// second return counts the frames the wire bound cut (0 when all
+// fit), for the caller's frames_dropped account.
+func wireFrames(snap board.FrameSnapshot) (out []any, wireCut int) {
+	out = make([]any, 0, len(snap.Frames))
+	size := 0
+	for i, f := range snap.Frames {
+		b64 := base64.StdEncoding.EncodeToString(f.Data)
+		if size+len(b64) > framesWireMax {
+			wireCut = len(snap.Frames) - i
+			break
+		}
+		size += len(b64)
 		out = append(out, map[string]any{
 			"ch":       int64(f.Ch),
 			"name":     f.Name,
-			"data_b64": base64.StdEncoding.EncodeToString(f.Data),
+			"data_b64": b64,
 		})
 	}
-	return out
+	return out, wireCut
 }
 
 // warmController connects (or reuses) the board's warm TCP controller
