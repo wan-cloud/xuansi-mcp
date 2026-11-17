@@ -361,8 +361,17 @@ func endOfIntent(conn Board, capNum int64) {
 // is an error (mirroring hFsRead's walk with the stopped ring's
 // stricter accounting).
 func readAll(ctx context.Context, conn Board, capNum int64, sink func(off int64, data []byte) error) (int64, error) {
+	return readAllFrom(ctx, conn, capNum, 0, sink)
+}
+
+// readAllFrom is readAll over the stopped ring starting at start (the
+// wave C stream pull's tail walk: the live loop consumed [0, start)
+// and the ring serves [start, total) — the recycled prefix is refused
+// board-side with its own coach, which crosses as an ordinary error).
+// The identities are readAll's own, with start in the accounting.
+func readAllFrom(ctx context.Context, conn Board, capNum int64, start int64, sink func(off int64, data []byte) error) (int64, error) {
 	var total int64 = -1
-	var off int64
+	var off int64 = start
 	for {
 		res, err := conn.Op(ctx, "la.read", map[string]any{"cap": capNum, "off": off, "len": int64(ReadWindow)})
 		if err != nil {

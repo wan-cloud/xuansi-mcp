@@ -143,6 +143,12 @@ func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf(
 			"la_capture: mode %q — this wave lands \"listen\", \"edge\", and \"samples\" (the LCD_CAM 8-channel sampler)", req.Mode)}
 	}
+	// wave C's live-stream gate first (zero-contact): samples cannot
+	// stream — the honest refusal names the measured budget so the seat
+	// does not retry the same shape.
+	if req.Stream && req.Mode == "samples" {
+		return nil, &RPCError{Class: "api", Msg: "la_capture: stream:true is LISTEN/EDGE only — the samples ring streams 1..40MB/s against a measured 0.215-0.322MB/s pull lane (waveS verdict, 3-4x short at 1MS/s already); capture stopped and pull post-stop (the lossless read-back is the samples design)"}
+	}
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
 		return nil, rerr
@@ -170,7 +176,13 @@ func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (
 	if err != nil {
 		return nil, err
 	}
-	ref, perr := s.laStore.PullCapture(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	var ref la.CaptureRef
+	var perr error
+	if req.Stream {
+		ref, perr = s.laStore.PullCaptureStream(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	} else {
+		ref, perr = s.laStore.PullCapture(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	}
 	if perr != nil {
 		if ref.ID == "" {
 			// before arm landed (subscribe/arm refusal, reserve/open
@@ -233,11 +245,18 @@ func laEdgeArgs(req *Request) (la.EdgeArmArgs, error) {
 				return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
 					"la_capture: trig.level %d — want 0|1", *t.Level)}
 			}
+		case "module":
+			// LA wave D (T1 wasm triggers): the module form names the
+			// loaded ABI 2 instance — no pin (the whole run stream is
+			// the scan window; the fw's own refusal coaches the load).
+			if t.Module == "" {
+				return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: "la_capture: kind \"module\" needs {kind:\"module\", module:\"<name>\", pre_kb?} — a loaded ABI 2 trigger module (bench.wasm.load first; the board's refusal names the load state)"}
+			}
 		default:
 			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
-				"la_capture: trig.kind %q — want \"edge_r\"|\"edge_f\"|\"level\"", t.Kind)}
+				"la_capture: trig.kind %q — want \"edge_r\"|\"edge_f\"|\"level\"|\"module\"", t.Kind)}
 		}
-		if !seen[t.Pin] {
+		if t.Kind != "module" && !seen[t.Pin] {
 			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
 				"la_capture: trig.pin %d must be one of the armed pins %v (the trigger rides a captured line)", t.Pin, req.Pins)}
 		}
@@ -245,7 +264,8 @@ func laEdgeArgs(req *Request) (la.EdgeArmArgs, error) {
 			return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
 				"la_capture: trig.pre_kb %d must be < ring_kb %d (post-trigger needs room)", t.PreKB, req.RingKB)}
 		}
-		arm.Trig = &la.EdgeTrig{Pin: t.Pin, Kind: t.Kind, Level: t.Level, PreKB: t.PreKB}
+		arm.Trig = &la.EdgeTrig{Pin: t.Pin, Kind: t.Kind, Level: t.Level,
+			PreKB: t.PreKB, Module: t.Module}
 	}
 	return arm, nil
 }
@@ -257,6 +277,13 @@ func (s *Server) hLaCaptureEdge(ctx context.Context, req *Request, b discover.Bo
 	if aerr != nil {
 		return nil, aerr
 	}
+	// wave C's live-stream gate (zero-contact): a trig-armed edge ring
+	// runs CIRCULAR pre-fire — the live window opens after fire only,
+	// so streaming refuses with the trig-less shape as the coach.
+	if req.Stream && arm.Trig != nil {
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: stream:true + trig — the pre-trigger edge ring is CIRCULAR (rotating pre_kb history; live window reads open on the linear phase only, after fire). Drop trig to stream the triggerless linear capture, or keep trig and pull post-stop")}
+	}
 	if v := s.protocolVer(b.MAC6); v > 0 && v < 9 {
 		return nil, &RPCError{Class: "server", Msg: fmt.Sprintf(
 			"la_capture: board %s reports protocol_ver=%d — the la.* edge face is a v9 overlay (the T10 engine); the board fw must be upgraded first", b.MAC6, v)}
@@ -265,7 +292,13 @@ func (s *Server) hLaCaptureEdge(ctx context.Context, req *Request, b discover.Bo
 	if err != nil {
 		return nil, err
 	}
-	ref, perr := s.laStore.PullEdge(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	var ref la.CaptureRef
+	var perr error
+	if req.Stream {
+		ref, perr = s.laStore.PullEdgeStream(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	} else {
+		ref, perr = s.laStore.PullEdge(ctx, la.PullBoard{ID: b.MAC6, Conn: ctl}, arm)
+	}
 	if perr != nil {
 		if ref.ID == "" {
 			return nil, perr
@@ -327,11 +360,19 @@ func laSampleArgs(req *Request) (la.SampleArmArgs, error) {
 				return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
 					"la_capture: trig.width %d — want 1..64 consecutive samples (0/omitted = 1)", t.Width)}
 			}
+		case "module":
+			// LA wave D: the whole run stream is the scan window (no
+			// channel to name — ch:255 sentinel in the mirror). The fw
+			// owns the >2MHz honest refusal (window traffic vs the AOT
+			// scan lane) — its coach crosses verbatim.
+			if t.Module == "" {
+				return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: "la_capture: kind \"module\" needs {kind:\"module\", module:\"<name>\", pre_kb?} — a loaded ABI 2 trigger module (bench.wasm.load first; the board's refusal names the load state)"}
+			}
 		default:
 			return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
-				"la_capture: trig.kind %q — want \"edge_r\"|\"edge_f\"|\"level\"|\"bits\"", t.Kind)}
+				"la_capture: trig.kind %q — want \"edge_r\"|\"edge_f\"|\"level\"|\"bits\"|\"module\"", t.Kind)}
 		}
-		if t.Kind != "bits" && (t.Ch < 0 || t.Ch > 7) {
+		if t.Kind != "bits" && t.Kind != "module" && (t.Ch < 0 || t.Ch > 7) {
 			return la.SampleArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
 				"la_capture: trig.ch %d — want 0..7 (= D0..D7, the sample byte's bit)", t.Ch)}
 		}
@@ -340,7 +381,8 @@ func laSampleArgs(req *Request) (la.SampleArmArgs, error) {
 				"la_capture: trig.pre_kb %d must be < ring_kb %d (post-trigger needs room)", t.PreKB, req.RingKB)}
 		}
 		arm.Trig = &la.SampleTrig{Ch: t.Ch, Kind: t.Kind, Level: t.Level,
-			Mask: t.Mask, Value: t.Value, Width: t.Width, PreKB: t.PreKB}
+			Mask: t.Mask, Value: t.Value, Width: t.Width, PreKB: t.PreKB,
+			Module: t.Module}
 	}
 	return arm, nil
 }

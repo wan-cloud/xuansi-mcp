@@ -64,6 +64,20 @@ type scriptedBoard struct {
 	sample     bool
 	sampleMeta map[string]any
 	rateHz     int64
+
+	// the wave C stream face: stream=true flips la.read into LIVE
+	// serving — the published prefix grows to liveCap (streamGrow per
+	// read; 0 = reveal the whole liveCap on the first read), and the
+	// first caught-up read AT the cap pushes the done event and freezes
+	// the capture (post-stop reads then serve [off, len(ring)) with
+	// total=len(ring) — the ring closing the account, reason=full's
+	// shape). liveCap==len(ring) models a self-ended capture the live
+	// loop drains completely.
+	stream    bool
+	streamCap int
+	streamGrow int
+	liveRevealed int
+	liveEnded bool
 }
 
 func newBoard(ring []byte) *scriptedBoard {
@@ -199,7 +213,56 @@ func (b *scriptedBoard) Op(ctx context.Context, op string, args map[string]any) 
 	case "la.read":
 		b.mu.Lock()
 		flip := b.flipAt >= 0 && n > b.flipAt
+		live := b.stream && !b.liveEnded
 		b.mu.Unlock()
+		if live {
+			// wave C live serving: the published prefix reveals toward
+			// streamCap (streamGrow per read; 0 = the whole cap at
+			// once). The first caught-up read AT the cap ends the
+			// capture — done pushes and serving freezes to the
+			// post-stop shape (total = len(ring): streamCap < len(ring)
+			// models reason=full with the ring closing the account;
+			// streamCap == len(ring) a capture the live loop drains
+			// whole).
+			b.mu.Lock()
+			cap := b.streamCap
+			if cap == 0 {
+				cap = len(b.ring)
+			}
+			if b.streamGrow > 0 {
+				if b.liveRevealed < cap {
+					b.liveRevealed += b.streamGrow
+					if b.liveRevealed > cap {
+						b.liveRevealed = cap
+					}
+				}
+			} else {
+				b.liveRevealed = cap
+			}
+			revealed := b.liveRevealed
+			b.mu.Unlock()
+			off := argU(args["off"])
+			ln := argU(args["len"])
+			if off < 0 || ln < 0 || off > int64(revealed) {
+				return nil, &replclient.OpError{Op: op, Class: "api",
+					Msg: "la.read: off outside live window"}
+			}
+			end := off + ln
+			if end > int64(revealed) {
+				end = int64(revealed)
+			}
+			eof := end >= int64(revealed)
+			if eof && revealed == cap {
+				b.mu.Lock()
+				b.liveEnded = true
+				b.mu.Unlock()
+				b.push("la", map[string]any{"event": "done", "cap": b.capID,
+					"bytes": b.stopB, "reason": b.stopR})
+			}
+			data := append([]byte(nil), b.ring[off:end]...)
+			return map[string]any{"data": data, "total": int64(revealed),
+				"eof": eof}, nil
+		}
 		off := argU(args["off"])
 		ln := argU(args["len"])
 		if off < 0 || ln < 0 || off > int64(len(b.ring)) {

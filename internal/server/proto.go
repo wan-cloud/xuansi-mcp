@@ -509,6 +509,16 @@ type Request struct {
 	SdaCh   *int `json:"sda_ch,omitempty"`
 	SclCh   *int `json:"scl_ch,omitempty"`
 
+	// Stream (LA wave C) flips la_capture into the live sliding-window
+	// pull: the daemon reads 32640B windows off the LIVE ring as it
+	// captures (the p90 budget cadence), the ring recycles behind the
+	// read cursor, and the tail lands post-stop — listen/edge only
+	// (samples refuse zero-contact: the 1..40MB/s stream outpaces the
+	// measured 0.215-0.322MB/s link, waveS verdict; edge+trig refuses:
+	// the pre-trigger ring is circular — the live window opens after
+	// fire only, arm trig-less to stream).
+	Stream bool `json:"stream,omitempty"`
+
 	// The LA wave-2 analysis fields (2026-11-17, LA 增強波 A). Pattern
 	// rides la_search (hex bytes for kind "bytes", a 0/1 string for
 	// kind "bits"); MinNS/MaxNS/Level are the timing kind's predicate
