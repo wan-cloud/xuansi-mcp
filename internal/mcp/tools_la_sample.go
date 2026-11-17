@@ -55,6 +55,7 @@ type laDecodeBusOut struct {
 	RateHz    int        `json:"rate_hz"`
 	T0NS      int64      `json:"t0_ns"`
 	SCKHalfNS uint64     `json:"sck_half_ns,omitempty" jsonschema:"spi: the MEDIAN SCK half-period inside transactions (deterministic) — 1e9/(2·freq); compare with xuansi_la_measure on an edge capture of the same clock"`
+	Note      string     `json:"note,omitempty" jsonschema:"spi: the sampling-floor warning — the median SCK half-period sat at 2 sample ticks (rate/4): a clean signal decodes, but zero margin against clock jitter/duty skew; corroborate before trusting the bytes (a clock at/above the Nyquist rate refuses outright instead)"`
 	Txns      []laBusTxn `json:"txns" jsonschema:"at most 64 rows (a cut sets truncated:true); n_txn carries the whole-capture count"`
 	NTxn      int        `json:"n_txn"`
 	Truncated bool       `json:"truncated,omitempty"`
@@ -69,7 +70,7 @@ func (ts *toolset) registerLASample(srv *mcpsdk.Server) {
 		Name: "xuansi_la_decode_bus",
 		Description: "Decode one SAMPLES capture as a BUS PROTOCOL — the transaction list a protocol conversation reads from: who drove what, when, in what order. " + laAntiConfusion + ". " +
 			"THE CHANNEL MAP IS THE WIRING (frozen fixture table): every sample byte is the 8-channel DVP bitmap, bit i = D_i = GPIO{11,9,8,10,12,18,17,16}[i]; the CC1101 fixture probes SCK=D0, MOSI=D1, MISO=D2, CSN1=D3, GDO0=D4. " +
-			"proto \"spi\": transactions frame on the CS line(s) (cs_mask bits all LOW = open; default 0x08 = D3); each bit samples at the mode's SCK edge (mode 0 default: rising; give mode 0..3 or cpol/cpha) — {t_ns = the FIRST SCK edge of the transaction (NOT the CS fall — masters legitimately wait ready with CS low), mosi/miso hex both directions, n_bits, remainder_bits (a mid-byte CS rise), torn (the capture ended with CS low)}. sck_half_ns = the median SCK half-period — your frequency cross-check against xuansi_la_measure on an edge capture of the same clock. " +
+			"proto \"spi\": transactions frame on the CS line(s) (cs_mask bits all LOW = open; default 0x08 = D3); each bit samples at the mode's SCK edge (mode 0 default: rising; give mode 0..3 or cpol/cpha) — {t_ns = the FIRST SCK edge of the transaction (NOT the CS fall — masters legitimately wait ready with CS low), mosi/miso hex both directions, n_bits, remainder_bits (a mid-byte CS rise), torn (the capture ended with CS low)}. sck_half_ns = the median SCK half-period — your frequency cross-check against xuansi_la_measure on an edge capture of the same clock. UNDERSAMPLING GUARD (honest refusal doctrine): the median in-transaction SCK half-period, in sample ticks, is the trust meter — at ≤1 tick (a clock at/above the sampling Nyquist rate) the sampled edges are phase luck and the decode REFUSES naming the floor (re-capture at a higher rate_hz notch); at exactly 2 ticks (rate/4) a clean signal genuinely decodes but rides the sampling-floor note (zero margin — corroborate before trusting the bytes). Never a plausible-looking aliased decode. " +
 			"proto \"i2c\": {t_ns = the START instant (SDA falls while SCL high), addr (7-bit), rw, rep (a repeated START opened this row — the register-read shape), bytes (the payload after the address), acks (one per 9th bit, true = ACK) — a final acks false on a read is the master's NAK after the last byte, the protocol's own end-of-read}. " +
 			"Bounded: ≤64 transaction rows (truncated flags the cut), byte payloads previewed at 64 bytes with n_bytes carrying the full count. TORN/REMAINDER rows are honest statements, never dropped. " +
 			"NEXT: the transaction bytes ARE the conversation — read them against the device's register map (a CC1101 write is [addr, val], its read-back [0xC0|addr, 0xFF] with the value on MISO); the timing story rides t_ns ordering + sck_half_ns; xuansi_la_edges (an edge capture of the same lines) shows the raw transitions when a decode looks wrong. Daemon-local: no lease, no board contact.",
@@ -97,6 +98,7 @@ func (ts *toolset) laDecodeBus(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 		RateHz:    num(res, "rate_hz"),
 		T0NS:      i64(res, "t0_ns"),
 		SCKHalfNS: uint64(num(res, "sck_half_ns")),
+		Note:      str(res, "note"),
 		NTxn:      num(res, "n_txn"),
 		Truncated: bol(res, "truncated"),
 	}

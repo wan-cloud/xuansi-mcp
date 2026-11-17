@@ -412,13 +412,31 @@ func Measure(ref CaptureRef, a, b MeasurePoint) (MeasureResult, error) {
 			hi += e - s
 		}
 	}
-	// Tail-window honesty (T11 minor): tb may sit past the capture's
-	// last run — the numerator then counts only the captured extent
-	// while dt_ns spans the full ask, so duty reads LOW (the missing
-	// tail counts as zero-high). State it rather than clamp silently:
-	// the note names the measured window the fraction actually covers.
-	if last := abs[len(runs)-1] + runs[len(runs)-1].WidthNS; tb > last {
-		res.Note = fmt.Sprintf("window end %dns is past the capture's last edge %dns — duty covers the captured extent only (the uncaptured tail reads as low, so the fraction under-reports)", tb, last)
+	// Window honesty (T11 minor; head side added minors wave — the
+	// tail note was alone and the ask can overhang BOTH ends): the
+	// ask [ta,tb) may exceed the captured extent on either side — the
+	// numerator counts only the captured window while dt_ns spans the
+	// full ask, so duty reads LOW on whichever side overhangs (the
+	// uncaptured span counts as zero-high). One merged note names the
+	// capture's measured extent and each overhang; silence means the
+	// window sat inside the capture.
+	if len(runs) == 0 {
+		res.Note = "capture has no runs — duty covers nothing (freq_hz still measures the two points)"
+	} else {
+		first, last := abs[0], abs[len(runs)-1]+runs[len(runs)-1].WidthNS
+		var sides []string
+		if ta < first {
+			sides = append(sides, fmt.Sprintf("start %dns is before the first edge %dns (the uncaptured head reads as low)", ta, first))
+		}
+		if tb > last {
+			sides = append(sides, fmt.Sprintf("end %dns is past the capture's last edge %dns (the uncaptured tail reads as low)", tb, last))
+		}
+		switch len(sides) {
+		case 2:
+			res.Note = fmt.Sprintf("window exceeds the captured extent on both sides — duty covers the captured extent [%d,%d]ns only, so the fraction under-reports: %s; %s", first, last, sides[0], sides[1])
+		case 1:
+			res.Note = fmt.Sprintf("window exceeds the captured extent — duty covers the captured extent [%d,%d]ns only, so the fraction under-reports: %s", first, last, sides[0])
+		}
 	}
 	d := float64(hi) / float64(res.DtNS)
 	res.Duty = &d

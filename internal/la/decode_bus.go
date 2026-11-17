@@ -82,6 +82,7 @@ type DecodeBusResult struct {
 	RateHz    int      `json:"rate_hz"`
 	T0NS      int64    `json:"t0_ns"`
 	SCKHalfNS uint64   `json:"sck_half_ns,omitempty"` // spi: the MEDIAN SCK half-period inside transactions = 1e9/(2·freq)
+	Note      string   `json:"note,omitempty"`        // spi: the sampling-floor warning (median half-period at 2 ticks — decodable, zero margin; the Nyquist edge itself refuses instead)
 	Txns      []BusTxn `json:"txns"`
 	NTxn      int      `json:"n_txn"`
 	Truncated bool     `json:"truncated,omitempty"`
@@ -132,7 +133,27 @@ func DecodeBus(ref CaptureRef, proto string, params DecodeBusParams) (DecodeBusR
 		if perr := spiParams(params, &res); perr != nil {
 			return DecodeBusResult{}, perr
 		}
-		decodeSPI(samples, &res)
+		medianHalf := decodeSPI(samples, &res)
+		// Undersampling guard (minors wave): the median in-transaction
+		// SCK half-period, in ticks, is the trust meter. At 1 tick or
+		// below the observed clock sits AT/ABOVE the Nyquist rate —
+		// the sampled pattern is pure phase luck (even a clean decode
+		// is the lucky phase), and a near-Nyquist clock beats into
+		// PLAUSIBLE-LOOKING rows that are not the wire's: honest
+		// refusal, coach the re-capture. At exactly 2 ticks (rate/4)
+		// a clean aligned signal genuinely decodes — but with zero
+		// margin: any clock jitter or duty skew aliases bits, so the
+		// note states the floor instead of refusing. No transactions
+		// at all = no halves = no guard: nothing to alias.
+		switch {
+		case medianHalf == 0, medianHalf > spiHalfFloorTicks:
+			// nothing observed at the floor — silent as ever
+		case medianHalf <= spiNyquistTicks:
+			return DecodeBusResult{}, fmt.Errorf(
+				"la: decode_bus spi: the median SCK half-period is %d sample tick(s) at rate_hz %d — at/above the sampling Nyquist rate the sampled edges are phase luck and the bit stream cannot be trusted (a near-Nyquist clock beats into plausible-looking rows); re-capture at a higher rate_hz notch or decode a slower clock (the honest refusal, not a confident garbage decode)", medianHalf, res.RateHz)
+		default: // the floor band: 2 ticks/half
+			res.Note = fmt.Sprintf("the median SCK half-period is %d sample ticks at rate_hz %d — the sampling floor: a clean aligned signal decodes, but any clock jitter or duty skew at this margin aliases bits; corroborate against a slower clock or a higher-rate capture before trusting the bytes", medianHalf, res.RateHz)
+		}
 	} else {
 		sda, scl := 2, 1 // the default bus: GPIO8/9 = D2/D1
 		if params.SDA != nil {
@@ -222,6 +243,15 @@ func i2cParams(p DecodeBusParams, sda, scl int) error {
 // notches divide 1e9 exactly).
 func tickOf(rateHz int) uint64 { return uint64(1_000_000_000 / rateHz) }
 
+// spiHalfFloorTicks is the SPI decode's sampling-floor band: a median
+// in-transaction SCK half-period at this many sample ticks decodes but
+// rides the floor note (see DecodeBus's guard); spiNyquistTicks and
+// below refuses outright.
+const (
+	spiHalfFloorTicks = 2
+	spiNyquistTicks   = 1
+)
+
 // decodeSPI walks the stream: CS-active intervals (all mask bits low)
 // frame transactions; bits sample at the mode's SCK edge (the tick
 // SCK REACHES the sampling level — rising for modes 0/3, falling for
@@ -237,7 +267,10 @@ func tickOf(rateHz int) uint64 { return uint64(1_000_000_000 / rateHz) }
 // that is NOT protocol idle time. Read the FIRST SCK edge for the
 // transaction's t_ns (this decoder already does) and do not infer
 // setup timing from CS-fall-to-first-clock spans on this fixture.
-func decodeSPI(samples []byte, res *DecodeBusResult) {
+//
+// The answer is the MEDIAN SCK half-period in ticks (0 when no
+// transaction clocked) — DecodeBus's undersampling guard reads it.
+func decodeSPI(samples []byte, res *DecodeBusResult) uint64 {
 	const sckCh, mosiCh, misoCh = 0, 1, 2
 	// sampleLevel: the level AT the sampling edge — rising for modes
 	// 0/3 (cpol0cpha0, cpol1cpha1), falling for 1/2. The walk's
@@ -322,7 +355,9 @@ func decodeSPI(samples []byte, res *DecodeBusResult) {
 	if len(halves) > 0 {
 		sort.Slice(halves, func(a, b int) bool { return halves[a] < halves[b] })
 		res.SCKHalfNS = halves[len(halves)/2] * tick
+		return halves[len(halves)/2]
 	}
+	return 0
 }
 
 // hexOfBits assembles bits (MSB first per byte) into the bounded hex

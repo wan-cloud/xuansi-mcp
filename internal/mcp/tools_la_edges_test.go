@@ -208,6 +208,9 @@ func TestLAEdgesDescAudit(t *testing.T) {
 		},
 		"xuansi_la_measure": {
 			"SIGNED", "edge_i", "PRO-RATA", "freq_hz", "duty", "xuansi_la_runs", "no lease",
+			// minors wave: the float64 precision floor — large t_ns
+			// values lose exactness above 2^53; edge_i is the exact form
+			"2^53", "float64",
 		},
 		"xuansi_la_diff": {
 			"FIRST-EDGE ALIGNED", "2000ns", "why", "length", "SAME-BOARD", "matched_ns", "xuansi_la_runs", "no lease",

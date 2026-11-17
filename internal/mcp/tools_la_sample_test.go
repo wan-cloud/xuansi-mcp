@@ -155,6 +155,9 @@ func TestLASampleDescAudit(t *testing.T) {
 		"xuansi_la_decode_bus": {
 			"NOT xuansi_capture", "D_i", "SCK=D0", "CSN1=D3", "FIRST SCK edge",
 			"sck_half_ns", "xuansi_la_measure", "64", "no lease",
+			// minors wave: the undersampling guard is face-visible —
+			// the Nyquist refusal, not a plausible-looking decode
+			"UNDERSAMPLING GUARD", "Nyquist", "higher rate_hz",
 		},
 	}
 	for name, wants := range audit {
@@ -179,6 +182,13 @@ func TestLASampleDescAudit(t *testing.T) {
 	// wave B supp (F-REV1): the capacity-semantics coach — the
 	// E-window pair and what to do when it bites
 	for _, want := range []string{"CAPACITY SEMANTICS", "zone_sat:true", "elapsed_ms", "lower rate_hz, raise ring_kb, or shorten the wait"} {
+		if !strings.Contains(desc["xuansi_la_capture"], want) {
+			t.Errorf("xuansi_la_capture Desc lacks %q", want)
+		}
+	}
+	// minors wave (M-1): the three-mode field matrix — a foreign field
+	// refuses with the omit-coach, never a silent ignore
+	for _, want := range []string{"FIELD MATRIX", "never a silent ignore", "listen has NO trigger", "mode \"edge\" with trig"} {
 		if !strings.Contains(desc["xuansi_la_capture"], want) {
 			t.Errorf("xuansi_la_capture Desc lacks %q", want)
 		}

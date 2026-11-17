@@ -54,8 +54,15 @@ type Meta struct {
 	ResHz    int    `json:"res_hz,omitempty"`
 	TStartNS uint64 `json:"t_start_ns"` // first chunk's start_ns (0 when empty)
 	TEndNS   uint64 `json:"t_end_ns"`   // last chunk's start_ns (0 when empty)
-	Bytes    int64  `json:"bytes"`      // payload bytes: Σ chunk n parsed from data.bin
-	Chunks   int    `json:"chunks"`
+	// Bytes is the landed payload account in the MODE'S OWN UNIT (the
+	// semantics drift across engines — read mode first, minors wave
+	// documentation): listen = Σ chunk n (payload bytes parsed from
+	// data.bin); edge = the run stream's bytes (runs × 9 — 9B/record,
+	// the frozen run format); samples = total sample bytes (one byte
+	// per tick — numerically the sample count, mirrored in samples).
+	// StreamBytes beside it is mode-uniform: len(data.bin) verbatim.
+	Bytes  int64 `json:"bytes"`
+	Chunks int   `json:"chunks"`
 	Runs     int    `json:"runs,omitempty"`
 	Samples  int64  `json:"samples,omitempty"`
 	// Reason is la.stop's ledger verbatim — the fw's full vocabulary
@@ -123,7 +130,7 @@ type Meta struct {
 // shape mirrors the 255 sentinel the bits arm established.
 type TrigMeta struct {
 	Pin   int    `json:"pin,omitempty"`   // edge: a pins[] member; 255 = the kind "module" sentinel (no pin to name)
-	Ch    int    `json:"ch,omitempty"`    // samples: 0..7 = D0..D7; 255 = the no-channel sentinel a kind "bits" arm mirrors (bits matches the whole byte — no channel exists to name)
+	Ch    int    `json:"ch,omitempty"`    // samples: 0..7 = D0..D7; 255 = the no-channel sentinel a kind "bits" arm mirrors (bits matches the whole byte — no channel exists to name). Go omitempty wart, documented once: Ch==0 (D0) rides ABSENT — an absent ch on a samples trigger means D0, never "no channel" (the same zero-hiding BusTxn.Mode/Addr accept as frozen shape)
 	Kind  string `json:"kind"`            // "edge_r" | "edge_f" | "level" | "bits" (samples) | "module" (wave D)
 	Level *int   `json:"level,omitempty"` // 0|1, kind "level" only (a pointer: presence is part of the request domain — an omitted level refuses)
 	Mask  uint8  `json:"mask,omitempty"`  // kind "bits" (samples) only: the window mask

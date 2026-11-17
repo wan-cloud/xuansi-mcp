@@ -64,7 +64,9 @@ func scriptLASampleBoard(f *fakeCtl, ring []byte, stopBytes int64) {
 }
 
 // lasampleRing: idle, one CS-framed mode-0 byte 0xC3/0x3C, idle —
-// 4 ticks per half period at 20MS/s = 50ns tick (SCK 2.5MHz).
+// 2 ticks per half period at 20MS/s = 50ns tick (SCK 5MHz, the
+// sampling-floor band: 1 tick/half is the Nyquist edge the decode now
+// refuses).
 func lasampleRing() []byte {
 	var buf []byte
 	cur := byte(0x08) // CS high, SCK/MOSI/MISO idle low
@@ -80,11 +82,17 @@ func lasampleRing() []byte {
 		mbit := mosi >> uint(i) & 1
 		ibit := miso >> uint(i) & 1
 		cur = cur&^0x06 | mbit<<1 | ibit<<2
-		buf = append(buf, cur)   // SCK low half
-		buf = append(buf, cur|1) // SCK rises (sample here)
+		buf = append(buf, cur)      // SCK low half (2 ticks)
+		buf = append(buf, cur)      //
+		buf = append(buf, cur|0x01) // SCK rises (sample here, 2 ticks)
+		buf = append(buf, cur|0x01) //
 	}
 	cur |= 0x08 // CS rises
-	for i := 0; i < 4; i++ {
+	// the tail idle is 6 ticks, not 4: the ring length must stay a
+	// multiple of 9 — TestLaDecodeBusCrossModeAndParamRefusals reuses
+	// this ring as an EDGE capture's run stream, whose pull identity
+	// parses whole 9-byte records (45 = 5×9).
+	for i := 0; i < 6; i++ {
 		buf = append(buf, cur)
 	}
 	return buf
@@ -156,9 +164,14 @@ func TestLaCaptureSamplesGreenPathAndDecodeBus(t *testing.T) {
 	if asInt(d["cs_mask"]) != 8 {
 		t.Errorf("decode echo = cs_mask %v, want 8 (mode 0 omits itself — the default)", d["cs_mask"])
 	}
-	// the sck half period: 1 tick per half × 50ns = 50ns
-	if asInt(d["sck_half_ns"]) != 50 {
-		t.Errorf("sck_half_ns = %v, want 50", d["sck_half_ns"])
+	// the sck half period: 2 ticks per half × 50ns = 100ns (the
+	// floor band — the decode note states it; sck_half_ns itself is
+	// the median echo)
+	if asInt(d["sck_half_ns"]) != 100 {
+		t.Errorf("sck_half_ns = %v, want 100", d["sck_half_ns"])
+	}
+	if !strings.Contains(asStr(d["note"]), "sampling floor") {
+		t.Errorf("note = %v, want the sampling-floor warning at 2 ticks/half", d["note"])
 	}
 }
 

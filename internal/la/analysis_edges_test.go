@@ -396,6 +396,58 @@ func TestMeasurePoints(t *testing.T) {
 	}
 }
 
+// TestMeasureWindowExtentNotes (minors wave): the ask overhanging the
+// captured extent notes BOTH sides symmetrically — the head window was
+// the missing one (the tail note stood alone): head-only, tail-only,
+// both, and the silent inside-window case each answer their shape.
+func TestMeasureWindowExtentNotes(t *testing.T) {
+	ref := pwmEdgeRef(t)
+	// the fixture: t0=4s, 20 periods of (250µs high, 750µs low) —
+	// captured extent [4_000_000_000, 4_020_000_000)ns.
+	headA, inB := uint64(3_900_000_000), uint64(4_010_000_000)
+	inA, tailB := uint64(4_010_000_000), uint64(4_500_000_000)
+	winA, winB := uint64(4_005_000_000), uint64(4_015_000_000)
+
+	// inside window: no note (the pre-existing silence)
+	got, err := Measure(ref, MeasurePoint{TNS: &winA}, MeasurePoint{TNS: &winB})
+	if err != nil || got.Note != "" {
+		t.Fatalf("inside window = %+v err=%v, want no note", got, err)
+	}
+	// head overhang only
+	got, err = Measure(ref, MeasurePoint{TNS: &headA}, MeasurePoint{TNS: &inB})
+	if err != nil {
+		t.Fatalf("head window: %v", err)
+	}
+	if !strings.Contains(got.Note, "window exceeds the captured extent") ||
+		!strings.Contains(got.Note, "before the first edge") ||
+		strings.Contains(got.Note, "past the capture's last edge") {
+		t.Errorf("head note = %q, want the head-only extent note", got.Note)
+	}
+	if got.Duty == nil || *got.Duty >= 0.25 {
+		t.Errorf("head duty = %v, want the under-reported fraction (< the true 0.25)", got.Duty)
+	}
+	// tail overhang only (the T11 minor, now the merged shape)
+	got, err = Measure(ref, MeasurePoint{TNS: &inA}, MeasurePoint{TNS: &tailB})
+	if err != nil {
+		t.Fatalf("tail window: %v", err)
+	}
+	if !strings.Contains(got.Note, "window exceeds the captured extent") ||
+		!strings.Contains(got.Note, "past the capture's last edge") ||
+		strings.Contains(got.Note, "before the first edge") {
+		t.Errorf("tail note = %q, want the tail-only extent note", got.Note)
+	}
+	// both sides — the merged both-sides note names each
+	got, err = Measure(ref, MeasurePoint{TNS: &headA}, MeasurePoint{TNS: &tailB})
+	if err != nil {
+		t.Fatalf("both-sides window: %v", err)
+	}
+	if !strings.Contains(got.Note, "on both sides") ||
+		!strings.Contains(got.Note, "before the first edge") ||
+		!strings.Contains(got.Note, "past the capture's last edge") {
+		t.Errorf("both-sides note = %q, want one merged note naming each side", got.Note)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Diff — the sequence walk (first-edge aligned)
 // ---------------------------------------------------------------------------

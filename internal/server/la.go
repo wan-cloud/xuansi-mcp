@@ -101,6 +101,14 @@ func laBaudRefuse(got any) error {
 // arithmetic, the uart mutual exclusion (bench + la on the same hw
 // UART) — the fw's refusal text is the product.
 func laArmArgs(req *Request) (la.ArmArgs, error) {
+	// Foreign-column refusal (minors wave, M-1 symmetry): listen must
+	// not silently swallow the other arms' columns — the painful one
+	// is trig (a seat's triggering intent dropped without a word is a
+	// mis-capture, not a typo): the listen engine has no trigger.
+	if len(req.Pins) > 0 || req.RateHz != 0 || req.Trig != nil {
+		return la.ArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
+			"la_capture: pins/rate_hz/trig are the EDGE/SAMPLES arms' columns — the listen arm rides port/pin/baud (got pins=%v rate_hz=%d trig=%v; omit them for mode \"listen\" — the listen engine records from arm with NO trigger: a triggered capture is mode \"edge\" with trig{pin,kind})", req.Pins, req.RateHz, req.Trig != nil)}
+	}
 	if req.LaPort < 1 || req.LaPort > laPortMax {
 		return la.ArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
 			"la_capture: port %d out of domain 1..%d (uart1/uart2 — the hw UARTs the listen engine can passively ride)", req.LaPort, laPortMax)}
@@ -202,9 +210,9 @@ func (s *Server) hLaCapture(ctx context.Context, cc *clientConn, req *Request) (
 // refusals; the board owns the rest — pin bans, the pin-claim dance,
 // the RMT group mutex, the ring-budget admission arithmetic).
 func laEdgeArgs(req *Request) (la.EdgeArmArgs, error) {
-	if req.LaPort != 0 || req.Baud != nil {
+	if req.LaPort != 0 || req.Baud != nil || req.RateHz != 0 {
 		return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(
-			"la_capture: port/baud are the LISTEN arm's columns — the edge arm rides pins[] (got port=%d baud=%v; omit them for mode \"edge\")", req.LaPort, req.Baud)}
+			"la_capture: port/baud/rate_hz are the LISTEN/SAMPLES arms' columns — the edge arm rides pins[] (got port=%d baud=%v rate_hz=%d; omit them for mode \"edge\")", req.LaPort, req.Baud, req.RateHz)}
 	}
 	if len(req.Pins) < 1 || len(req.Pins) > 4 {
 		return la.EdgeArmArgs{}, &RPCError{Class: "api", Msg: fmt.Sprintf(

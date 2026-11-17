@@ -618,6 +618,63 @@ func TestLaEdgeDomainRefusalsZeroContact(t *testing.T) {
 	}
 }
 
+// TestLaForeignColumnsRefuseZeroContact (minors wave, second-round
+// review M-1 symmetry): a foreign arm column REFUSES with the
+// omit-coach instead of silently ignoring — the listen arm must not
+// swallow pins/rate_hz (the samples columns), and above all not TRIG:
+// a seat's triggering intent dropped without a word is a mis-capture.
+// The edge arm refuses rate_hz beside its existing port/baud gate.
+// Zero board contact for every case.
+func TestLaForeignColumnsRefuseZeroContact(t *testing.T) {
+	const mac = "38f2c1"
+	e := newEnv(t, nil, mkBoard(mac, "bench2.local"))
+	c := dialSock(t, e.sock)
+	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "h1"}); rep["error"] != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	dials := e.dialedTCP(mac)
+	cases := []struct {
+		args map[string]any
+		want []string
+	}{
+		// listen + pins (edge's column)
+		{map[string]any{"la_port": 1, "la_pin": 38, "baud": 9600, "ring_kb": 64, "pins": []any{2}},
+			[]string{"pins/rate_hz/trig", "omit", "mode \"listen\""}},
+		// listen + rate_hz (samples' column)
+		{map[string]any{"la_port": 1, "la_pin": 38, "baud": 9600, "ring_kb": 64, "rate_hz": 1000000},
+			[]string{"pins/rate_hz/trig", "omit", "mode \"listen\""}},
+		// listen + trig — the real pain: triggering intent must not be
+		// silently swallowed; the coach names the edge mode.
+		{map[string]any{"la_port": 1, "la_pin": 38, "baud": 9600, "ring_kb": 64, "trig": map[string]any{"pin": 2, "kind": "edge_r"}},
+			[]string{"pins/rate_hz/trig", "mode \"edge\"", "trig{pin,kind}", "NO trigger"}},
+		// edge + rate_hz (samples' column) — port/baud cases already
+		// ride TestLaEdgeDomainRefusalsZeroContact
+		{map[string]any{"mode": "edge", "pins": []any{2}, "ring_kb": 64, "rate_hz": 1000000},
+			[]string{"port/baud/rate_hz", "omit", "mode \"edge\""}},
+	}
+	for i, tc := range cases {
+		r := map[string]any{"type": "la_capture", "board": mac, "holder": "h1"}
+		for k, v := range tc.args {
+			r[k] = v
+		}
+		rep, _ := c.call(int64(50+i), r)
+		er := asMap(rep["error"])
+		if er == nil || asStr(er["class"]) != "api" {
+			t.Errorf("case %d (%v): error = %#v, want a zero-contact api refusal", i, tc.args, er)
+			continue
+		}
+		msg := asStr(er["msg"])
+		for _, want := range tc.want {
+			if !strings.Contains(msg, want) {
+				t.Errorf("case %d (%v): msg = %q, want it to coach %q", i, tc.args, msg, want)
+			}
+		}
+	}
+	if got := e.dialedTCP(mac); got != dials {
+		t.Errorf("foreign-column refusals dialed %d→%d — the gate must be zero-contact", dials, got)
+	}
+}
+
 // TestLaListBoardFilter (LA 二輪審查 2026-11-16 I-2): the documented
 // optional board filter lands on the daemon face — a full mac6 keeps
 // only that board's rows, a mac6 prefix does the same, a board with

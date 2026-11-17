@@ -475,7 +475,10 @@ func TestDecodeBusBound(t *testing.T) {
 	var b tickBuf
 	spiIdle(&b, 0, 2)
 	for i := 0; i < busTxnsMax+3; i++ {
-		spiEmit(&b, 0, []byte{byte(i)}, []byte{byte(255 - i)}, 1, 0)
+		// half=2 (the sampling-floor band — half=1 now refuses at the
+		// Nyquist edge; this test's subject is the ROW bound, not the
+		// clock)
+		spiEmit(&b, 0, []byte{byte(i)}, []byte{byte(255 - i)}, 2, 0)
 	}
 	ref := sampleRef(t, b.buf, sampleMeta(5_000_000, 7))
 	res, err := DecodeBus(ref, "spi", DecodeBusParams{})
@@ -485,6 +488,59 @@ func TestDecodeBusBound(t *testing.T) {
 	if len(res.Txns) != busTxnsMax || !res.Truncated || res.NTxn != busTxnsMax+3 {
 		t.Errorf("bound = %d rows truncated=%v n_txn=%d, want %d/truncated/%d",
 			len(res.Txns), res.Truncated, res.NTxn, busTxnsMax, busTxnsMax+3)
+	}
+}
+
+// TestDecodeBUSSamplingFloor (minors wave): the median SCK half-period
+// in ticks is the trust meter — at the Nyquist edge (≤1 tick/half,
+// SCK at/above rate/2) the decode REFUSES (sampled edges are phase
+// luck; a near-Nyquist clock beats into plausible-looking rows), at
+// the floor band (exactly 2 ticks/half) it decodes with the stated
+// floor note, and a comfortable margin (4+) stays silent.
+func TestDecodeBUSSamplingFloor(t *testing.T) {
+	const rate = 1_000_000
+
+	// half=1: the Nyquist edge — honest refusal with the re-capture
+	// coach, even for a byte the walker could have placed.
+	var b tickBuf
+	spiIdle(&b, 0, 4)
+	spiEmit(&b, 0, []byte{0xA5}, []byte{0x5A}, 1, 1)
+	ref := sampleRef(t, b.buf, sampleMeta(rate, 5))
+	_, err := DecodeBus(ref, "spi", DecodeBusParams{})
+	if err == nil || !strings.Contains(err.Error(), "Nyquist") || !strings.Contains(err.Error(), "rate_hz") {
+		t.Fatalf("half=1 err = %v, want the Nyquist refusal with the re-capture coach", err)
+	}
+
+	// half=2: the floor band — decodes, with the floor note.
+	b = tickBuf{}
+	spiIdle(&b, 0, 4)
+	spiEmit(&b, 0, []byte{0xA5}, []byte{0x5A}, 2, 1)
+	ref = sampleRef(t, b.buf, sampleMeta(rate, 5))
+	res, err := DecodeBus(ref, "spi", DecodeBusParams{})
+	if err != nil {
+		t.Fatalf("half=2: %v", err)
+	}
+	if len(res.Txns) != 1 || strings.ToUpper(res.Txns[0].MOSI) != "A5" {
+		t.Fatalf("half=2 txns = %+v, want the clean decode", res.Txns)
+	}
+	if !strings.Contains(res.Note, "sampling floor") {
+		t.Errorf("half=2 note = %q, want the floor warning", res.Note)
+	}
+
+	// half=4: a comfortable margin — no note, same bytes.
+	b = tickBuf{}
+	spiIdle(&b, 0, 4)
+	spiEmit(&b, 0, []byte{0xA5}, []byte{0x5A}, 4, 1)
+	ref = sampleRef(t, b.buf, sampleMeta(rate, 5))
+	res, err = DecodeBus(ref, "spi", DecodeBusParams{})
+	if err != nil {
+		t.Fatalf("half=4: %v", err)
+	}
+	if res.Note != "" {
+		t.Errorf("half=4 note = %q, want silence", res.Note)
+	}
+	if len(res.Txns) != 1 || strings.ToUpper(res.Txns[0].MOSI) != "A5" {
+		t.Fatalf("half=4 txns = %+v", res.Txns)
 	}
 }
 

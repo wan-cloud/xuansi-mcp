@@ -79,7 +79,7 @@ type laHistBin struct {
 }
 
 type laPointIn struct {
-	TNS   *uint64 `json:"t_ns,omitempty" jsonschema:"an absolute instant (ns — the t_ns column's axis)"`
+	TNS   *uint64 `json:"t_ns,omitempty" jsonschema:"an absolute instant (ns — the t_ns column's axis). PRECISION FLOOR: t_ns rides JSON float64 on every cross-process face, so values above 2^53 (~104 days of ns — only reachable on a board up longer than that continuously) lose exactness in transit; when citing large absolute t_ns prefer edge_i (an exact integer index)"`
 	EdgeI *int    `json:"edge_i,omitempty" jsonschema:"a run index (the i column of xuansi_la_runs) — the point is that run's start"`
 }
 
@@ -165,7 +165,8 @@ func (ts *toolset) registerLAEdges(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "xuansi_la_measure",
 		Description: "One EDGE capture's TWO-POINT measurement: {dt_ns = t_b − t_a (SIGNED — reversed points answer negative with freq/duty absent and a note), freq_hz = 1e9/dt_ns (iff dt > 0), duty = the fraction of [a,b) the line spent high (single-pin captures; runs clipped to the window PRO-RATA, so points placed mid-run are honest)}. " + laAntiConfusion + ". " +
-			"Each point is exactly one form: {t_ns: absolute ns} or {edge_i: a run index — the i column of xuansi_la_runs, resolving to that run's start}. edge_i is the sturdy form (indices survive window arithmetic); t_ns places a point anywhere, including between transitions. " +
+			"Each point is exactly one form: {t_ns: absolute ns} or {edge_i: a run index — the i column of xuansi_la_runs, resolving to that run's start}. edge_i is the sturdy form (indices survive window arithmetic); t_ns places a point anywhere, including between transitions — but t_ns crosses every face as JSON float64, so absolute values above 2^53 ns (~104 days of continuous uptime) lose low-bit exactness in transit: on a long-up board cite edge_i (exact integers both ways), not pasted t_ns digits. " +
+			"Window honesty: a window overhanging the captured extent (start before the first edge, end past the last) answers duty over the full dt while the numerator covers only the capture — the note says the fraction under-reports. " +
 			"NEXT: measure one period (edge_i of consecutive same-direction edges) → freq_hz is the line's rate; compare against xuansi_la_hist's est_baud for the population view. Daemon-local: no lease, no board contact.",
 	}, ts.laMeasure)
 
