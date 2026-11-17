@@ -321,6 +321,73 @@ func goldenRing() []byte {
 
 func goldenPayload() int64 { return int64(len(ringA) + len(ringBig) + len(ringC)) }
 
+// TestSubscribeLADoneNeverDrops (minors wave): done events are the
+// pull's only completion signal — their delivery BLOCKS when the
+// 512-slot queue is full instead of dropping (a dropped done degraded
+// the wait into a request-ceiling timeout with a guessed cause), while
+// the droppable kinds keep the never-block discipline on a full queue.
+func TestSubscribeLADoneNeverDrops(t *testing.T) {
+	b := newBoard(nil)
+	evCh, cancel := subscribeLA(b)
+	defer cancel()
+
+	// fill the queue to its brim with progress events — all land
+	for i := 0; i < evQueue; i++ {
+		b.push("la", map[string]any{"event": "progress", "cap": 7})
+	}
+	// a further progress event still never blocks: it drops silently
+	delivered := make(chan struct{})
+	go func() {
+		b.push("la", map[string]any{"event": "progress", "cap": 7})
+		close(delivered)
+	}()
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a progress event blocked on a full queue — the droppable kinds must stay non-blocking")
+	}
+
+	// the done event BLOCKS until a consumer drains — it can never be
+	// the dropped completion signal
+	blocked := make(chan struct{})
+	go func() {
+		b.push("la", map[string]any{"event": "done", "cap": 7})
+		close(blocked)
+	}()
+	select {
+	case <-blocked:
+		t.Fatal("the done delivery completed without a consumer — it must block rather than drop")
+	case ev := <-evCh: // a drain frees it
+		if ev.Data["event"] != "progress" {
+			t.Fatalf("first drained = %#v, want a progress fill", ev.Data)
+		}
+	}
+
+	// the freed slot took the done: the blocked push completes, and
+	// the done sits at the queue's TAIL — past the remaining progress
+	// fills, exactly where the waiter's drain finds it
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the blocked done push never completed after its delivery")
+	}
+	for i := 0; i < evQueue-1; i++ {
+		ev := <-evCh
+		if ev.Data["event"] != "progress" {
+			t.Fatalf("drain %d = %#v, want the progress fill", i, ev.Data)
+		}
+	}
+	select {
+	case ev := <-evCh:
+		capN, _ := anyI(ev.Data["cap"])
+		if ev.Data["event"] != "done" || capN != 7 {
+			t.Fatalf("tail = %#v, want the done for cap 7", ev.Data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the done never landed in the queue")
+	}
+}
+
 func TestPullCaptureHappyPath(t *testing.T) {
 	ring := goldenRing()
 	sum := sha256.Sum256(ring)

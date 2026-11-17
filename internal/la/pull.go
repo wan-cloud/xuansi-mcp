@@ -44,7 +44,9 @@ const endOfIntentBound = 5 * time.Second
 // evQueue bounds the pull's event backlog. Progress is throttled by
 // the fw (≥32KB or ≥5s — a full 4MB ring draws ≤~130), so a 512-slot
 // buffer always leaves room for the one done the wait rides on; the
-// handler itself never blocks (the OnEvent discipline).
+// handler never blocks for the droppable kinds (the OnEvent
+// discipline) — done deliveries are the one blocking exception (see
+// subscribeLA: the completion signal may never drop).
 const evQueue = 512
 
 // Board is the pull's connection seam. Production is the daemon's
@@ -257,11 +259,27 @@ func (s *Store) PullCapture(ctx context.Context, board PullBoard, armArgs ArmArg
 
 // subscribeLA arms the pull families' local "la" event handler (the
 // shared step 2: registered BEFORE arm — a done pushed during the arm
-// op's own round trip is already queued when the wait starts; the
-// handler itself never blocks the connection's read goroutine).
+// op's own round trip is already queued when the wait starts). The
+// handler itself never blocks the connection's read goroutine for the
+// droppable kinds — EXCEPT done (minors wave): a dropped done degrades
+// the wait into a request-ceiling timeout with a guessed cause (the
+// pull would land incomplete on a capture that actually finished), so
+// done deliveries BLOCK. The block is safe by construction: a waiter
+// (waitDone / streamLive) is always draining by the time one matters,
+// and the queue cannot reach its 512 slots without one — the fw
+// throttles progress to ≥32KB-or-≥5s per event and caps the whole
+// ring budget at 4096KB (≤~130 progress events per full budget across
+// every live capture), so a full queue of non-done events ahead of a
+// done cannot exist on an honest board; the wedge would need a
+// fast-pathological fw, which the dead-link poll already catches from
+// the waiter's side.
 func subscribeLA(conn Board) (chan replclient.Event, func()) {
 	evCh := make(chan replclient.Event, evQueue)
 	cancel := conn.OnEvent("la", func(ev replclient.Event) {
+		if ev.Data["event"] == "done" {
+			evCh <- ev // the pull's only completion signal — never dropped
+			return
+		}
 		select {
 		case evCh <- ev:
 		default: // never block the connection's read goroutine
