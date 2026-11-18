@@ -51,7 +51,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -61,6 +60,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	xfetch "xuansi/internal/fetch"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -474,13 +474,10 @@ const (
 // production path ever assigns it (T3 review M1).
 var tcExtractMax int64 = 4 << 30
 
-// tcHTTP is the toolchain assets' client — deliberately NOT
-// fetchHTTP (the 60s index/artifact client): a wasi-sdk archive is
-// ~120MB (linux) to ~495MB (win) and a slow link legitimately takes
-// minutes. No client-level Timeout at all; the ONLY bound is the ctx
-// deadline toolchainFetch derives from timeout_sec (default 600s,
-// clamped to <=3600s), which cancels mid-body when it fires.
-var tcHTTP = &http.Client{}
+// tcHTTP retired with the fetch-core delegation: internal/fetch owns
+// asset transport now (its stall watchdog + the ctx deadline that
+// toolchainFetch derives from timeout_sec are the only bounds — a slow
+// link legitimately takes minutes, a hung one dies).
 
 // tcClampTimeoutSec: timeout_sec <=0 (unset, or nonsense-negative)
 // reads as the 600s default; anything above 3600 clamps down to it.
@@ -535,34 +532,16 @@ func tcPinComplete(a *tcAsset) bool {
 // staging dir, which the atomic sequence discards WHOLESALE on any
 // failure — on a mismatch w may hold the bad bytes for a moment, but
 // the CACHE (the rename targets, the state file) never receives one.
+// fetchTCArchive streams one pinned archive through the fetch core's
+// ranged-resume leg (dist wave D7: a dropped connection mid-118MB no
+// longer restarts from zero — the retry re-dials with a Range header;
+// a server that ignores Range restarts cleanly because w is always the
+// staged *os.File, a natural io.Seeker). The staging dir's atomic
+// sequence discards everything WHOLESALE on any failure — the CACHE
+// (the rename targets, the state file) never receives an unverified
+// byte.
 func fetchTCArchive(ctx context.Context, rawurl, wantSHA string, wantBytes, maxBytes int64, w io.Writer) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
-	if err != nil {
-		return err
-	}
-	res, err := tcHTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", res.StatusCode)
-	}
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(w, h), io.LimitReader(res.Body, maxBytes+1))
-	if err != nil {
-		return err
-	}
-	if n > maxBytes {
-		return fmt.Errorf("stream exceeds the %d-byte per-archive cap", maxBytes)
-	}
-	if n != wantBytes {
-		return fmt.Errorf("got %d bytes, index says %d", n, wantBytes)
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != strings.ToLower(wantSHA) {
-		return fmt.Errorf("sha256 %s != index %s", got, wantSHA)
-	}
-	return nil
+	return xfetch.Resume(ctx, rawurl, wantSHA, wantBytes, maxBytes, w, 0, xfetch.Options{})
 }
 
 // tcFilePerm is the extraction's file mode: 0644 as the rule, with

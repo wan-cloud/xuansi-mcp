@@ -19,8 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -28,11 +26,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"xuansi/internal/apiclient"
+	xfetch "xuansi/internal/fetch"
+	"xuansi/internal/paths"
 	"xuansi/internal/server"
 )
 
@@ -1081,9 +1080,10 @@ const (
 	fetchTotalMax = 8 << 20 // whole fetch
 )
 
-// fetchHTTP is the fetch leg's shared client — stdlib net/http only
-// (the repo's five-dependency whitelist stays five).
-var fetchHTTP = &http.Client{Timeout: 60 * time.Second}
+// fetchHTTP retired with the fetch-core delegation (dist wave D7/D8):
+// internal/fetch owns the client now — bounded retry, stall watchdog,
+// and (for the small-document legs) the persistent ETag cache under
+// StateDir()/http-cache.
 
 type driverFetchIn struct {
 	Name     string `json:"name" jsonschema:"module name from the index, lowercase [a-z0-9_-]+ (e.g. \"hello\", \"ledwatch\")"`
@@ -1203,30 +1203,17 @@ func fetchModuleMeta(ctx context.Context, iu *url.URL, name, ver string) (*modul
 	return &m, nil
 }
 
-// fetchGet GETs url with the fetch client, refusing bodies above max
-// (the index cap; for artifacts, declared bytes + 1 — a longer body is
-// a size mismatch, not a buffer).
+// fetchGet GETs url with the fetch core (bounded retry, stall
+// watchdog, and the persistent ETag cache under StateDir()/http-cache —
+// this is the small-document leg: index/meta/doc bodies), refusing
+// bodies above max (the index cap; for artifacts, declared bytes + 1 —
+// a longer body is a size mismatch, not a buffer).
 func fetchGet(ctx context.Context, url string, max int64) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
+	opt := xfetch.Options{}
+	if dir := paths.StateDir(); dir != "" {
+		opt.CacheDir = filepath.Join(dir, "http-cache")
 	}
-	res, err := fetchHTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", res.StatusCode)
-	}
-	b, err := io.ReadAll(io.LimitReader(res.Body, max+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(b)) > max {
-		return nil, fmt.Errorf("body exceeds %d bytes", max)
-	}
-	return b, nil
+	return xfetch.Get(ctx, url, max, opt)
 }
 
 // fetchRefPathOK gates one index file reference: repo-relative, no
