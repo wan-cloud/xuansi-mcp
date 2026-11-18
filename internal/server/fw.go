@@ -159,13 +159,41 @@ func (s *Server) hFwFetch(ctx context.Context, req *Request) (any, error) {
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", uerr)}
 	}
 	dst := filepath.Join(s.fwCacheDir, fmt.Sprintf("xuansi_fw-%s-%s.bin", m.FwVersion, m.FwBuild[:7]))
+	// dest (spec §4.3): the optional bare-basename demo copy — applied
+	// on BOTH exits (skip and download), O_EXCL, never overwriting
+	withDest := func(out map[string]any) (any, error) {
+		if req.Dest == "" {
+			return out, nil
+		}
+		if req.Dest != filepath.Base(req.Dest) || strings.ContainsAny(req.Dest, `/\`) || req.Dest == "." || req.Dest == ".." {
+			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: dest %q must be a bare basename (no path separators)", req.Dest)}
+		}
+		body, rerr := os.ReadFile(dst)
+		if rerr != nil {
+			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: dest: %v", rerr)}
+		}
+		target := filepath.Join(s.fwCacheDir, req.Dest)
+		f, oerr := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if oerr != nil {
+			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: dest %s: %v (exists? O_EXCL never overwrites)", req.Dest, oerr)}
+		}
+		if _, werr := f.Write(body); werr != nil {
+			f.Close()
+			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: dest: %v", werr)}
+		}
+		if cerr := f.Close(); cerr != nil {
+			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: dest: %v", cerr)}
+		}
+		out["dest"] = target
+		return out, nil
+	}
 	// the skip RE-VALIDATES the landed file against the manifest pins
 	// (final-review I3: a corrupted entry re-downloads — this is the
 	// file ota_push flashes, so a byte of doubt is a re-download)
 	if body, rerr := os.ReadFile(dst); rerr == nil && int64(len(body)) == m.BinBytes {
 		sum := sha256.Sum256(body)
 		if hex.EncodeToString(sum[:]) == strings.ToLower(m.BinSha256) {
-			return map[string]any{"path": dst, "downloaded": false, "manifest": fwManifestView(m)}, nil
+			return withDest(map[string]any{"path": dst, "downloaded": false, "manifest": fwManifestView(m)})
 		}
 	}
 	img, gerr := s.fetchBin(ctx, binURL, m)
@@ -203,7 +231,7 @@ func (s *Server) hFwFetch(ctx context.Context, req *Request) (any, error) {
 		os.Remove(tmp)
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", rerr)}
 	}
-	return map[string]any{"path": dst, "downloaded": true, "manifest": fwManifestView(m)}, nil
+	return withDest(map[string]any{"path": dst, "downloaded": true, "manifest": fwManifestView(m)})
 }
 
 // fetchBin downloads and sha-pins the image body (zero board contact,

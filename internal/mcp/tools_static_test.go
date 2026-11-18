@@ -1077,6 +1077,40 @@ func TestDriverFetchIndexVer2Gate(t *testing.T) {
 	}
 }
 
+// TestDriverFetchMissingShaRefusedZeroDownloads: a v2 entry whose
+// sha256 pin is absent/malformed is refused BEFORE any file download
+// (the final-review deferred minor — the hostile-index gate family's
+// one downloadable-then-refused sub-case, closed).
+func TestDriverFetchMissingShaRefusedZeroDownloads(t *testing.T) {
+	e, _, _ := newWsEnv(t, nil)
+	var hits atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.json", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, `{"index_ver":2,"modules":[{"name":"nopin","kind":"driver","version":"1.0.0","files":[`+
+			`{"url":"`+"https://example.com/nopin.wasm"+`","sha256":"","bytes":8}]}]}`)
+	})
+	mux.HandleFunc("/nopin.wasm", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, "12345678")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "nopin", "index_url": srv.URL + "/index.json"})
+	if !res.IsError {
+		t.Fatalf("sha-less entry accepted: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "sha256"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text %q, want it to contain %q", got, want)
+		}
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("HTTP hits = %d, want exactly 1 (the index only — refusal BEFORE any download)", n)
+	}
+}
+
 // TestDriverFetchURLSchemeGate: an entry url outside http(s) is
 // refused client-side before any download — a hostile index must not
 // steer other schemes (the toolchain asset-gate precedent, verbatim).

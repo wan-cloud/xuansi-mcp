@@ -21,8 +21,9 @@ type fwVersionsIn struct {
 }
 
 type fwFetchIn struct {
-	Version   string `json:"version,omitempty" jsonschema:"the pinned fw version (x.y.z); omit or \"latest\" rides the stable entry"`
+	Version   string `json:"version,omitempty" jsonschema:"the pinned fw version (x.y.z, optionally -rc.N); omit or \"latest\" rides the stable entry"`
 	SourceURL string `json:"source_url,omitempty" jsonschema:"the distribution root override (…/releases); omit for the default images repo wan-cloud/xuansi-fw-images"`
+	Dest      string `json:"dest,omitempty" jsonschema:"optional bare basename: also land a demo copy of the image beside the cache (O_EXCL — never overwrites; path separators are refused)"`
 }
 
 // registerFW adds the fw pair (the register seam lives in
@@ -47,7 +48,7 @@ func (ts *toolset) fwVersions(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 }
 
 func (ts *toolset) fwFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, in fwFetchIn) (*mcpsdk.CallToolResult, any, error) {
-	res, err := ts.call(ctx, server.Request{Type: "fw_fetch", Version: in.Version, URL: in.SourceURL})
+	res, err := ts.call(ctx, server.Request{Type: "fw_fetch", Version: in.Version, URL: in.SourceURL, Dest: in.Dest})
 	if err != nil {
 		return nil, nil, err
 	}

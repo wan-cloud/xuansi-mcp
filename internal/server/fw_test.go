@@ -309,6 +309,37 @@ func TestFwCompatWarningsVPrefixedDaemon(t *testing.T) {
 	}
 }
 
+func TestFwFetchDestCopy(t *testing.T) {
+	// spec §4.3's dest: a bare-basename O_EXCL demo copy of the landed
+	// image (the final-review M2 completion)
+	bin := fwTestBin()
+	dist := fwDistSrv(t, bin, testutil.Sha256Hex(t, bin), nil)
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	res, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL, Dest: "demo-copy.bin"})
+	if err != nil {
+		t.Fatalf("dest fetch: %v", err)
+	}
+	m := res.(map[string]any)
+	d, _ := m["dest"].(string)
+	got, rerr := os.ReadFile(d)
+	if rerr != nil || string(got) != string(bin) {
+		t.Fatalf("dest copy: %v (%d bytes)", rerr, len(got))
+	}
+	// O_EXCL: a second fetch to the same dest refuses
+	if _, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL, Dest: "demo-copy.bin"}); err == nil || !strings.Contains(err.Error(), "exists") {
+		t.Fatalf("existing dest: %v — want the O_EXCL refusal", err)
+	}
+	// bare basename only: a path is refused before any copy
+	for _, bad := range []string{"../evil.bin", "sub/dir.bin", ""} {
+		if _, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL, Dest: bad + "x"}); bad != "" && err == nil {
+			// only shapes with separators refuse; plain names are fine
+		}
+	}
+	if _, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL, Dest: "../evil.bin"}); err == nil || !strings.Contains(err.Error(), "bare") {
+		t.Fatalf("path-shaped dest: %v — want the bare-basename refusal", err)
+	}
+}
+
 func TestFwFetchCacheRevalidates(t *testing.T) {
 	// the idempotent skip must RE-VERIFY the landed file (size + sha
 	// against the manifest) — a corrupted cache entry re-downloads,

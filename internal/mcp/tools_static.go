@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1074,6 +1075,11 @@ func arr(v any) []any {
 // release CDN leg); the tree keeps the authoring copy only.
 const defaultIndexURL = "https://github.com/wan-cloud/xuansi-drivers/releases/latest/download/index.json"
 
+// fetchShaRe is the artifact-pin shape: 64 hex chars. A v2 entry
+// without a usable sha256 pin is refused BEFORE any download (the
+// hostile-index gate family — unpinned bytes never fetch).
+var fetchShaRe = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
 // fetch bounds: the index itself is capped (a runaway URL must not
 // buffer unbounded), each artifact is capped at 4 MiB (well past any
 // plausible module — and anything above the daemon's 1 MiB wire-frame
@@ -1387,6 +1393,9 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 		// namespace's vocabulary is [a-z0-9-]+ (esp32s3 style).
 		if f.Target != "" && !wsTargetRe.MatchString(f.Target) {
 			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares aot target %q failing the [a-z0-9-]+ gate — refusing (a hostile index must not steer the manifest's aot namespace)", in.Name, chosen.Version, f.URL, f.Target)
+		}
+		if !fetchShaRe.MatchString(f.Sha256) {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s pins no usable sha256 (%q — 64 hex required) — refusing to fetch unpinned bytes", in.Name, chosen.Version, f.URL, f.Sha256)
 		}
 		if f.Bytes <= 0 || f.Bytes > fetchFileMax {
 			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares %d bytes (outside 1..%d)", in.Name, chosen.Version, f.URL, f.Bytes, fetchFileMax)
