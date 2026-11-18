@@ -103,6 +103,24 @@ func fwDistSrv(t *testing.T, bin []byte, shaHex string, hits *atomic.Int64) *htt
 	return srv
 }
 
+func TestFwVersionsRootOverride(t *testing.T) {
+	// the url override is the distribution ROOT — fwRoot tolerates both
+	// the bare repo URL and the …/releases form; the manifest rides the
+	// stable latest entry either way (the HIL's attempt-1 catch).
+	bin := fwTestBin()
+	dist := fwDistSrv(t, bin, testutil.Sha256Hex(t, bin), nil)
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	for _, override := range []string{dist.URL, dist.URL + "/latest/download/manifest.json"} {
+		res, err := srv.hFwVersions(context.Background(), &Request{URL: override})
+		if err != nil {
+			t.Fatalf("fw_versions override %q: %v", override, err)
+		}
+		if latest := res.(map[string]any)["latest"].(map[string]any); latest["fw_version"] != "0.7.1" {
+			t.Errorf("override %q: latest = %v", override, latest)
+		}
+	}
+}
+
 func TestFwVersionsUpDownToDate(t *testing.T) {
 	bin := fwTestBin()
 	dist := fwDistSrv(t, bin, testutil.Sha256Hex(t, bin), nil)

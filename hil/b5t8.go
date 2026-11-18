@@ -89,6 +89,8 @@ func main() {
 		os.Exit(runB10T5(*attempt, *daemonBin, *runDir))
 	case "b10t8b":
 		os.Exit(runB10T8B(*attempt, *daemonBin, *runDir))
+	case "distwave":
+		os.Exit(runDistWave(*attempt, *daemonBin, *runDir))
 	case "b10t7aim":
 		os.Exit(runB10T7Aim(*round, *daemonBin, *runDir, *outDir))
 	case "b10t7":

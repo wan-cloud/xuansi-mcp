@@ -42,12 +42,11 @@ func (s *Server) fetchDoc(ctx context.Context, rawURL string, max int64) ([]byte
 }
 
 // hFwVersions: ro, zero board contact — the latest manifest × the
-// daemon's in-memory hello sightings, plus the compat warnings.
+// daemon's in-memory hello sightings, plus the compat warnings. The
+// url override is the distribution ROOT (repo or …/releases — fwRoot
+// tolerates both); the manifest rides the stable latest entry.
 func (s *Server) hFwVersions(ctx context.Context, req *Request) (any, error) {
-	raw := req.URL
-	if raw == "" {
-		raw = defaultFwManifestURL
-	}
+	raw := fwRoot(req.URL) + "/latest/download/manifest.json"
 	body, err := s.fetchDoc(ctx, raw, 1<<20)
 	if err != nil {
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_versions: manifest %s: %v", raw, err)}
@@ -108,8 +107,9 @@ func (s *Server) fwCompatWarnings(m *ota.FwManifest) []string {
 // fwRoot resolves the distribution root from a request override:
 // "" → the default images repo; a URL ending in /manifest.json
 // (the stable-entry shape) strips back to its root; anything else IS
-// the root (…/xuansi-fw-images/releases). Versioned manifest and bin
-// URLs derive from the root + the manifest's own fw_version.
+// the root verbatim — the documented override shape is the …/releases
+// path (…/xuansi-fw-images/releases). Versioned manifest and bin URLs
+// derive from the root + the request's tag.
 func fwRoot(raw string) string {
 	if raw == "" {
 		return strings.Replace(defaultFwManifestURL, "/latest/download/manifest.json", "", 1)
