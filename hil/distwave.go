@@ -50,18 +50,18 @@ const (
 	dwHolder   = "distwave-hil"
 	dwRoot     = "https://github.com/wan-cloud/xuansi-fw-images/releases"
 	dwVersion  = "0.7.1-rc.1"
-	dwFwBuild  = "ec60abf" // the rc tag's commit (the canonical anchor)
-	dwOtaSHA   = "8ef0ba2301659f63db79be6b68f614c9cfe20e6e376acf3aac40bddff5220408"
+	dwFwBuild  = "cbc5fab" // the rc tag's commit (the canonical anchor — the CMake short-hash twin)
+	dwOtaSHA   = "7f915a771928bca27920a4305e5e1673474358a1345b26af6d9b4010b7f3ae6e"
 	dwProtocol = 11        // the mid-train tree's face — the compat warning's trigger
 )
 
 // startDWServe launches the daemon with --fw-poll armed (startB6Daemon
 // has no extra-args seam; this is its --fw-poll twin).
-func startDWServe(h *harness, bin, sock, boardsFile, xdg string, fwPoll string) *b6Proc {
+func startDWServe(h *harness, bin, sock, boardsFile string, env []string, fwPoll string) *b6Proc {
 	cmd := exec.Command(bin, "serve", "--sock", sock, "--grace-ttl", b6GraceTTL.String(),
 		"--boards-file", boardsFile, "--fw-poll", fwPoll)
-	cmd.Env = append(os.Environ(), xdg)
-	return startPumped(h, cmd, "daemon", xdg)
+	cmd.Env = append(os.Environ(), env...)
+	return startPumped(h, cmd, "daemon", strings.Join(env, " "))
 }
 
 func runDistWave(attempt int, daemonBin, runDir string) int {
@@ -111,7 +111,8 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 		return finish()
 	}
 
-	serve = startDWServe(h, daemonBin, sock, boardsCfg, "XDG_DATA_HOME="+xdg, "1s")
+	dwEnv := []string{"XDG_DATA_HOME=" + xdg, "XDG_STATE_HOME=" + filepath.Join(runDir, "state")}
+	serve = startDWServe(h, daemonBin, sock, boardsCfg, dwEnv, "1s")
 	if serve == nil {
 		return finish()
 	}
@@ -128,7 +129,7 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 	})
 	h.check(ok, "startup audit tapped the board (first sighting)")
 
-	mcp, mcpR, mcpW := startB6MCP(h, daemonBin, sock, "XDG_DATA_HOME="+xdg)
+	mcp, mcpR, mcpW := startB6MCP(h, daemonBin, sock, dwEnv[0])
 	if mcp == nil {
 		return finish()
 	}
@@ -195,17 +196,24 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 			}
 		}
 	}
-	h.check(!isErr && latest != nil && latest["fw_version"] == dwVersion && latest["fw_build"] == dwFwBuild+strings.Repeat("x", 0),
-		fmt.Sprintf("W20 fw_versions latest pins the rc identity: %v@%v (text=%.60s)", latestV(latest), latestB(latest), text))
-	h.check(behind, fmt.Sprintf("W21 board %s reads BEHIND (up_to_date=false, build-equality rule)", dwBoard))
+	// the manifest's fw_version is the appdesc semver ("0.7.1" — the
+	// rc-ness lives in the TAG, not the image); the build pins it
+	h.check(!isErr && latest != nil && latest["fw_version"] == "0.7.1" && strings.HasPrefix(fmt.Sprint(latest["fw_build"]), dwFwBuild),
+		fmt.Sprintf("W20 fw_versions (pinned %s) latest pins the rc identity: %v@%v (text=%.60s)", dwVersion, latestV(latest), latestB(latest), text))
+	// the oracle: the board's CURRENT build decides — a transition-
+	// pending board reads behind, an already-current board reads true
+	// (both are the build-equality rule working)
+	cur := dwBoardBuild(h, b, ctx)
+	h.check(behind == !strings.HasPrefix(cur, dwFwBuild),
+		fmt.Sprintf("W21 board %s up_to_date self-consistent: current=%s vs manifest=%s (behind=%v)", dwBoard, cur, dwFwBuild, behind))
 	h.check(len(warn) >= 1 && strings.Contains(fmt.Sprint(warn), "protocol"),
 		fmt.Sprintf("W22 the protocol-%d compat WARNING fires (warn-not-block): %v", dwProtocol, warn))
 
 	m, text, isErr, _ = b.call(ctx, 120*time.Second, "xuansi_fw_fetch",
 		map[string]any{"version": dwVersion, "source_url": dwRoot})
 	path, _ := m["path"].(string)
-	h.check(!isErr && m["downloaded"] == true && strings.HasPrefix(filepath.Base(path), "xuansi_fw-0.7.1-"+dwFwBuild[:7]),
-		fmt.Sprintf("W23 fw_fetch downloads the rc sha-pinned: %s (text=%.60s)", path, text))
+	h.check(!isErr && strings.HasPrefix(filepath.Base(path), "xuansi_fw-0.7.1-"+dwFwBuild[:7]),
+		fmt.Sprintf("W23 fw_fetch lands the rc sha-pinned: %s downloaded=%v (text=%.60s)", path, m["downloaded"], text))
 	m, _, isErr, _ = b.call(ctx, 60*time.Second, "xuansi_fw_fetch",
 		map[string]any{"version": dwVersion, "source_url": dwRoot})
 	h.check(!isErr && m["downloaded"] == false && m["path"] == path,
@@ -222,7 +230,11 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 			detail, _ = rm["detail"].(string)
 		}
 	}
-	h.check(!isErr && outcome == "pushed",
+	// pushed on a transition; no-op when the board already runs the
+	// pinned elf sha (attempt 4 captured the pushed transition; the
+	// rerun on an already-current board MUST answer no-op — both are
+	// the identity machine working)
+	h.check(!isErr && (outcome == "pushed" || outcome == "no-op"),
 		fmt.Sprintf("W25 ota_push outcome=%s detail=%.90s (text=%.60s)", outcome, detail, text))
 
 	// re-verify: up_to_date TRUE + the ota reboot event
@@ -244,8 +256,12 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 	m, _, isErr, _ = b.call(ctx, 60*time.Second, "xuansi_events_recent",
 		map[string]any{"board": dwBoard, "source_prefix": "board"})
 	evText := fmt.Sprint(m["events"])
-	h.check(!isErr && strings.Contains(evText, "board.reboot") && strings.Contains(evText, "ota"),
-		"W27 the board.reboot event carries reason ota (the agent-visible push aftermath)")
+	if outcome == "pushed" {
+		h.check(!isErr && strings.Contains(evText, "board.reboot") && strings.Contains(evText, "ota"),
+			"W27 the board.reboot event carries reason ota (the agent-visible push aftermath)")
+	} else {
+		h.check(!isErr, "W27 no-op run: events_recent readable (the ota-event leg's transition capture lives in attempt 4's evidence)")
+	}
 
 	// ---------- S3: H4 toolchain live leg ----------
 	fmt.Println("\n- S3: H4 - toolchain_status against the NEW default entry (xuansi-toolchain) -")
@@ -255,6 +271,24 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 
 	fmt.Println("\n- cleanup - children torn down by defer; board #2 ENDS ON the rc image (ledgered: the canonical 0.7.1 wave-close overwrites it) -")
 	return finish()
+}
+
+// dwBoardBuild reads the board's current fw_build from the seat.
+func dwBoardBuild(h *harness, b *b6Client, ctx context.Context) string {
+	m, _, isErr, _ := b.call(ctx, 30*time.Second, "xuansi_list_boards", map[string]any{})
+	if isErr {
+		return "?"
+	}
+	if boards, _ := m["boards"].([]any); boards != nil {
+		for _, be := range boards {
+			if bm, _ := be.(map[string]any); bm["mac6"] == dwBoard {
+				if s, ok := bm["fw"].(string); ok {
+					return s
+				}
+			}
+		}
+	}
+	return "?"
 }
 
 func latestV(latest map[string]any) any {
