@@ -728,6 +728,9 @@ var staticToolsRequiredAudit = map[string][]string{
 	// opt-in).
 	"xuansi_ota_push":   {"boards", "path"},
 	"xuansi_ota_status": {"board"},
+	// dist wave D6: the fw pair — both fully optional (ro faces).
+	"xuansi_fw_versions": {},
+	"xuansi_fw_fetch":    {},
 	// LA 增強波 A (2026-11-17): the wave-2 octet. search names its
 	// kind (the pattern rides the kind); adjacent names its SUBJECT
 	// channel (the account speaks its side); align names both
@@ -1125,7 +1128,7 @@ func TestDriverFetchMissingURLRefused(t *testing.T) {
 // by this face.
 func TestModuleDocV2MetaLeg(t *testing.T) {
 	e, _, _ := newWsEnv(t, nil)
-	meta := `{"name":"metamod","version":"1.0.0","release":"production","doc":{"ops":[`+
+	meta := `{"name":"metamod","version":"1.0.0","release":"production","doc":{"ops":[` +
 		`{"name":"ping","args":"-","result":"-","semantics":"v2 leg"}]}}`
 	var hits atomic.Int64
 	mux := http.NewServeMux()

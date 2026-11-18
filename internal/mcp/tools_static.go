@@ -473,6 +473,8 @@ var staticToolNames = []string{
 	// read (47 now — appended, nothing renumbers).
 	"xuansi_ota_push",
 	"xuansi_ota_status",
+	"xuansi_fw_versions",
+	"xuansi_fw_fetch",
 	// LA 增強波 A (2026-11-17): the second analysis batch — the
 	// pattern search, the activity map, the universal bit decoder,
 	// the cross-channel accompaniment, the glitch account, the eye
@@ -660,6 +662,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	// T7 (OTA ops wave): the fleet push + the live state read.
 	ts.registerOTA(srv)
+	ts.registerFW(srv)
 }
 
 // ---------------------------------------------------------------------------

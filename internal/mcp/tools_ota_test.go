@@ -35,12 +35,12 @@ func TestOTAToolsServed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lr.Tools) != 55 {
+	if len(lr.Tools) != 57 {
 		names := make([]string, 0, len(lr.Tools))
 		for _, tool := range lr.Tools {
 			names = append(names, tool.Name)
 		}
-		t.Fatalf("tools/list serves %d tools, want exactly 55 (the OTA pair on top of 45, then the LA wave-2 octet): %v", len(lr.Tools), names)
+		t.Fatalf("tools/list serves %d tools, want exactly 57 (the OTA pair + the LA octet + the fw pair on top of 45): %v", len(lr.Tools), names)
 	}
 	schema := map[string]map[string]bool{}
 	for _, tool := range lr.Tools {
