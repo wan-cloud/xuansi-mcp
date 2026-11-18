@@ -28,7 +28,7 @@ import (
 // stream: every fw tag's release carries manifest.json).
 const defaultFwManifestURL = "https://github.com/wan-cloud/xuansi-fw-images/releases/latest/download/manifest.json"
 
-var fwVerRe = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+var fwVerRe = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$`)
 
 // fetchDoc is the small-document leg (manifest): the fetch core with
 // the shared persistent ETag cache, so repeated fw_versions calls and
@@ -126,11 +126,13 @@ func fwRoot(raw string) string {
 func (s *Server) hFwFetch(ctx context.Context, req *Request) (any, error) {
 	root := fwRoot(req.URL)
 	manifestURL := root + "/latest/download/manifest.json"
+	tag := ""
 	ver := req.Version
 	if ver != "" && ver != "latest" {
 		if !fwVerRe.MatchString(ver) {
-			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: version %q must be x.y.z or \"latest\"", ver)}
+			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: version %q must be x.y.z (optionally -rc.N) or \"latest\"", ver)}
 		}
+		tag = ver // the request's tag verbatim — an rc tag serves the same layout
 		manifestURL = root + "/download/v" + ver + "/manifest.json"
 	}
 	body, err := s.fetchDoc(ctx, manifestURL, 1<<20)
@@ -141,7 +143,10 @@ func (s *Server) hFwFetch(ctx context.Context, req *Request) (any, error) {
 	if perr != nil {
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: manifest %s: %v", manifestURL, perr)}
 	}
-	binURL := root + "/download/v" + m.FwVersion + "/xuansi_fw.bin"
+	if tag == "" {
+		tag = m.FwVersion // latest: the manifest's own identity names its tag
+	}
+	binURL := root + "/download/v" + tag + "/xuansi_fw.bin"
 	if _, uerr := url.Parse(binURL); uerr != nil {
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", uerr)}
 	}

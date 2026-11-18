@@ -215,6 +215,31 @@ func TestFwFetchShaPinnedRefusal(t *testing.T) {
 	}
 }
 
+func TestFwFetchRcTagPinned(t *testing.T) {
+	// ④b: a prerelease TAG (v0.7.1-rc.1) serves the same asset layout;
+	// the manifest's fw_version stays the strict appdesc semver
+	// ("0.7.1") — the bin URL must ride the REQUEST's tag, not the
+	// manifest's version, or the rc fetch 404s.
+	bin := fwTestBin()
+	manifest := fmt.Sprintf(fwTestManifest, testutil.Sha256Hex(t, bin), len(bin))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/download/v0.7.1-rc.1/manifest.json", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, manifest) })
+	mux.HandleFunc("/download/v0.7.1/xuansi_fw.bin", func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("bin fetched from the manifest-version tag, not the request tag")
+	})
+	mux.HandleFunc("/download/v0.7.1-rc.1/xuansi_fw.bin", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(bin) })
+	dist := httptest.NewServer(mux)
+	t.Cleanup(dist.Close)
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	res, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1-rc.1", URL: dist.URL})
+	if err != nil {
+		t.Fatalf("rc fetch: %v", err)
+	}
+	if m := res.(map[string]any); m["downloaded"] != true {
+		t.Fatalf("rc fetch: %+v", m)
+	}
+}
+
 func TestFwUpdateAnnotationInBoardView(t *testing.T) {
 	behind := &ota.FwManifest{FwVersion: "0.7.1", FwBuild: "aaaabbbb", ProtocolVer: 10, MinDaemon: "0.6.0"}
 	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
