@@ -45,19 +45,22 @@ func isHex64(s string) bool {
 	return true
 }
 
-// semverOK is the loose x.y.z shape check (numbers only) — the compat
-// comparison itself is server-side.
+// semverOK is the strict x.y.z shape check: exactly three parts, each
+// 1..9 digits (no v prefix, no spaces, no empty middles — the
+// final-review I1 fix: the old digit loop only ran for empty/>9-char
+// parts, letting "x.y.z" and "v0.7.1" through).
 func semverOK(s string) bool {
 	parts := strings.Split(s, ".")
 	if len(parts) != 3 {
 		return false
 	}
 	for _, p := range parts {
-		if p == "" || len(p) > 9 {
-			for _, c := range p {
-				if c < '0' || c > '9' {
-					return false
-				}
+		if len(p) == 0 || len(p) > 9 {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
 			}
 		}
 	}

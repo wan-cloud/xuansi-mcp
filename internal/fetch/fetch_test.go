@@ -74,19 +74,23 @@ func TestGetHonorsRetryAfter(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits.Add(1) == 1 {
-			w.Header().Set("Retry-After", "0")
+			w.Header().Set("Retry-After", "1") // a REAL server-directed second
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
 		fmt.Fprint(w, "ok")
 	}))
 	defer srv.Close()
+	t0 := time.Now()
 	b, err := Get(context.Background(), srv.URL, 1<<20, fastOpt())
 	if err != nil {
 		t.Fatalf("want success after 429, got %v", err)
 	}
 	if string(b) != "ok" || hits.Load() != 2 {
 		t.Fatalf("body %q hits %d", b, hits.Load())
+	}
+	if gap := time.Since(t0); gap < 900*time.Millisecond {
+		t.Fatalf("inter-attempt gap %v — Retry-After: 1 was not honored", gap)
 	}
 }
 
@@ -117,6 +121,39 @@ func TestGet304HitsCache(t *testing.T) {
 	}
 	if ok200.Load() != 1 || notMod.Load() != 1 || !sawINM.Load().(bool) {
 		t.Fatalf("200s=%d 304s=%d inmSeen=%v", ok200.Load(), notMod.Load(), sawINM.Load())
+	}
+}
+
+func TestGet304UnreadableDegradesWithRetries1(t *testing.T) {
+	// the cache must never be the reason a fetch fails: a 304 whose
+	// body file vanished degrades to a plain GET WITHIN the attempt —
+	// even a Retries:1 caller succeeds (final-review M3)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Etag", `"v1"`)
+		fmt.Fprint(w, "payload")
+	}))
+	defer srv.Close()
+	opt := fastOpt()
+	opt.CacheDir = t.TempDir()
+	opt.Retries = 1
+	b1, err := Get(context.Background(), srv.URL, 1<<20, opt)
+	if err != nil || string(b1) != "payload" {
+		t.Fatalf("prime: %v %q", err, b1)
+	}
+	// vanish every body blob: the next 304 cannot be served from disk
+	ents, _ := os.ReadDir(opt.CacheDir)
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".bin") {
+			_ = os.Remove(filepath.Join(opt.CacheDir, e.Name()))
+		}
+	}
+	b2, err := Get(context.Background(), srv.URL, 1<<20, opt)
+	if err != nil || string(b2) != "payload" {
+		t.Fatalf("unreadable 304 with Retries=1 must degrade to plain GET: %v %q", err, b2)
 	}
 }
 

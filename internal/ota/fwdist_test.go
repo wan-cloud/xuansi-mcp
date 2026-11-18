@@ -39,6 +39,11 @@ func TestParseFwManifestInvalid(t *testing.T) {
 		{"over cap", `"bin_bytes": 99999999`, "bin"},
 		{"zero protocol", `"protocol_ver": 0`, "protocol_ver"},
 		{"bad min_daemon", `"min_daemon": "x.y"`, "min_daemon"},
+		{"letters version", `"fw_version": "x.y.z"`, "fw_version"},
+		{"v-prefixed version", `"fw_version": "v0.7.1"`, "fw_version"},
+		{"empty middle part", `"fw_version": "0..1"`, "fw_version"},
+		{"trailing space", `"fw_version": "0.7.1 "`, "fw_version"},
+		{"v-prefixed min_daemon", `"min_daemon": "v1.2.3"`, "min_daemon"},
 	}
 	for _, b := range bad {
 		body := `{"fw_version":"0.7.1","fw_build":"abc1234def56789abc1234def56789abc1234def","protocol_ver":10,` +
@@ -52,6 +57,9 @@ func TestParseFwManifestInvalid(t *testing.T) {
 			"bad bin sha": `"bin_sha256":"ebe70c1997d9706872f2f32f09dcfc871ac1a45a192efd7b0ff9f8bb32b06f46"`,
 			"zero bytes":  `"bin_bytes":1514024`, "over cap": `"bin_bytes":1514024`,
 			"zero protocol": `"protocol_ver":10`, "bad min_daemon": `"min_daemon":"0.6.0"`,
+			"letters version": `"fw_version":"0.7.1"`, "v-prefixed version": `"fw_version":"0.7.1"`,
+			"empty middle part": `"fw_version":"0.7.1"`, "trailing space": `"fw_version":"0.7.1"`,
+			"v-prefixed min_daemon": `"min_daemon":"0.6.0"`,
 		}[b.name]
 		if b.name == "over cap" {
 			body = strings.Replace(body, `"bin_bytes":1514024`, `"bin_bytes":99999999`, 1)

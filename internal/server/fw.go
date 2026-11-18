@@ -100,7 +100,7 @@ func (s *Server) fwCompatWarnings(m *ota.FwManifest) []string {
 	if m.ProtocolVer > ota.SupportedProtocolVer {
 		w = append(w, fmt.Sprintf("manifest protocol_ver %d exceeds this daemon's supported face %d — flashing it may leave THIS toolchain unable to manage the board (fw_versions cannot reconcile a face it does not speak)", m.ProtocolVer, ota.SupportedProtocolVer))
 	}
-	v := s.daemonVersion
+	v := strings.TrimPrefix(s.daemonVersion, "v") // a raw-describe stamp may carry the tag prefix (make strips it; hand builds may not)
 	if !fwVerRe.MatchString(v) {
 		w = append(w, fmt.Sprintf("daemon version unknown (%q — a dev build); min_daemon %s cannot be checked here", v, m.MinDaemon))
 		return w
@@ -114,9 +114,10 @@ func (s *Server) fwCompatWarnings(m *ota.FwManifest) []string {
 // fwRoot resolves the distribution root from a request override:
 // "" → the default images repo; a URL ending in /manifest.json
 // (the stable-entry shape) strips back to its root; anything else IS
-// the root verbatim — the documented override shape is the …/releases
-// path (…/xuansi-fw-images/releases). Versioned manifest and bin URLs
-// derive from the root + the request's tag.
+// the root verbatim — the override shape is the …/releases path
+// (…/xuansi-fw-images/releases; a bare repo URL is a 404 here — pass
+// the releases path). Versioned manifest and bin URLs derive from the
+// root + the request's tag.
 func fwRoot(raw string) string {
 	if raw == "" {
 		return strings.Replace(defaultFwManifestURL, "/latest/download/manifest.json", "", 1)
@@ -158,8 +159,14 @@ func (s *Server) hFwFetch(ctx context.Context, req *Request) (any, error) {
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", uerr)}
 	}
 	dst := filepath.Join(s.fwCacheDir, fmt.Sprintf("xuansi_fw-%s-%s.bin", m.FwVersion, m.FwBuild[:7]))
-	if _, serr := os.Stat(dst); serr == nil {
-		return map[string]any{"path": dst, "downloaded": false, "manifest": fwManifestView(m)}, nil
+	// the skip RE-VALIDATES the landed file against the manifest pins
+	// (final-review I3: a corrupted entry re-downloads — this is the
+	// file ota_push flashes, so a byte of doubt is a re-download)
+	if body, rerr := os.ReadFile(dst); rerr == nil && int64(len(body)) == m.BinBytes {
+		sum := sha256.Sum256(body)
+		if hex.EncodeToString(sum[:]) == strings.ToLower(m.BinSha256) {
+			return map[string]any{"path": dst, "downloaded": false, "manifest": fwManifestView(m)}, nil
+		}
 	}
 	img, gerr := s.fetchBin(ctx, binURL, m)
 	if gerr != nil {
@@ -168,11 +175,32 @@ func (s *Server) hFwFetch(ctx context.Context, req *Request) (any, error) {
 	if merr := os.MkdirAll(s.fwCacheDir, 0o755); merr != nil {
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", merr)}
 	}
-	tmp := dst + ".tmp"
-	if werr := os.WriteFile(tmp, img, 0o644); werr != nil {
+	// durable landing (I3): a UNIQUE temp (concurrent same-version
+	// fetches from two daemon connections cannot interleave on a
+	// shared fixed name), fsync before the rename — the post-rename
+	// page-cache window must not hand a truncated image to a future
+	// skip
+	tmpf, terr := os.CreateTemp(s.fwCacheDir, ".fwfetch-*")
+	if terr != nil {
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", terr)}
+	}
+	tmp := tmpf.Name()
+	if _, werr := tmpf.Write(img); werr != nil {
+		tmpf.Close()
+		os.Remove(tmp)
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", werr)}
 	}
+	if serr := tmpf.Sync(); serr != nil {
+		tmpf.Close()
+		os.Remove(tmp)
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", serr)}
+	}
+	if cerr := tmpf.Close(); cerr != nil {
+		os.Remove(tmp)
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", cerr)}
+	}
 	if rerr := os.Rename(tmp, dst); rerr != nil {
+		os.Remove(tmp)
 		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_fetch: %v", rerr)}
 	}
 	return map[string]any{"path": dst, "downloaded": true, "manifest": fwManifestView(m)}, nil

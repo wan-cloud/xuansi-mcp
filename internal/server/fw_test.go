@@ -285,6 +285,68 @@ func TestFwFetchRcTagPinned(t *testing.T) {
 	}
 }
 
+func TestFwCompatWarningsVPrefixedDaemon(t *testing.T) {
+	// a hand-built daemon stamped with the raw describe form ("v0.6.0")
+	// still gets the min_daemon verdict, not the unknown label (the
+	// final-review I2 belt — make-built binaries strip the v, raw
+	// describe builds do not)
+	bin := fwTestBin()
+	raised := strings.Replace(fmt.Sprintf(fwTestManifest, testutil.Sha256Hex(t, bin), len(bin)),
+		`"min_daemon": "0.6.0"`, `"min_daemon": "0.7.0"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/latest/download/manifest.json", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, raised) })
+	dist := httptest.NewServer(mux)
+	t.Cleanup(dist.Close)
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "x"))
+	srv.daemonVersion = "v0.6.0"
+	res, err := srv.hFwVersions(context.Background(), &Request{URL: dist.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := res.(map[string]any)["warnings"].([]string)
+	if len(w) != 1 || strings.Contains(w[0], "unknown") || !strings.Contains(w[0], "below the manifest") {
+		t.Fatalf("warnings = %v, want the below-min_daemon verdict (not the unknown label) for a v-prefixed daemon version", w)
+	}
+}
+
+func TestFwFetchCacheRevalidates(t *testing.T) {
+	// the idempotent skip must RE-VERIFY the landed file (size + sha
+	// against the manifest) — a corrupted cache entry re-downloads,
+	// never hands the agent the bad path (final-review I3)
+	bin := fwTestBin()
+	dist := fwDistSrv(t, bin, testutil.Sha256Hex(t, bin), nil)
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	res, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL})
+	if err != nil || res.(map[string]any)["downloaded"] != true {
+		t.Fatalf("first fetch: %v %+v", err, res)
+	}
+	p := res.(map[string]any)["path"].(string)
+	bad := append([]byte(nil), bin...)
+	bad[100] ^= 0xff
+	if err := os.WriteFile(p, bad, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL})
+	if err != nil {
+		t.Fatalf("re-fetch after corruption: %v", err)
+	}
+	m2 := res2.(map[string]any)
+	if m2["downloaded"] != true {
+		t.Fatalf("corrupted cache entry must re-download, got %+v", m2)
+	}
+	got, _ := os.ReadFile(p)
+	if string(got) != string(bin) {
+		t.Fatalf("cache repaired: %d bytes", len(got))
+	}
+	// no temp residue from the durable landing
+	ents, _ := os.ReadDir(filepath.Dir(p))
+	for _, e := range ents {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Fatalf("temp residue: %s", e.Name())
+		}
+	}
+}
+
 func TestFwUpdateAnnotationInBoardView(t *testing.T) {
 	behind := &ota.FwManifest{FwVersion: "0.7.1", FwBuild: "aaaabbbb", ProtocolVer: 10, MinDaemon: "0.6.0"}
 	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))

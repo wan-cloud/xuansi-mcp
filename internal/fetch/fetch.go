@@ -135,8 +135,11 @@ func getOnce(ctx context.Context, u *url.URL, maxBytes int64, stall time.Duratio
 	case res.StatusCode == http.StatusNotModified && ent != nil:
 		b, rerr := cache.readBody(*ent)
 		if rerr != nil {
-			cache.drop(u.String()) // stale entry: fall back to a plain GET
-			return nil, true, 0, fmt.Errorf("fetch %s: cache entry unreadable (%v) — retrying uncached", u, rerr)
+			// the cache must never be the reason a fetch fails (M3):
+			// drop the stale entry and answer THIS attempt with a
+			// plain GET — even a Retries:1 caller succeeds
+			cache.drop(u.String())
+			return getOnce(ctx, u, maxBytes, stall, cache)
 		}
 		return b, false, 0, nil
 	case res.StatusCode >= 500 || res.StatusCode == 429:

@@ -4551,7 +4551,7 @@ func TestWriteLoopOversizeReplyHonestError(t *testing.T) {
 	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
 	f := e.fakes["d75884"]
 	f.on("log.read", func(args map[string]any) (map[string]any, *replclient.OpError) {
-		return map[string]any{"log": strings.Repeat("L", MaxMsgBytes+ (1<<20))}, nil
+		return map[string]any{"log": strings.Repeat("L", MaxMsgBytes+(1<<20))}, nil
 	})
 	c := dialSock(t, e.sock)
 	if rep, _ := c.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "p8b"}); rep["error"] != nil {

@@ -61,6 +61,9 @@ func (c *etagCache) readBody(e cacheEntry) ([]byte, error) {
 func (c *etagCache) drop(rawURL string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if e, ok := c.m[rawURL]; ok {
+		_ = os.Remove(filepath.Join(c.dir, e.File)) // no orphaned body either
+	}
 	delete(c.m, rawURL)
 	c.persistLocked()
 }
@@ -86,7 +89,7 @@ func (c *etagCache) store(rawURL, etag string, body []byte) {
 		return
 	}
 	c.m[rawURL] = cacheEntry{ETag: etag, File: name, Bytes: int64(len(body)), Saved: time.Now().UTC()}
-	for len(c.m) > etagMaxTables { // overflow: evict the oldest entry
+	for len(c.m) > etagMaxTables { // overflow: evict the oldest entry (body included)
 		var oldestKey string
 		var oldest time.Time
 		first := true
@@ -94,6 +97,9 @@ func (c *etagCache) store(rawURL, etag string, body []byte) {
 			if first || e.Saved.Before(oldest) {
 				oldestKey, oldest, first = k, e.Saved, false
 			}
+		}
+		if e, ok := c.m[oldestKey]; ok {
+			_ = os.Remove(filepath.Join(c.dir, e.File))
 		}
 		delete(c.m, oldestKey)
 	}
