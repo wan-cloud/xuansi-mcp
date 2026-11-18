@@ -1064,10 +1064,12 @@ func arr(v any) []any {
 // xuansi_driver_fetch (B10 task 5: the fetch leg — module index → the
 // daemon-side driver workspace)
 
-// defaultIndexURL is the public driver-module index (task 3's repo,
-// wan-cloud/xuansi-drivers, live): index.json at the root,
-// modules/<name>/<ver>/ artifacts at repo-relative paths.
-const defaultIndexURL = "https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/index.json"
+// defaultIndexURL is the public driver-module index entry (dist wave
+// D1/D2): the drivers repo's release face — every release carries a
+// regenerated index.json, and this stable permalink always answers
+// from the most recent one. Entries carry ABSOLUTE asset urls (the
+// release CDN leg); the tree keeps the authoring copy only.
+const defaultIndexURL = "https://github.com/wan-cloud/xuansi-drivers/releases/latest/download/index.json"
 
 // fetch bounds: the index itself is capped (a runaway URL must not
 // buffer unbounded), each artifact is capped at 4 MiB (well past any
@@ -1088,7 +1090,7 @@ const (
 type driverFetchIn struct {
 	Name     string `json:"name" jsonschema:"module name from the index, lowercase [a-z0-9_-]+ (e.g. \"hello\", \"ledwatch\")"`
 	Version  string `json:"version,omitempty" jsonschema:"omit to fetch the index's HIGHEST version of the name; an explicit value picks exactly it"`
-	IndexURL string `json:"index_url,omitempty" jsonschema:"the index.json URL; omit for the default https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/index.json"`
+	IndexURL string `json:"index_url,omitempty" jsonschema:"the index.json URL; omit for the default https://github.com/wan-cloud/xuansi-drivers/releases/latest/download/index.json"`
 }
 
 // fetchFileOut is one landed artifact's record.
@@ -1113,9 +1115,13 @@ type driverFetchOut struct {
 	Bytes int            `json:"bytes" jsonschema:"total stored bytes across files"`
 }
 
-// fetchIndex / fetchModule / fetchFileRef mirror task 3's index schema
-// (index_ver 1): one entry per module version; files are repo-relative
-// references with sha256 + byte count.
+// fetchIndex / fetchModule / fetchFileRef mirror the drivers index
+// schema v2 (dist wave D1 — the clean cut): one entry per module
+// version; files are ABSOLUTE release-asset urls with sha256 + byte
+// count (the path leg is retired — no old daemon carries it); the
+// entry itself carries the version's doc pins (schema-carried forward
+// fields — no current face downloads doc.md) and the optional
+// absolute meta_url module_doc's GitHub fallback reads.
 type fetchIndex struct {
 	IndexVer int           `json:"index_ver"`
 	Modules  []fetchModule `json:"modules"`
@@ -1126,10 +1132,20 @@ type fetchModule struct {
 	Kind    string         `json:"kind"`
 	Version string         `json:"version"`
 	Files   []fetchFileRef `json:"files"`
+	// DocURL/DocSha256/DocBytes are the version's doc.md release-asset
+	// pins — carried in the schema for the faces that will serve the
+	// raw doc; no current face downloads or verifies them (module_doc
+	// serves the META, not the markdown).
+	DocURL    string `json:"doc_url,omitempty"`
+	DocSha256 string `json:"doc_sha256,omitempty"`
+	DocBytes  int64  `json:"doc_bytes,omitempty"`
+	// MetaURL is the version's meta.json asset (the doc.md extractor's
+	// output) — presence-tolerant exactly as the path-era meta was.
+	MetaURL string `json:"meta_url,omitempty"`
 }
 
 type fetchFileRef struct {
-	Path   string `json:"path"`
+	URL    string `json:"url"`
 	Sha256 string `json:"sha256"`
 	Bytes  int64  `json:"bytes"`
 	// Target (P3-T12's index face, consumed P3-T13): the aot target a
@@ -1179,26 +1195,25 @@ type moduleMetaDoc struct {
 	} `json:"footprint"`
 }
 
-// fetchModuleMeta pulls the version's meta.json, best-effort by
-// PRESENCE (a 404 or any transport failure from a pre-restructure
-// index is the honest no-meta shape — the version stores without
-// doc/footprint/release), hard by INTEGRITY (a body that arrives but
-// is not valid JSON refuses the fetch: the drivers CI locks meta↔
-// index↔artifacts three-way, so a present-but-garbage meta is drift,
-// not shape evolution; extra unknown keys stay ignored).
-func fetchModuleMeta(ctx context.Context, iu *url.URL, name, ver string) (*moduleMetaDoc, error) {
-	ref := fmt.Sprintf("modules/%s/%s/%s.meta.json", name, ver, name)
-	fu, ferr := iu.Parse(ref)
-	if ferr != nil || fu.Scheme != iu.Scheme || fu.Host != iu.Host {
-		return nil, nil // the conventional path does not resolve in-origin: no meta to read
+// fetchModuleMetaURL pulls the version's meta.json by its absolute
+// meta_url, best-effort by PRESENCE (a 404 or any transport failure
+// from a pre-restructure index is the honest no-meta shape — the
+// version stores without doc/footprint/release), hard by INTEGRITY (a
+// body that arrives but is not valid JSON refuses the fetch: the
+// drivers CI locks meta↔index↔artifacts three-way, so a present-but-
+// garbage meta is drift, not shape evolution; extra unknown keys stay
+// ignored).
+func fetchModuleMetaURL(ctx context.Context, name, ver, metaURL string) (*moduleMetaDoc, error) {
+	if metaURL == "" {
+		return nil, nil
 	}
-	body, derr := fetchGet(ctx, fu.String(), fetchIndexMax)
+	body, derr := fetchGet(ctx, metaURL, fetchIndexMax)
 	if derr != nil {
 		return nil, nil // absent/unreachable: tolerated, no meta recorded
 	}
 	var m moduleMetaDoc
 	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, errWs("xuansi_driver_fetch %s@%s: %s: not valid JSON: %v — the index serves a malformed meta (the drivers CI locks meta↔index; this is drift), refusing the fetch", name, ver, ref, err)
+		return nil, errWs("xuansi_driver_fetch %s@%s: %s: not valid JSON: %v — the index serves a malformed meta (the drivers CI locks meta↔index; this is drift), refusing the fetch", name, ver, metaURL, err)
 	}
 	return &m, nil
 }
@@ -1216,13 +1231,9 @@ func fetchGet(ctx context.Context, url string, max int64) ([]byte, error) {
 	return xfetch.Get(ctx, url, max, opt)
 }
 
-// fetchRefPathOK gates one index file reference: repo-relative, no
-// traversal, no backslash, no NUL — a hostile index must not steer the
-// fetch outside its own origin.
-func fetchRefPathOK(p string) bool {
-	return p != "" && !strings.HasPrefix(p, "/") && !strings.Contains(p, "..") &&
-		!strings.Contains(p, "\\") && !strings.Contains(p, "\x00")
-}
+// fetchRefPathOK retired with the index_ver 2 clean cut (D1): entries
+// pin absolute http(s) urls now — the scheme gate replaces the
+// repo-relative path gate.
 
 // cmpVer orders dotted version strings: segments compare numerically
 // when both parse ("1.10.0" > "1.2.0"), lexically otherwise
@@ -1300,8 +1311,8 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 	if err := json.Unmarshal(body, &idx); err != nil {
 		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: index %s: not valid JSON: %v", raw, err)
 	}
-	if idx.IndexVer != 1 {
-		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: index %s: unsupported index_ver %d (want 1)", raw, idx.IndexVer)
+	if idx.IndexVer != 2 {
+		return nil, driverFetchOut{}, errWs("xuansi_driver_fetch: index %s: index_ver %d unsupported (this daemon speaks 2 — a newer or older index needs a different daemon)", raw, idx.IndexVer)
 	}
 
 	// 2) module + version selection (omitted version = the index's
@@ -1348,48 +1359,48 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 	// workspace until all of it verified)
 	var total int64
 	staged := make([]stagedFile, 0, len(chosen.Files))
-	seen := map[string]string{} // ext → declared path (one artifact per extension slot)
+	seen := map[string]string{} // ext → declared url (one artifact per extension slot)
 	for _, f := range chosen.Files {
-		if !fetchRefPathOK(f.Path) {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file path %q must be repo-relative, without \"..\"", in.Name, chosen.Version, f.Path)
+		if f.URL == "" {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: a file entry carries no url — index_ver 2 entries pin absolute release-asset urls", in.Name, chosen.Version)
 		}
-		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(f.Path), "."))
+		fu, ferr := url.Parse(f.URL)
+		if ferr != nil || (fu.Scheme != "http" && fu.Scheme != "https") || fu.Host == "" {
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file url %q must be an http(s) URL — a hostile index must not steer other schemes", in.Name, chosen.Version, f.URL)
+		}
+		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(fu.Path), "."))
 		if ext != "lua" && ext != "wasm" && ext != "aot" {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %q has unsupported extension %q (want .lua/.wasm/.aot)", in.Name, chosen.Version, f.Path, ext)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %q has unsupported extension %q (want .lua/.wasm/.aot)", in.Name, chosen.Version, f.URL, ext)
 		}
 		if prev, dup := seen[ext]; dup {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: files %q and %q share the .%s slot — the workspace stores one artifact per extension", in.Name, chosen.Version, prev, f.Path, ext)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: files %q and %q share the .%s slot — the workspace stores one artifact per extension", in.Name, chosen.Version, prev, f.URL, ext)
 		}
-		seen[ext] = f.Path
+		seen[ext] = f.URL
 		if f.Target != "" && ext != "aot" {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %q declares target %q but is not an .aot — only an .aot artifact carries an aot target", in.Name, chosen.Version, f.Path, f.Target)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %q declares target %q but is not an .aot — only an .aot artifact carries an aot target", in.Name, chosen.Version, f.URL, f.Target)
 		}
 		// the target is a manifest KEY (aot.<target>), never a path —
 		// still, a hostile index must not plant arbitrary keys: the
 		// namespace's vocabulary is [a-z0-9-]+ (esp32s3 style).
 		if f.Target != "" && !wsTargetRe.MatchString(f.Target) {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares aot target %q failing the [a-z0-9-]+ gate — refusing (a hostile index must not steer the manifest's aot namespace)", in.Name, chosen.Version, f.Path, f.Target)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares aot target %q failing the [a-z0-9-]+ gate — refusing (a hostile index must not steer the manifest's aot namespace)", in.Name, chosen.Version, f.URL, f.Target)
 		}
 		if f.Bytes <= 0 || f.Bytes > fetchFileMax {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares %d bytes (outside 1..%d)", in.Name, chosen.Version, f.Path, f.Bytes, fetchFileMax)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s declares %d bytes (outside 1..%d)", in.Name, chosen.Version, f.URL, f.Bytes, fetchFileMax)
 		}
 		if total+f.Bytes > fetchTotalMax {
 			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: total %d bytes exceeds the %d-byte fetch cap", in.Name, chosen.Version, total+f.Bytes, fetchTotalMax)
 		}
-		fu, ferr := iu.Parse(f.Path) // relative reference → resolved against the index's own directory
-		if ferr != nil || fu.Scheme != iu.Scheme || fu.Host != iu.Host {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file path %q does not resolve inside the index origin", in.Name, chosen.Version, f.Path)
-		}
-		fbody, derr := fetchGet(ctx, fu.String(), f.Bytes+1)
+		fbody, derr := fetchGet(ctx, f.URL, f.Bytes+1)
 		if derr != nil {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: %v", in.Name, chosen.Version, f.Path, derr)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: %v", in.Name, chosen.Version, f.URL, derr)
 		}
 		if int64(len(fbody)) != f.Bytes {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: got %d bytes, index says %d", in.Name, chosen.Version, f.Path, len(fbody), f.Bytes)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: got %d bytes, index says %d", in.Name, chosen.Version, f.URL, len(fbody), f.Bytes)
 		}
 		sha := sha256hex(fbody)
 		if sha != strings.ToLower(f.Sha256) {
-			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: sha256 %s != index %s", in.Name, chosen.Version, f.Path, sha, f.Sha256)
+			return nil, driverFetchOut{}, errWs("xuansi_driver_fetch %s@%s: file %s: sha256 %s != index %s", in.Name, chosen.Version, f.URL, sha, f.Sha256)
 		}
 		total += f.Bytes
 		staged = append(staged, stagedFile{ext: ext, body: fbody, sha: sha, target: f.Target})
@@ -1397,9 +1408,9 @@ func (ts *toolset) driverFetch(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 
 	// 3.5) the per-version meta (B15 W2-T4): doc/footprint/release for
 	// the seat's module_doc and admission faces. Presence-tolerant,
-	// integrity-hard (fetchModuleMeta's contract); a malformed body
+	// integrity-hard (fetchModuleMetaURL's contract); a malformed body
 	// refuses the whole fetch before anything durable lands.
-	meta, merr := fetchModuleMeta(ctx, iu, in.Name, chosen.Version)
+	meta, merr := fetchModuleMetaURL(ctx, in.Name, chosen.Version, chosen.MetaURL)
 	if merr != nil {
 		return nil, driverFetchOut{}, merr
 	}

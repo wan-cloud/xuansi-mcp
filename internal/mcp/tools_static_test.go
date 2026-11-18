@@ -9,10 +9,13 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1045,5 +1048,124 @@ func TestCoachingDescs(t *testing.T) {
 		if !strings.Contains(jw, want) {
 			t.Errorf("job_wait Desc lacks %q", want)
 		}
+	}
+}
+
+// --- dist wave Task 2 (D1/D2): index_ver 2 clean cut ---
+
+// TestDriverFetchIndexVer2Gate: a v1 index is refused by name — the
+// daemon speaks 2 (the clean-cut ruling: the 47-tool face is
+// unpublished, no old daemon carries the path leg).
+func TestDriverFetchIndexVer2Gate(t *testing.T) {
+	e, _, _ := newWsEnv(t, nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"index_ver":1,"modules":[]}`)
+	}))
+	defer srv.Close()
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "hello", "index_url": srv.URL + "/index.json"})
+	if !res.IsError {
+		t.Fatalf("v1 index accepted: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "index_ver 1 unsupported", "speaks 2"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// TestDriverFetchURLSchemeGate: an entry url outside http(s) is
+// refused client-side before any download — a hostile index must not
+// steer other schemes (the toolchain asset-gate precedent, verbatim).
+func TestDriverFetchURLSchemeGate(t *testing.T) {
+	e, _, _ := newWsEnv(t, nil)
+	idx := fmt.Sprintf(`{"index_ver":2,"modules":[{"name":"evil","kind":"driver","version":"1.0.0","files":[`+
+		`{"url":"file:///etc/passwd","sha256":%q,"bytes":4}]}]}`, strings.Repeat("a", 64))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, idx)
+	}))
+	defer srv.Close()
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "evil", "index_url": srv.URL + "/index.json"})
+	if !res.IsError {
+		t.Fatalf("file:// url accepted: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "http(s)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// TestDriverFetchMissingURLRefused: a v2 entry without files[].url is
+// refused naming the module — url is mandatory in the clean cut.
+func TestDriverFetchMissingURLRefused(t *testing.T) {
+	e, _, _ := newWsEnv(t, nil)
+	idx := fmt.Sprintf(`{"index_ver":2,"modules":[{"name":"nourl","kind":"driver","version":"1.0.0","files":[`+
+		`{"sha256":%q,"bytes":4}]}]}`, strings.Repeat("b", 64))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, idx)
+	}))
+	defer srv.Close()
+	res := e.call("xuansi_driver_fetch", map[string]any{"name": "nourl", "index_url": srv.URL + "/index.json"})
+	if !res.IsError {
+		t.Fatalf("url-less entry accepted: %+v", res)
+	}
+	got := resultText(t, res)
+	for _, want := range []string{"api:", "nourl@1.0.0", "url"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error text %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// TestModuleDocV2MetaLeg: module_doc's GitHub fallback rides the v2
+// index — the entry's absolute meta_url answers the ops table, and the
+// doc_* pins (present in the entry) are schema-carried, never fetched
+// by this face.
+func TestModuleDocV2MetaLeg(t *testing.T) {
+	e, _, _ := newWsEnv(t, nil)
+	meta := `{"name":"metamod","version":"1.0.0","release":"production","doc":{"ops":[`+
+		`{"name":"ping","args":"-","result":"-","semantics":"v2 leg"}]}}`
+	var hits atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.json", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, fmt.Sprintf(`{"index_ver":2,"modules":[{"name":"metamod","kind":"driver","version":"1.0.0",`+
+			`"doc_url":"https://example.com/doc.md","doc_sha256":%q,"doc_bytes":12,`+
+			`"meta_url":"METAURL","files":[{"url":"https://example.com/m.wasm","sha256":%q,"bytes":8}]}]}`,
+			strings.Repeat("c", 64), strings.Repeat("d", 64)))
+	})
+	mux.HandleFunc("/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		t.Logf("served /meta.json")
+		fmt.Fprint(w, meta)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	// point meta_url at this server via a second index variant
+	idx2 := fmt.Sprintf(`{"index_ver":2,"modules":[{"name":"metamod","kind":"driver","version":"1.0.0",`+
+		`"doc_url":"https://example.com/doc.md","doc_sha256":%q,"doc_bytes":12,`+
+		`"meta_url":%q,"files":[{"url":"https://example.com/m.wasm","sha256":%q,"bytes":8}]}]}`,
+		strings.Repeat("c", 64), srv.URL+"/meta.json", strings.Repeat("d", 64))
+	mux.HandleFunc("/index2.json", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		t.Logf("served /index2.json")
+		fmt.Fprint(w, idx2)
+	})
+	res := e.call("xuansi_module_doc", map[string]any{"name": "metamod", "index_url": srv.URL + "/index2.json"})
+	if res.IsError {
+		t.Fatalf("v2 module_doc failed: %s", resultText(t, res))
+	}
+	out := structured(t, res)
+	if out["source"] != "github" || out["version"] != "1.0.0" {
+		t.Errorf("out = %v, want github fallback on 1.0.0", out)
+	}
+	ops, _ := out["ops"].([]any)
+	if len(ops) != 1 {
+		t.Fatalf("ops = %v, want the v2 meta leg's one row", out["ops"])
+	}
+	if n := hits.Load(); n != 2 { // index + meta; the doc_url is never fetched
+		t.Errorf("HTTP hits = %d, want 2 (index + meta, doc pins untouched)", n)
 	}
 }

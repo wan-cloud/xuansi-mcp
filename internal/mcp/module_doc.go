@@ -21,7 +21,7 @@ import (
 type moduleDocIn struct {
 	Name     string `json:"name" jsonschema:"module name, lowercase [a-z0-9_-]+ (e.g. \"hello\", \"ledwatch\")"`
 	Version  string `json:"version,omitempty" jsonschema:"omit to resolve: the workspace's ACTIVE version, else its highest stored, else the index's highest for the name (driver_fetch's rule)"`
-	IndexURL string `json:"index_url,omitempty" jsonschema:"the index.json URL for the GitHub fallback leg; omit for the default https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/index.json"`
+	IndexURL string `json:"index_url,omitempty" jsonschema:"the index.json URL for the GitHub fallback leg; omit for the default https://github.com/wan-cloud/xuansi-drivers/releases/latest/download/index.json"`
 }
 
 // moduleDocOut is the frozen seat shape: identity, the release class,
@@ -133,8 +133,8 @@ func (ts *toolset) moduleDocGitHub(ctx context.Context, iu *url.URL, name, versi
 	if err := json.Unmarshal(body, &idx); err != nil {
 		return moduleDocOut{}, errWs("xuansi_module_doc: index %s: not valid JSON: %v", iu.String(), err)
 	}
-	if idx.IndexVer != 1 {
-		return moduleDocOut{}, errWs("xuansi_module_doc: index %s: unsupported index_ver %d (want 1)", iu.String(), idx.IndexVer)
+	if idx.IndexVer != 2 {
+		return moduleDocOut{}, errWs("xuansi_module_doc: index %s: unsupported index_ver %d (this daemon speaks 2)", iu.String(), idx.IndexVer)
 	}
 	var vers []string
 	var chosen *fetchModule
@@ -162,9 +162,9 @@ func (ts *toolset) moduleDocGitHub(ctx context.Context, iu *url.URL, name, versi
 	}
 	out := moduleDocOut{Name: name, Version: chosen.Version, Kind: chosen.Kind, Source: "github"}
 
-	// the raw meta (same best-effort contract as the fetch leg:
-	// absence tolerated, garbage refused)
-	meta, merr := fetchModuleMeta(ctx, iu, name, chosen.Version)
+	// the version's meta asset (same best-effort contract as the
+	// fetch leg: absence tolerated, garbage refused)
+	meta, merr := fetchModuleMetaURL(ctx, name, chosen.Version, chosen.MetaURL)
 	if merr != nil {
 		return moduleDocOut{}, merr
 	}

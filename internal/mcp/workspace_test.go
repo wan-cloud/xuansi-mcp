@@ -972,13 +972,13 @@ func fetchSpec(t *testing.T, path string, body []byte, lieSha string) fetchFileS
 	return fetchFileSpec{path: path, sha256: sha, bytes: len(body), body: body}
 }
 
-// newFetchIndex serves a fake T3-shaped index plus its module files
-// and returns the index URL. hits counts every request so local
-// refusals can prove zero HTTP contact.
+// newFetchIndex serves a fake v2-shaped index (absolute release-style
+// asset urls) plus its module files, and returns the index URL. hits
+// counts every request so local refusals can prove zero HTTP contact.
 func newFetchIndex(t *testing.T, mods []fetchModSpec) (idxURL string, hits *atomic.Int64) {
 	t.Helper()
 	type fileEnt struct {
-		Path   string `json:"path"`
+		URL    string `json:"url"`
 		Sha256 string `json:"sha256"`
 		Bytes  int    `json:"bytes"`
 		Target string `json:"target,omitempty"`
@@ -988,26 +988,34 @@ func newFetchIndex(t *testing.T, mods []fetchModSpec) (idxURL string, hits *atom
 		Kind    string    `json:"kind"`
 		Version string    `json:"version"`
 		ABI     int       `json:"abi"`
+		MetaURL string    `json:"meta_url,omitempty"`
 		Files   []fileEnt `json:"files"`
 	}
-	modsJ := make([]modEnt, 0, len(mods))
-	for _, m := range mods {
-		me := modEnt{Name: m.name, Kind: m.kind, Version: m.version, ABI: 1}
-		for _, f := range m.files {
-			me.Files = append(me.Files, fileEnt{Path: f.path, Sha256: f.sha256, Bytes: f.bytes, Target: f.target})
+	buildIdx := func(base string) []byte {
+		modsJ := make([]modEnt, 0, len(mods))
+		for _, m := range mods {
+			me := modEnt{Name: m.name, Kind: m.kind, Version: m.version, ABI: 1}
+			for _, f := range m.files {
+				me.Files = append(me.Files, fileEnt{URL: base + "/" + f.path, Sha256: f.sha256, Bytes: f.bytes, Target: f.target})
+			}
+			if m.metaBody != nil || m.metaStatus != 0 {
+				me.MetaURL = fmt.Sprintf("%s/modules/%s/%s/%s.meta.json", base, m.name, m.version, m.name)
+			}
+			modsJ = append(modsJ, me)
 		}
-		modsJ = append(modsJ, me)
+		idxJ, err := json.Marshal(map[string]any{"index_ver": 2, "modules": modsJ})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return idxJ
 	}
-	idxJ, err := json.Marshal(map[string]any{"index_ver": 1, "modules": modsJ})
-	if err != nil {
-		t.Fatal(err)
-	}
+	var self atomic.Value // the server's own URL, set once it listens
 	mux := http.NewServeMux()
 	var n atomic.Int64
 	mux.HandleFunc("/index.json", func(w http.ResponseWriter, _ *http.Request) {
 		n.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(idxJ)
+		_, _ = w.Write(buildIdx(self.Load().(string)))
 	})
 	for _, m := range mods {
 		for _, f := range m.files {
@@ -1034,6 +1042,7 @@ func newFetchIndex(t *testing.T, mods []fetchModSpec) (idxURL string, hits *atom
 	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	self.Store(srv.URL)
 	return srv.URL + "/index.json", &n
 }
 
@@ -1166,20 +1175,22 @@ func TestDriverFetchTwoFilesKindAndManifest(t *testing.T) {
 func TestKindPassthroughTolerantAndCanary(t *testing.T) {
 	wbody := fetchWasmBody(48)
 
-	// a kindless index (the pre-canary index shape, and any index_ver 1
+	// a kindless index (the pre-canary index shape, and any index_ver 2
 	// entry that simply omits the key)
 	mux := http.NewServeMux()
-	idxJ := fmt.Sprintf(`{"index_ver":1,"modules":[{"name":"quietmod","version":"1.0.0","abi":1,`+
-		`"files":[{"path":"modules/quietmod/1.0.0/quietmod.wasm","sha256":%q,"bytes":%d}]}]}`,
-		sha256hex(wbody), len(wbody))
+	var self atomic.Value
 	mux.HandleFunc("/index.json", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(idxJ))
+		base, _ := self.Load().(string)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"index_ver":2,"modules":[{"name":"quietmod","version":"1.0.0","abi":1,`+
+			`"files":[{"url":"%s/modules/quietmod/1.0.0/quietmod.wasm","sha256":%q,"bytes":%d}]}]}`,
+			base, sha256hex(wbody), len(wbody))))
 	})
 	mux.HandleFunc("/modules/quietmod/1.0.0/quietmod.wasm", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(wbody)
 	})
 	kindless := httptest.NewServer(mux)
 	t.Cleanup(kindless.Close)
+	self.Store(kindless.URL)
 
 	e, _, root := newWsEnv(t, nil)
 	res := e.call("xuansi_driver_fetch", map[string]any{
