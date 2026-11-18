@@ -16,6 +16,7 @@ import (
 )
 
 type fwVersionsIn struct {
+	Version   string `json:"version,omitempty" jsonschema:"the pinned fw version to reconcile against (x.y.z, optionally -rc.N); omit or \"latest\" for the stable entry"`
 	SourceURL string `json:"source_url,omitempty" jsonschema:"the distribution root override (…/releases); omit for the default images repo wan-cloud/xuansi-fw-images"`
 }
 
@@ -38,7 +39,7 @@ func (ts *toolset) registerFW(srv *mcpsdk.Server) {
 }
 
 func (ts *toolset) fwVersions(ctx context.Context, _ *mcpsdk.CallToolRequest, in fwVersionsIn) (*mcpsdk.CallToolResult, any, error) {
-	res, err := ts.call(ctx, server.Request{Type: "fw_versions", URL: in.SourceURL})
+	res, err := ts.call(ctx, server.Request{Type: "fw_versions", Version: in.Version, URL: in.SourceURL})
 	if err != nil {
 		return nil, nil, err
 	}

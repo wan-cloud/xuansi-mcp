@@ -103,6 +103,30 @@ func fwDistSrv(t *testing.T, bin []byte, shaHex string, hits *atomic.Int64) *htt
 	return srv
 }
 
+func TestFwVersionsPinnedRc(t *testing.T) {
+	// ④b: fw_versions with a pinned version reads THAT release's
+	// manifest (a prerelease never occupies the latest entry — the
+	// rc chain's reconciliation leg).
+	bin := fwTestBin()
+	rc := strings.Replace(fmt.Sprintf(fwTestManifest, testutil.Sha256Hex(t, bin), len(bin)), `"fw_version": "0.7.1"`, `"fw_version": "0.7.1"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/download/v0.7.1-rc.1/manifest.json", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, rc) })
+	dist := httptest.NewServer(mux)
+	t.Cleanup(dist.Close)
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	res, err := srv.hFwVersions(context.Background(), &Request{Version: "0.7.1-rc.1", URL: dist.URL})
+	if err != nil {
+		t.Fatalf("pinned fw_versions: %v", err)
+	}
+	if latest := res.(map[string]any)["latest"].(map[string]any); latest["fw_version"] != "0.7.1" {
+		t.Fatalf("latest = %v", latest)
+	}
+	// a bad version refuses by name
+	if _, err := srv.hFwVersions(context.Background(), &Request{Version: "not-a-ver", URL: dist.URL}); err == nil || !strings.Contains(err.Error(), "x.y.z") {
+		t.Fatalf("bad version: %v", err)
+	}
+}
+
 func TestFwVersionsRootOverride(t *testing.T) {
 	// the url override is the distribution ROOT — fwRoot tolerates both
 	// the bare repo URL and the …/releases form; the manifest rides the
@@ -155,14 +179,17 @@ func TestFwVersionsCompatWarning(t *testing.T) {
 	// protocol 11 (over the daemon ceiling 10) + min_daemon 9.9.9
 	future := strings.NewReplacer(`"protocol_ver": 10`, `"protocol_ver": 11`, `"min_daemon": "0.6.0"`, `"min_daemon": "9.9.9"`).Replace(fmt.Sprintf(fwTestManifest, testutil.Sha256Hex(t, bin), len(bin)))
 	mux := http.NewServeMux()
-	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, future) })
+	mux.HandleFunc("/latest/download/manifest.json", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, future) })
 	dist := httptest.NewServer(mux)
 	t.Cleanup(dist.Close)
 
 	// a versioned daemon: both warnings fire
 	srv, _ := newFwSrv(t, fwHello("0.6.0", "x"))
 	srv.daemonVersion = "0.6.0"
-	res, _ := srv.hFwVersions(context.Background(), &Request{URL: dist.URL + "/manifest.json"})
+	res, _ := srv.hFwVersions(context.Background(), &Request{URL: dist.URL})
+	if res == nil {
+		t.Fatal("nil reply")
+	}
 	w := res.(map[string]any)["warnings"].([]string)
 	if len(w) != 2 {
 		t.Fatalf("warnings = %v, want protocol+min_daemon", w)
@@ -171,7 +198,7 @@ func TestFwVersionsCompatWarning(t *testing.T) {
 	// a dev build: the unknown-version warning, never an error
 	srv2, _ := newFwSrv(t, fwHello("0.6.0", "x"))
 	srv2.daemonVersion = "dev"
-	res2, err := srv2.hFwVersions(context.Background(), &Request{URL: dist.URL + "/manifest.json"})
+	res2, err := srv2.hFwVersions(context.Background(), &Request{URL: dist.URL})
 	if err != nil {
 		t.Fatalf("dev daemon: %v", err)
 	}

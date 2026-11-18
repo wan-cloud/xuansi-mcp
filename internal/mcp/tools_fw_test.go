@@ -57,8 +57,8 @@ func TestFWToolsServed(t *testing.T) {
 	if schema["xuansi_fw_versions"] == nil || schema["xuansi_fw_fetch"] == nil {
 		t.Fatalf("the fw pair is not both served: %v", schema)
 	}
-	if r := schema["xuansi_fw_versions"]; !r["has:source_url"] || len(r) != 1 {
-		t.Errorf("fw_versions schema = %v, want only the optional source_url", r)
+	if r := schema["xuansi_fw_versions"]; !r["has:source_url"] || !r["has:version"] || len(r) != 2 {
+		t.Errorf("fw_versions schema = %v, want source_url+version optional", r)
 	}
 	if r := schema["xuansi_fw_fetch"]; !r["has:version"] || !r["has:source_url"] {
 		t.Errorf("fw_fetch schema = %v, want version+source_url optional", r)

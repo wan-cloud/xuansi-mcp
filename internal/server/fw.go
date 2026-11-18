@@ -46,14 +46,21 @@ func (s *Server) fetchDoc(ctx context.Context, rawURL string, max int64) ([]byte
 // url override is the distribution ROOT (repo or …/releases — fwRoot
 // tolerates both); the manifest rides the stable latest entry.
 func (s *Server) hFwVersions(ctx context.Context, req *Request) (any, error) {
-	raw := fwRoot(req.URL) + "/latest/download/manifest.json"
-	body, err := s.fetchDoc(ctx, raw, 1<<20)
+	root := fwRoot(req.URL)
+	manifestURL := root + "/latest/download/manifest.json"
+	if req.Version != "" && req.Version != "latest" {
+		if !fwVerRe.MatchString(req.Version) {
+			return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_versions: version %q must be x.y.z (optionally -rc.N) or \"latest\"", req.Version)}
+		}
+		manifestURL = root + "/download/v" + req.Version + "/manifest.json"
+	}
+	body, err := s.fetchDoc(ctx, manifestURL, 1<<20)
 	if err != nil {
-		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_versions: manifest %s: %v", raw, err)}
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_versions: manifest %s: %v", manifestURL, err)}
 	}
 	m, perr := ota.ParseFwManifest(body)
 	if perr != nil {
-		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_versions: manifest %s: %v", raw, perr)}
+		return nil, &RPCError{Class: "api", Msg: fmt.Sprintf("fw_versions: manifest %s: %v", manifestURL, perr)}
 	}
 	boards := make([]map[string]any, 0)
 	for _, b := range s.reg.Snapshot() {

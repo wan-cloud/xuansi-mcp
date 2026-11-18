@@ -184,7 +184,7 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 	// ---------- S2: H2 the fw rc chain ----------
 	fmt.Println("\n- S2: H2 - fw_versions (behind + compat warning) -> fw_fetch (sha-pinned, skip) -> ota_push -> re-verify -")
 	m, text, isErr, _ = b.call(ctx, 60*time.Second, "xuansi_fw_versions",
-		map[string]any{"source_url": dwRoot})
+		map[string]any{"version": dwVersion, "source_url": dwRoot})
 	latest, _ := m["latest"].(map[string]any)
 	warn, _ := m["warnings"].([]any)
 	behind := false
@@ -227,7 +227,7 @@ func runDistWave(attempt int, daemonBin, runDir string) int {
 
 	// re-verify: up_to_date TRUE + the ota reboot event
 	ok, _ = pollUntil(1*time.Second, 30*time.Second, func() (bool, string) {
-		m, _, isErr, _ := b.call(ctx, 60*time.Second, "xuansi_fw_versions", map[string]any{"source_url": dwRoot})
+		m, _, isErr, _ := b.call(ctx, 60*time.Second, "xuansi_fw_versions", map[string]any{"version": dwVersion, "source_url": dwRoot})
 		if isErr {
 			return false, "fw_versions error"
 		}
