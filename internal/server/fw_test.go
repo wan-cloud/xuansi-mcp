@@ -1,0 +1,254 @@
+package server
+
+// fw_test.go — the fw distribution face's handler contract (dist wave
+// D4/D5/D9): fw_versions (ro reconciliation, compat warnings, the
+// update annotation in boardView) and fw_fetch (sha-pinned download,
+// idempotent fw-cache, zero board contact).
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"xuansi/internal/discover"
+	"xuansi/internal/ota"
+	"xuansi/internal/replclient"
+	"xuansi/internal/testutil"
+)
+
+const fwTestManifest = `{
+	"fw_version": "0.7.1", "fw_build": "aaaabbbbccccddddeeeeffff0000111122223333",
+	"protocol_ver": 10,
+	"ota_sha": "346e996200000000000000000000000000000000000000000000000000000000",
+	"bin_sha256": "%s",
+	"bin_bytes": %d, "min_daemon": "0.6.0"
+}`
+
+func fwTestBin() []byte {
+	b := make([]byte, 4096)
+	for i := range b {
+		b[i] = byte(i % 251)
+	}
+	return b
+}
+
+// newFwSrv builds a Server with ONE sighted board (mac6 d75884,
+// fw_version/fw_build from hello) and a hermetic fw-cache root.
+func newFwSrv(t *testing.T, hello *replclient.HelloInfo) (*Server, string) {
+	t.Helper()
+	reg := discover.NewRegistry(nil, nil,
+		discover.WithUSB(func(context.Context) ([]discover.Board, error) {
+			b := mkBoard("d75884", "xuansi-d75884.local")
+			b.Hello = hello
+			return []discover.Board{b}, nil
+		}),
+		discover.WithMDNS(func(context.Context) ([]discover.Board, error) { return nil, nil }),
+	)
+	cache := filepath.Join(testutil.ShortSockDir(t), "fw-cache")
+	srv, err := New(Opts{
+		SockPath:         filepath.Join(testutil.ShortSockDir(t), "d.sock"),
+		Registry:         reg,
+		RefreshInterval:  -1,
+		GraceTTL:         time.Second,
+		FwCacheDir:       cache,
+		DisableProvision: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	// discovery never carries Hello (Enrich-only): sweep once, then
+	// enrich the sighted identity explicitly
+	if err := reg.Refresh(context.Background()); err != nil {
+		t.Fatalf("registry refresh: %v", err)
+	}
+	reg.Enrich("d75884", hello)
+	return srv, cache
+}
+
+func fwHello(ver, build string) *replclient.HelloInfo {
+	return &replclient.HelloInfo{FwVersion: ver, FwBuild: build, ProtocolVer: 10}
+}
+
+// fwDistSrv serves manifest.json (latest) and the pinned v0.7.1 pair.
+func fwDistSrv(t *testing.T, bin []byte, shaHex string, hits *atomic.Int64) *httptest.Server {
+	t.Helper()
+	manifest := fmt.Sprintf(fwTestManifest, shaHex, len(bin))
+	mux := http.NewServeMux()
+	serve := func(p, body string) {
+		mux.HandleFunc(p, func(w http.ResponseWriter, _ *http.Request) {
+			if hits != nil {
+				hits.Add(1)
+			}
+			fmt.Fprint(w, body)
+		})
+	}
+	serve("/latest/download/manifest.json", manifest)
+	serve("/download/v0.7.1/manifest.json", manifest)
+	mux.HandleFunc("/download/v0.7.1/xuansi_fw.bin", func(w http.ResponseWriter, _ *http.Request) {
+		if hits != nil {
+			hits.Add(1)
+		}
+		_, _ = w.Write(bin)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestFwVersionsUpDownToDate(t *testing.T) {
+	bin := fwTestBin()
+	dist := fwDistSrv(t, bin, testutil.Sha256Hex(t, bin), nil)
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	res, err := srv.hFwVersions(context.Background(), &Request{URL: dist.URL + "/latest/download/manifest.json"})
+	if err != nil {
+		t.Fatalf("fw_versions: %v", err)
+	}
+	m := res.(map[string]any)
+	latest := m["latest"].(map[string]any)
+	if latest["fw_version"] != "0.7.1" || latest["fw_build"] != "aaaabbbbccccddddeeeeffff0000111122223333" {
+		t.Fatalf("latest = %v", latest)
+	}
+	boards := m["boards"].([]map[string]any)
+	if len(boards) != 1 || boards[0]["board"] != "d75884" || boards[0]["up_to_date"] != false {
+		t.Fatalf("boards = %v, want d75884 behind", boards)
+	}
+
+	// same build as the manifest: up to date
+	srv2, _ := newFwSrv(t, fwHello("0.7.1", "aaaabbbbccccddddeeeeffff0000111122223333"))
+	res2, err := srv2.hFwVersions(context.Background(), &Request{URL: dist.URL + "/latest/download/manifest.json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := res2.(map[string]any)["boards"].([]map[string]any); b[0]["up_to_date"] != true {
+		t.Fatalf("boards = %v, want up to date on fw_build equality", b)
+	}
+}
+
+func TestFwVersionsCompatWarning(t *testing.T) {
+	bin := fwTestBin()
+	// protocol 11 (over the daemon ceiling 10) + min_daemon 9.9.9
+	future := strings.NewReplacer(`"protocol_ver": 10`, `"protocol_ver": 11`, `"min_daemon": "0.6.0"`, `"min_daemon": "9.9.9"`).Replace(fmt.Sprintf(fwTestManifest, testutil.Sha256Hex(t, bin), len(bin)))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, future) })
+	dist := httptest.NewServer(mux)
+	t.Cleanup(dist.Close)
+
+	// a versioned daemon: both warnings fire
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "x"))
+	srv.daemonVersion = "0.6.0"
+	res, _ := srv.hFwVersions(context.Background(), &Request{URL: dist.URL + "/manifest.json"})
+	w := res.(map[string]any)["warnings"].([]string)
+	if len(w) != 2 {
+		t.Fatalf("warnings = %v, want protocol+min_daemon", w)
+	}
+
+	// a dev build: the unknown-version warning, never an error
+	srv2, _ := newFwSrv(t, fwHello("0.6.0", "x"))
+	srv2.daemonVersion = "dev"
+	res2, err := srv2.hFwVersions(context.Background(), &Request{URL: dist.URL + "/manifest.json"})
+	if err != nil {
+		t.Fatalf("dev daemon: %v", err)
+	}
+	w2 := res2.(map[string]any)["warnings"].([]string)
+	if len(w2) < 1 || !strings.Contains(w2[len(w2)-1], "unknown") {
+		t.Fatalf("dev warnings = %v, want the unknown-version line", w2)
+	}
+}
+
+func TestFwFetchDownloadAndSkip(t *testing.T) {
+	bin := fwTestBin()
+	var hits atomic.Int64
+	dist := fwDistSrv(t, bin, testutil.Sha256Hex(t, bin), &hits)
+	srv, cache := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+
+	res, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL})
+	if err != nil {
+		t.Fatalf("fw_fetch: %v", err)
+	}
+	m := res.(map[string]any)
+	if m["downloaded"] != true {
+		t.Fatalf("first fetch: %+v", m)
+	}
+	p, _ := m["path"].(string)
+	if p == "" || !strings.HasPrefix(filepath.Base(p), "xuansi_fw-0.7.1-aaaabbb") {
+		t.Fatalf("path = %q, want the self-identifying cache name", p)
+	}
+	if got, _ := os.ReadFile(p); string(got) != string(bin) {
+		t.Fatalf("cached bytes differ (%d)", len(got))
+	}
+
+	res2, err := srv.hFwFetch(context.Background(), &Request{Version: "latest", URL: dist.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2 := res2.(map[string]any)
+	if m2["downloaded"] != false {
+		t.Fatalf("second fetch: %+v, want the idempotent skip", m2)
+	}
+	if m2["path"] != p {
+		t.Fatalf("second path %v != first %v (the cache name must be stable)", m2["path"], p)
+	}
+	if _, err := os.Stat(filepath.Join(cache, "bogus")); !os.IsNotExist(err) {
+		t.Fatalf("cache pollution: %v", err)
+	}
+}
+
+func TestFwFetchShaPinnedRefusal(t *testing.T) {
+	bin := fwTestBin()
+	dist := fwDistSrv(t, bin, strings.Repeat("0", 64), nil) // bin_sha256 lies
+	srv, cache := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	_, err := srv.hFwFetch(context.Background(), &Request{Version: "0.7.1", URL: dist.URL})
+	if err == nil || !strings.Contains(err.Error(), "sha256") {
+		t.Fatalf("want a sha-pinned refusal, got %v", err)
+	}
+	entries, _ := os.ReadDir(cache)
+	if len(entries) != 0 {
+		t.Fatalf("refused fetch left %d cache entries", len(entries))
+	}
+}
+
+func TestFwUpdateAnnotationInBoardView(t *testing.T) {
+	behind := &ota.FwManifest{FwVersion: "0.7.1", FwBuild: "aaaabbbb", ProtocolVer: 10, MinDaemon: "0.6.0"}
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa"))
+	srv.setFwSnapshot(behind)
+
+	b := mkBoard("d75884", "xuansi-d75884.local")
+	b.Hello = fwHello("0.6.0", "394b683aaaa")
+	v := srv.boardView(b)
+	u, ok := v["fw_update"].(map[string]any)
+	if !ok || u["latest_ver"] != "0.7.1" || u["latest_build"] != "aaaabbb"+"b" || u["current_ver"] != "0.6.0" {
+		t.Fatalf("fw_update = %v, want the behind annotation", v["fw_update"])
+	}
+
+	// up to date: honestly absent
+	srv.setFwSnapshot(&ota.FwManifest{FwVersion: "0.6.0", FwBuild: "394b683aaaa", ProtocolVer: 10})
+	if _, still := srv.boardView(b)["fw_update"]; still {
+		t.Fatalf("fw_update present on an up-to-date board")
+	}
+
+	// no snapshot: honestly absent
+	srv.setFwSnapshot(nil)
+	if _, still := srv.boardView(b)["fw_update"]; still {
+		t.Fatalf("fw_update present without a manifest snapshot")
+	}
+}
+
+func TestFwPollerFlagOff(t *testing.T) {
+	srv, _ := newFwSrv(t, fwHello("0.6.0", "394b683aaaa")) // FwPoll zero = off
+	select {
+	case <-srv.fwPollStopped():
+		t.Fatalf("fw poller armed with FwPoll=0")
+	default:
+	}
+	if srv.fwSnapshot() != nil {
+		t.Fatalf("snapshot set with the poller off")
+	}
+}

@@ -35,6 +35,7 @@ import (
 	"xuansi/internal/discover"
 	"xuansi/internal/la"
 	"xuansi/internal/lease"
+	"xuansi/internal/ota"
 	"xuansi/internal/paths"
 	"xuansi/internal/replclient"
 )
@@ -245,6 +246,15 @@ type Opts struct {
 	// itself). A live capture at fire time stands the timer down; the
 	// capture's own ending re-arms it. 0 = disabled (the default).
 	IdleExit time.Duration
+	// FwPoll (dist wave D9): the fw-manifest reminder poller's cadence.
+	// 0 (default) keeps the poller off; a positive value arms it for
+	// the daemon's serving life (idle-exit ends it with the daemon).
+	FwPoll time.Duration
+	// FwCacheDir is the fw image cache root (default: StateDir()/fw-cache).
+	FwCacheDir string
+	// Version is the daemon's own version string (ldflags-injected at
+	// publish; "" or "dev" = unknown — the min_daemon warning says so).
+	Version string
 
 	// BootRecordsDir overrides the boot-banner receipt book's directory
 	// (B16-T6 D1; default paths.StateDir()/boards — one boot-<mac6>.json
@@ -325,6 +335,15 @@ type Server struct {
 	prov     *creds.Provisioner
 
 	auditCancel context.CancelFunc
+
+	// the fw distribution face (dist wave D4/D5/D9): the daemon's own
+	// version (min_daemon comparisons), the poller's manifest snapshot
+	// (fw_update annotations), and the poller's liveness channel.
+	daemonVersion string
+	fwMu          sync.Mutex
+	fwSnap        *ota.FwManifest
+	fwCacheDir    string
+	fwPollDone    chan struct{}
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -582,6 +601,20 @@ func New(o Opts) (*Server, error) {
 		Log:      o.Log,
 		OnExpiry: s.leaseTeardown,
 	})
+	// the fw distribution face (D4/D5/D9): cache root, version, poller
+	s.daemonVersion = o.Version
+	s.fwCacheDir = o.FwCacheDir
+	if s.fwCacheDir == "" {
+		s.fwCacheDir = filepath.Join(paths.StateDir(), "fw-cache")
+	}
+	s.fwPollDone = make(chan struct{})
+	if o.FwPoll > 0 {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.fwPoller(o.FwPoll)
+		}()
+	}
 	return s, nil
 }
 
@@ -1366,6 +1399,10 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hOtaPush(ctx, req)
 	case "ota.status": // T6: the ro ota observation (no lease)
 		result, err = s.hOtaStatus(ctx, req)
+	case "fw_versions": // dist wave D4: the fleet reconciliation view (ro, no board contact)
+		result, err = s.hFwVersions(ctx, req)
+	case "fw_fetch": // dist wave D4: the sha-pinned image download (ro, no board contact)
+		result, err = s.hFwFetch(ctx, req)
 	default:
 		err = &RPCError{Class: "server", Msg: "unknown request type " + strconv.Quote(req.Type)}
 	}
@@ -1521,6 +1558,12 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 	// credentials without the crossing this view must never trigger).
 	if st := s.provisionStateOf(b); st != "" {
 		v["provision_state"] = string(st)
+	}
+	// fw_update (dist wave D9): the reminder poller's behind-board
+	// annotation — honestly absent with no snapshot, no sighting, or a
+	// current board.
+	if u := s.fwUpdateFor(b.Hello); u != nil {
+		v["fw_update"] = u
 	}
 	return v
 }

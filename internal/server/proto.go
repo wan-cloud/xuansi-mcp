@@ -403,12 +403,19 @@ type Request struct {
 	// explicit "tcp" never falls back to USB at op time, and the pin
 	// clears at release.
 	Transport string `json:"transport,omitempty"`
-	Code      string `json:"code,omitempty"`
-	Tag       string `json:"tag,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Path      string `json:"path,omitempty"`
-	Data      []byte `json:"data,omitempty"` // JSON base64 ↔ board bin
-	Source    string `json:"source,omitempty"`
+	// Version is fw_fetch's pinned fw version ("x.y.z"; "" or "latest"
+	// rides the stable entry). Dist wave D4.
+	Version string `json:"version,omitempty"`
+	// URL overrides the distribution root/manifest for fw_versions and
+	// fw_fetch (dist wave D4 — tests and mirrors; "" = the default
+	// images-repo entry).
+	URL    string `json:"url,omitempty"`
+	Code   string `json:"code,omitempty"`
+	Tag    string `json:"tag,omitempty"`
+	Name   string `json:"name,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Data   []byte `json:"data,omitempty"` // JSON base64 ↔ board bin
+	Source string `json:"source,omitempty"`
 	// Op is the op passthrough request's board op — allowlisted (see
 	// the ops-face note in the contract above); eval/submit/fs/script/
 	// session ops are NOT reachable through it.

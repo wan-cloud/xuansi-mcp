@@ -38,6 +38,7 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	sock := fs.String("sock", "", "daemon unix socket (default $XDG_RUNTIME_DIR/xuansi/daemon.sock, fallback /tmp/xuansi-daemon.sock)")
 	graceTTL := fs.Duration("grace-ttl", lease.DefaultGraceTTL, "lease grace window after an agent disconnect (e.g. 300s, 10s)")
 	idleExit := fs.Duration("idle-exit", -1*time.Nanosecond, "self-exit after D with no clients and no live captures (-1ns = follow --grace-ttl, 0 = never)")
+	fwPoll := fs.Duration("fw-poll", 300*time.Second, "fw-manifest reminder poller cadence while serving (0 = off): a behind board's list_boards entry carries fw_update")
 	boardsFile := fs.String("boards-file", "", "boards.conf path (name=mac6 aliases; default user config dir xuansi/boards.conf, missing = zero-config)")
 	noProvision := fs.Bool("no-provision", false, "kill the zero-ritual provisioner: never auto-provision cred-less USB boards (default: on — plug in and it works)")
 	verbose := fs.Bool("verbose", false, "log at debug level (slog text handler)")
@@ -84,6 +85,9 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	if *sock != "" {
 		opts.SockPath = *sock
 	}
+	// dist wave D4/D5/D9: the fw distribution face's wiring
+	opts.FwPoll = *fwPoll
+	opts.Version = Version
 	srv, err := server.New(opts)
 	if err != nil {
 		if errors.Is(err, server.ErrAlreadyListening) {
