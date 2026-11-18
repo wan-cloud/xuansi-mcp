@@ -45,7 +45,7 @@ type parityIndexMod struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 	Files   []struct {
-		Path   string `json:"path"`
+		URL    string `json:"url"`
 		SHA256 string `json:"sha256"`
 		Bytes  int64  `json:"bytes"`
 	} `json:"files"`
@@ -185,8 +185,11 @@ func driversParity(repoDir, sdkRoot string) (problems, okLines []string) {
 			}
 			var pinSHA string
 			pinBytes := int64(-1)
+			wasmBase := name + ".wasm"
 			for _, f := range m.Files {
-				if f.Path == filepath.ToSlash(filepath.Join("modules", name, ver, name+".wasm")) {
+				// v2 pins absolute release urls; the artifact's tree
+				// home is modules/<n>/<v>/<url basename>
+				if strings.HasSuffix(f.URL, "/"+wasmBase) {
 					pinSHA, pinBytes = f.SHA256, f.Bytes
 					break
 				}
@@ -280,11 +283,11 @@ func TestDriversParityFixture(t *testing.T) {
 	// index.json pins hello's wrong committed bytes (self-consistent
 	// wrongness: the rebuild must disagree with BOTH legs) and
 	// ledwatch's right ones; probe stays absent on purpose.
-	idxJSON := fmt.Sprintf(`{"index_ver":1,"modules":[
+	idxJSON := fmt.Sprintf(`{"index_ver":2,"modules":[
 	  {"name":"hello","version":"1.0.0","files":[
-	    {"path":"modules/hello/1.0.0/hello.wasm","sha256":%q,"bytes":%d}]},
+	    {"url":"https://github.com/wan-cloud/xuansi-drivers/releases/download/m-hello-1.0.0/hello.wasm","sha256":%q,"bytes":%d}]},
 	  {"name":"ledwatch","version":"1.0.0","files":[
-	    {"path":"modules/ledwatch/1.0.0/ledwatch.wasm","sha256":%q,"bytes":%d}]}
+	    {"url":"https://github.com/wan-cloud/xuansi-drivers/releases/download/m-ledwatch-1.0.0/ledwatch.wasm","sha256":%q,"bytes":%d}]}
 	]}`, sha256hex(bad), len(bad), sha256hex(body), len(body))
 	if err := os.WriteFile(filepath.Join(repo, "index.json"), []byte(idxJSON), 0o644); err != nil {
 		t.Fatalf("plant index.json: %v", err)
