@@ -127,7 +127,7 @@ func TestEmbeddedSnapshotDriftLock(t *testing.T) {
 		t.Fatalf("embedded v2 head: want stock-wamrc/24.0, got %q/%q", v2.Kind, v2.WasiSDK)
 	}
 	wamrcAssetURL := func(gen, file string) string {
-		return "https://github.com/wan-cloud/xuansi-drivers/releases/download/" + gen + "/" + file
+		return "https://github.com/wan-cloud/xuansi-toolchain/releases/download/" + gen + "/" + file
 	}
 	wantV2Wamrc := map[string]struct {
 		url, sha string

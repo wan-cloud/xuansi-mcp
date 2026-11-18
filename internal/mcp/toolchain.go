@@ -235,10 +235,12 @@ func saveTCState(path string, s *tcState) error {
 // half, spec §6.3: local installed state x index latest x pairing
 // matrix in one view; missing pieces self-guide to fetch)
 
-// defaultToolchainIndexURL is the toolchain index's home — the drivers
-// repo, the driver index's twin hub (plan task 6 lands the file). The
+// defaultToolchainIndexURL is the toolchain index's home — the
+// dedicated xuansi-toolchain repo's release face (dist wave A9): every
+// generation release carries the regenerated index, and this stable
+// permalink always answers from the most recent one. The
 // embedded snapshot above is its known-good shadow.
-const defaultToolchainIndexURL = "https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json"
+const defaultToolchainIndexURL = "https://github.com/wan-cloud/xuansi-toolchain/releases/latest/download/toolchain-index.json"
 
 // toolchainStateFile is the state file's name inside the cache root
 // (design §6.1: ~/.cache/xuansi-wasm/toolchain-state.json).
@@ -299,7 +301,7 @@ func tcPathExists(path string) bool {
 }
 
 type tcStatusIn struct {
-	IndexURL string `json:"index_url,omitempty" jsonschema:"the toolchain-index.json URL; omit for the default https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json (http(s) only - file:// and other schemes are refused client-side)"`
+	IndexURL string `json:"index_url,omitempty" jsonschema:"the toolchain-index.json URL; omit for the default https://github.com/wan-cloud/xuansi-toolchain/releases/latest/download/toolchain-index.json (http(s) only - file:// and other schemes are refused client-side)"`
 }
 
 // tcInstalledOut is one piece's status row. Present = the state file
@@ -493,7 +495,7 @@ func tcClampTimeoutSec(sec int) int {
 
 type tcFetchIn struct {
 	Generation string `json:"generation,omitempty" jsonschema:"the toolchain generation to install (e.g. \"toolchain-v3\", the latest — the surgery wamrc; \"toolchain-v2\" stays installable for the wasm track — its .aot lane is retired, a stock .aot loads only on fw 0.3.x boards); omit for the index's latest"`
-	IndexURL   string `json:"index_url,omitempty" jsonschema:"the toolchain-index.json URL; omit for the default https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/toolchain-index.json (http(s) only - file:// and other schemes are refused client-side, and every ASSET url the index hands out re-passes the same gate)"`
+	IndexURL   string `json:"index_url,omitempty" jsonschema:"the toolchain-index.json URL; omit for the default https://github.com/wan-cloud/xuansi-toolchain/releases/latest/download/toolchain-index.json (http(s) only - file:// and other schemes are refused client-side, and every ASSET url the index hands out re-passes the same gate)"`
 	TimeoutSec int    `json:"timeout_sec,omitempty" jsonschema:"bounds the WHOLE fetch (index + every asset download), seconds; default 600, clamped to at most 3600; 0 or negative reads as the default"`
 }
 
