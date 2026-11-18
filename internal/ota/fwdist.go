@@ -14,7 +14,7 @@ import (
 // build speaks. Bump ritual: the same wave that re-binds the daemon
 // to a new fw face (the HIL re-bind discipline) moves the constant —
 // a manifest above it only warns (fetch != flash), never blocks.
-const SupportedProtocolVer = 10
+const SupportedProtocolVer = 11
 
 // fwBinMax bounds one fw image download — the ota slot size (3 MiB)
 // plus packaging slack; anything larger can neither stage nor flash.

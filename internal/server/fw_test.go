@@ -177,7 +177,7 @@ func TestFwVersionsUpDownToDate(t *testing.T) {
 func TestFwVersionsCompatWarning(t *testing.T) {
 	bin := fwTestBin()
 	// protocol 11 (over the daemon ceiling 10) + min_daemon 9.9.9
-	future := strings.NewReplacer(`"protocol_ver": 10`, `"protocol_ver": 11`, `"min_daemon": "0.6.0"`, `"min_daemon": "9.9.9"`).Replace(fmt.Sprintf(fwTestManifest, testutil.Sha256Hex(t, bin), len(bin)))
+	future := strings.NewReplacer(`"protocol_ver": 10`, `"protocol_ver": 12`, `"min_daemon": "0.6.0"`, `"min_daemon": "9.9.9"`).Replace(fmt.Sprintf(fwTestManifest, testutil.Sha256Hex(t, bin), len(bin)))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/latest/download/manifest.json", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, future) })
 	dist := httptest.NewServer(mux)
