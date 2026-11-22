@@ -4,11 +4,14 @@ package server
 // the ota.push fleet orchestration (internal/ota's Push over the
 // daemon's board plumbing) and the ota.status observation request.
 // The CDC policy ruling (2026-11-15) lives in the lane adapter below:
-// OTA NEVER crosses USB — a board whose live route is CDC is refused,
-// and a cold board dials TCP only (no fallback), unlike the lease
-// machinery's §4.4 seam. The fleet push is lease-gated (owner ruling
-// 2026-11-23): the pusher must hold every pushed board's lease —
-// otaLeaseGate below, force cannot bypass it.
+// OTA CARGO never crosses USB — a board whose live route is CDC is
+// refused for the push, and a cold board dials TCP only (no fallback),
+// unlike the lease machinery's §4.4 seam. The ruling's scope is the
+// write/cargo face (an OPEN reboots the board): the read-only
+// ota.status rides a warm controller of ANY transport (⑥b, 2026-11-23
+// — otaWarmLane); only fresh dials stay TCP-only. The fleet push is
+// lease-gated (owner ruling 2026-11-23): the pusher must hold every
+// pushed board's lease — otaLeaseGate below, force cannot bypass it.
 
 import (
 	"context"
@@ -61,6 +64,27 @@ func (s *Server) otaLane(ctx context.Context, mac6 string) (ota.Board, error) {
 	}
 	s.tap(mac6, db, ctl)
 	return ctl, nil
+}
+
+// otaWarmLane answers mac6's warm controller when one exists — ANY
+// transport (⑥b/D3, 2026-11-23): the read-only ota.status observation
+// rides a link ALREADY in hand; the 2026-11-15 never-USB ruling's
+// scope is the OTA cargo (an OPEN reboots the board), and a warm link
+// opens nothing — board_op's op ota.status over the same warm USB link
+// is the same read, so refusing it was the read/write two-face gap.
+// Same accessor pattern as otaLane's top, deliberately WITHOUT the
+// transport check. nil when no warm link: the caller falls to otaLane,
+// whose TCP-or-refuse policy still owns every fresh dial.
+func (s *Server) otaWarmLane(mac6 string) ota.Board {
+	if db, ok := s.lookupSupervisorBoard(mac6); ok && db != nil {
+		db.connectMu.Lock()
+		ctl := db.sup.Client()
+		db.connectMu.Unlock()
+		if ctl != nil {
+			return ctl
+		}
+	}
+	return nil
 }
 
 // otaEraGate is the per-board hard refusal: a board THIS daemon has
@@ -233,16 +257,33 @@ func (s *Server) hOtaPush(ctx context.Context, cc *clientConn, req *Request) (an
 
 // hOtaStatus serves the ro observation request: the board's own
 // ota.status result verbatim, plus the resolved board id. No lease
-// (fs_read's read-only shape); the lane obeys the same TCP-only OTA
-// policy as the push.
+// (fs_read's read-only shape). Behavior order (⑥b/D3, 2026-11-23):
+// ① a warm controller of ANY transport carries the op straight (no
+// open, no reboot — never-USB is the cargo policy); ② no warm link →
+// otaLane, whose fresh dials stay TCP-only — a USB-only board's cold
+// refusal keeps its existing text plus the read-face coach.
 func (s *Server) hOtaStatus(ctx context.Context, req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)
 	if rerr != nil {
 		return nil, rerr
 	}
-	lane, err := s.otaLane(ctx, b.MAC6)
-	if err != nil {
-		return nil, err
+	lane := s.otaWarmLane(b.MAC6)
+	if lane == nil {
+		var err error
+		lane, err = s.otaLane(ctx, b.MAC6)
+		if err != nil {
+			// the USB-only cold shape (no TCP face in the ref at all —
+			// TCPAddr()==""): the lane's existing refusal PLUS the
+			// read-face coach. The wrap keeps the boardErr/errUnreachable
+			// chain, so the reply's class/cause render unchanged.
+			if cur, ok := s.lookupExact(b.MAC6); ok {
+				ref := board.BoardRef{MAC6: cur.MAC6, Host: cur.Host, IP: cur.IP, Port: cur.Port, USBPath: cur.USBPath}
+				if ref.TCPAddr() == "" {
+					return nil, fmt.Errorf("%w — a read-only status can cross an ALREADY-WARM USB link; board_op op ota.status is the same read", err)
+				}
+			}
+			return nil, err
+		}
 	}
 	res, err := lane.Op(ctx, "ota.status", map[string]any{})
 	if err != nil {

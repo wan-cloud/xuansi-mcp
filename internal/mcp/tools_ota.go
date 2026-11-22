@@ -5,14 +5,16 @@ package mcp
 // fleet face (the daemon orchestrates write→activate→reboot→return→
 // identity-verify per board in parallel, one honest row per board);
 // xuansi_ota_status is the live per-board state read (the board's own
-// ota.status verbatim). Both are holder-less crossings — the push
-// carries no lease (the occupants refusal is its own conservative
-// shape daemon-side), the status is read-only. The Descs are the
-// product: each coaches the never-USB policy, the rolled-back
-// outcome's designed-not-broken reading, pending_verify's 45s
-// milestone (and the crash-loop self-heal wait), the occupants/force
-// pair, and the elf-sha identity model — frozen coaching discipline,
-// pinned by tools_ota_test.go's Desc audit.
+// ota.status verbatim). The push crosses holder-stamped (2026-11-23
+// ruling: the lease gate rides the pusher's identity), the status is
+// read-only and holder-less. The Descs are the product: the push's
+// Desc coaches the never-USB cargo policy, the status's scopes it to
+// cargo (its read rides warm controller links of ANY transport; only
+// fresh dials are TCP-only), plus the rolled-back outcome's
+// designed-not-broken reading, pending_verify's 45s milestone (and the
+// crash-loop self-heal wait), the occupants/force pair, and the
+// elf-sha identity model — frozen coaching discipline, pinned by
+// tools_ota_test.go's Desc audit.
 
 import (
 	"context"
@@ -99,7 +101,7 @@ func (ts *toolset) registerOTA(srv *mcpsdk.Server) {
 		Description: "One board's LIVE OTA state — the board's own ota.status verbatim plus the resolved board id. " +
 			"state is the transport machine: idle | writing | staged — writing carries slot + written (the in-flight uplink's target and progress), staged carries slot + staged_len + staged_sha (a verified image waiting in the inactive slot, one activate away). The RUNNING image's identity rides running_slot / running_ver / running_sha (the app_desc ELF sha hex64 — the same build identity xuansi_ota_push judges no-ops by) and img_state is the bootloader's ladder: valid = the running image is confirmed; pending_verify = UNCONFIRMED with the 45s rollback milestone armed (normal right after any push — confirm it or let it settle); new/aborted/undefined = the bootloader's bookkeeping states. " +
 			"READ IT LIKE THIS: idle + valid is the settled steady state; staged is one activate away; pending_verify immediately after a push is the machine working, not a fault — but pending_verify + a climbing boot_epoch between reads is a crash-looping image the milestone is about to roll back: wait for the self-heal, then read the settled truth here again. " +
-			"LIVE vs SNAPSHOT: this call crosses to the board for the current truth (TCP-only, the same never-USB policy as the push); xuansi_list_boards' ota_slot/ota_img_state/ota_sha columns are hello-snapshot values from the daemon's last sighting — judge a push's aftermath from HERE. Read-only, no lease.",
+			"LIVE vs SNAPSHOT: this call crosses to the board for the current truth — it rides the board's WARM controller link of ANY transport (USB included: never-USB is the CARGO face's policy, xuansi_ota_push's — an open reboots the board, and a link already open reboots nothing; a read over the warm CDC link is the same read board_op serves). Only a COLD crossing dials, and fresh dials stay TCP-only like the push's cargo; xuansi_list_boards' ota_slot/ota_img_state/ota_sha columns are hello-snapshot values from the daemon's last sighting — judge a push's aftermath from HERE. Read-only, no lease.",
 	}, ts.otaStatus)
 }
 

@@ -4986,3 +4986,179 @@ func TestSubmitRedialKeepsFrameWindow(t *testing.T) {
 		t.Fatalf("data_b64 = %x (err %v), want %x", got, derr, jpeg)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ota.status 溫鏈可讀 (⑥b/D3, 2026-11-23): the read-only observation
+// rides a warm controller of ANY transport; fresh dials stay TCP-only.
+// ---------------------------------------------------------------------------
+
+// TestOtaStatusReadsOverWarmUSBController (⑥b): the board holds a live
+// USB lease (transport:"usb" — the §4.4 deliberate route), so the warm
+// controller IS the USB one, and ota.status crosses straight over it:
+// verbatim reply, ZERO dials of either seam, the op landing on the USB
+// controller while the TCP one stays untouched. The 2026-11-15
+// never-USB ruling's scope is the OTA cargo (an OPEN reboots the
+// board); a link already in hand reboots nothing — the same read
+// board_op serves over the identical warm link.
+func TestOtaStatusReadsOverWarmUSBController(t *testing.T) {
+	const mac = "97c1ac"
+	e := newEnv(t, nil, mkBoard(mac, "xuansi-"+mac+".local"))
+	usb := e.usbFakes[mac]
+	scriptOtaHello(usb, 10, "ota_1", "valid", strings.Repeat("aa", 32))
+	usb.on("ota.status", func(args map[string]any) (map[string]any, *replclient.OpError) {
+		return map[string]any{"state": "writing", "slot": "ota_0", "written": int64(770048),
+			"running_slot": "ota_1", "running_ver": "0.6.0-warmusb",
+			"running_sha": strings.Repeat("aa", 32), "img_state": "valid"}, nil
+	})
+
+	c := dialSock(t, e.sock)
+	// let the startup audit's TCP dial settle so the before/after dial
+	// counters below are stable (the TestLeaseUSBTransport idiom)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && e.dialedTCP(mac) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	tcpBefore := e.dialedTCP(mac)
+
+	// warm the USB route the deliberate way: lease{transport:"usb"}
+	lrep, _ := c.call(1, map[string]any{"type": "lease", "board": mac, "holder": "u1", "transport": "usb"})
+	if asMap(lrep["error"]) != nil {
+		t.Fatalf("lease usb: %#v", lrep)
+	}
+	if asStr(asMap(lrep["result"])["transport"]) != "usb" {
+		t.Fatalf("lease transport = %#v, want usb (the warm-USB premise)", lrep["result"])
+	}
+	if n := e.dialedUSB(mac); n != 1 {
+		t.Fatalf("usb dials = %d, want 1 (the lease's deliberate open)", n)
+	}
+	usbDialed := e.dialedUSB(mac)
+
+	rep, _ := c.call(2, map[string]any{"type": "ota.status", "board": mac})
+	if rerr := asMap(rep["error"]); rerr != nil {
+		t.Fatalf("ota.status over the warm USB controller: %v", rerr)
+	}
+	res := asMap(rep["result"])
+	if asStr(res["board"]) != mac || asStr(res["state"]) != "writing" ||
+		asStr(res["running_ver"]) != "0.6.0-warmusb" || asInt(res["written"]) != 770048 {
+		t.Fatalf("result = %#v, want the USB controller's status verbatim + board", res)
+	}
+	// ZERO dials of either seam: the read rode the link already in hand
+	if n := e.dialedTCP(mac); n != tcpBefore {
+		t.Fatalf("tcp dials %d → %d: a warm read must open nothing", tcpBefore, n)
+	}
+	if n := e.dialedUSB(mac); n != usbDialed {
+		t.Fatalf("usb dials %d → %d: a warm read must open nothing", usbDialed, n)
+	}
+	// the op crossed the USB controller; the TCP fake never saw it
+	sawOnUSB, sawOnTCP := false, false
+	for _, call := range usb.got() {
+		if call.op == "ota.status" {
+			sawOnUSB = true
+		}
+	}
+	for _, call := range e.fakeOf(mac).got() {
+		if call.op == "ota.status" {
+			sawOnTCP = true
+		}
+	}
+	if !sawOnUSB || sawOnTCP {
+		t.Fatalf("ota.status crossed usb=%v tcp=%v, want the WARM usb controller only", sawOnUSB, sawOnTCP)
+	}
+}
+
+// newOtaUSBOnlyEnv builds the USB-ONLY cold world (⑥b's refusal leg):
+// one board whose only live source is USB (no TCP face at all — the
+// BoardRef carries no Host/IP/Port, so production's default DialTCP
+// would refuse ErrNoDialEndpoint). The env's DialTCP mirrors that
+// production refusal verbatim; DialUSB counts and refuses — a cold OTA
+// crossing must NEVER open CDC. The startup audit's TCP dial fails the
+// same fast way, so no warm link ever exists (newOtaEnvLog's "the
+// audit stops at that error" shape).
+func newOtaUSBOnlyEnv(t *testing.T, mac string) *env {
+	t.Helper()
+	e := &env{
+		t:         t,
+		fakes:     map[string]*fakeCtl{},
+		dialed:    map[string]int{},
+		usbFakes:  map[string]*fakeCtl{},
+		usbDialed: map[string]int{},
+	}
+	boards := []discover.Board{{
+		MAC6: mac, Sources: []string{discover.SourceUSB},
+		USBPath: "/dev/serial/by-id/fake-" + mac,
+	}}
+	reg := discover.NewRegistry(nil, nil,
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) { return boards, nil }),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) { return nil, nil }),
+	)
+	e.sock = filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srv, err := New(Opts{
+		SockPath:         e.sock,
+		Registry:         reg,
+		GraceTTL:         10 * time.Second,
+		RefreshInterval:  -1,
+		Log:              newTestLogf(t, "srv: "),
+		BootRecordsDir:   filepath.Join(testutil.ShortSockDir(t), "bootrec"),
+		DisableProvision: true,
+		VaultDir:         filepath.Join(testutil.ShortSockDir(t), "vault"),
+		NewSupervisor: func(ref board.BoardRef) *board.Supervisor {
+			return board.NewSupervisor(ref, board.SupOpts{
+				Log: newTestLogf(t, "sup: "),
+				DialTCP: func() (board.Controller, error) {
+					e.dmu.Lock()
+					e.dialed[ref.MAC6]++
+					e.dmu.Unlock()
+					return nil, fmt.Errorf("board %s: no TCP endpoint to dial: %w", ref.MAC6, board.ErrNoDialEndpoint)
+				},
+				DialUSB: func() (board.Controller, error) {
+					e.dmu.Lock()
+					e.usbDialed[ref.MAC6]++
+					e.dmu.Unlock()
+					return nil, fmt.Errorf("board %s: a cold OTA crossing must never open CDC", ref.MAC6)
+				},
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	e.srv = srv
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	awaitSweep(t, srv.reg, 1)
+	return e
+}
+
+// TestOtaStatusColdUSBOnlyStillRefusedTCPOnly (⑥b): with NO warm link
+// a USB-only board still refuses — fresh dials stay TCP-only (the
+// 2026-11-15 ruling's cargo scope owns the dial) — and the refusal now
+// carries the read-face coach: the existing unreachable text PLUS the
+// warm-link sentence, verbatim.
+func TestOtaStatusColdUSBOnlyStillRefusedTCPOnly(t *testing.T) {
+	const mac = "d75884"
+	e := newOtaUSBOnlyEnv(t, mac)
+
+	c := dialSock(t, e.sock)
+	rep, _ := c.call(1, map[string]any{"type": "ota.status", "board": mac})
+	rerr := asMap(rep["error"])
+	if rerr == nil {
+		t.Fatalf("ota.status on a cold USB-only board must refuse, got %#v", rep["result"])
+	}
+	if asStr(rerr["class"]) != "unreachable" {
+		t.Fatalf("class = %v, want unreachable (the existing cold-dial refusal)", rerr["class"])
+	}
+	msg := asStr(rerr["msg"])
+	if !strings.Contains(msg, "no TCP endpoint to dial") {
+		t.Fatalf("msg = %q, want the existing refusal text (no TCP endpoint to dial)", msg)
+	}
+	const coach = "a read-only status can cross an ALREADY-WARM USB link; board_op op ota.status is the same read"
+	if !strings.Contains(msg, coach) {
+		t.Fatalf("msg = %q, want the read-face coach verbatim: %q", msg, coach)
+	}
+	// TCP-only: the crossing never opened CDC
+	if n := e.dialedUSB(mac); n != 0 {
+		t.Fatalf("usb dials = %d, want 0 — a cold OTA read never opens CDC", n)
+	}
+}

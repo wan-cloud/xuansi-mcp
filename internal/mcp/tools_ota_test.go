@@ -257,7 +257,9 @@ func TestOTAStatusRefusalCrossesVerbatim(t *testing.T) {
 // force pair, confirm's skip-the-wait, the lease gate (2026-11-23
 // ruling: holder-stamped crossing, take-the-lease coaching, force
 // never bypassing it), and (push) the elf-sha identity model;
-// (status) the live-vs-snapshot reading.
+// (status) the live-vs-snapshot reading + the ⑥b warm-any-transport
+// scope (never-USB is the cargo face's; the read rides warm links of
+// any transport, fresh dials stay TCP-only).
 func TestOTADescCoachingAudit(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -281,6 +283,10 @@ func TestOTADescCoachingAudit(t *testing.T) {
 		"xuansi_ota_status": {
 			"idle | writing | staged", "img_state", "pending_verify", "45s",
 			"running_sha", "LIVE vs SNAPSHOT", "self-heal",
+			// ⑥b (2026-11-23): the read rides warm links of ANY transport;
+			// never-USB is scoped to the cargo face + fresh dials.
+			"WARM controller link of ANY transport", "USB included",
+			"fresh dials stay TCP-only",
 		},
 	}
 	for name, wants := range audit {
