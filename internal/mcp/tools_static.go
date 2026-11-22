@@ -315,6 +315,12 @@ type boardInfo struct {
 	// psk.hex must be DELETED — 'creds set' never touches it, so that
 	// coach would be a no-op). Absent before any sighting.
 	ProvisionState string `json:"provision_state,omitempty" jsonschema:"the board's wifi-credential provisioning verdict: ok (carries credentials), credless (none — the daemon's zero-ritual provisioner arms for it), vault-empty (none AND the host vault is empty: direct the USER to run 'xuansi creds set' or 'xuansi creds import <file>' on the HOST — credentials never cross the agent channel, and the device PSK is daemon-generated so the user provides nothing beyond WiFi), or vault-error (none AND the host vault read BROKEN — malformed creds.json or a corrupt psk.hex: NOT empty; the remedy is file-level — 'xuansi creds set' rewrites a malformed creds.json, but a corrupt psk.hex must be DELETED by the user, which re-arms the daemon's generation; 'creds set' never touches psk.hex); absent before the daemon's first sighting of the board"`
+	// Lease (⑥e) is the per-board lease column — who holds the board,
+	// visible from the listing alone. Same shape as board_status's
+	// lease leg; ALWAYS present (the transport precedent — a client
+	// never distinguishes an absent key from a free board): null when
+	// the board is free.
+	Lease *leaseSummary `json:"lease" jsonschema:"the current lease summary — holder/session/since, plus grace_deadline while the holder is gone (grace counting down; a same-holder op adopts it back live); null when the board is free"`
 }
 
 type listBoardsOut struct {
@@ -322,8 +328,10 @@ type listBoardsOut struct {
 	MdnsError string      `json:"mdns_error,omitempty" jsonschema:"mDNS discovery trouble, when present"`
 }
 
-// leaseView is the daemon's lease snapshot (board_status's lease leg).
-type leaseView struct {
+// leaseSummary is the daemon's lease snapshot shape — board_status's
+// lease leg and list_boards's per-board lease column (⑥e), one shape
+// across the seat.
+type leaseSummary struct {
 	Holder        string `json:"holder"`
 	Session       int    `json:"session"`
 	Since         string `json:"since" jsonschema:"RFC3339 lease start"`
@@ -333,7 +341,7 @@ type leaseView struct {
 type boardStatusOut struct {
 	Board        map[string]any `json:"board" jsonschema:"the board's identity view (same shape as xuansi_list_boards entries: fw, boot identity boot_epoch/reset_reason/last_seen, chip, and the freshness face transport/last_seen_age_ms/stale)"`
 	Connected    bool           `json:"connected" jsonschema:"whether the daemon holds a live warm controller connection to the board — a daemon-side link fact, NOT board liveness: false only means no contact yet or the last link died; judge board survival from boot_epoch/reset_reason/last_seen and board.reboot events"`
-	Lease        *leaseView     `json:"lease,omitempty" jsonschema:"the current lease; absent when the board is free"`
+	Lease        *leaseSummary  `json:"lease,omitempty" jsonschema:"the current lease; absent when the board is free"`
 	Scripts      []any          `json:"scripts,omitempty" jsonschema:"running scripts (present when connected); shapes are the board's script list"`
 	ScriptsError string         `json:"scripts_error,omitempty" jsonschema:"why the script list is missing, when the board refused it"`
 }
@@ -501,7 +509,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). " + provisionCoachDesc + " Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Lease column: holder/session/since + grace_deadline while the holder is gone (grace counting down; a same-holder op adopts it back live); null when the board is free. " + provisionCoachDesc + " Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -685,6 +693,20 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 		if v, ok := m["last_seen_age_ms"].(float64); ok {
 			age = int64(v)
 		}
+		// lease column (⑥e): the daemon's per-row summary passes through
+		// typed — grace_deadline only when the daemon sent it (live
+		// lease), nil (→ JSON null) when the board is free.
+		var lv *leaseSummary
+		if lm, ok := m["lease"].(map[string]any); ok {
+			lv = &leaseSummary{
+				Holder:  str(lm, "holder"),
+				Session: num(lm, "session"),
+				Since:   str(lm, "since"),
+			}
+			if _, ok := lm["grace_deadline"]; ok {
+				lv.GraceDeadline = str(lm, "grace_deadline")
+			}
+		}
 		out.Boards = append(out.Boards, boardInfo{
 			MAC6:           str(m, "mac6"),
 			Alias:          str(m, "alias"),
@@ -706,6 +728,7 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			LastSeenAgeMS:  age,
 			Stale:          bol(m, "stale"),
 			ProvisionState: str(m, "provision_state"),
+			Lease:          lv,
 		})
 	}
 	return nil, out, nil
@@ -723,7 +746,7 @@ func (ts *toolset) boardStatus(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 		ScriptsError: str(res, "scripts_error"),
 	}
 	if lm, ok := res["lease"].(map[string]any); ok {
-		out.Lease = &leaseView{
+		out.Lease = &leaseSummary{
 			Holder:        str(lm, "holder"),
 			Session:       num(lm, "session"),
 			Since:         str(lm, "since"),

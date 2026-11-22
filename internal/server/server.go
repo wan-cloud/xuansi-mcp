@@ -1624,11 +1624,38 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 	return v
 }
 
+// leaseSummaryOf renders one LeaseState in the shape board_status's
+// lease leg already serializes: holder/session/since always,
+// grace_deadline only while grace counts down. The list column (⑥e)
+// mirrors it verbatim — one lease shape across both faces.
+func leaseSummaryOf(ls lease.LeaseState) map[string]any {
+	m := map[string]any{
+		"holder": ls.Holder, "session": ls.Session,
+		"since": ls.Since.Format(time.RFC3339),
+	}
+	if !ls.GraceDeadline.IsZero() {
+		m["grace_deadline"] = ls.GraceDeadline.Format(time.RFC3339)
+	}
+	return m
+}
+
 func (s *Server) hListBoards() (any, error) {
 	boards := s.reg.Snapshot()
+	// One lease snapshot joined per row (⑥e): who holds each board,
+	// visible from the listing alone — null when the board is free.
+	byBoard := map[string]lease.LeaseState{}
+	for _, ls := range s.leases.Snapshot() {
+		byBoard[ls.Board] = ls
+	}
 	out := make([]any, 0, len(boards))
 	for _, b := range boards {
-		out = append(out, s.boardView(b))
+		v := s.boardView(b)
+		if ls, held := byBoard[b.MAC6]; held {
+			v["lease"] = leaseSummaryOf(ls)
+		} else {
+			v["lease"] = nil
+		}
+		out = append(out, v)
 	}
 	return map[string]any{"boards": out, "mdns_error": s.reg.MDNSError()}, nil
 }
@@ -1687,14 +1714,7 @@ func (s *Server) hBoardStatus(ctx context.Context, req *Request) (any, error) {
 		if ls.Board != b.MAC6 {
 			continue
 		}
-		lm := map[string]any{
-			"holder": ls.Holder, "session": ls.Session,
-			"since": ls.Since.Format(time.RFC3339),
-		}
-		if !ls.GraceDeadline.IsZero() {
-			lm["grace_deadline"] = ls.GraceDeadline.Format(time.RFC3339)
-		}
-		res["lease"] = lm
+		res["lease"] = leaseSummaryOf(ls)
 	}
 	return res, nil
 }

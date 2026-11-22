@@ -494,6 +494,56 @@ func TestListBoardsTransportAlwaysPresent(t *testing.T) {
 	}
 }
 
+// TestListBoardsLeaseColumnPassesThrough (⑥e): the daemon's per-board
+// lease column crosses the typed decode — live holder/session/since
+// (grace_deadline only when the daemon sent it), null when free.
+func TestListBoardsLeaseColumnPassesThrough(t *testing.T) {
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"boards": []any{
+			map[string]any{
+				"mac6": "d75884", "sources": []any{"usb"},
+				"lease": map[string]any{
+					"holder": "e1", "session": 3.0, "since": "2026-11-23T00:00:00Z",
+				},
+			},
+			map[string]any{
+				"mac6": "bb77cc", "sources": []any{"mdns"},
+				"lease": map[string]any{
+					"holder": "e2", "session": 5.0, "since": "2026-11-23T01:00:00Z",
+					"grace_deadline": "2026-11-23T01:02:00Z",
+				},
+			},
+			map[string]any{"mac6": "aabbdd", "sources": []any{"mdns"}, "lease": nil},
+		},
+	}}}, Options{})
+	res := e.call("xuansi_list_boards", nil)
+	if res.IsError {
+		t.Fatalf("list_boards failed: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	boards, _ := m["boards"].([]any)
+	if len(boards) != 3 {
+		t.Fatalf("boards = %#v, want the three-board list", m["boards"])
+	}
+	live, _ := boards[0].(map[string]any)
+	llease, _ := live["lease"].(map[string]any)
+	if llease == nil || llease["holder"] != "e1" || llease["session"] != 3.0 || llease["since"] != "2026-11-23T00:00:00Z" {
+		t.Errorf("live lease = %#v, want holder e1/session 3/since", live["lease"])
+	}
+	if _, ok := llease["grace_deadline"]; ok {
+		t.Errorf("live grace_deadline = %#v, want honest absence while the holder is live", llease["grace_deadline"])
+	}
+	grace, _ := boards[1].(map[string]any)
+	glease, _ := grace["lease"].(map[string]any)
+	if glease == nil || glease["grace_deadline"] != "2026-11-23T01:02:00Z" {
+		t.Errorf("grace lease = %#v, want the grace deadline carried through", grace["lease"])
+	}
+	free, _ := boards[2].(map[string]any)
+	if v, ok := free["lease"]; !ok || v != nil {
+		t.Errorf("free board lease = %#v (present=%v), want the explicit null", v, ok)
+	}
+}
+
 // TestDefaultHolderFormat: a zero Options generates a per-process
 // holder "mcp-<8 hex>" — short, unique per process.
 func TestDefaultHolderFormat(t *testing.T) {

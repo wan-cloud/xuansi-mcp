@@ -816,6 +816,85 @@ func TestListBoardsShape(t *testing.T) {
 	}
 }
 
+// TestListBoardsCarriesLeaseSummary (⑥e): the listing's per-board lease
+// column — the same summary shape board_status serializes (holder/
+// session/since, grace_deadline only while grace counts down) — null
+// when the board is free. An agent reading the listing sees who holds
+// what without a per-board status call.
+func TestListBoardsCarriesLeaseSummary(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"), mkBoard("aabbcc", "xuansi-aabbcc.local"))
+	lc := dialSock(t, e.sock) // the leasing connection (closed below to drive grace)
+	c := dialSock(t, e.sock)  // the listing connection (stays up)
+
+	rep, _ := lc.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "seat-1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	sess := asInt(asMap(rep["result"])["session"])
+
+	rowOf := func(id int64, mac string) map[string]any {
+		t.Helper()
+		r, _ := c.call(id, map[string]any{"type": "list_boards"})
+		if asMap(r["error"]) != nil {
+			t.Fatalf("list_boards: %#v", r)
+		}
+		boards, _ := asMap(r["result"])["boards"].([]any)
+		for _, b := range boards {
+			if m := asMap(b); asStr(m["mac6"]) == mac {
+				return m
+			}
+		}
+		t.Fatalf("board %s not listed: %#v", mac, r["result"])
+		return nil
+	}
+
+	// live: holder/session/since present, grace_deadline honestly absent.
+	held := rowOf(2, "d75884")
+	lm := asMap(held["lease"])
+	if lm == nil {
+		t.Fatalf("live lease column = %#v, want the summary map", held["lease"])
+	}
+	if asStr(lm["holder"]) != "seat-1" || asInt(lm["session"]) != sess {
+		t.Errorf("live lease = %#v, want holder seat-1 session %d", lm, sess)
+	}
+	if _, err := time.Parse(time.RFC3339, asStr(lm["since"])); err != nil {
+		t.Errorf("since = %q, want RFC3339 (%v)", lm["since"], err)
+	}
+	if _, ok := lm["grace_deadline"]; ok {
+		t.Errorf("grace_deadline = %#v, want honest absence while the holder is live", lm["grace_deadline"])
+	}
+	// free: the explicit null.
+	if v, ok := rowOf(3, "aabbcc")["lease"]; !ok || v != nil {
+		t.Errorf("free board lease = %#v (present=%v), want null", v, ok)
+	}
+
+	// grace: the leasing connection's drop moves the lease to grace —
+	// the column grows grace_deadline, RFC3339.
+	lc.conn.Close()
+	graced := false
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !graced {
+		for _, ls := range e.srv.Leases().Snapshot() {
+			if ls.Board == "d75884" && !ls.GraceDeadline.IsZero() {
+				graced = true
+			}
+		}
+		if !graced {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !graced {
+		t.Fatalf("lease never entered grace after disconnect: %+v", e.srv.Leases().Snapshot())
+	}
+	lm = asMap(rowOf(4, "d75884")["lease"])
+	if lm == nil {
+		t.Fatalf("grace lease column = nil, want the summary map")
+	}
+	if _, err := time.Parse(time.RFC3339, asStr(lm["grace_deadline"])); err != nil {
+		t.Errorf("grace_deadline = %q, want RFC3339 (%v)", lm["grace_deadline"], err)
+	}
+}
+
 // TestReplyIDPairingUnderConcurrency: two requests in flight on one
 // connection each get the reply carrying their own id. The replies may
 // legally complete in EITHER order — the server runs each request's
