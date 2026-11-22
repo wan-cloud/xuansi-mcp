@@ -1451,8 +1451,8 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hLaAlign(req)
 	case "la_export":
 		result, err = s.hLaExport(req)
-	case "ota.push": // T6: the fleet push (own ceiling, above)
-		result, err = s.hOtaPush(ctx, req)
+	case "ota.push": // T6: the fleet push (own ceiling, above; ⑨: lease-gated)
+		result, err = s.hOtaPush(ctx, cc, req)
 	case "ota.status": // T6: the ro ota observation (no lease)
 		result, err = s.hOtaStatus(ctx, req)
 	case "fw_versions": // dist wave D4: the fleet reconciliation view (ro, no board contact)

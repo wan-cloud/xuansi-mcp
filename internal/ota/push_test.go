@@ -640,3 +640,39 @@ func TestPushSecondsAndTransportVerified(t *testing.T) {
 		t.Fatalf("detail = %q, want the triple-match account", r.Detail)
 	}
 }
+
+// TestPushRequireLeaseSeam (⑨/D1, the daemon's 2026-11-23 ruling): the
+// Deps lease seam — a non-nil gate error refuses the row with the
+// error's own text BEFORE the lane (zero dials), and FORCE DOES NOT
+// CLEAR IT (force overrides the occupants refusal only, never the
+// authority). Ordering pin: with a Conflicts seam armed too, the row
+// carries the LEASE text, not the occupants text.
+func TestPushRequireLeaseSeam(t *testing.T) {
+	bin := writeBin(t, "0.7.0", shaBytes(newSha))
+	fb := (&fakeBoard{ops: map[string]func(map[string]any) (map[string]any, error){}}).
+		script("97c1ac", "idle", "valid", "0.6.0", "ota_1", oldSha)
+	src := newFakeSource(fb)
+	gateErr := fmt.Errorf("no lease — take the lease first (MCP: xuansi_lease; CLI: xuansi lease BOARD --holder <id>) — OTA requires the pusher to hold the board's lease (2026-11-23 ruling)")
+	d := defaultDeps(src)
+	d.RequireLease = func(context.Context, string) error { return gateErr }
+	d.Conflicts = func(context.Context, string, Board) []string {
+		return []string{"running scripts: watchdog"}
+	}
+
+	for _, force := range []bool{false, true} {
+		rows, err := Push(context.Background(), d, []string{"97c1ac"}, bin.path, Opts{Activate: true, Force: force})
+		if err != nil {
+			t.Fatalf("Push(force=%v): %v", force, err)
+		}
+		r := wantRow(t, rows, "97c1ac", OutcomeRefused)
+		if r.Detail != gateErr.Error() {
+			t.Fatalf("Push(force=%v) detail = %q, want the gate error's text verbatim", force, r.Detail)
+		}
+	}
+	if n := src.dialsOf("97c1ac"); n != 0 {
+		t.Fatalf("lane dials = %d, want 0 — the lease gate refuses before any board contact", n)
+	}
+	if fb.uploads() != 0 {
+		t.Fatal("a lease-refused push must not transport")
+	}
+}

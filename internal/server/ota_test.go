@@ -228,6 +228,12 @@ func TestOtaPushNoOpRow(t *testing.T) {
 	})
 
 	c := dialSock(t, e.sock)
+	// the pusher holds the lease (2026-11-23 ruling): the gate demands
+	// it before any row can answer, no-op included.
+	lrep, _ := c.call(0, map[string]any{"type": "lease", "board": mac, "holder": "bench-agent"})
+	if asMap(lrep["error"]) != nil {
+		t.Fatalf("lease: %#v", lrep)
+	}
 	rep, _ := c.call(1, map[string]any{"type": "ota.push", "boards": []string{mac}, "path": path})
 	if rerr := asMap(rep["error"]); rerr != nil {
 		t.Fatalf("ota.push: %v", rerr)
@@ -247,9 +253,12 @@ func TestOtaPushNoOpRow(t *testing.T) {
 	}
 }
 
-// TestOtaPushRefusedThenForce: an armed lease refuses the push with the
-// holder listed; force pushes through (transport + activate + the
-// post-reboot hello triple match).
+// TestOtaPushRefusedThenForce: the occupants refusal and its force
+// override UNDER the lease gate (2026-11-23 ruling): the pusher holds
+// the board's lease (the gate's requirement — the lease call binds the
+// connection), a running script refuses the unforced push with the
+// own lease NEVER in the disclosure, and force pushes through
+// (transport + activate + the post-reboot hello triple match).
 func TestOtaPushRefusedThenForce(t *testing.T) {
 	const mac = "97c1ac"
 	path, elf, fileSHA := mkOtaBin(t, "0.7.0", strings.Repeat("cc", 32))
@@ -285,8 +294,11 @@ func TestOtaPushRefusedThenForce(t *testing.T) {
 	if asStr(r["outcome"]) != "refused" {
 		t.Fatalf("outcome = %v, want refused (%#v)", r["outcome"], r)
 	}
-	if !strings.Contains(asStr(r["detail"]), "bench-agent") {
-		t.Fatalf("detail = %q, want the lease holder listed", asStr(r["detail"]))
+	if !strings.Contains(asStr(r["detail"]), "running scripts") {
+		t.Fatalf("detail = %q, want the running-script occupant listed", asStr(r["detail"]))
+	}
+	if strings.Contains(asStr(r["detail"]), "lease: holder") {
+		t.Fatalf("detail = %q — the pusher's own lease must not appear in the occupants list (the gate's authority, not an obstruction)", asStr(r["detail"]))
 	}
 	for _, call := range f.got() {
 		if call.op == "ota.begin+0x02" {
@@ -473,12 +485,13 @@ func TestOpAllowlistOta(t *testing.T) {
 // TestOtaOccupantDiscoveryDisclosure (final review fix #3): when
 // script.list or la.info refuses during occupant discovery, the
 // daemon logs one line per broken leg — the under-disclosure edge (a
-// dying script could go unlisted in a refused row's detail) stays
-// visible in the log while the lease (daemon-side truth) still
-// refuses the push.
+// dying script could go unlisted) stays visible in the log while the
+// push itself proceeds: the pusher's own lease (the gate's
+// requirement, 2026-11-23) never counts as an occupant, so a fully
+// broken discovery leaves the occupants list empty and the push lands.
 func TestOtaOccupantDiscoveryDisclosure(t *testing.T) {
 	const mac = "97c1ac"
-	path, elf, _ := mkOtaBin(t, "0.7.0", strings.Repeat("cc", 32))
+	path, elf, fileSHA := mkOtaBin(t, "0.7.0", strings.Repeat("cc", 32))
 	var mu sync.Mutex
 	var lines []string
 	logf := func(format string, args ...any) {
@@ -495,6 +508,7 @@ func TestOtaOccupantDiscoveryDisclosure(t *testing.T) {
 		f.on("la.info", func(args map[string]any) (map[string]any, *replclient.OpError) {
 			return nil, &replclient.OpError{Op: "la.info", Class: "api", Msg: "la view unavailable"}
 		})
+		armGatePushTail(f, elf, fileSHA)
 	}, logf)
 
 	c := dialSock(t, e.sock)
@@ -508,8 +522,8 @@ func TestOtaOccupantDiscoveryDisclosure(t *testing.T) {
 	}
 	rows, _ := rep["result"].(map[string]any)["rows"].([]any)
 	r := asMap(rows[0])
-	if asStr(r["outcome"]) != "refused" || !strings.Contains(asStr(r["detail"]), "bench-agent") {
-		t.Fatalf("row = %#v, want refused with the lease (daemon-side truth) listed", r)
+	if asStr(r["outcome"]) != "pushed" {
+		t.Fatalf("row = %#v, want pushed — a broken discovery leg discloses in the log, it does not block the authorized push", r)
 	}
 
 	mu.Lock()

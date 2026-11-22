@@ -6,7 +6,9 @@ package server
 // The CDC policy ruling (2026-11-15) lives in the lane adapter below:
 // OTA NEVER crosses USB — a board whose live route is CDC is refused,
 // and a cold board dials TCP only (no fallback), unlike the lease
-// machinery's §4.4 seam.
+// machinery's §4.4 seam. The fleet push is lease-gated (owner ruling
+// 2026-11-23): the pusher must hold every pushed board's lease —
+// otaLeaseGate below, force cannot bypass it.
 
 import (
 	"context"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"xuansi/internal/board"
+	"xuansi/internal/lease"
 	"xuansi/internal/ota"
 )
 
@@ -73,69 +76,117 @@ func (s *Server) otaEraGate(mac6 string) string {
 }
 
 // otaOccupants lists the board's occupants a non-forced push refuses
-// against (spec §5): active leases (daemon-side truth), running
-// scripts (script.list over the board), and live LA captures
+// against (spec §5): active leases (daemon-side truth) EXCEPT the
+// pusher's own — the 2026-11-23 ruling turns the own lease from an
+// obstruction into the push's authorization (otaLeaseGate holds that
+// door; the own line here would refuse the pusher for holding it) —
+// running scripts (script.list over the board), and live LA captures
 // (la.info's board-side caps — armed or stopped-undisarmed, a reboot
 // destroys both). Each line is one disclosure; ota.Push renders the
 // refusal and the force override.
-func (s *Server) otaOccupants(ctx context.Context, mac6 string, lane ota.Board) []string {
-	var out []string
-	for _, ls := range s.leases.Snapshot() {
-		if ls.Board == mac6 {
-			out = append(out, fmt.Sprintf("lease: holder %q (session %d, since %s)",
-				ls.Holder, ls.Session, ls.Since.Format(time.RFC3339)))
+func (s *Server) otaOccupants(holder string) func(ctx context.Context, mac6 string, lane ota.Board) []string {
+	return func(ctx context.Context, mac6 string, lane ota.Board) []string {
+		var out []string
+		for _, ls := range s.leases.Snapshot() {
+			if ls.Board == mac6 && ls.Holder != holder {
+				out = append(out, fmt.Sprintf("lease: holder %q (session %d, since %s)",
+					ls.Holder, ls.Session, ls.Since.Format(time.RFC3339)))
+			}
 		}
-	}
-	if db, ok := s.lookupSupervisorBoard(mac6); ok {
+		if db, ok := s.lookupSupervisorBoard(mac6); ok {
+			sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			if names, err := db.sup.ScriptList(sctx); err == nil && len(names) > 0 {
+				out = append(out, "running scripts: "+strings.Join(names, ", "))
+			} else if err != nil {
+				// the under-disclosure edge (final review fix #3): a dying
+				// script could go unlisted in the refusal's detail — one
+				// log line keeps the broken discovery leg visible.
+				s.logf("server: ota.push %s: occupant discovery: script.list failed (%v) — a refused row's detail may under-list running scripts", mac6, err)
+			}
+			cancel()
+		}
 		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if names, err := db.sup.ScriptList(sctx); err == nil && len(names) > 0 {
-			out = append(out, "running scripts: "+strings.Join(names, ", "))
-		} else if err != nil {
-			// the under-disclosure edge (final review fix #3): a dying
-			// script could go unlisted in the refusal's detail — one
-			// log line keeps the broken discovery leg visible.
-			s.logf("server: ota.push %s: occupant discovery: script.list failed (%v) — a refused row's detail may under-list running scripts", mac6, err)
+		if res, err := lane.Op(sctx, "la.info", map[string]any{}); err == nil {
+			if caps, ok := res["caps"].([]any); ok && len(caps) > 0 {
+				var nums []string
+				for _, c := range caps {
+					m, ok := c.(map[string]any)
+					if !ok {
+						continue
+					}
+					switch v := m["cap"].(type) {
+					case int64:
+						nums = append(nums, fmt.Sprintf("cap=%d", v))
+					case int:
+						nums = append(nums, fmt.Sprintf("cap=%d", v))
+					}
+				}
+				if len(nums) > 0 {
+					out = append(out, "la captures board-side: "+strings.Join(nums, ", "))
+				}
+			}
+		} else {
+			// same disclosure for the LA leg: a live capture the board
+			// could not enumerate stays visible in the log.
+			s.logf("server: ota.push %s: occupant discovery: la.info failed (%v) — a refused row's detail may under-list live captures", mac6, err)
 		}
 		cancel()
+		return out
 	}
-	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	if res, err := lane.Op(sctx, "la.info", map[string]any{}); err == nil {
-		if caps, ok := res["caps"].([]any); ok && len(caps) > 0 {
-			var nums []string
-			for _, c := range caps {
-				m, ok := c.(map[string]any)
-				if !ok {
-					continue
-				}
-				switch v := m["cap"].(type) {
-				case int64:
-					nums = append(nums, fmt.Sprintf("cap=%d", v))
-				case int:
-					nums = append(nums, fmt.Sprintf("cap=%d", v))
-				}
+}
+
+// otaLeaseGate is the push's per-board lease gate (owner ruling
+// 2026-11-23: the pusher must hold the board's lease — the push
+// reboots the board, exactly what a lease guards). It mirrors
+// ensureLiveLease's adopt semantics one-for-one (server.go): wherever
+// a same-holder eval would pass, the push passes — another holder's
+// lease (live or grace) refuses with lease.ErrHeld's text, a grace
+// lease of THIS holder is adopted back live first (a failed adopt
+// refuses), a mid-teardown entry refuses via Session, and NO lease at
+// all refuses with the take-the-lease coaching. The refusal rides the
+// per-board row's detail (outcome "refused"); force clears occupants
+// refusals only, never this gate (pushBoard's ordering: era gate →
+// RequireLease → Conflicts).
+func (s *Server) otaLeaseGate(holder string) func(ctx context.Context, mac6 string) error {
+	return func(ctx context.Context, mac6 string) error {
+		for _, ls := range s.leases.Snapshot() {
+			if ls.Board != mac6 {
+				continue
 			}
-			if len(nums) > 0 {
-				out = append(out, "la captures board-side: "+strings.Join(nums, ", "))
+			if ls.Holder != holder {
+				err := &lease.ErrHeld{Board: ls.Board, Holder: ls.Holder, Since: ls.Since}
+				if !ls.GraceDeadline.IsZero() {
+					err.GraceExpiry = ls.GraceDeadline
+				}
+				return err
 			}
+			if !ls.GraceDeadline.IsZero() {
+				if !s.leases.Adopt(holder) {
+					return fmt.Errorf("grace TTL expired on board %s (holder %s) — the lease was torn down at adopt; lease it fresh", mac6, holder)
+				}
+				s.logf("server: ota.push: holder %s adopted board %s back live", holder, mac6)
+			}
+			if _, ok := s.leases.Session(mac6); !ok {
+				return fmt.Errorf("lease on board %s is mid-teardown (holder %s) — retry shortly or lease it fresh", mac6, holder)
+			}
+			return nil
 		}
-	} else {
-		// same disclosure for the LA leg: a live capture the board
-		// could not enumerate stays visible in the log.
-		s.logf("server: ota.push %s: occupant discovery: la.info failed (%v) — a refused row's detail may under-list live captures", mac6, err)
+		return fmt.Errorf("no lease — take the lease first (MCP: xuansi_lease; CLI: xuansi lease BOARD --holder <id>) — OTA requires the pusher to hold the board's lease (2026-11-23 ruling)")
 	}
-	cancel()
-	return out
 }
 
 // hOtaPush serves ota.push: resolve the selectors, then internal/ota's
 // Push owns the orchestration (per-board parallel, one honest row per
-// board). No lease gate — the occupants refusal is this face's own
-// conservative shape (a lease-holder's board refuses unless forced;
-// the push reboots, which is exactly what a lease should guard).
-// The whole-push refusals (unreadable image, over-slot size, bad
-// app_desc, pinned-sha mismatch) are api-class with zero board
+// board). LEASE-GATED (owner ruling 2026-11-23): the pusher — the
+// request's effective holder, connHolder — must hold every pushed
+// board's lease; otaLeaseGate refuses the row (force cannot clear it)
+// and the pusher's own lease never counts as an occupant
+// (otaOccupants filters it) — the reboot a push performs is exactly
+// what a lease guards, so the authority and the action sit in one
+// hand. The whole-push refusals (unreadable image, over-slot size,
+// bad app_desc, pinned-sha mismatch) are api-class with zero board
 // contact, deliberately mirroring the board's own refusal class.
-func (s *Server) hOtaPush(ctx context.Context, req *Request) (any, error) {
+func (s *Server) hOtaPush(ctx context.Context, cc *clientConn, req *Request) (any, error) {
 	if len(req.Boards) == 0 {
 		return nil, &RPCError{Class: "server", Msg: "ota.push: boards[] is required (selectors, resolved daemon-side; the rows key by mac6)"}
 	}
@@ -158,11 +209,13 @@ func (s *Server) hOtaPush(ctx context.Context, req *Request) (any, error) {
 		}
 		macs = append(macs, b.MAC6)
 	}
+	holder := connHolder(cc, req)
 	rows, err := ota.Push(ctx, ota.Deps{
-		Source:    ota.SourceFunc(s.otaLane),
-		Gate:      s.otaEraGate,
-		Conflicts: s.otaOccupants,
-		Logf:      s.logf,
+		Source:       ota.SourceFunc(s.otaLane),
+		Gate:         s.otaEraGate,
+		RequireLease: s.otaLeaseGate(holder),
+		Conflicts:    s.otaOccupants(holder),
+		Logf:         s.logf,
 	}, macs, req.Path, ota.Opts{
 		Sha256:   req.Sha256,
 		Activate: activate,

@@ -6,6 +6,9 @@ package ota
 //
 //	0. era gate    — a board sighted at a KNOWN-old protocol era cannot
 //	                 ota at all; refused, force does not help.
+//	0b. lease gate — the pusher must hold the board's lease (the
+//	                 daemon's 2026-11-23 ruling); refused before any
+//	                 board contact, force does not help.
 //	1. lane        — the board's CURRENT controller (warm when live,
 //	                 redialed when the last link died).
 //	2. ota.status  — the preflight truth: the running identity, the
@@ -101,6 +104,13 @@ type Deps struct {
 	// (the fw lacks the ops); an UNSIGHTED board (0) passes: the push
 	// itself is a first sighting.
 	Gate func(mac6 string) string
+	// RequireLease is the per-board lease gate (the daemon's 2026-11-23
+	// ruling: the pusher must hold the board's lease). A non-nil error
+	// refuses the row with the error's own text BEFORE the lane — zero
+	// board contact — and FORCE DOES NOT CLEAR IT: force overrides the
+	// occupants refusal only, never the authority (Conflicts is the
+	// only seam force buys past).
+	RequireLease func(ctx context.Context, mac6 string) error
 	// Conflicts lists the board's occupants a non-forced push refuses
 	// against — active leases, live LA captures, running scripts — each
 	// rendered "kind: detail" (the refusal's disclosure; force pushes
@@ -237,6 +247,16 @@ func pushBoard(ctx context.Context, d Deps, mac6 string, bin []byte, desc AppDes
 	if d.Gate != nil {
 		if why := d.Gate(mac6); why != "" {
 			return row(OutcomeRefused, why)
+		}
+	}
+
+	// 0b. the lease gate — the pusher must hold THIS board's lease
+	// (2026-11-23 ruling): the row refuses with the gate's own text
+	// and touches no board. Force does not clear it — force answers
+	// "kill the occupants", never "skip the authority".
+	if d.RequireLease != nil {
+		if lerr := d.RequireLease(ctx, mac6); lerr != nil {
+			return row(OutcomeRefused, lerr.Error())
 		}
 	}
 

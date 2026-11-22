@@ -2,7 +2,8 @@ package mcp
 
 // tools_ota_test.go — the OTA seat against a scripted fake daemon
 // (OTA ops wave T7): the two crossings' shapes (the fleet push's
-// holder-less ota.push with every knob mapped; the ro ota.status),
+// holder-stamped ota.push — the 2026-11-23 lease gate rides the
+// pusher's identity — with every knob mapped; the ro ota.status),
 // the reply mappings (typed per-board rows with the nested identity
 // objects, the status state ladder with its per-state optional
 // columns), the honest refusal crossing, the 45→47 static-count pin,
@@ -72,9 +73,11 @@ func TestOTAToolsServed(t *testing.T) {
 	}
 }
 
-// TestOTAPushToolCrossing: the full-knob crossing (holder-less, every
-// knob mapped onto the ota.push request) and the typed rows reply —
-// the T6 Row shape passthrough with its nested identity objects.
+// TestOTAPushToolCrossing: the full-knob crossing (holder-stamped —
+// the 2026-11-23 lease gate needs the pusher's identity on the wire;
+// every knob mapped onto the ota.push request) and the typed rows
+// reply — the T6 Row shape passthrough with its nested identity
+// objects.
 func TestOTAPushToolCrossing(t *testing.T) {
 	e, reqs := newEnv(t, []step{{result: map[string]any{
 		"rows": []any{
@@ -91,7 +94,7 @@ func TestOTAPushToolCrossing(t *testing.T) {
 				"from":    map[string]any{"ver": "0.6.0", "slot": "ota_1", "sha": strings.Repeat("cc", 32)},
 				"to":      map[string]any{"ver": "0.7.0-t7seat", "slot": "ota_0", "sha": strings.Repeat("bb", 32)},
 				"outcome": "refused",
-				"detail":  "active occupants (the activate reboot kills them): lease: holder \"t7-seat\" — release/stop them, or retry with force",
+				"detail":  "lease: board d75884 held by t7-seat since 2026-11-23T09:00:00Z — the pusher must hold the board's lease (2026-11-23 ruling)",
 				"seconds": 0.4,
 			},
 		},
@@ -104,8 +107,8 @@ func TestOTAPushToolCrossing(t *testing.T) {
 		t.Fatalf("ota_push failed: %s", resultText(t, res))
 	}
 	req := wantReq(t, reqs)
-	if req.Type != "ota.push" || req.Holder != "" {
-		t.Errorf("request = %+v, want a holder-less ota.push", req)
+	if req.Type != "ota.push" || req.Holder != "mcp-fixed01" {
+		t.Errorf("request = %+v, want a holder-stamped ota.push (the lease gate's identity)", req)
 	}
 	if len(req.Boards) != 2 || req.Boards[0] != "97c1ac" || req.Boards[1] != "d75884" {
 		t.Errorf("boards = %v, want the selectors verbatim", req.Boards)
@@ -134,8 +137,8 @@ func TestOTAPushToolCrossing(t *testing.T) {
 		t.Errorf("row0 identity = %v → %v, want the nested from/to objects mapped", from, to)
 	}
 	r1, _ := rows[1].(map[string]any)
-	if r1["outcome"] != "refused" || !strings.Contains(r1["detail"].(string), "occupants") {
-		t.Errorf("row1 = %v, want the refused row carrying the conflict detail", r1)
+	if r1["outcome"] != "refused" || !strings.Contains(r1["detail"].(string), "held by t7-seat") {
+		t.Errorf("row1 = %v, want the refused row carrying the lease-gate detail", r1)
 	}
 }
 
@@ -251,8 +254,10 @@ func TestOTAStatusRefusalCrossesVerbatim(t *testing.T) {
 // Descs carry the mandated coaching — never USB, the rolled-back
 // outcome is the design working (not a fault), pending_verify's 45s
 // milestone + the crash-loop self-heal wait, the occupants refusal /
-// force pair, confirm's skip-the-wait, and (push) the elf-sha
-// identity model; (status) the live-vs-snapshot reading.
+// force pair, confirm's skip-the-wait, the lease gate (2026-11-23
+// ruling: holder-stamped crossing, take-the-lease coaching, force
+// never bypassing it), and (push) the elf-sha identity model;
+// (status) the live-vs-snapshot reading.
 func TestOTADescCoachingAudit(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -270,6 +275,8 @@ func TestOTADescCoachingAudit(t *testing.T) {
 			"NEVER CROSSES USB", "build artifact", "reason=ota", "rolled-back",
 			"NOT A FAULT", "pending_verify", "45s", "force", "confirm",
 			"elf sha", "no-op", "xuansi_ota_status",
+			"LEASE-GATED", "2026-11-23 ruling", "take the lease first",
+			"holder-stamped", "force NEVER bypasses the lease gate",
 		},
 		"xuansi_ota_status": {
 			"idle | writing | staged", "img_state", "pending_verify", "45s",
@@ -287,6 +294,9 @@ func TestOTADescCoachingAudit(t *testing.T) {
 				t.Errorf("%s Desc lacks %q", name, want)
 			}
 		}
+	}
+	if strings.Contains(desc["xuansi_ota_push"], "No lease;") {
+		t.Errorf("xuansi_ota_push Desc still carries the retired \"No lease;\" clause — the push is lease-gated (2026-11-23 ruling)")
 	}
 }
 
