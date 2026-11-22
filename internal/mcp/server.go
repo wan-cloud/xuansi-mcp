@@ -4,9 +4,10 @@
 // This file holds the registration seam and the process's holder
 // identity; tools_static.go holds the static daemon-surface tool set
 // (task 8), errors.go the failure mapping, tools_dynamic.go the
-// per-board dynamic tools (task 9), resources.go/ring.go the event
-// face (task 10). Tasks 11-12 extend the same seam with the websocket
-// and capture faces.
+// board-world refresh loop (list_boards + the caps cache, task 9; the
+// bench tool expansion it once drove retired 2026-11-23),
+// resources.go/ring.go the event face (task 10). Tasks 11-12 extend
+// the same seam with the websocket and capture faces.
 package mcp
 
 import (
@@ -92,7 +93,7 @@ func NewServer(impl *mcpsdk.Implementation) *mcpsdk.Server {
 func RegisterTools(srv *mcpsdk.Server, c *apiclient.Client, opts Options) (stop func()) {
 	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot), logf: opts.Logf}
 	ts.register(srv)
-	ts.dyn = newDynState(srv)
+	ts.dyn = newDynState()
 	return ts.startDynamic(srv, opts.Refresh)
 }
 

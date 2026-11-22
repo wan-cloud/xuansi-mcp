@@ -769,7 +769,7 @@ func staticServedRequired(t *testing.T, lr *mcpsdk.ListToolsResult) map[string][
 	served := map[string][]string{}
 	for _, tool := range lr.Tools {
 		if !static[tool.Name] {
-			continue // dynamic tools carry their own required logic
+			continue // the bench dynamic retirement (2026-11-23) left no non-static tools; defensive skip
 		}
 		m, ok := tool.InputSchema.(map[string]any)
 		if !ok {

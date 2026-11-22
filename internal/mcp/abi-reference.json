@@ -3,7 +3,7 @@
     "header": "src/xuansi_host.h",
     "header_sha256": "4b100f02ed5a8d267f5f7807078a31e97b3f56fa8ed88b1acc5db200753deedc",
     "sidecar": "tools/gen-abi-reference/sidecar.json",
-    "sidecar_sha256": "93cc389401f7a85995b665fd652b240ac9cc051a5afbb6b03c1189869ad6b9e3",
+    "sidecar_sha256": "43c316d01a8e90d620ea40b9c8cb6a85915622982461a329c0383035b88c7e70",
     "generator": "tools/gen-abi-reference/gen.py",
     "note": "regenerate with tools/gen-abi-reference/gen.py; the checked-in outputs are the single source the daemon embeds (xuansi_abi_reference) — CI byte-compares"
   },
@@ -278,7 +278,7 @@
         }
       ],
       "families": {
-        "_note": "op lists per family (the caps primitives face); full per-op semantics are each primitive's frozen page",
+        "_note": "op lists per family (the caps primitives face — the mirror of the fw registration table); each family's per-op signature+semantics entries ride 'ops' below",
         "gpio": [
           "mode",
           "write",
@@ -324,6 +324,145 @@
           "on",
           "off",
           "next"
+        ]
+      },
+      "ops": {
+        "_note": "per-op signature+semantics for every family op above — the seat's op-face index; drive them under a lease through eval (return bench.<prim>.<op>(...)), byte-string params riding as ordinary Lua strings",
+        "gpio": [
+          {
+            "sig": "bench.gpio.mode(pin, mode)",
+            "semantics": "set direction/pull before use — mode \"out\"|\"in\"|\"in_pu\"|\"in_pd\"; first touch auto-acquires the pin for the calling owner; switching a pin to \"out\" clears its edge watch; the 18 banned pins are refused at every gpio entry"
+          },
+          {
+            "sig": "bench.gpio.write(pin, level)",
+            "semantics": "drive an output pin, level 0/1; the pin must be configured \"out\" first (class rt otherwise). Sequencing note: a write to an unheld pin CLAIMS it (mode stays none) before the out-mode gate refuses — the leftover claim clears on session reset / script death / VM reopen, or reclaims silently on a later same-owner gpio.mode"
+          },
+          {
+            "sig": "bench.gpio.read(pin) -> 0|1",
+            "semantics": "read the pin level; a never-configured pin auto-enters safe input on first read (and is acquired)"
+          },
+          {
+            "sig": "bench.gpio.on(pin, edge, fn)",
+            "semantics": "register an edge callback — edge \"rising\"|\"falling\"|\"both\"; resident scripts only; same-pin re-registration replaces (old fn unref'd); the ISR classes the edge by the level read at interrupt time, so pulses narrower than ISR latency can mislabel or vanish (use rmt for narrow pulses); each fire resumes the owner coroutine with (fn, pin, edge)"
+          }
+        ],
+        "uart": [
+          {
+            "sig": "bench.uart.setup(port, cfg)",
+            "semantics": "configure a UART: port 1|2 (UART0 is the console); cfg {baud=115200, tx=17, rx=18, rxbuf=1024, tx_timeout_ms=100, parity=\"N\"} — port 2 defaults tx=42/rx=41; parity \"N\"|\"E\"|\"O\" (E/O frames are 11-bit, TX/RX matched; an illegal value refuses class api naming the field); omitted fields use the defaults, values are NOT carried over from the previous setup; same-owner re-setup = reset and clears the old on callback. Bounds: baud 100..5000000, rxbuf 256..65536"
+          },
+          {
+            "sig": "bench.uart.write(port, data[, gap_us])",
+            "semantics": "write a byte-string (v1 takes no array); bounded by tx_timeout_ms (default 100ms, hard cap 5000 — overrun raises class timeout). gap_us 0..500000 is an optional inter-byte gap: 0 = back-to-back (the default), >0 = per-byte paced (each byte waits for line-idle, then at-least-gap_us); the paced total duration is capped at 5s — an overlong request refuses class api before any byte leaves, with strict typing on this one param"
+          },
+          {
+            "sig": "bench.uart.read(port, max[, timeout_ms]) -> string",
+            "semantics": "read up to max bytes (max <=65536); waits to the deadline, then returns the partial data WITHOUT raising (the deliberate timeout exception); timeout_ms optional (omitted or 0 = non-blocking), cap 5000"
+          },
+          {
+            "sig": "bench.uart.on(port, fn)",
+            "semantics": "resident-script RX callback fn(data), <=256B per event, 50ms event budget each"
+          }
+        ],
+        "i2c": [
+          {
+            "sig": "bench.i2c.setup(port, cfg)",
+            "semantics": "configure the I2C master (master mode only): port 0|1; cfg {sda=8, scl=9, freq=100000, timeout_ms=50}; bounds freq 10000..1000000, timeout_ms 1..1000"
+          },
+          {
+            "sig": "bench.i2c.write(port, addr, data)",
+            "semantics": "write bytes to a 7-bit addr; single transfer <=4096B; bounded by cfg timeout_ms (cap 1000; a no-ack maps to class timeout)"
+          },
+          {
+            "sig": "bench.i2c.read(port, addr, n) -> string",
+            "semantics": "read n bytes from a 7-bit addr (<=4096B); same timeout semantics as write"
+          },
+          {
+            "sig": "bench.i2c.wreg(port, addr, reg, data)",
+            "semantics": "register write: the 8-bit reg then the data bytes"
+          },
+          {
+            "sig": "bench.i2c.rreg(port, addr, reg, n) -> string",
+            "semantics": "register read via repeated-start: the 8-bit reg then n bytes"
+          },
+          {
+            "sig": "bench.i2c.scan(port) -> {addrs}",
+            "semantics": "scan 0x08..0x77 and return the answering addresses; the per-probe timeout clamps to min(cfg.timeout_ms, 40ms) — aggregate worst ~4.7s"
+          }
+        ],
+        "spi": [
+          {
+            "sig": "bench.spi.setup(port, cfg)",
+            "semantics": "configure the SPI master (master mode): port 0|1 (->SPI2/SPI3); cfg {mosi=12, miso=13, sclk=14, freq=1000000, mode=0, timeout_ms=100} plus an optional cs pin — omitted = 3-wire (no CS, the old byte-for-byte behavior); set = a software chip-select frame: cs is claimed under spi (banned/fixture/distinct-pin checks like the three bus pins; must differ from mosi/miso/sclk, collisions refuse class api as bench.spi.cs), driven as output idling high, pulled low immediately before and released right after every xfer/write/read — exactly one frame per op. Bounds: freq 10000..80000000 (effective low bound ~78kHz), mode 0..3"
+          },
+          {
+            "sig": "bench.spi.xfer(port, data) -> string",
+            "semantics": "full-duplex transfer; returns the equal-length byte-string; wait budget = max(timeout_ms, len*8/freq)+100ms (worst ~5.1s)"
+          },
+          {
+            "sig": "bench.spi.write(port, data)",
+            "semantics": "one-way write, single transfer <=4096B (<=64B polled, larger via DMA)"
+          },
+          {
+            "sig": "bench.spi.read(port, n) -> string",
+            "semantics": "immediate MISO read of n bytes clocked with 0xFF dummy — SPI slaves have no memory: read does NOT replay previously written data; only xfer loops back; <=4096B"
+          }
+        ],
+        "pwm": [
+          {
+            "sig": "bench.pwm.setup(pin, cfg)",
+            "semantics": "configure LEDC PWM on a pin: cfg {freq=1000, duty=0, resolution=10}; resolution 1..14, freq bounds derived from it (res10: 77..78125Hz; res14: 5..4882Hz), duty 0..2^resolution-1; at most 8 channels and 4 distinct (freq,res) pairs (same parameters share a timer); a re-setup with an out-of-domain cfg refuses and KEEPS the old configuration (validated before hardware)"
+          },
+          {
+            "sig": "bench.pwm.duty(pin, duty)",
+            "semantics": "set the duty cycle, integer 0..2^resolution-1"
+          },
+          {
+            "sig": "bench.pwm.stop(pin)",
+            "semantics": "stop the PWM and return the pin to its safe state"
+          }
+        ],
+        "adc": [
+          {
+            "sig": "bench.adc.setup(pin, cfg)",
+            "semantics": "configure the oneshot ADC on a pin: cfg {atten=12, width=12} — atten in dB, one of {0, 2.5, 6, 12}; width only 12 (9-11 refuse class api). ADC2 pins (GPIO11..20) refuse class api while the WiFi radio is active (wifi.off releases them; ADC1 = GPIO1..10)"
+          },
+          {
+            "sig": "bench.adc.read(pin) -> integer",
+            "semantics": "the raw conversion (a single bounded conversion, ~60µs)"
+          },
+          {
+            "sig": "bench.adc.read_mv(pin) -> integer",
+            "semantics": "eFuse-calibrated millivolts (curve-fitting)"
+          }
+        ],
+        "rmt": [
+          {
+            "sig": "bench.rmt.setup(pin, cfg) -> {resolution_actual=Hz}",
+            "semantics": "configure RMT on a pin: cfg {dir=\"tx\"|\"rx\", resolution_hz=1000000, mem_blocks=1, idle_us=1000}; bounds resolution_hz 312500..80000000, mem_blocks 1..4; idle_us is the RX end-of-frame threshold (TX ignores its value, but 0/negative/>=2^32 refuse class api); returns resolution_actual — the hardware-quantized resolution every us<->tick conversion uses (requests quantize silently in either direction: 3MHz -> 2962962, 7MHz -> 7272727)"
+          },
+          {
+            "sig": "bench.rmt.tx(pin, items, timeout_ms)",
+            "semantics": "transmit items {{level=0|1, us=n}, ...} (<=256); discipline: start level=0 and end level=0; leading enable pseudo-segments <=2 ticks are stripped; timeout cap 5000ms; each segment's us must fit 1..32767 ticks at resolution_actual"
+          },
+          {
+            "sig": "bench.rmt.rx(pin, timeout_ms) -> {{level, us}, ...}",
+            "semantics": "receive up to 256 items; no signal -> the EMPTY table without raising (the deliberate exception, like uart.read); timeout cap 5000ms"
+          }
+        ],
+        "events": [
+          {
+            "sig": "bench.events.on(source[, fn])",
+            "semantics": "subscribe to source \"uart1.rx\"/\"uart2.rx\"/\"gpio.N\". fn non-nil = resident-only Lua callback, delivered as tables {source=, kind=, data=} (kind copies the source string); fn nil or omitted subscribes the source into the current owner's polling queue — eval can use it, poll with bench.events.next. uart payloads <=256B; per-owner queue depth 16 (overflow drops, console-only)"
+          },
+          {
+            "sig": "bench.events.off(source)",
+            "semantics": "unsubscribe a source; a not-subscribed source refuses class api"
+          },
+          {
+            "sig": "bench.events.next(timeout_ms) -> table|nil",
+            "semantics": "take one queued event for this owner (tables {source=, kind=, data=}), waiting in <=100ms slices up to timeout_ms (0..5000); returns nil on timeout; next(0) pumps at most ONE event per call — drain a backlog by looping"
+          }
         ]
       }
     },

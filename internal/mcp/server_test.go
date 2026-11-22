@@ -148,7 +148,7 @@ func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.Cli
 	srv := NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"})
 	ts := &toolset{c: c, holders: newHolderState(opts.Holder), ws: newWSState(opts.WorkspaceRoot), logf: opts.Logf}
 	ts.register(srv)
-	ts.dyn = newDynState(srv)
+	ts.dyn = newDynState()
 	stop := ts.startDynamic(srv, opts.Refresh)
 
 	ctx := context.Background()

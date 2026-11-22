@@ -913,7 +913,7 @@ func (ts *toolset) boardAPIVersion(ctx context.Context, board string, resolved b
 	if err != nil {
 		return 0, err
 	}
-	ver, _, ok := parseCaps(res)
+	ver, ok := parseCaps(res)
 	if !ok {
 		return 0, errWs("xuansi_driver_push %s: caps reply is malformed (no api_version) — cannot gate the driver", board)
 	}

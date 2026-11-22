@@ -123,6 +123,49 @@ func TestBenchIndexCoversTheRegistrationTable(t *testing.T) {
 	if !opIn(idx, "i2c", "scan") || !opIn(idx, "events", "next") || !opIn(idx, "gpio", "on") {
 		t.Error("family op spot-check failed (i2c.scan / events.next / gpio.on)")
 	}
+
+	// the per-op face (2026-11-23 seat-debt audit): every family op in
+	// the families lists carries a signature+semantics entry in ops —
+	// the replacement face for the retired bench dynamic tools, locked
+	// so a regeneration cannot silently drop it back to name lists
+	// (families/ops values ride RawMessage: both carry a "_note" prose
+	// key that is not a list)
+	var sigs struct {
+		Families map[string]json.RawMessage `json:"families"`
+		Ops      map[string]json.RawMessage `json:"ops"`
+	}
+	raw, _ := abiReference().abiSectionRaw("bench_signatures")
+	if err := json.Unmarshal(raw, &sigs); err != nil {
+		t.Fatal(err)
+	}
+	for fam, famRaw := range sigs.Families {
+		if fam == "_note" {
+			continue
+		}
+		var want []string
+		if err := json.Unmarshal(famRaw, &want); err != nil {
+			t.Fatalf("families.%s: %v", fam, err)
+		}
+		var entries []struct {
+			Sig string `json:"sig"`
+		}
+		if err := json.Unmarshal(sigs.Ops[fam], &entries); err != nil {
+			t.Fatalf("ops.%s: %v", fam, err)
+		}
+		got := map[string]bool{}
+		for _, e := range entries {
+			name := strings.SplitN(strings.TrimPrefix(e.Sig, "bench."+fam+"."), "(", 2)[0]
+			got[name] = true
+		}
+		if len(got) != len(want) {
+			t.Errorf("ops.%s carries %d entries, want %d (one per family op)", fam, len(got), len(want))
+		}
+		for _, op := range want {
+			if !got[op] {
+				t.Errorf("ops.%s lacks the %s %s signature entry", fam, fam, op)
+			}
+		}
+	}
 }
 
 func opIn(idx lualint.BenchIndex, fam, op string) bool {
@@ -137,6 +180,118 @@ func opIn(idx lualint.BenchIndex, fam, op string) bool {
 func TestRefWasmBudgetBytes(t *testing.T) {
 	if b := refWasmBudgetBytes(); b != 2097152 {
 		t.Errorf("refWasmBudgetBytes = %d, want 2097152 (the caps_keys constant)", b)
+	}
+}
+
+// TestAbiReferenceQueryFilters (2026-11-23 seat-debt batch): query=
+// narrows the served sections to the entries that mention the
+// substring — case-insensitive, over signatures/semantics/keys/notes;
+// no hit is an EMPTY content, never an error; an empty query is
+// exactly the unfiltered behavior.
+func TestAbiReferenceQueryFilters(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+
+	// "i2c": bench_signatures rides with the families table narrowed
+	// to exactly the i2c family, and host_table rides with exactly the
+	// i2c host symbols
+	res := e.call("xuansi_abi_reference", map[string]any{"query": "i2c"})
+	if res.IsError {
+		t.Fatalf("query=i2c failed: %s", resultText(t, res))
+	}
+	content, _ := structured(t, res)["content"].(map[string]any)
+	bs, _ := content["bench_signatures"].(map[string]any)
+	fams, _ := bs["families"].(map[string]any)
+	if fams["i2c"] == nil || fams["gpio"] != nil {
+		t.Errorf("bench_signatures.families after query=i2c = %v, want exactly the i2c family riding", fams)
+	}
+	ht, _ := content["host_table"].(map[string]any)
+	syms, _ := ht["symbols"].([]any)
+	if len(syms) == 0 {
+		t.Fatal("host_table carried no symbols after query=i2c — the i2c host family must ride")
+	}
+	for _, s := range syms {
+		sm, _ := s.(map[string]any)
+		if sym, _ := sm["symbol"].(string); !strings.Contains(sym, "i2c") {
+			t.Errorf("symbol %q rode an i2c query", sym)
+		}
+	}
+	// a section with no i2c fact anywhere does not ride
+	if _, ok := content["lua_boundaries"]; ok {
+		t.Error("lua_boundaries rode an i2c query — no boundary mentions i2c")
+	}
+
+	// case-insensitive: I2C serves the same sections
+	res = e.call("xuansi_abi_reference", map[string]any{"query": "I2C"})
+	if res.IsError {
+		t.Fatalf("query=I2C failed: %s", resultText(t, res))
+	}
+	upper, _ := structured(t, res)["content"].(map[string]any)
+	if len(upper) != len(content) {
+		t.Errorf("query=I2C served %d sections, query=i2c served %d — matching must be case-insensitive", len(upper), len(content))
+	}
+
+	// section + query compose: within bench_signatures, "scan" keeps
+	// the i2c family's op list narrowed to the matching op
+	res = e.call("xuansi_abi_reference", map[string]any{"section": "bench_signatures", "query": "scan"})
+	if res.IsError {
+		t.Fatalf("section+query failed: %s", resultText(t, res))
+	}
+	content, _ = structured(t, res)["content"].(map[string]any)
+	if len(content) != 1 {
+		t.Fatalf("section+query content = %v, want exactly bench_signatures", content)
+	}
+	bs, _ = content["bench_signatures"].(map[string]any)
+	fams, _ = bs["families"].(map[string]any)
+	if len(fams) != 1 {
+		t.Errorf("families after query=scan = %v, want the i2c list alone", fams)
+	} else if ops, _ := fams["i2c"].([]any); len(ops) != 1 || ops[0] != "scan" {
+		t.Errorf("families.i2c after query=scan = %v, want exactly [scan]", ops)
+	}
+
+	// no hit: an EMPTY content, not an error
+	res = e.call("xuansi_abi_reference", map[string]any{"query": "zzz-no-such-face"})
+	if res.IsError {
+		t.Fatalf("a no-hit query must not error: %s", resultText(t, res))
+	}
+	if m, _ := structured(t, res)["content"].(map[string]any); len(m) != 0 {
+		t.Errorf("no-hit query content = %d sections, want the empty map", len(m))
+	}
+
+	// empty query = the unfiltered behavior: all eight sections ride
+	res = e.call("xuansi_abi_reference", map[string]any{"query": ""})
+	if res.IsError {
+		t.Fatalf("empty query failed: %s", resultText(t, res))
+	}
+	if m, _ := structured(t, res)["content"].(map[string]any); len(m) != len(abiSectionNames) {
+		t.Errorf("empty query content = %d sections, want all %d (exactly the no-query behavior)", len(m), len(abiSectionNames))
+	}
+}
+
+// TestAbiReferenceQueryLeavesDocShape: a filtered reply keeps the
+// document's envelope — the FULL section vocabulary in document order,
+// the provenance pins, the abi block — with only content narrowed.
+func TestAbiReferenceQueryLeavesDocShape(t *testing.T) {
+	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_abi_reference", map[string]any{"query": "i2c"})
+	if res.IsError {
+		t.Fatalf("query=i2c failed: %s", resultText(t, res))
+	}
+	m := structured(t, res)
+	secs, _ := m["sections"].([]any)
+	if len(secs) != len(abiSectionNames) {
+		t.Fatalf("sections = %v, want the full vocabulary even under a query", secs)
+	}
+	for i, s := range secs {
+		if s != abiSectionNames[i] {
+			t.Errorf("sections[%d] = %v, want %v (document order unchanged by the filter)", i, s, abiSectionNames[i])
+		}
+	}
+	prov, _ := m["provenance"].(map[string]any)
+	if prov["header_sha256"] == nil || prov["sidecar_sha256"] == nil {
+		t.Errorf("provenance pins absent from a filtered reply: %v", prov)
+	}
+	if abi, _ := m["abi"].(map[string]any); abi["version"] == nil {
+		t.Errorf("abi block absent from a filtered reply: %v", m["abi"])
 	}
 }
 

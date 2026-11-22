@@ -101,8 +101,8 @@ func newEventEnv(t *testing.T, boards ...map[string]any) (*env, *dynFake) {
 }
 
 // refreshWithEvents drives one refresh cycle exactly like the loop
-// does: dynamic tools reconcile, then the event face (rings, resources,
-// watches) against the same board list.
+// does: the board world + caps cache reconcile, then the event face
+// (rings, resources, watches) against the same board list.
 func refreshWithEvents(t *testing.T, e *env) {
 	t.Helper()
 	boards := e.ts.refreshDynamic(context.Background())
@@ -181,7 +181,7 @@ func newMultiClientEnv(t *testing.T, n int, mac6 string) *multiClientEnv {
 	srv := NewServer(&mcpsdk.Implementation{Name: "xuansi", Version: "test"})
 	ts := &toolset{c: c, holders: newHolderState("mcp-fixed01")}
 	ts.register(srv)
-	ts.dyn = newDynState(srv)
+	ts.dyn = newDynState()
 	stop := ts.startDynamic(srv, 0)
 
 	ctx := context.Background()
