@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,28 @@ var ErrControllerSlotHeld = errors.New("controller slot not freed within the arb
 // sibling shape — the endpoint may appear later, and the supervisor
 // rebuild on endpoint drift is what picks it up).
 var ErrNoDialEndpoint = errors.New("no dial endpoint in the board ref")
+
+// ErrUSBDownloadMode (⑤a) marks a PERMANENT USB dial refusal: the
+// drained bytes of the CDC open's reboot window carry the ROM
+// download-mode banner — the board is sitting in the ROM bootloader
+// (foreign or wiped firmware), so no redial can help: every port OPEN
+// reboots the board again (§2), the app never runs, and hello can
+// never answer. The 2026-11-22 board2 incident rode this shape for ~19
+// redial rounds (one reboot each). Recovery is host-side (a watchdog
+// reset or a power cycle), never a retry.
+var ErrUSBDownloadMode = errors.New("usb drain window shows the ROM download-mode banner (board stuck in the bootloader; every CDC open reboots it again and the app never runs) — retrying cannot help; recover the board host-side, see the USB download-mode runbook in the project KB")
+
+// usbDownloadBanner reports whether the drain window's bytes carry the
+// ESP32-S3 ROM download-mode banner. Signature extracted verbatim from
+// the 2026-11-22 board incident's console capture (the board sat in
+// the ROM bootloader behind foreign firmware while the lease path
+// redialed): the ROM's own "waiting for download" trailer line, matched
+// case-insensitively inside the ≤4KB drain tail. A healthy boot
+// answers boot:0x8 (SPI_FAST_FLASH_BOOT) + IDF lines and never the
+// signature — the classifier stays this narrow on purpose.
+func usbDownloadBanner(raw []byte) bool {
+	return strings.Contains(strings.ToLower(string(raw)), "waiting for download")
+}
 
 // dialAttempts bounds one dialLoop run (B15 §4.1③): three tries — with
 // the 6s tcpConnectTimeout inside the real dialer that is an ~18s worst
@@ -206,8 +229,19 @@ func NewSupervisor(ref BoardRef, opts SupOpts) *Supervisor {
 			}
 		} else {
 			opts.DialUSB = func() (Controller, error) {
+				// DialOpts built at DIAL time, read through the LIVE
+				// opts (s.opts — Opts() re-wirings flow into every
+				// dial; the BootCapture the server's D1 wrap attaches
+				// post-construction rides exactly this seam, per-open
+				// by contract). The tap read goes under s.mu:
+				// classifiedUSB (⑤a) swaps the field for the dial's
+				// duration so download-mode classification rides the
+				// same drain window the caller's tap sees.
+				s.mu.Lock()
+				tap := s.opts.BootCapture
+				s.mu.Unlock()
 				return replclient.DialUSB(ref.USBPath, replclient.DialOpts{
-					Log: s.opts.Log, BootCapture: s.opts.BootCapture})
+					Log: s.opts.Log, BootCapture: tap})
 			}
 		}
 	}
@@ -315,8 +349,10 @@ func (s *Supervisor) waitCtx(ctx context.Context, d time.Duration) error {
 
 // dialLoop retries the dial seam a bounded number of times (B15 §4.1③:
 // dialAttempts tries ≈ 3 × tcpConnectTimeout worst case, replacing the
-// full-request-budget spin). A PERMANENT refusal (ErrNoDialEndpoint)
-// fails immediately — no retry can conjure an endpoint.
+// full-request-budget spin). A PERMANENT refusal — ErrNoDialEndpoint
+// (no endpoint to dial) or ErrUSBDownloadMode (the drain window shows
+// the ROM download-mode banner; every open reboots the board again, ⑤a)
+// — fails immediately: no retry can help either shape.
 func (s *Supervisor) dialLoop(ctx context.Context, dial func() (Controller, error)) (Controller, error) {
 	var lastErr error
 	for i := 0; i < dialAttempts; i++ {
@@ -331,7 +367,7 @@ func (s *Supervisor) dialLoop(ctx context.Context, dial func() (Controller, erro
 		if i == 0 {
 			s.logf("board %s: dial failed: %v", s.ref.MAC6, err)
 		}
-		if errors.Is(err, ErrNoDialEndpoint) {
+		if errors.Is(err, ErrNoDialEndpoint) || errors.Is(err, ErrUSBDownloadMode) {
 			return nil, fmt.Errorf("board %s: %w", s.ref.MAC6, err)
 		}
 		if i == dialAttempts-1 {
@@ -356,9 +392,11 @@ func SameLinkRetry(err error, ctl Controller) bool {
 
 // ConnectUSB is the on-demand fallback route: opening the CDC port
 // REBOOTS the board into a fresh device session (§2) — use only when
-// TCP is gone and a reboot is acceptable.
+// TCP is gone and a reboot is acceptable. The dial rides
+// classifiedUSB: the open's drain window is scanned for the ROM
+// download-mode banner (⑤a) and refuses permanently on sight.
 func (s *Supervisor) ConnectUSB(ctx context.Context) (Controller, error) {
-	ctl, err := s.dialLoop(ctx, s.opts.DialUSB)
+	ctl, err := s.dialLoop(ctx, s.classifiedUSB)
 	if err != nil {
 		return nil, err
 	}
@@ -378,6 +416,51 @@ func (s *Supervisor) ConnectUSB(ctx context.Context) (Controller, error) {
 	}
 	s.logf("board %s: USB fallback connection up (board REBOOTED, §2; fw=%s)", s.ref.MAC6, info.FwBuild)
 	return ctl, nil
+}
+
+// classifiedUSB is the USB dial seam wrapped with ⑤a download-mode
+// classification. The drained bytes of the open's reboot window ride
+// opts.BootCapture — the SAME tap the default dialer forwards into
+// replclient's drain window (live read at dial time, per-open by
+// contract), so for the dial's duration the wrapper chains
+// classification IN FRONT of the caller's tap (the D1 banner stash
+// still sees every byte; an injected fake serves its drain bytes
+// through the same field). When the window carries the ROM
+// download-mode banner the dial is refused with ErrUSBDownloadMode —
+// dialLoop's permanent family, so one open classifies, one refusal
+// answers, and zero redials follow (each open reboots the board, §2;
+// the 2026-11-22 incident rode ~19 rounds before this). The swap is
+// mutex-guarded: per-board dialing is serialized by the server's
+// connectMu, and the guard keeps the shared field honest under any
+// stray concurrent wiring; the tap itself fires on the dialing
+// goroutine only.
+func (s *Supervisor) classifiedUSB() (Controller, error) {
+	s.mu.Lock()
+	callerTap := s.opts.BootCapture
+	saw := false
+	s.opts.BootCapture = func(raw []byte) {
+		if usbDownloadBanner(raw) {
+			saw = true
+		}
+		if callerTap != nil {
+			callerTap(raw)
+		}
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.opts.BootCapture = callerTap
+		s.mu.Unlock()
+	}()
+	ctl, err := s.opts.DialUSB()
+	if saw {
+		if ctl != nil {
+			ctl.Close() // release the diagnosing open; only OPEN reboots the board
+		}
+		s.logf("board %s: usb drain window classified: ROM download mode — permanent refusal (one open, zero redial; recovery is host-side, see the USB download-mode runbook in the project KB)", s.ref.MAC6)
+		return nil, fmt.Errorf("board %s: usb drain: %w", s.ref.MAC6, ErrUSBDownloadMode)
+	}
+	return ctl, err
 }
 
 // YieldUSBController voluntarily gives up a live USB controller link:

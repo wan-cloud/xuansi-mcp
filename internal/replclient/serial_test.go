@@ -106,6 +106,37 @@ func canonical(t *testing.T, p string) string {
 	return real
 }
 
+// TestResolveUSBDeviceCOMNameNoByIDFallback (⑤b): a Windows COM port
+// name is a DIRECT device name — the udev by-id fallback must not be
+// bolted onto it. The 2026-11-22 Windows incident rendered
+// `usb device "COM4" not found (tried COM4, \dev\serial\by-id\COM4)`
+// nine times while the board re-enumerated: a POSIX by-id prefix glued
+// to a COM name is noise on every host that has COM ports. The
+// not-found error names the COM name alone; by-id-style names keep the
+// two-candidate fallback untouched.
+func TestResolveUSBDeviceCOMNameNoByIDFallback(t *testing.T) {
+	_, _, err := resolveUSBDevice("COM4")
+	if err == nil {
+		t.Fatal("COM4 resolved without error on a host with no such port")
+	}
+	if strings.Contains(err.Error(), "by-id") {
+		t.Errorf("error %q bolts the by-id prefix onto a COM name", err)
+	}
+	if !strings.Contains(err.Error(), `"COM4" not found (tried COM4)`) {
+		t.Errorf("error %q, want the bare COM candidate list", err)
+	}
+	// lower-case com names are COM ports too (windows names are
+	// case-insensitive)
+	if _, _, err := resolveUSBDevice("com4"); err == nil || strings.Contains(err.Error(), "by-id") {
+		t.Errorf("com4: %v, want the same COM-shape refusal", err)
+	}
+	// by-id-style names keep the two-candidate fallback
+	_, _, err = resolveUSBDevice("usb-No_Such_Device-if00")
+	if err == nil || !strings.Contains(err.Error(), filepath.Join(byIDDir, "usb-No_Such_Device-if00")) {
+		t.Errorf("by-id fallback changed shape: %v", err)
+	}
+}
+
 // TestDialOptsDrainWindow: zero Drain → the 4.5s CDC default; explicit
 // Drain honored; NoDrain suppresses.
 func TestDialOptsDrainWindow(t *testing.T) {

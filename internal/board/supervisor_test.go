@@ -755,3 +755,121 @@ func TestSameLinkRetryPredicate(t *testing.T) {
 		t.Error("an unrelated error must never trigger the resend")
 	}
 }
+
+// usbDownloadBannerFixture is the 2026-11-22 board2 incident's drain
+// window, verbatim (the console capture taken while the board sat in
+// the ROM bootloader behind foreign firmware: the download-mode banner
+// — five signature lines, CRLF ends exactly as the CDC delivered
+// them). The classifier must find its signature inside these exact
+// bytes.
+var usbDownloadBannerFixture = []byte(
+	"ESP-ROM:esp32s3-20210327\r\n" +
+		"Build:Mar 27 2021\r\n" +
+		"rst:0x15 (USB_UART_CHIP_RESET),boot:0x0 (DOWNLOAD(USB/UART0))\r\n" +
+		"Saved PC:0x40041a76\r\n" +
+		"waiting for download\r\n")
+
+// usbHealthyBootFixture is the same incident's healthy-boot shape for
+// the negative control (the as-found capture's boot lines: SPI fast
+// flash boot + IDF 2nd-stage bootloader) — it must NOT classify.
+var usbHealthyBootFixture = []byte(
+	"ESP-ROM:esp32s3-20210327\r\n" +
+		"Build:Mar 27 2021\r\n" +
+		"rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\r\n" +
+		"Saved PC:0x40381fb5\r\n" +
+		"I (24) boot: ESP-IDF v5.5.5 2nd stage bootloader\r\n" +
+		"I (378) boot: Loaded app from partition at offset 0x10000\r\n")
+
+// TestUSBDownloadModeBannerFailsFastOnce (⑤a): a USB dial whose drain
+// window carries the ROM download-mode banner (the 2026-11-22 board2
+// incident — foreign firmware stuck in the ROM bootloader; every CDC
+// open reboots the board again, so the lease path's redial loop
+// hammered it ~19 rounds) is refused PERMANENTLY: ConnectUSB answers
+// ErrUSBDownloadMode with the runbook coach in the text, after exactly
+// ONE dial (zero redial — retrying is pure harm), without ever saying
+// hello, closing the diagnosing open, and the caller's BootCapture
+// stash still saw every drained byte.
+func TestUSBDownloadModeBannerFailsFastOnce(t *testing.T) {
+	virt := &virtualClock{}
+	var mu sync.Mutex
+	dials := 0
+	var stashed [][]byte
+	ctl := newFakeCtl()
+	var sup *Supervisor
+	sup = NewSupervisor(BoardRef{MAC6: "d75884", USBPath: "/dev/serial/by-id/usb-FAKE-if00"}, SupOpts{
+		DialUSB: func() (Controller, error) {
+			mu.Lock()
+			dials++
+			mu.Unlock()
+			// the drain window delivering the incident's banner bytes —
+			// the same tap the production dialer fires from drainPort
+			// (nil-guarded there, nil-guarded here)
+			if tap := sup.Opts().BootCapture; tap != nil {
+				tap(usbDownloadBannerFixture)
+			}
+			return ctl, nil // port open, drained; the board can only download
+		},
+		BootCapture: func(raw []byte) {
+			mu.Lock()
+			stashed = append(stashed, raw)
+			mu.Unlock()
+		},
+		Wait: virt.sleep,
+	})
+	_, err := sup.ConnectUSB(context.Background())
+	if !errors.Is(err, ErrUSBDownloadMode) {
+		t.Fatalf("err = %v, want ErrUSBDownloadMode in the chain", err)
+	}
+	if !strings.Contains(err.Error(), "see the USB download-mode runbook in the project KB") {
+		t.Errorf("err = %v\nwant the runbook coach in the text (public wording, no private paths)", err)
+	}
+	mu.Lock()
+	n := dials
+	stashN := len(stashed)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("dial count = %d, want exactly 1 (permanent refusal, zero redial — every open reboots the board)", n)
+	}
+	if stashN != 1 {
+		t.Errorf("caller BootCapture stash saw %d windows, want 1 (classification rides IN FRONT of the caller's tap, never replaces it)", stashN)
+	}
+	if virt.elapsed() != 0 {
+		t.Errorf("download-mode refusal burned %v of retry wait, want zero", virt.elapsed())
+	}
+	if ctl.hasOp("hello") {
+		t.Error("ConnectUSB said hello against a download-mode board — the refusal must land before hello")
+	}
+	ctl.mu.Lock()
+	closed := ctl.closed
+	ctl.mu.Unlock()
+	if !closed {
+		t.Error("the diagnosing open's controller was left unclosed")
+	}
+}
+
+// TestUSBDownloadModeHealthyBootNotClassified (⑤a negative control):
+// the same drain tap carrying a HEALTHY boot banner (SPI fast flash
+// boot + IDF lines — the as-found capture's shape) dials through and
+// hellos normally: the classifier is narrow enough that boot noise
+// cannot fast-fail a booting board.
+func TestUSBDownloadModeHealthyBootNotClassified(t *testing.T) {
+	ctl := newFakeCtl()
+	var sup *Supervisor
+	sup = NewSupervisor(BoardRef{MAC6: "d75884", USBPath: "/dev/serial/by-id/usb-FAKE-if00"}, SupOpts{
+		DialUSB: func() (Controller, error) {
+			// the drain window delivering a healthy boot banner —
+			// nil-guarded like drainPort fires the production tap
+			if tap := sup.Opts().BootCapture; tap != nil {
+				tap(usbHealthyBootFixture)
+			}
+			return ctl, nil
+		},
+	})
+	got, err := sup.ConnectUSB(context.Background())
+	if err != nil {
+		t.Fatalf("ConnectUSB over a healthy boot banner: %v", err)
+	}
+	if got != Controller(ctl) {
+		t.Fatal("ConnectUSB did not return the dialed controller")
+	}
+}

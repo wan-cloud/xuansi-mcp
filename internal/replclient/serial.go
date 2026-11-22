@@ -239,17 +239,36 @@ func mac6FromByID(s string) (string, bool) {
 // a device name (greedy scan, last match used).
 var macInByID = regexp.MustCompile(`(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}`)
 
+// comPortName matches a Windows COM port name (COM4, com12): a DIRECT
+// device name that can never be a udev by-id basename.
+var comPortName = regexp.MustCompile(`(?i)^com\d+$`)
+
+// usbDeviceCandidates lists the paths one USB dial tries, in order:
+// the name as given, plus the udev by-id fallback when the name is not
+// already a by-id path. A COM port name gets NO fallback (⑤b): joining
+// the POSIX by-id dir onto "COM4" rendered
+// "\dev\serial\by-id\COM4" in the 2026-11-22 Windows incident's
+// not-found errors (nine times while the board re-enumerated) — a COM
+// port lives outside the udev tree on every host, so the joined
+// candidate is pure noise.
+func usbDeviceCandidates(byIdOrPath string) []string {
+	candidates := []string{byIdOrPath}
+	if comPortName.MatchString(byIdOrPath) {
+		return candidates
+	}
+	if !strings.HasPrefix(byIdOrPath, byIDDir+string(filepath.Separator)) {
+		candidates = append(candidates, filepath.Join(byIDDir, filepath.Base(byIdOrPath)))
+	}
+	return candidates
+}
+
 // resolveUSBDevice maps a by-id name (full path or bare basename) or a
 // direct device path to an openable tty path, canonicalizing a by-id
 // symlink down to the real /dev/ttyACM* node so logs name the device
 // the kernel opened.
 func resolveUSBDevice(byIdOrPath string) (path string, mac6 string, err error) {
 	mac6, _ = mac6FromByID(byIdOrPath)
-	candidates := []string{byIdOrPath}
-	if !strings.HasPrefix(byIdOrPath, byIDDir+string(filepath.Separator)) {
-		candidates = append(candidates, filepath.Join(byIDDir, filepath.Base(byIdOrPath)))
-	}
-	for _, p := range candidates {
+	for _, p := range usbDeviceCandidates(byIdOrPath) {
 		if _, statErr := os.Stat(p); statErr == nil {
 			if real, evalErr := filepath.EvalSymlinks(p); evalErr == nil {
 				p = real
@@ -258,5 +277,5 @@ func resolveUSBDevice(byIdOrPath string) (path string, mac6 string, err error) {
 		}
 	}
 	return "", mac6, fmt.Errorf("replclient: usb device %q not found (tried %s)",
-		byIdOrPath, strings.Join(candidates, ", "))
+		byIdOrPath, strings.Join(usbDeviceCandidates(byIdOrPath), ", "))
 }
