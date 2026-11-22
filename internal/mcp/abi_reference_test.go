@@ -185,9 +185,10 @@ func TestRefWasmBudgetBytes(t *testing.T) {
 
 // TestAbiReferenceQueryFilters (2026-11-23 seat-debt batch): query=
 // narrows the served sections to the entries that mention the
-// substring — case-insensitive, over signatures/semantics/keys/notes;
-// no hit is an EMPTY content, never an error; an empty query is
-// exactly the unfiltered behavior.
+// substring — case-insensitive, over signatures/semantics/keys/notes,
+// with a matching entry riding WHOLE (never just the matching
+// fragment); no hit is an EMPTY content, never an error; an empty
+// query is exactly the unfiltered behavior.
 func TestAbiReferenceQueryFilters(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{Holder: "mcp-fixed01"})
 
@@ -211,7 +212,7 @@ func TestAbiReferenceQueryFilters(t *testing.T) {
 	}
 	for _, s := range syms {
 		sm, _ := s.(map[string]any)
-		if sym, _ := sm["symbol"].(string); !strings.Contains(sym, "i2c") {
+		if sym, _ := sm["symbol"].(string); !strings.Contains(strings.ToLower(sym), "i2c") {
 			t.Errorf("symbol %q rode an i2c query", sym)
 		}
 	}
@@ -228,6 +229,26 @@ func TestAbiReferenceQueryFilters(t *testing.T) {
 	upper, _ := structured(t, res)["content"].(map[string]any)
 	if len(upper) != len(content) {
 		t.Errorf("query=I2C served %d sections, query=i2c served %d — matching must be case-insensitive", len(upper), len(content))
+	}
+
+	// entries ride WHOLE: a semantics-only hit still returns the full
+	// original entry — "mislabel" lives only in the gpio.on op's
+	// semantics, and the served entry carries its sig (and every other
+	// field) beside it
+	res = e.call("xuansi_abi_reference", map[string]any{"section": "bench_signatures", "query": "mislabel"})
+	if res.IsError {
+		t.Fatalf("query=mislabel failed: %s", resultText(t, res))
+	}
+	if content, _ = structured(t, res)["content"].(map[string]any); len(content) != 1 {
+		t.Fatalf("query=mislabel content = %v, want bench_signatures alone", content)
+	}
+	gpioOps, _ := content["bench_signatures"].(map[string]any)["ops"].(map[string]any)["gpio"].([]any)
+	if len(gpioOps) != 1 {
+		t.Fatalf("ops.gpio after query=mislabel = %d entries, want exactly the matching one", len(gpioOps))
+	}
+	entry, _ := gpioOps[0].(map[string]any)
+	if entry["sig"] != "bench.gpio.on(pin, edge, fn)" || entry["semantics"] == nil {
+		t.Errorf("the semantics-matched entry rode partial (%v) — a match via any field keeps the WHOLE entry (sig included)", entry)
 	}
 
 	// section + query compose: within bench_signatures, "scan" keeps

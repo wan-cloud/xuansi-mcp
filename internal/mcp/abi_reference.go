@@ -244,19 +244,22 @@ type abiReferenceIn struct {
 }
 
 // filterAbiSection narrows one decoded section to the entries that
-// mention q (already lowercased): lists keep their matching entries,
-// objects keep a key when the KEY matches (the whole pair rides — a
-// family named by the query keeps its whole op list) or when something
-// inside its value survives, and scalars match their rendered form.
-// Entries themselves are atomic — a matching map entry rides whole.
-// nil answers "nothing survived" so the caller drops the section.
+// mention q (already lowercased): lists keep their matching entries —
+// an entry that matches via ANY field rides WHOLE (the original
+// element, never the matching fragment — a symbol hit through its
+// semantics still carries its prototype/wasm view); objects keep a key
+// when the KEY matches (the whole pair rides — a family named by the
+// query keeps its whole op list) or when something inside its value
+// survives (the value narrows recursively); scalars match their
+// rendered form. nil answers "nothing survived" so the caller drops
+// the section.
 func filterAbiSection(v any, q string) any {
 	switch t := v.(type) {
 	case []any:
 		out := make([]any, 0, len(t))
 		for _, e := range t {
-			if f := filterAbiSection(e, q); f != nil {
-				out = append(out, f)
+			if filterAbiSection(e, q) != nil {
+				out = append(out, e) // the entry rides whole (a matched scalar is itself)
 			}
 		}
 		if len(out) == 0 {
