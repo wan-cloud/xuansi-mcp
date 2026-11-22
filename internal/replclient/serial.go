@@ -268,7 +268,8 @@ func usbDeviceCandidates(byIdOrPath string) []string {
 // the kernel opened.
 func resolveUSBDevice(byIdOrPath string) (path string, mac6 string, err error) {
 	mac6, _ = mac6FromByID(byIdOrPath)
-	for _, p := range usbDeviceCandidates(byIdOrPath) {
+	candidates := usbDeviceCandidates(byIdOrPath)
+	for _, p := range candidates {
 		if _, statErr := os.Stat(p); statErr == nil {
 			if real, evalErr := filepath.EvalSymlinks(p); evalErr == nil {
 				p = real
@@ -277,5 +278,5 @@ func resolveUSBDevice(byIdOrPath string) (path string, mac6 string, err error) {
 		}
 	}
 	return "", mac6, fmt.Errorf("replclient: usb device %q not found (tried %s)",
-		byIdOrPath, strings.Join(usbDeviceCandidates(byIdOrPath), ", "))
+		byIdOrPath, strings.Join(candidates, ", "))
 }

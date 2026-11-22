@@ -1093,6 +1093,7 @@ func (cc *clientConn) drop() {
 		// ride the same sets under their generated ids; no lease sits
 		// under those, so the agent-gone call there is a no-op.
 		holder := cc.holder_()
+		// last defaults true (no set — a conn that never joined one): the over-fire direction is deliberate — it restores pre-change behavior and a live peer recovers via adopt-within-TTL, while under-fire would leak leases (live forever, holder gone).
 		last := true
 		if set := s.holderConns[holder]; set != nil {
 			delete(set, cc)
@@ -1110,6 +1111,20 @@ func (cc *clientConn) drop() {
 		}
 		s.mu.Unlock()
 
+		// ⑤c seam (final whole-branch review): `last` was computed above,
+		// but this goroutine released s.mu before acting on it — a
+		// same-holder bindHolder may have joined the set in that gap, and
+		// firing agent-gone then would grace a holder that demonstrably
+		// has a live connection. Two-phase check: re-acquire s.mu and
+		// re-check the set (leases are never called under s.mu anywhere,
+		// so re-acquiring here opens no lock-ordering edge; a bind
+		// landing in the residual gap after the re-check still over-fires
+		// — the safe direction, see the last-fallback note above).
+		if last {
+			s.mu.Lock()
+			last = len(s.holderConns[holder]) == 0
+			s.mu.Unlock()
+		}
 		if last {
 			s.leases.OnAgentGone(holder)
 		}
