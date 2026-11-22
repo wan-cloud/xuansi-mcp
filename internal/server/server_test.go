@@ -1437,6 +1437,82 @@ func TestDisconnectMovesLeaseToGrace(t *testing.T) {
 	t.Fatalf("lease never entered grace after disconnect: %+v", e.srv.Leases().Snapshot())
 }
 
+// leaseLiveFor asserts the negative half of the grace polls: for a
+// bounded window (early-fail) every lease snapshot of board must stay
+// live — GraceDeadline zero. The window starts only after the departed
+// connection's drop handler has run (waitConns returned), so a grace
+// move lands inside it on a loaded box too, not after the assert.
+func leaseLiveFor(t *testing.T, e *env, board string) {
+	t.Helper()
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, ls := range e.srv.Leases().Snapshot() {
+			if ls.Board == board && !ls.GraceDeadline.IsZero() {
+				t.Fatalf("lease of %s entered grace: %+v", board, ls)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestSameHolderSecondConnExitKeepsLeaseLive: two connections may
+// present ONE holder id (one agent's CLI and MCP server, say) — the
+// exit of one must not start the holder's grace countdown while the
+// other connection is still live.
+func TestSameHolderSecondConnExitKeepsLeaseLive(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	a := dialSock(t, e.sock)
+	rep, _ := a.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "twin-1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	// a second connection presenting the SAME holder: any request
+	// carrying the holder binds it (list_boards is the harmless one)
+	b := dialSock(t, e.sock)
+	rep, _ = b.call(2, map[string]any{"type": "list_boards", "holder": "twin-1"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("second conn bind: %#v", rep)
+	}
+
+	a.conn.Close()
+	waitConns(t, e.srv, 1)
+	leaseLiveFor(t, e, "d75884") // survivor still seated: no grace
+}
+
+// TestLastHolderConnExitMovesToGrace: the countdown does start — but
+// only when the holder's LAST connection exits.
+func TestLastHolderConnExitMovesToGrace(t *testing.T) {
+	e := newEnv(t, nil, mkBoard("d75884", "xuansi-d75884.local"))
+	a := dialSock(t, e.sock)
+	rep, _ := a.call(1, map[string]any{"type": "lease", "board": "d75884", "holder": "twin-2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("lease: %#v", rep)
+	}
+	b := dialSock(t, e.sock)
+	rep, _ = b.call(2, map[string]any{"type": "list_boards", "holder": "twin-2"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("second conn bind: %#v", rep)
+	}
+
+	// first exit: one same-holder connection survives → still live
+	a.conn.Close()
+	waitConns(t, e.srv, 1)
+	leaseLiveFor(t, e, "d75884")
+
+	// last exit: the holder is gone → grace
+	b.conn.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, ls := range e.srv.Leases().Snapshot() {
+			if ls.Board == "d75884" && !ls.GraceDeadline.IsZero() {
+				return // in grace: the LAST same-holder connection dropped
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("lease never entered grace after the last same-holder connection dropped: %+v", e.srv.Leases().Snapshot())
+}
+
 // TestHolderAdoptAcrossConnections: adopt-within-TTL — a NEW connection
 // re-supplying the same holder takes the grace lease back live and may
 // eval immediately.

@@ -293,13 +293,14 @@ type Server struct {
 	sockPath string
 	ownSock  bool // we created the sock file → Close removes it
 
-	mu         sync.Mutex
-	sups       map[string]*daemonBoard             // mac6 → supervisor wrapper
-	conns      map[*clientConn]struct{}            // live API connections
-	watchers   map[string]map[*clientConn]struct{} // mac6 → subscribed conns
-	connSeq    int64
-	captures   map[string]*captureSession // capture_id → live capture (capture.go)
-	captureSeq int64                      // capture_id assignment, under mu
+	mu          sync.Mutex
+	sups        map[string]*daemonBoard             // mac6 → supervisor wrapper
+	conns       map[*clientConn]struct{}            // live API connections
+	watchers    map[string]map[*clientConn]struct{} // mac6 → subscribed conns
+	holderConns map[string]map[*clientConn]struct{} // holder → live conns; agent-gone fires when the LAST one drops
+	connSeq     int64
+	captures    map[string]*captureSession // capture_id → live capture (capture.go)
+	captureSeq  int64                      // capture_id assignment, under mu
 	// captureRoot / captureOpen are the capture face's filesystem
 	// seams: the root defaults to capturesRoot() (Opts.CaptureRoot
 	// injects a temp root in tests) and the opener defaults to
@@ -544,6 +545,7 @@ func New(o Opts) (*Server, error) {
 		sups:        map[string]*daemonBoard{},
 		conns:       map[*clientConn]struct{}{},
 		watchers:    map[string]map[*clientConn]struct{}{},
+		holderConns: map[string]map[*clientConn]struct{}{},
 		captures:    map[string]*captureSession{},
 		captureRoot: o.CaptureRoot,
 		laStore:     la.NewStore(),
@@ -993,6 +995,12 @@ func (s *Server) handleConn(c net.Conn) {
 		replyWait: defaultReplyWait,
 	}
 	s.conns[cc] = struct{}{}
+	// every connection is born into its own generated holder's set; a
+	// later request carrying a holder moves it (bindHolder)
+	if s.holderConns[cc.holder] == nil {
+		s.holderConns[cc.holder] = map[*clientConn]struct{}{}
+	}
+	s.holderConns[cc.holder][cc] = struct{}{}
 	// idle-exit hook: a live connection disarms the pending window (a
 	// client returned; the fire closure re-checks under this same lock,
 	// so a Stop()-too-late race is still refused)
@@ -1062,8 +1070,9 @@ func (cc *clientConn) readLoop() {
 }
 
 // dropConn is the one-way teardown of a connection: unsubscribe from
-// every board's events, signal agent-gone for its holder, stop the
-// writer. Idempotent per connection.
+// every board's events, signal agent-gone for its holder when it was
+// the holder's last live connection, stop the writer. Idempotent per
+// connection.
 func (s *Server) dropConn(cc *clientConn) { cc.drop() }
 
 func (cc *clientConn) drop() {
@@ -1077,6 +1086,22 @@ func (cc *clientConn) drop() {
 				delete(s.watchers, mac6)
 			}
 		}
+		// per-holder liveness: the grace countdown starts only when this
+		// was the holder's LAST live connection — two processes may
+		// present one holder id (one agent's CLI and its MCP server),
+		// and the survivor's lease must not wobble. Holder-less conns
+		// ride the same sets under their generated ids; no lease sits
+		// under those, so the agent-gone call there is a no-op.
+		holder := cc.holder_()
+		last := true
+		if set := s.holderConns[holder]; set != nil {
+			delete(set, cc)
+			if len(set) == 0 {
+				delete(s.holderConns, holder)
+			} else {
+				last = false
+			}
+		}
 		// idle-exit hook: the LAST departure arms the window (captures
 		// do not block arming — the fire closure re-checks them under
 		// this lock and a live capture stands it down instead)
@@ -1085,8 +1110,9 @@ func (cc *clientConn) drop() {
 		}
 		s.mu.Unlock()
 
-		holder := cc.holder_()
-		s.leases.OnAgentGone(holder)
+		if last {
+			s.leases.OnAgentGone(holder)
+		}
 		s.logf("server: conn dropped (holder=%s)", holder)
 
 		cc.wmu.Lock()
@@ -1265,19 +1291,49 @@ func (cc *clientConn) holder_() string {
 
 // bindHolder applies the holder rules: the first request carrying a
 // holder binds the connection; a conflicting one is a protocol error.
+// A first bind also moves the connection into the holder's live set
+// (holderConns) — out of the generated id it was born under.
 func (cc *clientConn) bindHolder(h string) *RPCError {
 	if h == "" {
 		return nil
 	}
+	from := ""
 	cc.mu.Lock()
-	defer cc.mu.Unlock()
 	if cc.holderBound && cc.holder != h {
-		return &RPCError{Class: "holder", Msg: fmt.Sprintf("connection bound to holder %q, request says %q", cc.holder, h)}
+		err := &RPCError{Class: "holder", Msg: fmt.Sprintf("connection bound to holder %q, request says %q", cc.holder, h)}
+		cc.mu.Unlock()
+		return err
 	}
 	if !cc.holderBound {
+		from = cc.holder
 		cc.holder = h
 		cc.holderBound = true
 	}
+	// cc.mu is released BEFORE srv.mu is taken: srv.mu nests ABOVE
+	// conn.mu elsewhere (holder_() under srv.mu in sendLocked and
+	// broadcast), so the two must never be held the other way round.
+	cc.mu.Unlock()
+	if from == "" {
+		return nil // already bound to this holder: nothing moves
+	}
+	s := cc.srv
+	s.mu.Lock()
+	// leave the generated id's set (delete on a nil map — a conn built
+	// outside handleConn never joined one — is a no-op)
+	delete(s.holderConns[from], cc)
+	if len(s.holderConns[from]) == 0 {
+		delete(s.holderConns, from)
+	}
+	// join the holder's set — unless a concurrent drop (server Close)
+	// already tore this conn out of s.conns: that drop accounted it
+	// under the holder above, and re-adding would pin the set open
+	if _, live := s.conns[cc]; live {
+		if s.holderConns[h] == nil {
+			s.holderConns[h] = map[*clientConn]struct{}{}
+		}
+		s.holderConns[h][cc] = struct{}{}
+	}
+	s.mu.Unlock()
 	return nil
 }
 
