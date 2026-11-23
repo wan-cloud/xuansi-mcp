@@ -57,7 +57,31 @@ var (
 // mac6 (by hand, or as SetAlias(mac6, mac6), which the registry does
 // through this editor): the payload stays, and the board answers to its
 // mac6 exactly as an unaliased board does.
+//
+// That edit is the END of the refusal. A line (or several) already
+// named by the mac6 carries no alias, and a clear on it is a success
+// that writes nothing — never this error again with a coach that
+// sends the reader where they already are.
 var ErrLineHasPayload = errors.New("clearing the alias would take more than the alias with it")
+
+// fileAlias is the name the boards.conf at path gives mac6 — the alias
+// a daemon start would read for it — or "" when no line names the
+// board. It rides nameSpan, so it is the parser's own verdict, read
+// off the file as it is NOW (a file that cannot be read names nobody).
+func fileAlias(path, mac6 string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	mac6 = strings.ToLower(strings.TrimSpace(mac6))
+	name := ""
+	for _, l := range splitConfLines(data) {
+		if start, end, m, ok := nameSpan(l.text); ok && m == mac6 {
+			name = l.text[start:end] // the LAST line naming the board, as the parser lets win
+		}
+	}
+	return name
+}
 
 // confLine is one physical line of the file: its bytes without the
 // terminator, and the terminator itself — "\n", "\r\n", or "" for an
@@ -123,10 +147,14 @@ func nameSpan(raw string) (start, end int, mac6 string, ok bool) {
 // and NOTHING else: no @endpoint, no key=value tail, no comment, no
 // stray word. The parser's tolerated spellings are still pure (spaces
 // around the "=", an uppercase mac6, trailing whitespace): deleting
-// the line takes the alias and nothing a human wrote beside it.
+// the line takes the alias and nothing a human wrote beside it. An
+// inline comment leaves the head and the token list untouched — so
+// nothing in them betrays it — yet it is something a human wrote
+// beside the alias: the line is read with commentStart too, and is not
+// pure.
 func isPureAlias(raw string) bool {
 	t := strings.TrimSpace(raw)
-	if t == "" || strings.HasPrefix(t, "#") {
+	if t == "" || strings.HasPrefix(t, "#") || commentStart(t) >= 0 {
 		return false
 	}
 	head, tokens := splitTokenTail(t)
@@ -136,6 +164,20 @@ func isPureAlias(raw string) bool {
 	}
 	_, value, _ := strings.Cut(head, "=")
 	return strings.ToLower(strings.TrimSpace(value)) == h.mac6
+}
+
+// mac6Named reports whether every line at (indexes into lines) names
+// its board by the board's own mac6 — exactly, as the editor would
+// write it (an uppercase spelling is not there yet: its coach still
+// leads somewhere).
+func mac6Named(lines []confLine, at []int, mac6 string) bool {
+	for _, i := range at {
+		start, end, _, ok := nameSpan(lines[i].text)
+		if !ok || lines[i].text[start:end] != mac6 {
+			return false
+		}
+	}
+	return true
 }
 
 // eolOf is the line terminator a NEW line takes after lines: the one
@@ -165,8 +207,11 @@ func eolOf(lines []confLine) string {
 //     When the line already carries alias, nothing is written.
 //   - clear=true: the line is deleted only when it is the ONE line
 //     naming mac6 AND a pure alias line (`name=mac6`, nothing else).
-//     Anything more is ErrLineHasPayload, and nothing is written. When
-//     no line names mac6 there is nothing to clear: nothing is
+//     Anything more is ErrLineHasPayload, and nothing is written —
+//     with one end state excepted: a payload line (or several lines)
+//     already named by the board's own mac6 has no alias left to
+//     clear, and the clear is a success that writes nothing. When no
+//     line names mac6 there is nothing to clear either: nothing is
 //     written and no file is created.
 //
 // No existing byte ever changes value. Bytes leave the file only with
@@ -211,18 +256,31 @@ func EditAlias(path, mac6, alias string, clear bool) error {
 		case target < 0:
 			return nil
 		case len(earlier) > 0:
+			if mac6Named(lines, append(earlier, target), mac6) {
+				// every line already named by the mac6 — the multi-line
+				// coach, followed by hand: nothing is left to clear
+				return nil
+			}
 			at := make([]string, len(earlier)+1)
 			for i, n := range append(earlier, target) {
 				at[i] = fmt.Sprint(n + 1)
 			}
 			return fmt.Errorf("discover: unalias %s: %w: %s names the board on %d lines (%s) — the daemon never splits its edit across several lines; to clear this alias, rename the name on each of them to the board's mac6 (%s) by hand",
 				mac6, ErrLineHasPayload, path, len(at), strings.Join(at, ", "), mac6)
-		case !isPureAlias(lines[target].text):
+		case !isPureAlias(lines[target].text) && !mac6Named(lines, []int{target}, mac6):
 			// the safe edit, spelled out: which name, to what, and that
 			// the rest of the line stays (the seat's alias call does it)
 			start, end, _, _ := nameSpan(lines[target].text)
 			return fmt.Errorf("discover: unalias %s: %w: %s names it as %q — a boards.conf line needs its name (without it the @endpoint and model= on that line are lost at the next start), so the daemon deletes only a pure alias=mac6 line; to clear this alias, rename the name to the board's mac6 (here %q → %q, the rest of the line unchanged) — by hand, or by setting the alias to %s",
 				mac6, ErrLineHasPayload, path, strings.TrimSpace(lines[target].text), lines[target].text[start:end], mac6, mac6)
+		case !isPureAlias(lines[target].text):
+			// the safe recipe, done — by the alias call or by hand: the
+			// payload line is named by the mac6 and carries no alias.
+			// Success, and not a byte written: refusing here again, from
+			// the very place the coach sent the reader, was a terminal
+			// loop (`"d75884" → "d75884"`). The line stays what it is —
+			// a payload line, never one the daemon deletes.
+			return nil
 		}
 		lines = append(lines[:target], lines[target+1:]...)
 	} else if target >= 0 {
@@ -281,7 +339,8 @@ const staleTempAge = time.Minute
 //     user's tools create — parent directories included.
 //   - a symlinked boards.conf is followed, not replaced: the link
 //     stays a link (a dangling one included) and its target is what
-//     changes.
+//     changes — a relative target resolved from the link's real
+//     directory, the way the kernel reads it.
 //   - a temp file a crashed write left behind is swept once it is
 //     stale (sweepStaleTemps).
 func writeBoardsFile(path string, data []byte) error {
@@ -298,7 +357,20 @@ func writeBoardsFile(path string, data []byte) error {
 		// followed (a rename would replace the link with a plain file)
 		if dest, rerr := os.Readlink(path); rerr == nil {
 			if !filepath.IsAbs(dest) {
-				dest = filepath.Join(filepath.Dir(path), dest)
+				// A relative target is read from the link's REAL directory:
+				// the kernel resolves a `..` through the directories as
+				// they are on disk, not through the path as spelled. A
+				// lexical join onto the spelled path cancels a symlinked
+				// config directory textually (`link/conf/../x` →
+				// `link/x`) and lands the file where nothing that reads
+				// the link would look — after creating that directory.
+				// So the directory is resolved first, and a directory
+				// that cannot be resolved refuses: nothing is written.
+				dir, derr := filepath.EvalSymlinks(filepath.Dir(path))
+				if derr != nil {
+					return fmt.Errorf("resolve the directory of %s: %w — nothing was written", path, derr)
+				}
+				dest = filepath.Join(dir, dest)
 			}
 			target = dest
 		}

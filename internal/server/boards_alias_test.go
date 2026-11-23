@@ -307,6 +307,25 @@ func TestBoardsUnaliasCoachNamesTheSafeEdit(t *testing.T) {
 	}
 	check(c, 3, "running daemon")
 
+	// …and the recipe is the END of it: a line already named by the
+	// mac6 has no alias left to clear. boards_unalias is then the
+	// idempotent success the Desc promises — never the refusal again
+	// with a coach that goes nowhere (`"1a2b3c" → "1a2b3c"` was a
+	// terminal loop for an agent following it) — and nothing is
+	// written: the line keeps its payload, and the board goes on
+	// answering to its mac6 exactly as before the call.
+	renamed := "# rig\n1a2b3c=1a2b3c" + payload + "\n"
+	for id := int64(4); id <= 5; id++ { // twice: the second answers the same
+		rep, _ = c.call(id, map[string]any{"type": "boards_unalias", "board": "1a2b3c"})
+		if asMap(rep["error"]) != nil || asStr(asMap(rep["result"])["unaliased"]) != "1a2b3c" {
+			t.Fatalf("boards_unalias after the recipe (call %d) = %#v, want {unaliased: 1a2b3c}", id, rep)
+		}
+		if got, _ := os.ReadFile(e.conf); !bytes.Equal(got, []byte(renamed)) {
+			t.Fatalf("the idempotent unalias wrote: %q", got)
+		}
+	}
+	check(c, 6, "running daemon, after the idempotent unalias")
+
 	// a restart reads exactly the same
 	e.srv.Close()
 	e2 := newAliasEnvAt(t, e.conf, board)

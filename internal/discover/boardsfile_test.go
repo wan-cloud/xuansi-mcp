@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -187,10 +188,10 @@ func assertRenamed(t *testing.T, before, after []byte, oldName, alias string) {
 // disturb: a header comment, blank lines (and a whitespace-only one),
 // every legal line shape — pure alias, endpoint pin, key=value token,
 // the tolerated spacing and mac6-case quirks, an inline `# note`
-// riding a token tail (the T1 parser's known quirk: it warns once per
-// word — preserved here, not fixed) — and the unknown/malformed lines
-// the parser skips with a warning. Deliberately without a trailing
-// newline.
+// riding a token tail (an inline comment is part of the grammar since
+// the owner ruling of 2026-11-24: read as a comment, never warned
+// about) — and the unknown/malformed lines the parser skips with a
+// warning. Deliberately without a trailing newline.
 const precisionCorpus = "" +
 	"# bench boards (hand-maintained)\n" +
 	"\n" +
@@ -848,6 +849,51 @@ func TestEditAliasNewFileRidesTheSameWriter(t *testing.T) {
 			}
 			assertNoLeftovers(t, filepath.Join(dir, "real"))
 		})
+
+		// The same dangling link under a SYMLINKED config directory, its
+		// relative target climbing out with `..`. The kernel reads a
+		// relative target from the link's REAL directory:
+		//   <dir>/real/../shared/boards.conf  =  <dir>/shared/boards.conf
+		// Joining the target onto the path as SPELLED reads it from
+		// somewhere else — `<dir>/link/conf/../shared` cleans to
+		// `<dir>/link/shared`, a directory that never existed, which the
+		// writer then created and reported success over: the file landed
+		// where nothing that reads the link would ever look.
+		t.Run("a dangling symlink with a relative `..` target under a symlinked directory lands where the kernel resolves it", func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Mkdir(filepath.Join(dir, "real"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(dir, "link"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join("..", "real"), filepath.Join(dir, "link", "conf")); err != nil {
+				t.Skipf("symlinks unavailable here: %v", err)
+			}
+			path := filepath.Join(dir, "link", "conf", "boards.conf")
+			if err := os.Symlink(filepath.Join("..", "shared", "boards.conf"), path); err != nil {
+				t.Skipf("symlinks unavailable here: %v", err)
+			}
+			if err := EditAlias(path, "d75884", "bench", false); err != nil {
+				t.Fatalf("EditAlias through the dangling symlink: %v", err)
+			}
+			want := filepath.Join(dir, "shared", "boards.conf")
+			if got, err := os.ReadFile(want); err != nil || string(got) != "bench=d75884\n" {
+				t.Errorf("the link target = %q, %v; want the file where the kernel resolves the link (%s)", got, err, want)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "link", "shared")); !os.IsNotExist(err) {
+				t.Errorf("a `shared` directory was created beside the symlinked config directory — the lexical join's landing spot (err = %v)", err)
+			}
+			// …and reading the link — what the next daemon start does —
+			// finds it: the link stayed a link, and it resolves now
+			if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("the symlink was replaced by a regular file (%v, %v)", fi, err)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != "bench=d75884\n" {
+				t.Errorf("reading %s through the link = %q, %v", path, got, err)
+			}
+			assertNoLeftovers(t, filepath.Join(dir, "shared"))
+		})
 	}
 }
 
@@ -949,6 +995,18 @@ func assertSafeCoach(t *testing.T, msg string) {
 	if !strings.Contains(msg, "rename the name") || !strings.Contains(msg, "mac6") {
 		t.Errorf("the coach lacks the safe recipe (rename the name to the board's mac6):\n %q", msg)
 	}
+	// …and it must lead somewhere: a coach of the form `"d75884" →
+	// "d75884"` sends the reader where they already are. An agent that
+	// follows it calls unalias again, gets the same coach back, and
+	// loops — the terminal state the fix wave closed (a line already
+	// named by the mac6 now clears as the idempotent success).
+	if i := strings.Index(msg, "\" → \""); i >= 0 {
+		from := msg[strings.LastIndex(msg[:i], "\"")+1 : i]
+		rest := msg[i+len("\" → \""):]
+		if j := strings.IndexByte(rest, '"'); j >= 0 && from == rest[:j] {
+			t.Errorf("the coach sends the reader where they already are (%q → %q):\n %q", from, from, msg)
+		}
+	}
 }
 
 // TestUnaliasCoachIsTheSafeEdit: a boards.conf line needs its name —
@@ -959,7 +1017,9 @@ func assertSafeCoach(t *testing.T, msg string) {
 // alias off a payload line and keeps the payload — renaming the name
 // to the board's own mac6 — and never to the edit that loses it. The
 // recipe is then followed through the registry: the alias set to the
-// mac6 renames the name and nothing else, now and after a restart.
+// mac6 renames the name and nothing else, now and after a restart —
+// and that is the END of the recipe: the clear that was refused is
+// then the idempotent success.
 func TestUnaliasCoachIsTheSafeEdit(t *testing.T) {
 	captureLogs(t)
 	const payload = "@10.1.11.204:7777 model=esp32s3-dev"
@@ -1020,11 +1080,304 @@ func TestUnaliasCoachIsTheSafeEdit(t *testing.T) {
 			t.Errorf("%s: Resolve(1a2b3c) = %+v, %v — want the pin and the conf model intact", name, b, err)
 		}
 	}
-	// …and it is still a payload line: unalias keeps refusing, safely
-	if err := w.reg.ClearAlias("1a2b3c"); !errors.Is(err, ErrLineHasPayload) {
-		t.Fatalf("ClearAlias after the rename = %v, want ErrLineHasPayload (the line still carries payload)", err)
-	} else {
+	// …and the recipe is the END of it. The line is still a payload line
+	// — unalias never deletes it — but it carries no alias any more: a
+	// clear on it is the idempotent success the Desc promises, never
+	// the same refusal again with a coach that goes nowhere (until the
+	// fix wave it kept refusing, with `"1a2b3c" → "1a2b3c"`, and an
+	// agent following the coach looped). Nothing is written.
+	renamed := "# rig\n1a2b3c=1a2b3c" + payload + "\n"
+	before, existed = stampFile(t, w.conf)
+	for i := 1; i <= 2; i++ { // idempotent: the second call answers the same
+		if err := w.reg.ClearAlias("1a2b3c"); err != nil {
+			t.Fatalf("ClearAlias #%d after the rename = %v, want nil (nothing left to clear)", i, err)
+		}
+		assertUnwritten(t, w.conf, before, existed)
+	}
+	if got := readConf(t, w.conf); !bytes.Equal(got, []byte(renamed)) {
+		t.Fatalf("file = %q, want the recipe's line untouched:\n       %q", got, renamed)
+	}
+	// …and memory is what the file says, which is what a restart reads:
+	// the line keeps the mac6 as its name (the parser has no "name ==
+	// mac6 means no alias" rule — that is a separate ruling), so the
+	// board answers to its mac6 live and after a restart, pin and model
+	// intact.
+	for name, r := range map[string]*Registry{"the running registry": w.reg, "a restart": w.rebuild()} {
+		if got := aliasOf(r, "1a2b3c"); got != "1a2b3c" {
+			t.Errorf("%s: alias = %q, want the mac6 (the file's name)", name, got)
+		}
+		b, err := r.Resolve("1a2b3c")
+		if err != nil || b.MAC6 != "1a2b3c" || b.Port != 7777 || b.IP != "10.1.11.204" || b.Model != "esp32s3-dev" || b.ModelSource != ModelSourceConf {
+			t.Errorf("%s: Resolve(1a2b3c) = %+v, %v — want the pin and the conf model intact", name, b, err)
+		}
+	}
+}
+
+// TestUnaliasAfterAHandRenameToTheMac6: the same end state reached by
+// hand — the file's line renamed to the mac6 while the daemon still
+// holds the old alias in memory. The clear succeeds, writes nothing,
+// and the memory follows the file: the stale alias is gone from this
+// daemon too (it no longer resolves), and what remains is exactly what
+// a restart reads.
+func TestUnaliasAfterAHandRenameToTheMac6(t *testing.T) {
+	captureLogs(t)
+	const payload = "@10.1.11.204:7777 model=esp32s3-dev"
+	w := newAliasWorld(t, "cam=1a2b3c"+payload+"\n", worldBoard("1a2b3c", "xuansi-1a2b3c.local"))
+	if got := aliasOf(w.reg, "1a2b3c"); got != "cam" {
+		t.Fatalf("precondition: alias = %q, want cam", got)
+	}
+	if err := os.WriteFile(w.conf, []byte("1a2b3c=1a2b3c"+payload+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, existed := stampFile(t, w.conf)
+	if err := w.reg.ClearAlias("1a2b3c"); err != nil {
+		t.Fatalf("ClearAlias on a line the file already names by the mac6 = %v, want nil", err)
+	}
+	assertUnwritten(t, w.conf, before, existed)
+	if got, want := aliasOf(w.reg, "1a2b3c"), aliasOf(w.rebuild(), "1a2b3c"); got != "1a2b3c" || want != "1a2b3c" {
+		t.Fatalf("after the clear: memory %q, a restart %q — want the file's name (the mac6) in both", got, want)
+	}
+	if _, err := w.reg.Resolve("cam"); err == nil {
+		t.Errorf("the stale alias cam still resolves after the clear")
+	}
+	if _, err := w.reg.Resolve("1a2b3c"); err != nil {
+		t.Errorf("the board no longer answers to its mac6: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the line editor: the END of the safe recipe — a line already named by
+// the mac6 has no alias left to clear
+// ---------------------------------------------------------------------------
+
+// TestClearAliasOnAMac6NamedLineIsANoop: the end of the safe recipe,
+// at the editor. The coach sends the reader to rename the name to the
+// board's own mac6; once that is done the line carries no alias, and a
+// clear on it is the idempotent success — not the same refusal again,
+// with a coach that now says `"d75884" → "d75884"` (the terminal loop:
+// an agent following the coach never gets out). Nothing is written: the
+// line keeps its payload, and the parser reads it as before. The
+// predicate lives in the payload branch only — a PURE line named by the
+// mac6 is still deleted — and a name that merely looks like the mac6
+// (another case) is not there yet: its coach still leads somewhere.
+func TestClearAliasOnAMac6NamedLineIsANoop(t *testing.T) {
+	captureLogs(t)
+	const payload = "@10.1.11.204:7777 model=esp32s3-dev"
+	for _, tc := range []struct{ name, line string }{
+		{"an @endpoint", "d75884=d75884@10.1.11.204:7777"},
+		{"a model= token", "d75884=d75884 model=esp32s3-dev"},
+		{"an @endpoint and a model=", "d75884=d75884" + payload},
+		{"an unknown key", "d75884=d75884 foo=bar"},
+		{"an inline comment", "d75884=d75884 # left bay"},
+		{"a token tail and an inline comment", "d75884=d75884 model=x # left bay"},
+		{"leading whitespace and an uppercase mac6 value", "  d75884 = D75884  model=esp32s3-dev"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeConf(t, dir, "# rig\n"+tc.line+"\nother=000001\n")
+			before, existed := stampFile(t, path)
+			a0, p0, m0 := parseConf(t, path)
+			for i := 1; i <= 2; i++ { // idempotent: the second call answers the same
+				if err := EditAlias(path, "d75884", "", true); err != nil {
+					t.Fatalf("clear #%d on %q = %v, want nil (nothing left to clear)", i, tc.line, err)
+				}
+				assertUnwritten(t, path, before, existed)
+			}
+			assertNoLeftovers(t, dir)
+			if a, p, m := parseConf(t, path); !reflect.DeepEqual(a, a0) || !reflect.DeepEqual(p, p0) || !reflect.DeepEqual(m, m0) {
+				t.Fatalf("the parser's verdict moved on an untouched file:\n before %#v %#v %#v\n after  %#v %#v %#v", a0, p0, m0, a, p, m)
+			}
+		})
+	}
+
+	t.Run("an uppercase name is not the mac6 yet: the coach still leads somewhere", func(t *testing.T) {
+		dir := t.TempDir()
+		path := writeConf(t, dir, "D75884=d75884"+payload+"\n")
+		before, existed := stampFile(t, path)
+		err := EditAlias(path, "d75884", "", true)
+		if !errors.Is(err, ErrLineHasPayload) {
+			t.Fatalf("clear on an uppercase name = %v, want ErrLineHasPayload (the name is not the mac6 yet)", err)
+		}
+		for _, want := range []string{`"D75884" → "d75884"`, "or by setting the alias to d75884"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q lacks %q", err, want)
+			}
+		}
 		assertSafeCoach(t, err.Error())
+		assertUnwritten(t, path, before, existed)
+	})
+
+	t.Run("a pure line named by the mac6 still goes", func(t *testing.T) {
+		dir := t.TempDir()
+		path := writeConf(t, dir, "# rig\nd75884=d75884\nother=000001\n")
+		if err := EditAlias(path, "d75884", "", true); err != nil {
+			t.Fatalf("clear on a pure line named by the mac6 = %v, want the line deleted", err)
+		}
+		if got := readConf(t, path); !bytes.Equal(got, []byte("# rig\nother=000001\n")) {
+			t.Errorf("file = %q", got)
+		}
+	})
+
+	// The same end state by another road: the board named on several
+	// lines, every name already the mac6 (the multi-line coach says
+	// "rename the name on each of them" — done, it must not refuse
+	// again with the same nowhere-leading coach).
+	for _, tc := range []struct{ name, conf string }{
+		{"a pure line and a payload line", "d75884=d75884\nd75884=d75884" + payload + "\n"},
+		{"two payload lines", "d75884=d75884@10.1.11.204:7777\nd75884=d75884 model=esp32s3-dev\n"},
+	} {
+		t.Run("several lines, each already named by the mac6: "+tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeConf(t, dir, tc.conf)
+			before, existed := stampFile(t, path)
+			if err := EditAlias(path, "d75884", "", true); err != nil {
+				t.Fatalf("clear = %v, want nil (no line carries an alias any more)", err)
+			}
+			assertUnwritten(t, path, before, existed)
+			assertNoLeftovers(t, dir)
+		})
+	}
+	t.Run("several lines, one still under another name: still refused", func(t *testing.T) {
+		dir := t.TempDir()
+		path := writeConf(t, dir, "old=d75884\nd75884=d75884"+payload+"\n")
+		before, existed := stampFile(t, path)
+		err := EditAlias(path, "d75884", "", true)
+		if !errors.Is(err, ErrLineHasPayload) || !strings.Contains(err.Error(), "2 lines") {
+			t.Fatalf("clear = %v, want the ErrLineHasPayload refusal naming 2 lines (line 1 is still an alias)", err)
+		}
+		assertSafeCoach(t, err.Error())
+		assertUnwritten(t, path, before, existed)
+	})
+}
+
+// TestInlineCommentThroughTheEditor: an inline comment on each line
+// shape, round-tripped through the editor (owner ruling 2026-11-24: `#`
+// comments are supported inline on every line shape).
+//
+//   - the line NAMES its board — nameSpan is the parser's own verdict —
+//     and a set/rename moves the name field and nothing else: the
+//     comment survives byte for byte, the whitespace around it included;
+//   - the parser then reads the edited file as the alias plus whatever
+//     the MEANINGFUL part carries (pin, model) — the comment ignored,
+//     and none of its words warned about;
+//   - the line is STILL not deletable: a comment is not payload, but
+//     unalias does not delete a line that carries anything after the
+//     mac6 slot. The refusal is the conservative safe recipe, and the
+//     file is untouched.
+func TestInlineCommentThroughTheEditor(t *testing.T) {
+	logs := captureLogs(t)
+	warns := func() int { return strings.Count(logs.String(), "level=WARN") }
+	for _, tc := range []struct {
+		name, line string
+		pins       map[string]Pin
+		models     map[string]string
+		warnings   int // what the tokens BEFORE the comment earn
+	}{
+		{"alias-only", "cam=d75884 # left bay, 3rd floor", map[string]Pin{}, map[string]string{}, 0},
+		{"alias-only, a bare #", "cam=d75884 #", map[string]Pin{}, map[string]string{}, 0},
+		{"pinned", "cam=d75884@10.1.11.204:7777 # left bay", map[string]Pin{"d75884": {Host: "10.1.11.204", Port: 7777}}, map[string]string{}, 0},
+		{"a model= token", "cam=d75884 model=esp32s3-dev # left bay", map[string]Pin{}, map[string]string{"d75884": "esp32s3-dev"}, 0},
+		{"a commented-out model= after a live one", "cam=d75884 model=esp32s3-dev # model=commented-out-2", map[string]Pin{}, map[string]string{"d75884": "esp32s3-dev"}, 0},
+		{"a pin and only a commented-out model=", "cam=d75884@10.1.11.204:7777 # model=commented-out-2", map[string]Pin{"d75884": {Host: "10.1.11.204", Port: 7777}}, map[string]string{}, 0},
+		{"an unknown key and a stray word before the comment", "cam=d75884 foo=bar stray # note", map[string]Pin{}, map[string]string{}, 2},
+	} {
+		for _, eol := range []struct{ name, s string }{{"LF", "\n"}, {"CRLF", "\r\n"}} {
+			t.Run(tc.name+" ("+eol.name+")", func(t *testing.T) {
+				dir := t.TempDir()
+				orig := "# rig" + eol.s + tc.line + eol.s + "other=000001" + eol.s
+				path := writeConf(t, dir, orig)
+				before, existed := stampFile(t, path)
+
+				// names its board, and is not a deletable line
+				if start, end, mac6, ok := nameSpan(tc.line); !ok || mac6 != "d75884" || tc.line[start:end] != "cam" {
+					t.Fatalf("nameSpan(%q) = %d,%d,%q,%v — want the name field of a line that names d75884", tc.line, start, end, mac6, ok)
+				}
+				if isPureAlias(tc.line) {
+					t.Fatalf("isPureAlias(%q) = true — a comment-bearing line must not be deletable", tc.line)
+				}
+				// setting the name it already has: not a byte is written
+				if err := EditAlias(path, "d75884", "cam", false); err != nil {
+					t.Fatalf("no-op set: %v", err)
+				}
+				assertUnwritten(t, path, before, existed)
+
+				// the rename: the name field, nothing else — the comment
+				// survives byte for byte
+				if err := EditAlias(path, "d75884", "bay3", false); err != nil {
+					t.Fatalf("rename: %v", err)
+				}
+				renamed := strings.Replace(tc.line, "cam=d75884", "bay3=d75884", 1)
+				want := "# rig" + eol.s + renamed + eol.s + "other=000001" + eol.s
+				if got := readConf(t, path); !bytes.Equal(got, []byte(want)) {
+					t.Fatalf("file = %q\n     want %q (only the name moved; the comment as written)", got, want)
+				}
+				assertRenamed(t, []byte(orig), []byte(want), "cam", "bay3")
+				assertNoLeftovers(t, dir)
+
+				// …and the production parser reads it back: the alias, the
+				// meaningful part's pin and model, the comment ignored
+				w0 := warns()
+				aliases, pins, models := parseConf(t, path)
+				if !reflect.DeepEqual(aliases, map[string]string{"d75884": "bay3", "000001": "other"}) {
+					t.Errorf("aliases = %#v", aliases)
+				}
+				if !reflect.DeepEqual(pins, tc.pins) || !reflect.DeepEqual(models, tc.models) {
+					t.Errorf("pins/models = %#v %#v, want %#v %#v", pins, models, tc.pins, tc.models)
+				}
+				if got := warns() - w0; got != tc.warnings {
+					t.Errorf("warnings from the edited file = %d, want %d — a word behind the '#' warned, or a real one went missing:\n%s", got, tc.warnings, logs.String())
+				}
+
+				// unalias: the line carries a comment, so it is not
+				// deleted — refused with the safe recipe, file untouched
+				before, existed = stampFile(t, path)
+				err := EditAlias(path, "d75884", "", true)
+				if !errors.Is(err, ErrLineHasPayload) {
+					t.Fatalf("clear on %q = %v, want ErrLineHasPayload (a comment-bearing line is not deletable)", renamed, err)
+				}
+				for _, want := range []string{path, strconv.Quote(renamed), `"bay3" → "d75884"`, "the rest of the line unchanged", "or by setting the alias to d75884"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("refusal %q lacks %q", err, want)
+					}
+				}
+				assertSafeCoach(t, err.Error())
+				assertUnwritten(t, path, before, existed)
+				assertNoLeftovers(t, dir)
+			})
+		}
+	}
+}
+
+// nameSpanVerdicts — TestNameSpanOnInlineCommentLines pins the editor's
+// two per-line verdicts on the inline-comment spellings of the ruled
+// grammar, and the look-alikes it does not accept: whatever names a
+// board is the parser's own reading (they ride one splitter), and
+// nothing that carries a comment is pure.
+func TestNameSpanOnInlineCommentLines(t *testing.T) {
+	for _, tc := range []struct {
+		line  string
+		names bool
+		name  string
+		pure  bool
+	}{
+		{"cam=d75884 # note", true, "cam", false},
+		{"  cam = D75884\t# note  ", true, "cam", false},
+		{"cam=d75884@10.1.11.204:7777 # note", true, "cam", false},
+		{"cam=d75884 model=x # note", true, "cam", false},
+		{"cam=d75884 # model=x", true, "cam", false},
+		{"cam=d75884#", false, "", false},             // the '#' glued to the mac6 value is no comment: the value is `d75884#`, not a mac6
+		{"cam=d75884 stray # note", false, "", false}, // the stray word: still part of the head, still malformed
+		{"cam=d75884 model=a#b", true, "cam", false},  // a '#' inside a token is no comment: an illegal model value
+		{"# cam=d75884 # note", false, "", false},     // a comment line
+		{"cam=d75884", true, "cam", true},             // no comment at all: the pure line, deletable
+	} {
+		start, end, mac6, ok := nameSpan(tc.line)
+		if ok != tc.names || (ok && (mac6 != "d75884" || tc.line[start:end] != tc.name)) {
+			t.Errorf("nameSpan(%q) = %d,%d,%q,%v, want names=%v as %q", tc.line, start, end, mac6, ok, tc.names, tc.name)
+		}
+		if got := isPureAlias(tc.line); got != tc.pure {
+			t.Errorf("isPureAlias(%q) = %v, want %v", tc.line, got, tc.pure)
+		}
 	}
 }
 
@@ -1640,6 +1993,9 @@ func splitPhys(data []byte) []phys {
 // itself: which board it names and under what name (the parser's
 // per-line read), and whether it is PURE — `name=mac6` and nothing
 // else: no @endpoint, no key=value tail, no comment, no stray word.
+// (An inline comment is read with the test's own eye, inlineCommentAt:
+// it leaves the head and the token list, so nothing in them would
+// betray it — yet the line is not pure.)
 func lineFact(line string) (mac6, name string, names, pure bool) {
 	t := strings.TrimSpace(line)
 	if t == "" || strings.HasPrefix(t, "#") {
@@ -1652,7 +2008,7 @@ func lineFact(line string) (mac6, name string, names, pure bool) {
 	}
 	_, after, _ := strings.Cut(head, "=")
 	mac6, name, names = h.mac6, h.name, true
-	pure = !h.hasEndpoint && len(tokens) == 0 && strings.EqualFold(strings.TrimSpace(after), h.mac6)
+	pure = !h.hasEndpoint && len(tokens) == 0 && inlineCommentAt(t) < 0 && strings.EqualFold(strings.TrimSpace(after), h.mac6)
 	return
 }
 
@@ -1667,9 +2023,19 @@ func lineFact(line string) (mac6, name string, names, pure bool) {
 //     winner already carries the alias, nothing is written;
 //   - CLEAR deletes the line only when it is the ONE line naming the
 //     board AND pure; a payload line or a second line naming the board
-//     is refused with ErrLineHasPayload and the file stays whole;
+//     is refused with ErrLineHasPayload and the file stays whole —
+//     unless every line naming the board already carries the mac6 as
+//     its name (the safe recipe, done): no alias is left to clear, the
+//     call succeeds and nothing is written;
 //   - either way the production parser reads the edited file as the
 //     original world plus exactly the intended change.
+//
+// The generator spans the three line shapes with an inline comment on
+// each (` # plain note`, a note riding a token tail, a note with an =
+// inside), so the ruled comment grammar is under the property too —
+// and three of its names ARE target mac6s, so files name a board by
+// its own mac6 often enough to put the end of the safe recipe under
+// the property (both counts are asserted at the end, not assumed).
 func TestEditAliasRandomized(t *testing.T) {
 	captureLogs(t) // generated malformed lines warn by design
 	rng := rand.New(rand.NewSource(20261123))
@@ -1682,11 +2048,11 @@ func TestEditAliasRandomized(t *testing.T) {
 			return pick("", " ", "\t") + "#" + pick(" bench boards", " d75884 sits on the bench", "", " note: model= is per board", " d75884=d75884")
 		case 2:
 			return pick("stray line", "=d75884", "ghost=abc", "no-separator", "==d75884", "d75884", "#",
-				"bench=d75884 stray", "note=d75884 # plain note", "bench = d75884 stray")
+				"bench=d75884 stray", "note=d75884 stray # plain note", "bench = d75884 stray")
 		}
 		ws := func() string { return pick("", " ", "  ", "\t") }
 		return pick("", " ", "\t") +
-			pick("bench", "cam", "a-b", "x_y", "two words", "lab", "d75884", "xuansi", "note") +
+			pick("bench", "cam", "a-b", "x_y", "two words", "lab", "d75884", "d75884", "1a2b3c", "abcdef", "xuansi", "note") +
 			ws() + "=" + ws() +
 			pick("d75884", "D75884", "1a2b3c", "abcdef", "0badf0", "0BADF0") +
 			pick("", " ", "  ") +
@@ -1811,6 +2177,18 @@ func TestEditAliasRandomized(t *testing.T) {
 			}
 		}
 	}
+	// mac6Named: every line naming the board already carries the mac6 as
+	// its name, pure or not. (One PURE line named by the mac6 is still
+	// deleted — the oracle matches that case first, as the editor does.)
+	mac6Named := func(c *genCase) bool {
+		for _, i := range c.naming {
+			if c.facts[i].name != c.mac6 {
+				return false
+			}
+		}
+		return len(c.naming) > 0
+	}
+	mac6NamedClears, inlineCommentLines := 0, 0
 	oracleClear := func(t *testing.T, c *genCase, after []byte, err error) {
 		t.Helper()
 		switch {
@@ -1842,6 +2220,17 @@ func TestEditAliasRandomized(t *testing.T) {
 			if err != nil || !bytes.Equal(after, c.before) {
 				t.Fatalf("clear with no line: err = %v, file %q -> %q\n%s", err, c.before, after, where(c, "clear"))
 			}
+		case mac6Named(c):
+			// every line naming the board already carries the mac6 as
+			// its name — the safe recipe, done by the alias tool or by
+			// hand: no alias is left to clear. Success, nothing written
+			// (a single PURE line named by the mac6 never gets here: it
+			// was deleted one case up).
+			if err != nil || !bytes.Equal(after, c.before) {
+				t.Fatalf("clear with every naming line already named by the mac6: err = %v, file %q -> %q\n%s",
+					err, c.before, after, where(c, "clear"))
+			}
+			mac6NamedClears++
 		default:
 			// a payload line, or a second line naming the board: refused
 			if !errors.Is(err, ErrLineHasPayload) || !bytes.Equal(after, c.before) {
@@ -1887,6 +2276,9 @@ func TestEditAliasRandomized(t *testing.T) {
 			if mac6, name, names, pure := lineFact(l.text); names && mac6 == c.mac6 {
 				c.facts[i] = fact{name: name, pure: pure}
 				c.naming = append(c.naming, i)
+				if inlineCommentAt(l.text) >= 0 {
+					inlineCommentLines++
+				}
 			}
 		}
 
@@ -1900,4 +2292,14 @@ func TestEditAliasRandomized(t *testing.T) {
 		}
 		assertNoLeftovers(t, dir)
 	}
+	// the two properties the corpus must actually have exercised: lines
+	// already named by the mac6 (the end of the safe recipe), and the
+	// target's line carrying an inline comment on some shape
+	if mac6NamedClears == 0 {
+		t.Errorf("no generated case reached the end of the safe recipe (every naming line already named by the mac6) — that branch of the oracle ran 0 times")
+	}
+	if inlineCommentLines == 0 {
+		t.Errorf("no generated file named the target on a line with an inline comment — the ruled comment grammar ran 0 times under the property")
+	}
+	t.Logf("iterations %d: clears on lines already named by the mac6 %d; target lines carrying an inline comment %d", iterations, mac6NamedClears, inlineCommentLines)
 }

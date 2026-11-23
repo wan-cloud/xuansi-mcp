@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
 
 	"xuansi/internal/replclient"
 )
@@ -1011,7 +1012,8 @@ func TestLoadBoardsFileModelToken(t *testing.T) {
 // legacyLoadBoardsFile is boards.conf's PRE-token parser, frozen
 // verbatim from the last commit before the key=value tail landed. It
 // is the oracle of the zero-drift claim below: a line that carries no
-// key=value token has no business parsing differently than it did then.
+// key=value token — and no inline comment, the one ruled divergence —
+// has no business parsing differently than it did then.
 func legacyLoadBoardsFile(path string) (map[string]string, map[string]Pin, error) {
 	out := map[string]string{}
 	pins := map[string]Pin{}
@@ -1085,12 +1087,55 @@ func oldShapeLines(n int) []string {
 	return lines
 }
 
+// inlineCommentAt is the TEST's own reading of where a line's inline
+// comment begins — stated from the ruled grammar itself and shared
+// with nothing in the parser: the byte offset of the first
+// whitespace-delimited field after the first "=" that starts with '#',
+// or -1 when the line has none.
+func inlineCommentAt(line string) int {
+	eq := strings.IndexByte(line, '=')
+	if eq < 0 {
+		return -1
+	}
+	rest := line[eq+1:]
+	for slot := 0; rest != ""; slot++ {
+		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		if rest == "" {
+			break
+		}
+		if slot > 0 && strings.HasPrefix(rest, "#") {
+			return len(line) - len(rest)
+		}
+		end := strings.IndexFunc(rest, unicode.IsSpace)
+		if end < 0 {
+			break
+		}
+		rest = rest[end:]
+	}
+	return -1
+}
+
 // TestLoadBoardsFileOldShapesIdentical: backward compatibility is
-// byte-identical, not "close enough". Every token-less line — the
-// documented shapes AND the spacing quirks the old parser tolerated
-// into junk hosts — must yield exactly the alias and pin maps the
-// frozen pre-token parser yields, and grow no model. Curated corpus
-// (CRLF, as a Windows hand-edit lands) plus 20k seeded lines.
+// byte-identical, not "close enough". Every token-less line WITHOUT an
+// inline comment — the documented shapes AND the spacing quirks the
+// old parser tolerated into junk hosts — must yield exactly the alias
+// and pin maps the frozen pre-token parser yields, and grow no model.
+//
+// Inline-comment lines are the ONE deliberate divergence. Owner ruling
+// 2026-11-24: inline comments are supported; before it these lines
+// were malformed — `name=mac6 # note` was skipped with a warning and
+// its alias silently dropped at every start. So the zero-drift
+// guarantee reads: zero drift for every line WITHOUT an inline comment;
+// inline-comment lines were malformed before and are valid now. For
+// those the oracle is the frozen parser applied to the line's
+// MEANINGFUL part (everything before the '#' field): the new parser
+// must read the full line exactly as the old one read that part —
+// alias and pin, and nothing else — and the lines where that differs
+// from what the old parser did with the full line are COUNTED, so the
+// divergence is exercised, not merely permitted.
+//
+// Curated corpus (CRLF, as a Windows hand-edit lands) plus 20k seeded
+// lines (the generator's inline-comment suffixes feed the second half).
 func TestLoadBoardsFileOldShapesIdentical(t *testing.T) {
 	captureLogs(t) // the malformed corpus warns by design; keep it out of the test output
 	cases := map[string]struct {
@@ -1110,7 +1155,8 @@ func TestLoadBoardsFileOldShapesIdentical(t *testing.T) {
 			"quirk2=d7588b @ 10.1.11.7:77",     // …host " 10.1.11.7"
 			"quirk3=d7588a@10.1.11.6:77 stray", // trailing junk after a good endpoint: alias, no pin
 			"trailing=d75889 stray",            // trailing junk on an alias line: the whole line is malformed
-			"inline=d75888 # not a comment in the old grammar",
+			"inline=d75888 # a comment since the owner ruling (2026-11-24): this alias used to be dropped at every start",
+			"inlinepin=d75887@10.1.11.9:77 # …and this pin was dropped with it",
 			"no-separator-line",
 			"=d75884",
 			"ghost=abc",
@@ -1121,10 +1167,26 @@ func TestLoadBoardsFileOldShapesIdentical(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "boards.conf")
-			if err := os.WriteFile(path, []byte(strings.Join(tc.lines, tc.sep)), 0o644); err != nil {
-				t.Fatal(err)
+			// the partition: lines with and without an inline comment
+			var plain, inline []string
+			for _, l := range tc.lines {
+				if inlineCommentAt(l) >= 0 {
+					inline = append(inline, l)
+				} else {
+					plain = append(plain, l)
+				}
 			}
+			path := filepath.Join(t.TempDir(), "boards.conf")
+			write := func(lines ...string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(strings.Join(lines, tc.sep)), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// zero drift: every line without an inline comment, the two
+			// parsers side by side on one file
+			write(plain...)
 			gotAliases, gotPins, models, err := LoadBoardsFile(path)
 			if err != nil {
 				t.Fatalf("LoadBoardsFile: %v", err)
@@ -1160,6 +1222,267 @@ func TestLoadBoardsFileOldShapesIdentical(t *testing.T) {
 					}
 				}
 			}
+
+			if len(inline) == 0 {
+				t.Fatalf("the corpus carries no inline-comment line — the ruled divergence is untested here")
+			}
+			// the ruled divergence, in bulk: the new parser on the full
+			// lines == the pre-token parser on their meaningful parts
+			// (per-line verdicts that are equal aggregate to maps that
+			// are equal, last-line-wins included)
+			meaningful := make([]string, len(inline))
+			for i, l := range inline {
+				meaningful[i] = l[:inlineCommentAt(l)]
+			}
+			write(inline...)
+			nA, nP, nM, err := LoadBoardsFile(path)
+			if err != nil {
+				t.Fatalf("LoadBoardsFile (inline-comment lines): %v", err)
+			}
+			write(meaningful...)
+			sA, sP, lerr := legacyLoadBoardsFile(path)
+			if lerr != nil {
+				t.Fatalf("legacy parse (meaningful parts): %v", lerr)
+			}
+			if !reflect.DeepEqual(nA, sA) || !reflect.DeepEqual(nP, sP) || len(nM) != 0 {
+				t.Errorf("the %d inline-comment lines do not read as their meaningful parts:\n new parser, full lines:    aliases %#v pins %#v models %#v\n pre-token parser, meaningful: aliases %#v pins %#v",
+					len(inline), nA, nP, nM, sA, sP)
+			}
+			// …and it IS a divergence: line by line, on the curated corpus
+			// whole and on the seeded corpus's first lines, the new parser
+			// on the full line is what the old parser read from the
+			// meaningful part — and unlike what the old parser read from
+			// the full line. Counted, so the change is exercised, not
+			// merely permitted.
+			sample := inline
+			if len(sample) > 400 {
+				sample = sample[:400]
+			}
+			diverged, gainedAlias, gainedPin := 0, 0, 0
+			for _, l := range sample {
+				write(l + tc.sep)
+				fA, fP, fM, err := LoadBoardsFile(path)
+				if err != nil {
+					t.Fatalf("LoadBoardsFile(%q): %v", l, err)
+				}
+				oA, oP, lerr := legacyLoadBoardsFile(path)
+				if lerr != nil {
+					t.Fatalf("legacy parse %q: %v", l, lerr)
+				}
+				m := l[:inlineCommentAt(l)]
+				write(m + tc.sep)
+				sA, sP, lerr := legacyLoadBoardsFile(path)
+				if lerr != nil {
+					t.Fatalf("legacy parse %q: %v", m, lerr)
+				}
+				if !reflect.DeepEqual(fA, sA) || !reflect.DeepEqual(fP, sP) || len(fM) != 0 {
+					t.Errorf("inline-comment line %q:\n new parser, full line:      aliases %#v pins %#v models %#v\n pre-token parser, %q: aliases %#v pins %#v\n want the same (and no model)",
+						l, fA, fP, fM, m, sA, sP)
+				}
+				if !reflect.DeepEqual(fA, oA) || !reflect.DeepEqual(fP, oP) {
+					diverged++
+					if len(fA) > len(oA) {
+						gainedAlias++
+					}
+					if len(fP) > len(oP) {
+						gainedPin++
+					}
+				}
+			}
+			if diverged == 0 {
+				t.Fatalf("of %d inline-comment lines not one reads differently from the pre-token parser — the ruled change is exercised by nothing here", len(sample))
+			}
+			t.Logf("inline-comment lines: %d (%d checked one by one); diverged from the pre-token parser: %d (%d gained the alias the old parser dropped, %d gained the pin)",
+				len(inline), len(sample), diverged, gainedAlias, gainedPin)
+			if tc.sep == "\r\n" {
+				// the two curated lines, named: valid now, with nothing left of the comment
+				write(tc.lines...)
+				aliases, pins, models, err := LoadBoardsFile(path)
+				if err != nil {
+					t.Fatalf("LoadBoardsFile: %v", err)
+				}
+				if aliases["d75888"] != "inline" || aliases["d75887"] != "inlinepin" {
+					t.Errorf("the inline-comment aliases = %q / %q, want inline / inlinepin", aliases["d75888"], aliases["d75887"])
+				}
+				if pins["d75887"] != (Pin{Host: "10.1.11.9", Port: 77}) {
+					t.Errorf("the inline-comment pin = %#v, want the endpoint before the comment", pins["d75887"])
+				}
+				for _, m := range []string{"d75888", "d75887"} {
+					if _, ok := models[m]; ok {
+						t.Errorf("line %s grew a model: %#v", m, models)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestLoadBoardsFileInlineComment: `#` comments are supported inline on
+// EVERY line shape (owner ruling 2026-11-24). A whitespace-delimited
+// field that starts with '#' anywhere after the name/mac6 slot begins
+// a comment and ends the meaningful part of the line: nothing after it
+// is read — not a `model=`, not a stray word to warn about. Before the
+// ruling `name=mac6 # note` was a malformed line (skipped with a
+// warning, its alias silently dropped at every start) and a `model=`
+// behind a comment on a token line was honoured.
+func TestLoadBoardsFileInlineComment(t *testing.T) {
+	logs := captureLogs(t)
+	content := "" +
+		"# a full-line comment, as always\n" +
+		"\n" +
+		// the three shapes, a plain note each: valid, and nothing to warn about
+		"only=d758a1 # plain note\n" +
+		"pinned=d758a2@10.1.11.204:7777 # plain note\n" +
+		"tok=d758a3 model=kept-3 # plain note\n" +
+		"ptok=d758a4@10.1.11.204:7777 model=kept-4 # plain note\n" +
+		// a commented-out model= is ignored — on each shape
+		"c1=d758a5 # model=commented-out-5\n" +
+		"c2=d758a6@10.1.11.204:7777 # model=commented-out-6\n" +
+		"c3=d758a7 model=kept-7 # model=commented-out-7\n" +
+		"c4=d758a8@10.1.11.204:7777 model=kept-8 # model=commented-out-8\n" +
+		"c5=d758a9 model=BAD # model=commented-out-9\n" +
+		"c6=d758aa@10.1.11.204:7777 model=BAD # model=commented-out-a\n" +
+		"c7=d758ab foo=bar # model=commented-out-b\n" +
+		"c8=d758ac model= # model=commented-out-c\n" +
+		"c9=d758ad model=kept-d model=second-d # model=commented-out-d\n" +
+		"ca=d758ae model=kept-e #model=commented-out-e\n" +
+		"cb=d758af model=kept-f stray # model=commented-out-f\n" +
+		"cc=d758b0 model=kept-0 foo=bar # x=y model=z note\n" +
+		"cd=d758b1 #\n" +
+		"ce=d758b2 # tag:note=x y=z\n" +
+		"cf=d758b3 # # # nested-looking, still one comment\n" +
+		// spellings
+		"s1=d758b4   #   note   \n" +
+		"s2=d758b5\t#note\n" +
+		"s3=d758b6\u00a0# note\n" +
+		"  s4  =  D758B7  # note  \n" +
+		// a '#' that does not start a field is no comment
+		"g1=d758b8 model=a#b\n" + // inside a token: the value is `a#b`, illegal as ever
+		"g2=d758b9@10.1.11.204:7777#c model=kept-9\n" + // glued to the endpoint: one malformed endpoint, as ever
+		"g3=d758ba#x\n" + // inside the mac6 slot: the slot is never a comment
+		// what precedes the comment is still the grammar: a stray word
+		// after the mac6 slot stays part of the head
+		"h1=d758bb stray # note\n" +
+		"h2=d758bc@10.1.11.204:7777 stray # note\n" +
+		// duplicates: a commented-out model leaves its line token-less —
+		// it moves the alias only; an earlier legal model is not cleared
+		"dup=d758bd model=old-1\n" +
+		"dup2=d758bd # model=commented-out\n"
+	// CRLF line endings: the shape a Windows hand-edit lands in.
+	path := filepath.Join(t.TempDir(), "boards.conf")
+	if err := os.WriteFile(path, []byte(strings.ReplaceAll(content, "\n", "\r\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliases, pins, models, err := LoadBoardsFile(path)
+	if err != nil {
+		t.Fatalf("LoadBoardsFile: %v", err)
+	}
+	pin := Pin{Host: "10.1.11.204", Port: 7777}
+	wantAliases, wantPins, wantModels := map[string]string{}, map[string]Pin{}, map[string]string{}
+	note := func(mac6, name string, hasPin bool, model string) {
+		wantAliases[mac6] = name
+		if hasPin {
+			wantPins[mac6] = pin
+		}
+		if model != "" {
+			wantModels[mac6] = model
+		}
+	}
+	note("d758a1", "only", false, "")
+	note("d758a2", "pinned", true, "")
+	note("d758a3", "tok", false, "kept-3")
+	note("d758a4", "ptok", true, "kept-4")
+	note("d758a5", "c1", false, "")
+	note("d758a6", "c2", true, "")
+	note("d758a7", "c3", false, "kept-7")
+	note("d758a8", "c4", true, "kept-8")
+	note("d758a9", "c5", false, "")
+	note("d758aa", "c6", true, "")
+	note("d758ab", "c7", false, "")
+	note("d758ac", "c8", false, "")
+	note("d758ad", "c9", false, "kept-d")
+	note("d758ae", "ca", false, "kept-e")
+	note("d758af", "cb", false, "kept-f")
+	note("d758b0", "cc", false, "kept-0")
+	note("d758b1", "cd", false, "")
+	note("d758b2", "ce", false, "")
+	note("d758b3", "cf", false, "")
+	note("d758b4", "s1", false, "")
+	note("d758b5", "s2", false, "")
+	note("d758b6", "s3", false, "")
+	note("d758b7", "s4", false, "")
+	note("d758b8", "g1", false, "") // model=a#b is an illegal value, not a comment
+	note("d758b9", "g2", false, "kept-9")
+	note("d758bc", "h2", false, "") // the stray word spoiled the endpoint; the alias stands
+	note("d758bd", "dup2", false, "old-1")
+	if !reflect.DeepEqual(aliases, wantAliases) {
+		t.Errorf("aliases =\n got %#v\nwant %#v", aliases, wantAliases)
+	}
+	if !reflect.DeepEqual(pins, wantPins) {
+		t.Errorf("pins =\n got %#v\nwant %#v", pins, wantPins)
+	}
+	if !reflect.DeepEqual(models, wantModels) {
+		t.Errorf("models =\n got %#v\nwant %#v", models, wantModels)
+	}
+	// Exactly the warnings the MEANINGFUL parts earn, by class — and not
+	// one for a word behind a '#': four illegal model values (BAD twice,
+	// the empty one, `a#b`), two unknown keys, the one stray word before
+	// the comment, the one later model= token; two malformed lines (the
+	// '#' inside the mac6 slot, the stray word on an alias line) and two
+	// malformed endpoints (the '#' glued to the port, the stray word
+	// after it).
+	for msg, want := range map[string]int{
+		"skipping malformed line":            2,
+		"skipping malformed pin endpoint":    2,
+		"skipping illegal model= token":      4,
+		"skipping token with an unknown key": 2,
+		"skipping stray token":               1,
+		"ignoring a later model= token":      1,
+	} {
+		if n := strings.Count(logs.String(), msg); n != want {
+			t.Errorf("%q warnings = %d, want %d:\n%s", msg, n, want, logs.String())
+		}
+	}
+	if n := strings.Count(logs.String(), "level=WARN"); n != 12 {
+		t.Errorf("total warnings = %d, want 12 — a word behind a '#' warned, or a real one went missing:\n%s", n, logs.String())
+	}
+}
+
+// TestInlineCommentDoesNotMaskTheEfuseIdentity: before the ruling a
+// `model=` behind an inline comment was honoured — `cam=… # model=x`
+// set model_source "conf", and an override always wins, so it covered
+// the board's own eFuse record: the identity the daemon exists to show.
+// The comment is not read now, and the record resolves through the
+// model table; a real `model=` token before the comment stays the
+// override it always was. The alias and the pin survive the comment
+// either way.
+func TestInlineCommentDoesNotMaskTheEfuseIdentity(t *testing.T) {
+	captureLogs(t)
+	for _, tc := range []struct{ name, line, wantModel, wantSource string }{
+		{"a commented-out model=", "cam=d75884@10.1.11.204:7777 # model=commented-out-2", "goouuu-s3cam-v1.3", ModelSourceEfuse},
+		{"a live model= before the comment", "cam=d75884@10.1.11.204:7777 model=conf-1 # note", "conf-1", ModelSourceConf},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			aliases, pins, models, err := LoadBoardsFile(writeConf(t, t.TempDir(), tc.line+"\n"))
+			if err != nil {
+				t.Fatalf("LoadBoardsFile: %v", err)
+			}
+			f := &fakeSources{}
+			f.set(nil, nil) // the board is known from its pin alone
+			r := NewRegistry(aliases, pins, WithModels(models),
+				WithModelTable(map[uint32]string{0x2a7: "goouuu-s3cam-v1.3"}),
+				WithUSB(f.usbFn), WithMDNS(f.mdnsFn))
+			if err := r.Refresh(context.Background()); err != nil {
+				t.Fatalf("Refresh: %v", err)
+			}
+			if b := entryOf(t, r, "cam"); b.Alias != "cam" || b.IP != "10.1.11.204" || b.Port != 7777 {
+				t.Fatalf("before the sighting: %+v — want the alias and the pin the comment rides on", b)
+			}
+			r.Enrich("d75884", sighting(0x2a7, "2026-11-20"))
+			if m, src := modelOf(t, r, "cam"); m != tc.wantModel || src != tc.wantSource {
+				t.Errorf("model = %q/%q, want %q/%q — the comment must not stand between the board and its own record", m, src, tc.wantModel, tc.wantSource)
+			}
+			checkRecord(t, entryOf(t, r, "cam"), "after the sighting", 0x2a7, "2026-11-20")
 		})
 	}
 }
@@ -1221,7 +1544,7 @@ func TestApplyModelTableHit(t *testing.T) {
 		t.Errorf("verdict = %q/%q, want goouuu-s3cam-v1.3/efuse", e.Model, e.ModelSource)
 	}
 	checkRecord(t, e, "table hit", 0x2a7, "2026-11-20")
-	if strings.Contains(logs.String(), "predates the board") {
+	if strings.Contains(logs.String(), "the daemon's model table has no entry for this id") {
 		t.Errorf("a table hit coached:\n%s", logs.String())
 	}
 }
@@ -1233,7 +1556,7 @@ func TestApplyModelTableHit(t *testing.T) {
 // not once per sweep, and not again for the same sighting re-applied.
 func TestApplyModelTableMiss(t *testing.T) {
 	logs := captureLogs(t)
-	coach := func() int { return strings.Count(logs.String(), "this daemon's model table predates the board") }
+	coach := func() int { return strings.Count(logs.String(), "the daemon's model table has no entry for this id") }
 	r := NewRegistry(nil, nil, WithModelTable(map[uint32]string{1: "other-1"}))
 	e := Board{Hello: sighting(0x2a7, "2026-11-20")}
 	r.applyModel("d75884", &e)
@@ -1301,7 +1624,7 @@ func TestConfOverridesEfuse(t *testing.T) {
 		t.Errorf("conf board with a table miss = %q/%q, want conf-1/conf", e.Model, e.ModelSource)
 	}
 	checkRecord(t, e, "conf board, table miss", 0x2a7, "2026-11-20")
-	if strings.Contains(logs.String(), "predates the board") {
+	if strings.Contains(logs.String(), "the daemon's model table has no entry for this id") {
 		t.Errorf("a conf-overridden board was coached about the table:\n%s", logs.String())
 	}
 
@@ -1406,7 +1729,7 @@ func TestModelSourceChain(t *testing.T) {
 	}
 	checkRecord(t, entryOf(t, r, "d75884"), "stale conf board", 0x2a8, "2026-11-21")
 	// nothing above had a reason to coach: every id was in the table
-	if strings.Contains(logs.String(), "predates the board") {
+	if strings.Contains(logs.String(), "the daemon's model table has no entry for this id") {
 		t.Errorf("an in-table record coached:\n%s", logs.String())
 	}
 
@@ -1429,7 +1752,7 @@ func TestModelSourceChain(t *testing.T) {
 		t.Errorf("factory-table record board = %q/%q, want empty/efuse (a miss, coached)", m, src)
 	}
 	checkRecord(t, entryOf(t, r2, "1a2b3c"), "factory-table record board", 0x2a7, "2026-11-20")
-	if n := strings.Count(logs.String(), "predates the board"); n != 1 {
+	if n := strings.Count(logs.String(), "the daemon's model table has no entry for this id"); n != 1 {
 		t.Errorf("coach lines = %d, want exactly the factory-table miss (1):\n%s", n, logs.String())
 	}
 	// …and said once: the sweeps that re-resolve the live entry (it is
@@ -1439,7 +1762,7 @@ func TestModelSourceChain(t *testing.T) {
 			t.Fatalf("factory-table Refresh %d: %v", i+2, err)
 		}
 	}
-	if n := strings.Count(logs.String(), "predates the board"); n != 1 {
+	if n := strings.Count(logs.String(), "the daemon's model table has no entry for this id"); n != 1 {
 		t.Errorf("coach lines after three sweeps = %d, want still 1 (once per board and id, not once per sweep):\n%s", n, logs.String())
 	}
 	if m, src := modelOf(t, r2, "1a2b3c"); m != "" || src != ModelSourceEfuse {
@@ -1485,6 +1808,14 @@ func TestPinCarriesConfModel(t *testing.T) {
 // before the first token is the classic head, verbatim — quirks and
 // all; the mac6 slot is never a token, and a line without a token is
 // all head.
+//
+// Inline comments (owner ruling 2026-11-24: supported on every line
+// shape): a whitespace-delimited field that STARTS with '#' anywhere
+// after the name/mac6 slot begins a comment and ends the meaningful
+// line — the head is what precedes it and the token list stops there.
+// A '#' that does not start a field is no comment: glued to the
+// endpoint (`…:7777#c`) or inside a token (`model=a#b`) it stays part
+// of that field, with the behaviour it always had.
 func TestSplitTokenTail(t *testing.T) {
 	for _, tc := range []struct {
 		line, head string
@@ -1494,10 +1825,25 @@ func TestSplitTokenTail(t *testing.T) {
 		{"bench=d75884 model=x", "bench=d75884", []string{"model=x"}},
 		{"bench = d75884 @10.1.1.1:7 \t model=x  foo=bar", "bench = d75884 @10.1.1.1:7", []string{"model=x", "foo=bar"}},
 		{"bench=d75884 @10.1.1.1:7", "bench=d75884 @10.1.1.1:7", nil}, // tolerated space before the @: no token
-		{"bench=d75884 # a note", "bench=d75884 # a note", nil},       // an inline note is not a token
-		{"bench=d75884 model", "bench=d75884 model", nil},             // a bare word is not a token
-		{"bench=d75884 =x", "bench=d75884 =x", nil},                   // neither is a field that starts with '='
-		{"x=d75884= model=y", "x=d75884=", []string{"model=y"}},       // the mac6 slot is never a token
+		// an inline comment ends the meaningful line — on each of the three shapes
+		{"bench=d75884 # a note", "bench=d75884", nil},                                          // alias-only: the comment is simply not there
+		{"bench=d75884@10.1.1.1:7 # a note", "bench=d75884@10.1.1.1:7", nil},                    // pinned: the endpoint survives the comment
+		{"bench=d75884 model=x # left bay", "bench=d75884", []string{"model=x"}},                // a token tail is cut at the comment
+		{"bench=d75884 model=x stray # left bay", "bench=d75884", []string{"model=x", "stray"}}, // …a stray word BEFORE it stays a token
+		{"bench=d75884 # model=commented-out", "bench=d75884", nil},                             // a commented-out model= is not a token
+		{"bench=d75884@10.1.1.1:7 #model=commented-out", "bench=d75884@10.1.1.1:7", nil},        // …glued to the '#' or not
+		{"bench=d75884 model=x #model=commented-out", "bench=d75884", []string{"model=x"}},
+		{"bench=d75884 model=x # note with = inside", "bench=d75884", []string{"model=x"}},
+		{"  bench=d75884\t#note  ", "  bench=d75884", nil},                      // the head keeps its own leading bytes
+		{"bench=d75884\u00a0# note", "bench=d75884", nil},                       // whitespace is strings.Fields' notion here too
+		{"bench=d75884 stray # model=commented-out", "bench=d75884 stray", nil}, // the stray word is still part of the head: the old grammar, comment gone
+		// a '#' that does not start a field is no comment
+		{"bench=d75884 model=a#b", "bench=d75884", []string{"model=a#b"}},                       // inside a token: the value is `a#b` (illegal, as ever)
+		{"bench=d75884@10.1.1.1:7#c model=x", "bench=d75884@10.1.1.1:7#c", []string{"model=x"}}, // glued to the endpoint: one malformed endpoint, as ever
+		{"bench=d75884# a note", "bench=d75884# a note", nil},                                   // inside the mac6 slot: the slot is never a comment
+		{"bench=d75884 model", "bench=d75884 model", nil},                                       // a bare word is not a token
+		{"bench=d75884 =x", "bench=d75884 =x", nil},                                             // neither is a field that starts with '='
+		{"x=d75884= model=y", "x=d75884=", []string{"model=y"}},                                 // the mac6 slot is never a token
 		{"x=d75884@10.1.1.1:7= model=y", "x=d75884@10.1.1.1:7=", []string{"model=y"}},
 		{"d75884 model=x", "d75884 model=x", nil}, // the name's '=' is the FIRST one: its slot is the token text
 		{"=d75884 model=x", "=d75884", []string{"model=x"}},

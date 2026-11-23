@@ -252,9 +252,11 @@ func listedBoard(t *testing.T, e *env, mac6 string) map[string]any {
 // generation 2 — a restarted daemon over the same file — reads the
 // removal, still refuses the payload line — with the safe recipe,
 // which is then followed from the seat: the alias set to the board's
-// own mac6 renames the name and keeps endpoint and model — and sets
-// another alias; generation 3 reads both. The file's payload line
-// differs from start to finish in its name alone.
+// own mac6 renames the name and keeps endpoint and model — where the
+// recipe ENDS: unalias is then the idempotent success (the loop of the
+// fix wave, closed) — and sets another alias; generation 3 reads both.
+// The file's payload line differs from start to finish in its name
+// alone.
 func TestBoardsAliasRestartPersistence(t *testing.T) {
 	const header = "# bench boards\ncam=1a2b3c@10.1.11.204:7777 model=esp32s3-dev\n"
 	conf := filepath.Join(t.TempDir(), "boards.conf")
@@ -356,6 +358,27 @@ func TestBoardsAliasRestartPersistence(t *testing.T) {
 			t.Fatalf("after the recipe the board = %#v, want alias = its mac6 with the conf model intact", row)
 		}
 
+		// …and the recipe is the END of it: unalias is then the
+		// idempotent success the Desc promises — the terminal loop of
+		// the fix wave ("the same refusal again, with `"1a2b3c" →
+		// "1a2b3c"`") is closed. Nothing is written, and the board goes
+		// on answering to its mac6 as it did: the line keeps the mac6
+		// as its name, so list_boards keeps showing it in the alias
+		// column — live here, and after the restart below.
+		res = e.call("xuansi_boards_unalias", map[string]any{"board": "1a2b3c"})
+		if res.IsError {
+			t.Fatalf("boards_unalias after the recipe (the loop's end): %s", resultText(t, res))
+		}
+		if m := structured(t, res); m["unaliased"] != "1a2b3c" {
+			t.Fatalf("boards_unalias reply = %#v", m)
+		}
+		if row := listedBoard(t, e, "1a2b3c"); row["alias"] != "1a2b3c" || row["model"] != "esp32s3-dev" || row["model_source"] != "conf" {
+			t.Fatalf("after the idempotent unalias the board = %#v, want the mac6 as its name, pin and model intact", row)
+		}
+		if b, _ := os.ReadFile(conf); !bytes.Equal(b, []byte(strings.Replace(header, "cam=1a2b3c@", "1a2b3c=1a2b3c@", 1))) {
+			t.Fatalf("the idempotent unalias wrote: %q", b)
+		}
+
 		res = e.call("xuansi_boards_alias", map[string]any{"board": "d75884", "alias": "spare"})
 		if res.IsError {
 			t.Fatalf("boards_alias after the restart: %s", resultText(t, res))
@@ -385,4 +408,92 @@ func TestBoardsAliasRestartPersistence(t *testing.T) {
 	if got, err := os.ReadFile(conf); err != nil || string(got) != renamed+"spare=d75884\n" {
 		t.Fatalf("boards.conf = %q (%v)\n            want %q", got, err, renamed+"spare=d75884\n")
 	}
+}
+
+// TestInlineCommentAliasAtTheSeat: the ruled inline-comment grammar
+// (owner ruling 2026-11-24) as an agent at this seat meets it — a real
+// daemon over a real file, only MCP tools. A hand-written
+// `bench1=d75884 # inline note` names the board (before the ruling
+// that line was malformed: skipped with a warning, its alias dropped
+// at every start); a rename through xuansi_boards_alias moves the name
+// and leaves the comment byte for byte; the line is still not
+// deletable — unalias is refused with the safe recipe and writes
+// nothing — and once the recipe names it by the mac6, unalias is the
+// idempotent success, the comment still in place.
+func TestInlineCommentAliasAtTheSeat(t *testing.T) {
+	conf := filepath.Join(t.TempDir(), "boards.conf")
+	const header = "# bench boards\nbench1=d75884 # inline note\n"
+	if err := os.WriteFile(conf, []byte(header), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	boards := []discover.Board{
+		{MAC6: "d75884", Sources: []string{discover.SourceUSB}, USBPath: "/dev/serial/by-id/fake-d75884"},
+	}
+	sock := filepath.Join(testutil.ShortSockDir(t), "d.sock")
+	srv := startAliasDaemon(t, sock, conf, boards...)
+	e := wireMCPSock(t, sock, Options{}, nil)
+
+	// the alias is registered: listed, and a selector already
+	if row := listedBoard(t, e, "d75884"); row["alias"] != "bench1" {
+		t.Fatalf("an alias-only line with an inline note = %#v, want alias bench1 (the comment is not part of the line's meaning)", row)
+	}
+	res := e.call("xuansi_board_status", map[string]any{"board": "bench1"})
+	if res.IsError {
+		t.Fatalf("board_status(bench1): %s", resultText(t, res))
+	}
+	if b, _ := structured(t, res)["board"].(map[string]any); b["mac6"] != "d75884" {
+		t.Fatalf("board_status(bench1) = %#v", b)
+	}
+
+	// the rename: the name moves, the comment stays byte for byte
+	res = e.call("xuansi_boards_alias", map[string]any{"board": "bench1", "alias": "bench1x"})
+	if res.IsError {
+		t.Fatalf("boards_alias{board: bench1, alias: bench1x}: %s", resultText(t, res))
+	}
+	const renamed = "# bench boards\nbench1x=d75884 # inline note\n"
+	if b, _ := os.ReadFile(conf); string(b) != renamed {
+		t.Fatalf("after the rename boards.conf = %q\n             want %q (the comment as written)", b, renamed)
+	}
+	if row := listedBoard(t, e, "d75884"); row["alias"] != "bench1x" {
+		t.Fatalf("after the rename the board = %#v, want alias bench1x", row)
+	}
+
+	// unalias: the line carries a comment, so it is not deleted
+	res = e.call("xuansi_boards_unalias", map[string]any{"board": "bench1x"})
+	if !res.IsError {
+		t.Fatalf("unalias of a comment-bearing line succeeded: %#v", res)
+	}
+	for _, want := range []string{`"bench1x" → "d75884"`, "rename the name to the board's mac6", conf} {
+		if got := resultText(t, res); !strings.Contains(got, want) {
+			t.Errorf("refusal lacks the safe recipe %q: %q", want, got)
+		}
+	}
+	if b, _ := os.ReadFile(conf); string(b) != renamed {
+		t.Fatalf("the refusal wrote: %q", b)
+	}
+
+	// the recipe on that line, then the clear: idempotent success, the
+	// comment still in place
+	res = e.call("xuansi_boards_alias", map[string]any{"board": "bench1x", "alias": "d75884"})
+	if res.IsError {
+		t.Fatalf("boards_alias{board: bench1x, alias: d75884}: %s", resultText(t, res))
+	}
+	const recipe = "# bench boards\nd75884=d75884 # inline note\n"
+	if b, _ := os.ReadFile(conf); string(b) != recipe {
+		t.Fatalf("after the recipe boards.conf = %q\n             want %q", b, recipe)
+	}
+	res = e.call("xuansi_boards_unalias", map[string]any{"board": "d75884"})
+	if res.IsError {
+		t.Fatalf("boards_unalias after the recipe: %s", resultText(t, res))
+	}
+	if m := structured(t, res); m["unaliased"] != "d75884" {
+		t.Fatalf("boards_unalias reply = %#v", m)
+	}
+	if b, _ := os.ReadFile(conf); string(b) != recipe {
+		t.Fatalf("the idempotent unalias wrote: %q", b)
+	}
+	if row := listedBoard(t, e, "d75884"); row["alias"] != "d75884" {
+		t.Fatalf("after the idempotent unalias the board = %#v, want the mac6 as its name", row)
+	}
+	srv.Close()
 }

@@ -39,7 +39,7 @@ func runServe(stdin io.Reader, stdout, stderr io.Writer, args []string) int {
 	graceTTL := fs.Duration("grace-ttl", lease.DefaultGraceTTL, "lease grace window after an agent disconnect (e.g. 300s, 10s)")
 	idleExit := fs.Duration("idle-exit", -1*time.Nanosecond, "self-exit after D with no clients and no live captures (-1ns = follow --grace-ttl, 0 = never)")
 	fwPoll := fs.Duration("fw-poll", 300*time.Second, "fw-manifest reminder poller cadence while serving (0 = off): a behind board's list_boards entry carries fw_update")
-	boardsFile := fs.String("boards-file", "", "boards.conf path (lines name=mac6[@ip:port] [model=...], shared by hand and daemon — the alias tools edit only the name field; default user config dir xuansi/boards.conf, missing = zero-config)")
+	boardsFile := fs.String("boards-file", "", "boards.conf path (lines name=mac6[@ip:port] [model=...], `#` comments whole-line or inline, shared by hand and daemon — the alias tools edit only the name field; default user config dir xuansi/boards.conf, missing = zero-config)")
 	noProvision := fs.Bool("no-provision", false, "kill the zero-ritual provisioner: never auto-provision cred-less USB boards (default: on — plug in and it works)")
 	verbose := fs.Bool("verbose", false, "log at debug level (slog text handler)")
 	fs.Usage = func() {

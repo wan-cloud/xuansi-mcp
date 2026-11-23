@@ -99,12 +99,12 @@ const (
 
 // modelTable is the daemon's production model table: eFuse model id →
 // model string, the eFuse leg's lookup. EMPTY on purpose — the first
-// real allocation comes with the self-drawn boards; until then the
-// only thing that names a model is the boards.conf `model=` override,
-// and every record-bearing board is a table miss. Values share the
-// conf token's string domain (isModel), which is what keeps `model`
-// one string form wherever it comes from. Tests inject their own
-// table through WithModelTable.
+// real allocation comes with boards burned with a model record; until
+// then the only thing that names a model is the boards.conf `model=`
+// override, and every record-bearing board is a table miss. Values
+// share the conf token's string domain (isModel), which is what keeps
+// `model` one string form wherever it comes from. Tests inject their
+// own table through WithModelTable.
 var modelTable = map[uint32]string{}
 
 func (b *Board) addSource(s string) {
@@ -740,6 +740,21 @@ func (r *Registry) SetAlias(mac6, alias string) error {
 // A board that was never aliased, or whose line someone already
 // removed by hand, is an idempotent no-op — nothing is written, and
 // the memory is brought in line with the file.
+//
+// The safe recipe ENDS here too. Once the line is named by the board's
+// own mac6 — through SetAlias above, or by hand — it carries no alias
+// any more, and the clear is the idempotent success, not the refusal
+// again with a coach that sends the reader where they already are
+// (`"d75884" → "d75884"`: an agent following it looped). Nothing is
+// written: the line is a payload line and keeps its payload.
+//
+// After EVERY successful clear the memory is whatever the file says
+// (fileAlias) — which is what the next start reads: no alias where the
+// line is gone or never was; the mac6 as the name where the line stays
+// and already carries it (the parser has no "name == mac6 means no
+// alias" rule, so list_boards keeps showing the mac6 in the alias
+// column — live and after a restart alike; the board answers to its
+// mac6 either way).
 func (r *Registry) ClearAlias(mac6 string) error {
 	mac6 = strings.ToLower(strings.TrimSpace(mac6))
 	if !isMac6(mac6) {
@@ -756,7 +771,7 @@ func (r *Registry) ClearAlias(mac6 string) error {
 		return err
 	}
 	r.mu.Lock()
-	r.applyAliasLocked(mac6, "")
+	r.applyAliasLocked(mac6, fileAlias(r.boardsFile, mac6))
 	r.mu.Unlock()
 	return nil
 }
@@ -861,9 +876,9 @@ func (r *Registry) Enrich(mac6 string, h *replclient.HelloInfo) {
 // Verdict: the conf override always wins (ModelSourceConf). Else a
 // sighting carrying the record is the eFuse leg (ModelSourceEfuse) and
 // the daemon's model table turns the id into the model string — a HIT
-// names it; a MISS leaves Model empty (the id is real, this daemon's
-// table just predates it) and logs the coach. Neither: unknown, with
-// no model.
+// names it; a MISS leaves Model empty (the id is real; this daemon's
+// model table simply has no entry for it) and logs the coach. Neither:
+// unknown, with no model.
 //
 // Re-run wherever either input changes (Refresh, Pin, Enrich), so a
 // sighting that stops carrying a record un-claims as honestly as one
@@ -894,7 +909,7 @@ func (r *Registry) applyModel(mac6 string, e *Board) {
 	// coming back, is
 	alreadyCoached := prevHad && prevID == e.ModelID && prevModel == "" && prevSource == ModelSourceEfuse
 	if !hit && !alreadyCoached {
-		slog.Warn("discover: board model: unknown model_id — this daemon's model table predates the board; a boards.conf model= override names it meanwhile",
+		slog.Warn("discover: board model: unknown model_id — the daemon's model table has no entry for this id; a boards.conf model= override names it meanwhile",
 			"board", mac6, "model_id", fmt.Sprintf("0x%06x", e.ModelID), "mfg_date", e.MfgDate)
 	}
 }
@@ -947,20 +962,36 @@ func (r *Registry) EnrichEndpoint(mac6, ip string, port int) {
 // token is the classic head and parses exactly as it always did — a
 // line without a token IS the old grammar, byte for byte (see
 // splitTokenTail). The third map is the `model=` result, mac6 →
-// model, the top of the registry's model chain. The FIRST legal token
-// on the line wins, legal being the model string domain:
-// ^[a-z0-9][a-z0-9.-]{0,28}$ (1..29 chars, verbatim — no case
+// model, the top of the registry's model chain. The FIRST legal
+// `model=` token on the line wins, legal being the model string
+// domain: ^[a-z0-9][a-z0-9.-]{0,28}$ (1..29 chars, verbatim — no case
 // folding) — the one string form `model` takes wherever it comes
 // from. This token is its hand-written door; the daemon's model table
 // is the other, and its values are held to the same domain. Inside
-// the tail an illegal model token, an unknown key or a bare word is
-// skipped with a logged warning and costs the board nothing — not its
-// alias, pin or model — the malformed-line discipline, per token.
-// (Before the tail there is no such tolerance: a stray word there is
-// part of the head, and the head is the old grammar.) Duplicate mac6s
-// follow the alias rule (and the pin rule): the last line that
-// carries a legal model wins, and a token-less line moves the alias
-// only.
+// the tail — after the first key=value token — an illegal model token,
+// an unknown key or a bare word is skipped with a logged warning and
+// costs the board nothing: not its alias, pin or model (the
+// malformed-line discipline, per token). Before the tail there is no
+// such tolerance, and the cost is the whole line: a bare word after
+// the mac6 slot is part of the head, the head is the old grammar, and
+// a head that is not `name=mac6[@ip:port]` is a malformed line —
+// skipped with ONE warning, alias included. Duplicate mac6s follow the
+// alias rule (and the pin rule): the last line that carries a legal
+// model wins, and a token-less line moves the alias only.
+//
+// Inline comments (owner ruling 2026-11-24): a `#` comment is
+// supported on every line shape, as a full line and inline. A
+// whitespace-delimited field that starts with `#`, anywhere after the
+// name/mac6 slot, begins a comment and ends the meaningful part of the
+// line — nothing after it is read. So `name=mac6 # note` is a valid
+// alias-only line and `name=mac6@ip:port # note` a valid pin; on a
+// token line the tail stops at the comment, and a `model=` behind it
+// is not a model (nor is any word of it a stray token to warn about).
+// A `#` that does not start a field is no comment (see commentStart).
+// Before the ruling an inline `#` was simply text: `name=mac6 # note`
+// was a malformed line — skipped with a warning, its alias silently
+// dropped at every start — and the words behind a `#` on a token line
+// were stray tokens to warn about, a `model=` among them even counted.
 func LoadBoardsFile(path string) (map[string]string, map[string]Pin, map[string]string, error) {
 	out := map[string]string{}
 	pins := map[string]Pin{}
@@ -1052,12 +1083,57 @@ func parseHead(head string) headLine {
 // exactly the text the pre-token grammar read: a line without a token
 // is all head (tokens nil), which is what keeps the old grammar —
 // tolerated spacing and quirks alike — byte-identical.
+//
+// Only the line's MEANINGFUL part is cut (commentStart): an inline
+// comment ends the line for the parser, so it can neither hold a token
+// nor extend the head. A line whose meaningful part carries no token
+// but a comment still yields that part as the head — right-trimmed,
+// as a token line's head is — so `name=mac6 # note` parses as the
+// `name=mac6` it means.
 func splitTokenTail(line string) (head string, tokens []string) {
-	cut := tokenTailStart(line)
-	if cut == len(line) {
-		return line, nil
+	stop := commentStart(line)
+	if stop < 0 {
+		stop = len(line)
 	}
-	return strings.TrimRightFunc(line[:cut], unicode.IsSpace), strings.Fields(line[cut:])
+	meaningful, cut := line[:stop], tokenTailStart(line[:stop])
+	if cut == len(meaningful) {
+		if stop == len(line) {
+			return line, nil // neither a comment nor a token: the line IS the head
+		}
+		return strings.TrimRightFunc(meaningful, unicode.IsSpace), nil
+	}
+	return strings.TrimRightFunc(meaningful[:cut], unicode.IsSpace), strings.Fields(meaningful[cut:])
+}
+
+// commentStart is the byte offset where line's inline comment begins,
+// or -1 when the line has none. A `#` comment is supported inline on
+// every line shape (owner ruling 2026-11-24): the first
+// whitespace-delimited field after the name/mac6 slot that STARTS with
+// '#' begins a comment and ends the meaningful part of the line. A '#'
+// that does not start a field is no comment — glued to the mac6 or
+// endpoint slot (`…:7777#c`) or inside a token (`model=a#b`) it stays
+// part of that field, with the behaviour it always had. The slot after
+// the name's own '=' is the mac6 and is never a comment; a line that
+// BEGINS with '#' is a comment line before the grammar is reached.
+// Whitespace is the strings.Fields notion, the same one the tail is
+// split by.
+func commentStart(line string) int {
+	rest := line[strings.IndexByte(line, '=')+1:] // no '=' at all → the whole line
+	for slot := 0; rest != ""; slot++ {
+		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		if rest == "" {
+			break
+		}
+		if slot > 0 && strings.HasPrefix(rest, "#") {
+			return len(line) - len(rest) // rest is a suffix of line: its own length names its offset
+		}
+		end := strings.IndexFunc(rest, unicode.IsSpace)
+		if end < 0 {
+			break
+		}
+		rest = rest[end:]
+	}
+	return -1
 }
 
 // tokenTailStart is the byte offset where line's key=value tail begins
@@ -1065,7 +1141,9 @@ func splitTokenTail(line string) (head string, tokens []string) {
 // separator and never a token; neither is the first field after it —
 // the mac6[@endpoint] slot (`name=d75884@10.1.1.1:7=` stays one
 // malformed endpoint, as it always was). Whitespace is the
-// strings.Fields notion, the same one the tail is split by.
+// strings.Fields notion, the same one the tail is split by. It is
+// given the line's meaningful part (see commentStart): what sits
+// behind an inline comment is never a token.
 func tokenTailStart(line string) int {
 	rest := line[strings.IndexByte(line, '=')+1:] // no '=' at all → the whole line
 	for slot := 0; rest != ""; slot++ {

@@ -621,7 +621,12 @@ func TestListBoardsModelPassesThrough(t *testing.T) {
 	zero, _ := boards[5].(map[string]any)
 	checkRecordColumn(t, zero, "zero-id record board", true, 0, "")
 
-	// the column claims are documented where the seat serves it
+	// the column claims are documented where the seat serves it — and
+	// claim no more than is true. The daemon passes whatever integer the
+	// board reports (the RECORD stores 24 bits; nothing here checks a
+	// ceiling), and a model absent under model_source "efuse" means the
+	// daemon's model table has no entry for that id — the production
+	// table is empty by design, so nothing "predates" anything today.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
@@ -633,9 +638,30 @@ func TestListBoardsModelPassesThrough(t *testing.T) {
 		descs[tool.Name] = tool.Description
 	}
 	for _, name := range []string{"xuansi_list_boards", "xuansi_board_status"} {
-		for _, want := range []string{"model_source", "model=", "model_id", "mfg_date", "predates this board"} {
+		for _, want := range []string{"model_source", "model=", "model_id", "mfg_date", "the daemon's model table has no entry for this id"} {
 			if !strings.Contains(descs[name], want) {
-				t.Errorf("%s Desc lacks %q (the model columns, the raw record, the conf override's spelling, the stale-table coach)", name, want)
+				t.Errorf("%s Desc lacks %q (the model columns, the raw record, the conf override's spelling, the table-miss coach)", name, want)
+			}
+		}
+		if strings.Contains(descs[name], "predates") {
+			t.Errorf("%s Desc still says \"predates\": the production model table is empty by design — a miss is a missing entry, not an old table", name)
+		}
+	}
+	for field, want := range map[string]string{
+		"ModelID": "the integer the board reports (the record stores 24 bits)",
+		"Model":   "the daemon's model table has no entry for this id",
+	} {
+		f, ok := reflect.TypeOf(boardInfo{}).FieldByName(field)
+		if !ok {
+			t.Fatalf("boardInfo lost its %s field", field)
+		}
+		tag := f.Tag.Get("jsonschema")
+		if !strings.Contains(tag, want) {
+			t.Errorf("boardInfo.%s schema text lacks %q: %q", field, want, tag)
+		}
+		for _, overClaim := range []string{"a 24-bit integer", "predates"} {
+			if strings.Contains(tag, overClaim) {
+				t.Errorf("boardInfo.%s schema text over-claims %q: %q", field, overClaim, tag)
 			}
 		}
 	}
