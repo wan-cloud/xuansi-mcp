@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"xuansi/internal/replclient"
 )
@@ -60,7 +61,25 @@ type Board struct {
 	Port    int
 	TXT     map[string]string     // ver/api…
 	Hello   *replclient.HelloInfo // 按需 enrich
+
+	// Model is the board's model, resolved by the registry through the
+	// chain conf → hello → unknown; ModelSource names the link it came
+	// from (a ModelSource* value) and is set on EVERY registry entry:
+	// a board no link claims says "unknown", with Model empty.
+	Model       string
+	ModelSource string
 }
+
+// Model sources — Board.ModelSource's vocabulary: the three-level
+// chain that resolves a board's model, in priority order. The
+// boards.conf override always wins; the hello-carried model (what the
+// fw reads off the board's own locked eFuse block) stands in for a
+// board with no override; neither is "unknown", with no model.
+const (
+	ModelSourceConf    = "conf"
+	ModelSourceEfuse   = "efuse"
+	ModelSourceUnknown = "unknown"
+)
 
 func (b *Board) addSource(s string) {
 	for _, x := range b.Sources {
@@ -112,6 +131,7 @@ type discoverFunc func(ctx context.Context) ([]Board, error)
 type Registry struct {
 	mu      sync.Mutex
 	aliases map[string]string // mac6 → alias (boards.conf)
+	models  map[string]string // mac6 → conf model (the boards.conf `model=` token)
 	boards  map[string]Board  // mac6 → entry (current + stale)
 	pins    map[string]Pin    // mac6 → pinned endpoint (⑨ source)
 	mdnsErr string            // last refresh's mdns failure ("" = healthy)
@@ -122,6 +142,8 @@ type Registry struct {
 
 // RegistryOption parameterizes NewRegistry; the source seams exist so
 // the daemon tests (and only they) inject canned discovery faces.
+// WithModels is the odd one out on purpose: it is production config,
+// not a seam.
 type RegistryOption func(*Registry)
 
 // WithUSB replaces the USB discovery face (tests inject canned boards).
@@ -134,11 +156,25 @@ func WithMDNS(fn func(ctx context.Context) ([]Board, error)) RegistryOption {
 	return func(r *Registry) { r.mdns = fn }
 }
 
+// WithModels seeds the conf models (mac6 → model, LoadBoardsFile's
+// third map): the `model=` token of a board's boards.conf line is the
+// top of the model chain and beats whatever the board itself reports.
+// The map is copied; nil is zero-config (no board has an override).
+func WithModels(models map[string]string) RegistryOption {
+	return func(r *Registry) {
+		m := make(map[string]string, len(models))
+		for k, v := range models {
+			m[k] = v
+		}
+		r.models = m
+	}
+}
+
 // NewRegistry builds an empty registry; aliases (from LoadBoardsFile)
 // map mac6 → human name and fill Board.Alias on every refresh. pins
 // (the boards.conf `name=mac6@ip:port` seed, also from LoadBoardsFile)
 // seed the pin source — their entries materialize on the first Refresh
-// and survive every later one.
+// and survive every later one. Conf models ride WithModels.
 func NewRegistry(aliases map[string]string, pins map[string]Pin, opts ...RegistryOption) *Registry {
 	a := make(map[string]string, len(aliases))
 	for k, v := range aliases {
@@ -150,6 +186,7 @@ func NewRegistry(aliases map[string]string, pins map[string]Pin, opts ...Registr
 	}
 	r := &Registry{
 		aliases: a,
+		models:  map[string]string{},
 		pins:    p,
 		boards:  map[string]Board{},
 		usb:     DiscoverUSB,
@@ -263,6 +300,7 @@ func (r *Registry) Refresh(ctx context.Context) error {
 	}
 	for mac6, e := range fresh {
 		e.Alias = r.aliases[mac6]
+		r.applyModel(mac6, &e)
 		fresh[mac6] = e
 	}
 	r.boards = fresh
@@ -425,6 +463,7 @@ func (r *Registry) Pin(mac6, host string, port int) error {
 	e.addSource(SourcePin)
 	e.IP, e.Port = host, port
 	e.Alias = r.aliases[mac6]
+	r.applyModel(mac6, &e)
 	r.boards[mac6] = e
 	return nil
 }
@@ -461,14 +500,37 @@ func (r *Registry) Unpin(mac6 string) bool {
 // lazy half of Board.Hello: discovery never dials (a USB dial reboots
 // the board, §2 — nobody wants that as a discovery side effect), so
 // Hello stays nil until some caller dials, says hello, and reports back
-// here. Like all last-known data it survives refreshes.
+// here. Like all last-known data it survives refreshes. This is also
+// the eFuse leg of the model chain: a hello carrying a `model` key
+// names the model of a board with no conf override (applyModel).
 func (r *Registry) Enrich(mac6 string, h *replclient.HelloInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if b, ok := r.boards[mac6]; ok {
 		b.Hello = h
+		r.applyModel(mac6, &b)
 		r.boards[mac6] = b
 	}
+}
+
+// applyModel resolves one entry's model through the chain and writes
+// the pair back: the conf override always wins; else the model the
+// entry's hello sighting carried (what the fw reads off the board's
+// own locked eFuse block — taken verbatim, the board's statement is
+// ground truth); else unknown, with no model. Re-run wherever either
+// input changes, so a sighting that stops carrying a model (older fw
+// after a downgrade) un-claims as honestly as one that starts.
+// Callers hold r.mu.
+func (r *Registry) applyModel(mac6 string, e *Board) {
+	if m := r.models[mac6]; m != "" {
+		e.Model, e.ModelSource = m, ModelSourceConf
+		return
+	}
+	if e.Hello != nil && e.Hello.Model != "" {
+		e.Model, e.ModelSource = e.Hello.Model, ModelSourceEfuse
+		return
+	}
+	e.Model, e.ModelSource = "", ModelSourceUnknown
 }
 
 // EnrichEndpoint records a board's self-reported endpoint (Bug 2②, B15
@@ -499,7 +561,7 @@ func (r *Registry) EnrichEndpoint(mac6, ip string, port int) {
 
 // LoadBoardsFile reads boards.conf: one name=mac6 line per board, '#'
 // comments and blank lines skipped, spaces tolerated, mac6
-// case-normalized. A missing file is zero-config (empty map, no error)
+// case-normalized. A missing file is zero-config (empty maps, no error)
 // — discovery works without any aliases. The file may be hand-edited,
 // so malformed lines are skipped with a logged warning instead of
 // failing the whole load; a duplicate mac6 keeps the last line.
@@ -513,22 +575,39 @@ func (r *Registry) EnrichEndpoint(mac6, ip string, port int) {
 // works. A mac6 with a MALFORMED endpoint still names the board (the
 // alias registers) but seeds no pin — the bad endpoint is skipped with
 // the same logged warning.
-func LoadBoardsFile(path string) (map[string]string, map[string]Pin, error) {
+//
+// The key=value tail: a line may go on with space-separated tokens,
+// `name=mac6[@ip:port] [key=value …]`. Everything before the first
+// token is the classic head and parses exactly as it always did — a
+// line without a token IS the old grammar, byte for byte (see
+// splitTokenTail). The third map is the `model=` result, mac6 →
+// model, the top of the registry's model chain. The FIRST legal token
+// on the line wins, legal being the model domain every link of the
+// chain shares: ^[a-z0-9][a-z0-9.-]{0,28}$ (1..29 chars, verbatim —
+// no case folding). An illegal model token, an unknown key and a bare
+// word are each skipped with a logged warning, and none of them costs
+// the board its alias, pin or model — the malformed-line discipline,
+// now per token. Duplicate mac6s follow the alias rule (and the pin
+// rule): the last line that carries a legal model wins, and a
+// token-less line moves the alias only.
+func LoadBoardsFile(path string) (map[string]string, map[string]Pin, map[string]string, error) {
 	out := map[string]string{}
 	pins := map[string]Pin{}
+	models := map[string]string{}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return out, pins, nil
+			return out, pins, models, nil
 		}
-		return nil, nil, fmt.Errorf("discover: read %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("discover: read %s: %w", path, err)
 	}
 	for i, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		name, value, ok := strings.Cut(line, "=")
+		head, tokens := splitTokenTail(line)
+		name, value, ok := strings.Cut(head, "=")
 		name = strings.TrimSpace(name)
 		value = strings.ToLower(strings.TrimSpace(value))
 		mac6, endpoint, hasEndpoint := strings.Cut(value, "@")
@@ -538,6 +617,22 @@ func LoadBoardsFile(path string) (map[string]string, map[string]Pin, error) {
 			continue
 		}
 		out[mac6] = name
+		haveModel := false
+		for _, tok := range tokens {
+			key, val, isKV := strings.Cut(tok, "=")
+			switch {
+			case !isKV || key == "":
+				slog.Warn("discover: boards.conf: skipping stray token (want key=value)", "file", path, "line", i+1, "token", tok)
+			case key != "model":
+				slog.Warn("discover: boards.conf: skipping token with an unknown key", "file", path, "line", i+1, "key", key)
+			case !isModel(val):
+				slog.Warn("discover: boards.conf: skipping illegal model= token (want ^[a-z0-9][a-z0-9.-]{0,28}$)", "file", path, "line", i+1, "token", tok)
+			case haveModel:
+				slog.Warn("discover: boards.conf: ignoring a later model= token (the first legal one wins)", "file", path, "line", i+1, "token", tok)
+			default:
+				models[mac6], haveModel = val, true
+			}
+		}
 		if !hasEndpoint {
 			continue // the classic alias-only line: nothing more to read
 		}
@@ -553,5 +648,69 @@ func LoadBoardsFile(path string) (map[string]string, map[string]Pin, error) {
 		}
 		pins[mac6] = Pin{Host: host, Port: port}
 	}
-	return out, pins, nil
+	return out, pins, models, nil
+}
+
+// splitTokenTail cuts one boards.conf line into its classic head —
+// `name=mac6[@ip:port]` — and the key=value token tail after it. The
+// head comes back verbatim (right-trimmed), so the head parser sees
+// exactly the text the pre-token grammar read: a line without a token
+// is all head (tokens nil), which is what keeps the old grammar —
+// tolerated spacing and quirks alike — byte-identical.
+func splitTokenTail(line string) (head string, tokens []string) {
+	cut := tokenTailStart(line)
+	if cut == len(line) {
+		return line, nil
+	}
+	return strings.TrimRightFunc(line[:cut], unicode.IsSpace), strings.Fields(line[cut:])
+}
+
+// tokenTailStart is the byte offset where line's key=value tail begins
+// (len(line) when the line has none). The name's own '=' is the
+// separator and never a token; neither is the first field after it —
+// the mac6[@endpoint] slot (`name=d75884@10.1.1.1:7=` stays one
+// malformed endpoint, as it always was). Whitespace is the
+// strings.Fields notion, the same one the tail is split by.
+func tokenTailStart(line string) int {
+	rest := line[strings.IndexByte(line, '=')+1:] // no '=' at all → the whole line
+	for slot := 0; rest != ""; slot++ {
+		rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
+		end := strings.IndexFunc(rest, unicode.IsSpace)
+		if end < 0 {
+			end = len(rest)
+		}
+		if slot > 0 && isKVToken(rest[:end]) {
+			return len(line) - len(rest) // rest is a suffix of line: its own length names its offset
+		}
+		rest = rest[end:]
+	}
+	return len(line)
+}
+
+// isKVToken reports whether a whitespace-delimited field is shaped
+// key=value (a non-empty key, any value — `model=` included).
+func isKVToken(field string) bool {
+	key, _, ok := strings.Cut(field, "=")
+	return ok && key != ""
+}
+
+// isModel reports whether s lies in the model string domain every link
+// of the chain shares — ^[a-z0-9][a-z0-9.-]{0,28}$: 1..29 ASCII
+// bytes, a lowercase letter or digit first, then a lowercase letter, a
+// digit, '.' or '-'. (Same shape as isMac6: a hand loop, no regexp.)
+func isModel(s string) bool {
+	if s == "" || len(s) > 29 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			continue
+		}
+		if i > 0 && (c == '.' || c == '-') {
+			continue
+		}
+		return false
+	}
+	return true
 }

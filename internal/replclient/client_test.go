@@ -179,6 +179,45 @@ func TestParseHelloResetHistoryFaces(t *testing.T) {
 	}
 }
 
+// TestParseHelloModel: the hello `model` overlay (an additive key, no
+// protocol bump) parses into HelloInfo.Model verbatim. A board whose fw
+// predates the key — or whose model block is not burned and locked —
+// sends no key, and that must stay EMPTY: the registry's model chain
+// reads empty as "no model from the board", never as a model.
+func TestParseHelloModel(t *testing.T) {
+	c, b := newTestClient(t)
+	withModel := defaultHello()
+	withModel["model"] = "goouuu-s3cam-v1.3"
+	b.setHello(withModel)
+	h, err := c.Hello(false, "daemon-test")
+	if err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	if h.Model != "goouuu-s3cam-v1.3" {
+		t.Fatalf("Model = %q, want the hello-carried model verbatim", h.Model)
+	}
+	if h.FwBuild != "deadbee" || h.Chip != "ESP32-S3" || h.ProtocolVer != 5 {
+		t.Fatalf("the model key must not disturb the other fields: %#v", h)
+	}
+
+	// Older fw: no key → empty.
+	b.setHello(defaultHello())
+	h2, err := c.Hello(false, "daemon-test")
+	if err != nil {
+		t.Fatalf("old-board hello: %v", err)
+	}
+	if h2.Model != "" {
+		t.Fatalf("absent model key = %q, want empty", h2.Model)
+	}
+
+	// A non-string value is not a model (the tolerant-parser rule).
+	odd := defaultHello()
+	odd["model"] = int64(7)
+	if h3 := parseHello(odd); h3.Model != "" {
+		t.Fatalf("non-string model = %q, want empty", h3.Model)
+	}
+}
+
 // TestPingOp: a plain op round-trips its result map.
 func TestPingOp(t *testing.T) {
 	c, _ := newTestClient(t)

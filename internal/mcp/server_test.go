@@ -544,6 +544,97 @@ func TestListBoardsLeaseColumnPassesThrough(t *testing.T) {
 	}
 }
 
+// TestListBoardsModelPassesThrough: the model chain's two columns cross
+// the typed decode — model + model_source on a conf board and on an
+// efuse board; a board whose source is unknown carries NO model key
+// (honest absence, never an empty string); a daemon that sends neither
+// key (an older one) still reads "unknown" — model_source is ALWAYS
+// present, the transport precedent. The column claim is documented on
+// both board tools' Descs.
+func TestListBoardsModelPassesThrough(t *testing.T) {
+	e, _ := newEnv(t, []step{{result: map[string]any{
+		"boards": []any{
+			map[string]any{"mac6": "d75884", "model": "goouuu-s3cam-v1.3", "model_source": "conf"},
+			map[string]any{"mac6": "aabbcc", "model": "burned-1", "model_source": "efuse"},
+			map[string]any{"mac6": "bb77cc", "model": "", "model_source": "unknown"},
+			map[string]any{"mac6": "cafe01"},
+		},
+	}}}, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_list_boards", nil)
+	if res.IsError {
+		t.Fatalf("list_boards failed: %s", resultText(t, res))
+	}
+	boards, _ := structured(t, res)["boards"].([]any)
+	if len(boards) != 4 {
+		t.Fatalf("boards = %#v, want the four-board list", structured(t, res)["boards"])
+	}
+	b0, _ := boards[0].(map[string]any)
+	if b0["model"] != "goouuu-s3cam-v1.3" || b0["model_source"] != "conf" {
+		t.Errorf("conf board = %v/%v, want goouuu-s3cam-v1.3/conf", b0["model"], b0["model_source"])
+	}
+	b1, _ := boards[1].(map[string]any)
+	if b1["model"] != "burned-1" || b1["model_source"] != "efuse" {
+		t.Errorf("efuse board = %v/%v, want burned-1/efuse", b1["model"], b1["model_source"])
+	}
+	// unknown: the source says so, the model is simply not there
+	for i, why := range map[int]string{2: "unknown-source row", 3: "row from a daemon without the keys"} {
+		b, _ := boards[i].(map[string]any)
+		if v, present := b["model"]; present {
+			t.Errorf("%s carries model = %#v, want the key absent", why, v)
+		}
+		if v, present := b["model_source"]; !present || v != "unknown" {
+			t.Errorf("%s model_source = %#v (present=%v), want the always-present \"unknown\"", why, v, present)
+		}
+	}
+
+	// the column claim is documented where the seat serves it
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descs := map[string]string{}
+	for _, tool := range lr.Tools {
+		descs[tool.Name] = tool.Description
+	}
+	for _, name := range []string{"xuansi_list_boards", "xuansi_board_status"} {
+		for _, want := range []string{"model_source", "model="} {
+			if !strings.Contains(descs[name], want) {
+				t.Errorf("%s Desc lacks %q (the model columns + the conf override's spelling)", name, want)
+			}
+		}
+	}
+}
+
+// TestBoardStatusModelPassesThrough: board_status's board view is the
+// daemon's map verbatim — the model pair rides it untouched, the conf
+// verdict and the honest unknown alike.
+func TestBoardStatusModelPassesThrough(t *testing.T) {
+	e, _ := newEnv(t, []step{
+		{result: map[string]any{"connected": false, "board": map[string]any{
+			"mac6": "d75884", "model": "conf-1", "model_source": "conf"}}},
+		{result: map[string]any{"connected": false, "board": map[string]any{
+			"mac6": "aabbcc", "model_source": "unknown"}}},
+	}, Options{Holder: "mcp-fixed01"})
+	res := e.call("xuansi_board_status", map[string]any{"board": "d75884"})
+	if res.IsError {
+		t.Fatalf("board_status failed: %s", resultText(t, res))
+	}
+	if bv := structured(t, res)["board"]; !reflect.DeepEqual(bv, map[string]any{
+		"mac6": "d75884", "model": "conf-1", "model_source": "conf"}) {
+		t.Errorf("conf board view = %#v, want the daemon's map verbatim", bv)
+	}
+	res = e.call("xuansi_board_status", map[string]any{"board": "aabbcc"})
+	if res.IsError {
+		t.Fatalf("board_status failed: %s", resultText(t, res))
+	}
+	if bv := structured(t, res)["board"]; !reflect.DeepEqual(bv, map[string]any{
+		"mac6": "aabbcc", "model_source": "unknown"}) {
+		t.Errorf("unknown board view = %#v, want the daemon's map verbatim (no model key)", bv)
+	}
+}
+
 // TestDefaultHolderFormat: a zero Options generates a per-process
 // holder "mcp-<8 hex>" — short, unique per process.
 func TestDefaultHolderFormat(t *testing.T) {

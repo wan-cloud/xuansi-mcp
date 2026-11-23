@@ -68,6 +68,13 @@ type HelloInfo struct {
 	OtaSlot     string
 	OtaImgState string
 	OtaSha      string
+
+	// Model is the board model the fw derived from its eFuse block —
+	// an additive hello key (no protocol bump; the fw_version
+	// precedent). The fw emits it only when the model block is burned
+	// AND write-locked with a sound CRC; an unburned board sends no
+	// key, so empty means "the board stated no model" — never a model.
+	Model string
 }
 
 // parseHello tolerates missing keys (older protocol faces): absent
@@ -116,6 +123,9 @@ func parseHello(res map[string]any) *HelloInfo {
 	h.OtaSlot, _ = res["ota_slot"].(string)
 	h.OtaImgState, _ = res["ota_img_state"].(string)
 	h.OtaSha, _ = res["ota_sha"].(string)
+	// The model overlay rides verbatim (the board's own statement is
+	// ground truth); the absent key stays empty.
+	h.Model, _ = res["model"].(string)
 	return h
 }
 

@@ -1,12 +1,17 @@
 package discover
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -70,13 +75,16 @@ func TestRefreshDualSourceMerge(t *testing.T) {
 		t.Fatalf("Refresh: %v", err)
 	}
 	got := r.Snapshot()
+	// Every registry entry states its model verdict — a conf-less,
+	// never-crossed board says so ("unknown"), it never carries a
+	// blank that reads as "not resolved yet".
 	want := []Board{
 		{
-			MAC6: "1a2b3c", Sources: []string{"usb", "mdns"}, USBPath: usbB.USBPath,
+			MAC6: "1a2b3c", Sources: []string{"usb", "mdns"}, USBPath: usbB.USBPath, ModelSource: ModelSourceUnknown,
 			Host: "xuansi-1a2b3c.local", Port: 7777, TXT: map[string]string{"ver": "3", "api": "1"},
 		},
 		{
-			MAC6: "d75884", Sources: []string{"usb", "mdns"}, USBPath: usbA.USBPath,
+			MAC6: "d75884", Sources: []string{"usb", "mdns"}, USBPath: usbA.USBPath, ModelSource: ModelSourceUnknown,
 			Host: "xuansi-d75884.local", Port: 7777, TXT: map[string]string{"ver": "3", "api": "1"},
 		},
 	}
@@ -608,7 +616,7 @@ func TestLoadBoardsFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := LoadBoardsFile(path)
+	got, _, _, err := LoadBoardsFile(path)
 	if err != nil {
 		t.Fatalf("LoadBoardsFile: %v", err)
 	}
@@ -618,7 +626,7 @@ func TestLoadBoardsFile(t *testing.T) {
 	}
 
 	// missing file = no aliases (zero-config), not an error
-	got, _, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
+	got, _, _, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
 	if err != nil || len(got) != 0 {
 		t.Errorf("missing file: got (%#v, %v), want (empty, nil)", got, err)
 	}
@@ -860,7 +868,7 @@ func TestLoadBoardsFileEndpoint(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	aliases, pins, err := LoadBoardsFile(path)
+	aliases, pins, models, err := LoadBoardsFile(path)
 	if err != nil {
 		t.Fatalf("LoadBoardsFile: %v", err)
 	}
@@ -875,10 +883,442 @@ func TestLoadBoardsFileEndpoint(t *testing.T) {
 	if !reflect.DeepEqual(pins, wantPins) {
 		t.Errorf("pins = %#v, want %#v", pins, wantPins)
 	}
+	if len(models) != 0 {
+		t.Errorf("token-less lines grew models: %#v", models)
+	}
 
 	// missing file = zero-config, not an error
-	aliases, pins, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
-	if err != nil || len(aliases) != 0 || len(pins) != 0 {
-		t.Errorf("missing file: got (%#v, %#v, %v), want (empty, empty, nil)", aliases, pins, err)
+	aliases, pins, models, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
+	if err != nil || len(aliases) != 0 || len(pins) != 0 || len(models) != 0 {
+		t.Errorf("missing file: got (%#v, %#v, %#v, %v), want (empty, empty, empty, nil)", aliases, pins, models, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// boards.conf key=value tokens: the `model=` override
+// ---------------------------------------------------------------------------
+
+// captureLogs swaps the default slog for a buffer for the test's
+// duration (restored on cleanup) — the hand-edited-file discipline
+// ("skip with a logged warning, never fail the load") is part of the
+// contract, so the warnings are asserted, not just tolerated.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	return &buf
+}
+
+// TestLoadBoardsFileModelToken: the key=value token tail. The three
+// line shapes (`name=mac6` / `name=mac6@ip:port` / either plus
+// space-separated tokens) × legal / illegal / absent `model=` token,
+// endpoint coexistence included. The first LEGAL model= token on the
+// line is the board's conf model; an illegal one (outside
+// ^[a-z0-9][a-z0-9.-]{0,28}$) is skipped with a warning and never
+// costs the board its alias or pin — the malformed-line discipline.
+func TestLoadBoardsFileModelToken(t *testing.T) {
+	logs := captureLogs(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "boards.conf")
+	atCeiling := strings.Repeat("m", 29)   // the domain's ceiling…
+	overCeiling := strings.Repeat("m", 30) // …and one past it
+	content := "" +
+		"# the model= token matrix\n" +
+		"bench=d75884 model=goouuu-s3cam-v1.3\n" + // plain alias + legal model
+		"cam=1a2b3c@10.1.11.204:7777 model=esp32s3-dev\n" + // endpoint + legal model: alias, pin AND model coexist
+		"v6=abcdef@[fe80::1]:7777 model=v6.board-1\n" + // bracketed v6 endpoint rides along
+		"plain=d75885\n" + // plain alias, no token: alias only
+		"pinned=d75886@10.1.11.205:7777\n" + // endpoint, no token: alias + pin only
+		"  spaced  =  D75887   model=spaced-1  \n" + // tolerated spacing; mac6 case-normalized, model verbatim
+		"spaceat=d75899 @10.1.11.207:7777 model=spaceat-1\n" + // the old parser's tolerated space before the @ survives the token
+		"upper=d7588a model=Goouuu-S3\n" + // illegal: uppercase
+		"under=d7588b model=goouuu_s3\n" + // illegal: underscore
+		"empty=d7588c model=\n" + // illegal: empty value
+		"lead=d7588d model=-board\n" + // illegal: leading '-'
+		"uni=d7588e model=板1\n" + // illegal: non-ASCII
+		"long=d7588f model=" + overCeiling + "\n" + // illegal: 30 chars
+		"first=d75890 model=first-1 model=second-2\n" + // the first legal token wins
+		"recover=d75891 model=BAD model=good-1\n" + // the illegal token is skipped; the first LEGAL one lands
+		"ceil=d75892 model=" + atCeiling + "\n" + // 29 chars: inside the domain
+		"mixed=d75893 foo=bar model=kept-1\n" + // an unknown key rides along; the model still lands
+		"bare=d75894 model=kept-2 stray\n" + // a bare word rides along too
+		"epbad=d75897@10.1.11.204 model=after-ep\n" + // bad endpoint: alias + model stay, no pin
+		"epbad2=d75898@10.1.11.206:7777 model=BAD\n" + // endpoint + illegal model: alias + pin stay
+		"badmac=zzzzzz model=never-1\n" + // malformed line: nothing lands, tokens and all
+		"=d75895 model=never-2\n" + // empty name: malformed line
+		"dup=d75896 model=old-1\n" +
+		"dup2=d75896 model=new-1\n" + // duplicate mac6: the last line wins, model included
+		"dup3=d75896\n" // a later token-less line moves the alias only — like an earlier pin, an earlier model is not cleared
+	// CRLF line endings: the shape a Windows hand-edit lands in, new grammar and all.
+	if err := os.WriteFile(path, []byte(strings.ReplaceAll(content, "\n", "\r\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliases, pins, models, err := LoadBoardsFile(path)
+	if err != nil {
+		t.Fatalf("LoadBoardsFile: %v", err)
+	}
+	wantAliases := map[string]string{
+		"d75884": "bench", "1a2b3c": "cam", "abcdef": "v6", "d75885": "plain", "d75886": "pinned",
+		"d75887": "spaced", "d75899": "spaceat", "d7588a": "upper", "d7588b": "under", "d7588c": "empty", "d7588d": "lead",
+		"d7588e": "uni", "d7588f": "long", "d75890": "first", "d75891": "recover", "d75892": "ceil",
+		"d75893": "mixed", "d75894": "bare", "d75896": "dup3", "d75897": "epbad", "d75898": "epbad2",
+	}
+	if !reflect.DeepEqual(aliases, wantAliases) {
+		t.Errorf("aliases = %#v\nwant %#v (a skipped token never costs the alias)", aliases, wantAliases)
+	}
+	wantPins := map[string]Pin{
+		"1a2b3c": {Host: "10.1.11.204", Port: 7777},
+		"abcdef": {Host: "fe80::1", Port: 7777},
+		"d75886": {Host: "10.1.11.205", Port: 7777},
+		"d75898": {Host: "10.1.11.206", Port: 7777},
+		"d75899": {Host: "10.1.11.207", Port: 7777},
+	}
+	if !reflect.DeepEqual(pins, wantPins) {
+		t.Errorf("pins = %#v, want %#v", pins, wantPins)
+	}
+	wantModels := map[string]string{
+		"d75884": "goouuu-s3cam-v1.3", "1a2b3c": "esp32s3-dev", "abcdef": "v6.board-1",
+		"d75887": "spaced-1", "d75890": "first-1", "d75891": "good-1", "d75892": atCeiling,
+		"d75893": "kept-1", "d75894": "kept-2", "d75896": "new-1", "d75897": "after-ep", "d75899": "spaceat-1",
+	}
+	if !reflect.DeepEqual(models, wantModels) {
+		t.Errorf("models = %#v\nwant %#v", models, wantModels)
+	}
+	// every skipped token warned exactly once, by class: the eight
+	// illegal values (six illegal-only lines + the BAD token on the
+	// recover and epbad2 lines), the one unknown key, the one stray
+	// word, the one later legal model token.
+	for msg, want := range map[string]int{
+		"skipping illegal model= token":      8,
+		"skipping token with an unknown key": 1,
+		"skipping stray token":               1,
+		"ignoring a later model= token":      1,
+	} {
+		if n := strings.Count(logs.String(), msg); n != want {
+			t.Errorf("%q warnings = %d, want %d:\n%s", msg, n, want, logs.String())
+		}
+	}
+
+	// missing file = zero-config: no models either, no error
+	_, _, models, err = LoadBoardsFile(filepath.Join(dir, "absent.conf"))
+	if err != nil || len(models) != 0 {
+		t.Errorf("missing file: models = %#v, %v, want (empty, nil)", models, err)
+	}
+}
+
+// legacyLoadBoardsFile is boards.conf's PRE-token parser, frozen
+// verbatim from the last commit before the key=value tail landed. It
+// is the oracle of the zero-drift claim below: a line that carries no
+// key=value token has no business parsing differently than it did then.
+func legacyLoadBoardsFile(path string) (map[string]string, map[string]Pin, error) {
+	out := map[string]string{}
+	pins := map[string]Pin{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, pins, nil
+		}
+		return nil, nil, fmt.Errorf("discover: read %s: %w", path, err)
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		name = strings.TrimSpace(name)
+		value = strings.ToLower(strings.TrimSpace(value))
+		mac6, endpoint, hasEndpoint := strings.Cut(value, "@")
+		mac6 = strings.TrimSpace(mac6)
+		if !ok || name == "" || !isMac6(mac6) {
+			slog.Warn("discover: boards.conf: skipping malformed line", "file", path, "line", i+1, "text", line)
+			continue
+		}
+		out[mac6] = name
+		if !hasEndpoint {
+			continue // the classic alias-only line: nothing more to read
+		}
+		host, portStr, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			slog.Warn("discover: boards.conf: skipping malformed pin endpoint (want mac6@ip:port)", "file", path, "line", i+1, "text", line, "err", err)
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 || host == "" {
+			slog.Warn("discover: boards.conf: skipping malformed pin endpoint (want mac6@ip:port)", "file", path, "line", i+1, "text", line)
+			continue
+		}
+		pins[mac6] = Pin{Host: host, Port: port}
+	}
+	return out, pins, nil
+}
+
+// oldShapeLines renders n token-less boards.conf lines from a fixed
+// seed: the documented shapes plus every tolerated-spacing and
+// malformed-endpoint quirk the old parser ever had, comments and
+// blanks included. By construction not one of them carries a '='
+// beyond the name's own separator — every line is old-shape.
+func oldShapeLines(n int) []string {
+	rng := rand.New(rand.NewSource(20261123))
+	pick := func(from ...string) string { return from[rng.Intn(len(from))] }
+	spaces := []string{"", " ", "  ", "\t", " \t "}
+	lines := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		line := pick(spaces...) + pick("bench", "cam", "a-b", "x_y", "", "two words") +
+			pick(spaces...) + "=" + pick(spaces...) +
+			pick("d75884", "D75884", "1A2B3C", "abcdef", "0F0F0F", "d7588", "d7588z", "12345", "1234567") +
+			pick("", " ") + // the tolerated space before the @ (and its junk-host twin, the space after it)
+			pick("", "@10.1.11.204:7777", "@[fe80::1]:7777", "@", "@10.1.11.204", "@10.1.11.204:0",
+				"@10.1.11.204:99999", "@lab-host.example:7", "@:7777", "@ 10.1.11.5:77") +
+			pick("", " ", "  # a note", " stray word", " @10.1.1.1:7", "@", " :", "  #", " # tag:note") +
+			pick(spaces...)
+		switch rng.Intn(12) {
+		case 0:
+			line = "#" + line
+		case 1:
+			line = ""
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// TestLoadBoardsFileOldShapesIdentical: backward compatibility is
+// byte-identical, not "close enough". Every token-less line — the
+// documented shapes AND the spacing quirks the old parser tolerated
+// into junk hosts — must yield exactly the alias and pin maps the
+// frozen pre-token parser yields, and grow no model. Curated corpus
+// (CRLF, as a Windows hand-edit lands) plus 20k seeded lines.
+func TestLoadBoardsFileOldShapesIdentical(t *testing.T) {
+	captureLogs(t) // the malformed corpus warns by design; keep it out of the test output
+	cases := map[string]struct {
+		lines []string
+		sep   string
+	}{
+		"curated (CRLF)": {sep: "\r\n", lines: []string{
+			"# bench boards",
+			"",
+			"bench=d75884",
+			"cam = 1A2B3C  ",
+			"v6=abcdef@[fe80::1]:7777",
+			"spaceat=d7588f @10.1.11.204:7777", // tolerated space before the @: a valid pin
+			"bad=d7588e@10.1.11.204",           // no port
+			"bad2=d7588d@10.1.11.204:0",        // port 0
+			"quirk=d7588c@ 10.1.11.8:77",       // the old parser's tolerance: a pin whose host is " 10.1.11.8"
+			"quirk2=d7588b @ 10.1.11.7:77",     // …host " 10.1.11.7"
+			"quirk3=d7588a@10.1.11.6:77 stray", // trailing junk after a good endpoint: alias, no pin
+			"trailing=d75889 stray",            // trailing junk on an alias line: the whole line is malformed
+			"inline=d75888 # not a comment in the old grammar",
+			"no-separator-line",
+			"=d75884",
+			"ghost=abc",
+			"dup=d75884",
+			"# trailing comment",
+		}},
+		"seeded (20k lines)": {sep: "\n", lines: oldShapeLines(20000)},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "boards.conf")
+			if err := os.WriteFile(path, []byte(strings.Join(tc.lines, tc.sep)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gotAliases, gotPins, models, err := LoadBoardsFile(path)
+			if err != nil {
+				t.Fatalf("LoadBoardsFile: %v", err)
+			}
+			wantAliases, wantPins, lerr := legacyLoadBoardsFile(path)
+			if lerr != nil {
+				t.Fatalf("legacy parse: %v", lerr)
+			}
+			if !reflect.DeepEqual(gotAliases, wantAliases) {
+				t.Errorf("aliases drifted from the pre-token parser:\n got %#v\nwant %#v", gotAliases, wantAliases)
+			}
+			if !reflect.DeepEqual(gotPins, wantPins) {
+				t.Errorf("pins drifted from the pre-token parser:\n got %#v\nwant %#v", gotPins, wantPins)
+			}
+			if len(models) != 0 {
+				t.Errorf("token-less lines grew models: %#v", models)
+			}
+			// the oracle must have had something to say — an all-malformed
+			// corpus would pass the equality for free
+			if len(wantAliases) == 0 {
+				t.Fatalf("the corpus parsed to nothing on BOTH parsers — the comparison proves nothing")
+			}
+			if tc.sep == "\r\n" {
+				// …quirks included: the tolerated and the junk-host lines
+				// really do pin on the old parser, so their identity is
+				// not vacuous
+				for mac, want := range map[string]Pin{
+					"d7588f": {Host: "10.1.11.204", Port: 7777},
+					"d7588c": {Host: " 10.1.11.8", Port: 77},
+				} {
+					if got, ok := wantPins[mac]; !ok || got != want {
+						t.Fatalf("oracle lost its quirk: pins[%s] = %#v, want %#v", mac, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the model chain on the registry: conf → hello (efuse) → unknown
+// ---------------------------------------------------------------------------
+
+// modelOf resolves one board and answers its model pair.
+func modelOf(t *testing.T, r *Registry, mac6 string) (model, source string) {
+	t.Helper()
+	b, err := r.Resolve(mac6)
+	if err != nil {
+		t.Fatalf("Resolve(%s): %v", mac6, err)
+	}
+	return b.Model, b.ModelSource
+}
+
+// TestModelSourceChain: Board.Model/ModelSource resolve through the
+// chain — the boards.conf override always wins, else the model the
+// hello sighting carried (the eFuse leg, backfilled at Enrich), else
+// unknown with NO model. Like the rest of the last-known identity the
+// verdict survives refreshes, and a sighting that carries no model
+// (older fw) never claims one.
+func TestModelSourceChain(t *testing.T) {
+	f := &fakeSources{}
+	r := NewRegistry(nil, nil, WithModels(map[string]string{"d75884": "conf-model"}))
+	r.usb, r.mdns = f.usbFn, f.mdnsFn
+	f.set([]Board{usbA}, []Board{mdnsB})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	// conf: the override names the model before any sighting
+	if m, src := modelOf(t, r, "d75884"); m != "conf-model" || src != ModelSourceConf {
+		t.Errorf("conf board = %q/%q, want conf-model/conf", m, src)
+	}
+	// unknown: no override, never crossed
+	if m, src := modelOf(t, r, "1a2b3c"); m != "" || src != ModelSourceUnknown {
+		t.Errorf("uncrossed board = %q/%q, want empty/unknown", m, src)
+	}
+	// efuse: the sighting's model backfills a conf-less board
+	r.Enrich("1a2b3c", &replclient.HelloInfo{FwBuild: "b310378", Model: "burned-1"})
+	if m, src := modelOf(t, r, "1a2b3c"); m != "burned-1" || src != ModelSourceEfuse {
+		t.Errorf("enriched board = %q/%q, want burned-1/efuse", m, src)
+	}
+	// conf wins over a sighting that carries a different model
+	r.Enrich("d75884", &replclient.HelloInfo{Model: "burned-2"})
+	if m, src := modelOf(t, r, "d75884"); m != "conf-model" || src != ModelSourceConf {
+		t.Errorf("conf board after a model sighting = %q/%q, want conf-model/conf (the override always wins)", m, src)
+	}
+	// a model-less sighting (older fw) is not efuse: it un-claims honestly
+	r.Enrich("1a2b3c", &replclient.HelloInfo{FwBuild: "b310378"})
+	if m, src := modelOf(t, r, "1a2b3c"); m != "" || src != ModelSourceUnknown {
+		t.Errorf("board after a model-less sighting = %q/%q, want empty/unknown", m, src)
+	}
+	// last-known: the pair survives a sweep that crosses nothing (the
+	// boards go stale, their identity stays)
+	r.Enrich("1a2b3c", &replclient.HelloInfo{Model: "burned-1"})
+	f.set(nil, nil)
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh 2: %v", err)
+	}
+	if m, src := modelOf(t, r, "1a2b3c"); m != "burned-1" || src != ModelSourceEfuse {
+		t.Errorf("stale board = %q/%q, want burned-1/efuse kept", m, src)
+	}
+	if m, src := modelOf(t, r, "d75884"); m != "conf-model" || src != ModelSourceConf {
+		t.Errorf("stale conf board = %q/%q, want conf-model/conf kept", m, src)
+	}
+
+	// zero-config (no model map): every entry still states its verdict
+	r2, f2 := newFakeRegistry(nil)
+	f2.set([]Board{usbA}, []Board{mdnsB})
+	if err := r2.Refresh(context.Background()); err != nil {
+		t.Fatalf("zero-config Refresh: %v", err)
+	}
+	for _, mac6 := range []string{"d75884", "1a2b3c"} {
+		if m, src := modelOf(t, r2, mac6); m != "" || src != ModelSourceUnknown {
+			t.Errorf("zero-config %s = %q/%q, want empty/unknown", mac6, m, src)
+		}
+	}
+}
+
+// TestPinCarriesConfModel: both pin paths stamp the conf model — a
+// runtime Pin materializes the entry with its verdict immediately (no
+// sweep), and a seeded pin (the boards.conf `name=mac6@ip:port` line)
+// picks it up on the first sweep. A pin without a conf model is
+// unknown like any other board.
+func TestPinCarriesConfModel(t *testing.T) {
+	r := NewRegistry(nil, nil, WithModels(map[string]string{"abcdef": "pin-model"}))
+	if err := r.Pin("abcdef", "10.1.11.204", 7777); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	if err := r.Pin("1a2b3c", "10.1.11.9", 7777); err != nil {
+		t.Fatalf("Pin 2: %v", err)
+	}
+	if m, src := modelOf(t, r, "abcdef"); m != "pin-model" || src != ModelSourceConf {
+		t.Errorf("runtime-pinned conf board = %q/%q, want pin-model/conf", m, src)
+	}
+	if m, src := modelOf(t, r, "1a2b3c"); m != "" || src != ModelSourceUnknown {
+		t.Errorf("runtime-pinned plain board = %q/%q, want empty/unknown", m, src)
+	}
+
+	f := &fakeSources{}
+	r2 := NewRegistry(nil, map[string]Pin{"abcdef": {Host: "10.1.11.204", Port: 7777}},
+		WithModels(map[string]string{"abcdef": "seed-model"}))
+	r2.usb, r2.mdns = f.usbFn, f.mdnsFn
+	f.set(nil, nil)
+	if err := r2.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if m, src := modelOf(t, r2, "abcdef"); m != "seed-model" || src != ModelSourceConf {
+		t.Errorf("seeded-pin conf board = %q/%q, want seed-model/conf", m, src)
+	}
+}
+
+// TestSplitTokenTail: where the key=value tail begins. Everything
+// before the first token is the classic head, verbatim — quirks and
+// all; the mac6 slot is never a token, and a line without a token is
+// all head.
+func TestSplitTokenTail(t *testing.T) {
+	for _, tc := range []struct {
+		line, head string
+		tokens     []string
+	}{
+		{"bench=d75884", "bench=d75884", nil},
+		{"bench=d75884 model=x", "bench=d75884", []string{"model=x"}},
+		{"bench = d75884 @10.1.1.1:7 \t model=x  foo=bar", "bench = d75884 @10.1.1.1:7", []string{"model=x", "foo=bar"}},
+		{"bench=d75884 @10.1.1.1:7", "bench=d75884 @10.1.1.1:7", nil}, // tolerated space before the @: no token
+		{"bench=d75884 # a note", "bench=d75884 # a note", nil},       // an inline note is not a token
+		{"bench=d75884 model", "bench=d75884 model", nil},             // a bare word is not a token
+		{"bench=d75884 =x", "bench=d75884 =x", nil},                   // neither is a field that starts with '='
+		{"x=d75884= model=y", "x=d75884=", []string{"model=y"}},       // the mac6 slot is never a token
+		{"x=d75884@10.1.1.1:7= model=y", "x=d75884@10.1.1.1:7=", []string{"model=y"}},
+		{"d75884 model=x", "d75884 model=x", nil}, // the name's '=' is the FIRST one: its slot is the token text
+		{"=d75884 model=x", "=d75884", []string{"model=x"}},
+		{"a=b=c", "a=b=c", nil},
+		{"bench=d75884\u00a0model=x", "bench=d75884", []string{"model=x"}}, // whitespace is strings.Fields' notion, NBSP included
+	} {
+		head, tokens := splitTokenTail(tc.line)
+		if head != tc.head || !reflect.DeepEqual(tokens, tc.tokens) {
+			t.Errorf("splitTokenTail(%q) = (%q, %q), want (%q, %q)", tc.line, head, tokens, tc.head, tc.tokens)
+		}
+	}
+}
+
+// TestIsModel: the model domain every link of the chain shares,
+// ^[a-z0-9][a-z0-9.-]{0,28}$ — 1..29 chars, lowercase alnum first,
+// then lowercase alnum, '.' or '-'.
+func TestIsModel(t *testing.T) {
+	for _, s := range []string{"a", "0", "goouuu-s3cam-v1.3", "v6.board-1", "a.b-c.d", strings.Repeat("m", 29)} {
+		if !isModel(s) {
+			t.Errorf("isModel(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{
+		"", strings.Repeat("m", 30), "-a", ".a", "A", "aB", "a_b", "a b", "a/b", "板", "a=b", "a\x00",
+	} {
+		if isModel(s) {
+			t.Errorf("isModel(%q) = true, want false", s)
+		}
 	}
 }

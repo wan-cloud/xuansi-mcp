@@ -205,8 +205,9 @@ func defaultBoardsFile() string {
 type Opts struct {
 	SockPath string // default DefaultSockPath()
 	GraceTTL time.Duration
-	// BoardsFile feeds the alias map when Registry is nil (default:
-	// user config dir xuansi/boards.conf; missing file = zero-config).
+	// BoardsFile feeds the alias, pin and conf-model maps when Registry
+	// is nil (default: user config dir xuansi/boards.conf; missing
+	// file = zero-config).
 	BoardsFile string
 	// Registry injects a pre-built registry (tests); nil = built from
 	// BoardsFile.
@@ -520,11 +521,11 @@ func New(o Opts) (*Server, error) {
 		if path == "" {
 			path = defaultBoardsFile()
 		}
-		aliases, pins, err := discover.LoadBoardsFile(path)
+		aliases, pins, models, err := discover.LoadBoardsFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("server: boards file: %w", err)
 		}
-		reg = discover.NewRegistry(aliases, pins)
+		reg = discover.NewRegistry(aliases, pins, discover.WithModels(models))
 	}
 
 	if o.SockPath == "" {
@@ -1572,7 +1573,11 @@ const staleAfter = 30 * time.Second
 // freshness face: transport (the current ACTUAL route, "" when never
 // connected), last_seen_age_ms (numeric; -1 = never crossed), and
 // stale (no live source AND no crossing within staleAfter —
-// never-crossed counts as infinitely old).
+// never-crossed counts as infinitely old). The model pair closes the
+// view: model_source is ALWAYS present — conf (a boards.conf model=
+// override), efuse (the model the board's hello sighting carried) or
+// unknown — and model rides along only when a link claims one, so an
+// unknown board has no model key at all (honest absence, not a blank).
 func (s *Server) boardView(b discover.Board) map[string]any {
 	v := map[string]any{
 		"mac6":     b.MAC6,
@@ -1604,6 +1609,10 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 	}
 	v["fw"] = fw
 	v["fw_version"] = fwVer
+	if b.Model != "" {
+		v["model"] = b.Model
+	}
+	v["model_source"] = b.ModelSource
 	s.mu.Lock()
 	db := s.sups[b.MAC6]
 	var last time.Time

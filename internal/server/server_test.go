@@ -322,6 +322,7 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	h.OtaSlot, _ = res["ota_slot"].(string)
 	h.OtaImgState, _ = res["ota_img_state"].(string)
 	h.OtaSha, _ = res["ota_sha"].(string)
+	h.Model, _ = res["model"].(string) // the model overlay (parseHello's twin)
 	// net section (parseHello's twin — the provision_state sighting's
 	// cred source; 憑證波 T2)
 	if v, ok := res["net"].(map[string]any); ok {
@@ -448,6 +449,14 @@ func newTestLogf(t *testing.T, prefix string) func(format string, args ...any) {
 // idle-exit window (0 = the disabled default every older test relies on).
 func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string, boards ...discover.Board) *env {
 	t.Helper()
+	return newEnvModels(t, ttl, idle, aliases, nil, boards...)
+}
+
+// newEnvModels is newEnvFull with the boards.conf model map injected
+// (the conf leg of the model chain — what LoadBoardsFile's model=
+// tokens hand NewRegistry); nil = zero-config, no conf models.
+func newEnvModels(t *testing.T, ttl, idle time.Duration, aliases, models map[string]string, boards ...discover.Board) *env {
+	t.Helper()
 	e := &env{
 		t:         t,
 		fakes:     map[string]*fakeCtl{},
@@ -460,6 +469,7 @@ func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string
 		e.usbFakes[b.MAC6] = newFakeCtl()
 	}
 	reg := discover.NewRegistry(aliases, nil,
+		discover.WithModels(models),
 		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
 			return boards, nil
 		}),
@@ -892,6 +902,169 @@ func TestListBoardsCarriesLeaseSummary(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339, asStr(lm["grace_deadline"])); err != nil {
 		t.Errorf("grace_deadline = %q, want RFC3339 (%v)", lm["grace_deadline"], err)
+	}
+}
+
+// boardRowOf lists the boards over c and answers one board's row.
+func boardRowOf(t *testing.T, c *sockClient, id int64, mac string) map[string]any {
+	t.Helper()
+	r, _ := c.call(id, map[string]any{"type": "list_boards"})
+	if asMap(r["error"]) != nil {
+		t.Fatalf("list_boards: %#v", r)
+	}
+	boards, _ := asMap(r["result"])["boards"].([]any)
+	for _, b := range boards {
+		if m := asMap(b); asStr(m["mac6"]) == mac {
+			return m
+		}
+	}
+	t.Fatalf("board %s not listed: %#v", mac, r["result"])
+	return nil
+}
+
+// statusBoardOf asks board_status for one board and answers its board view.
+func statusBoardOf(t *testing.T, c *sockClient, id int64, mac string) map[string]any {
+	t.Helper()
+	r, _ := c.call(id, map[string]any{"type": "board_status", "board": mac})
+	if asMap(r["error"]) != nil {
+		t.Fatalf("board_status(%s): %#v", mac, r)
+	}
+	bv := asMap(asMap(r["result"])["board"])
+	if bv == nil {
+		t.Fatalf("board_status(%s) carries no board view: %#v", mac, r["result"])
+	}
+	return bv
+}
+
+// checkModelPair asserts one board view's model pair: model present
+// with wantModel only when the source is not unknown, and the source
+// itself. Both rows (list/status) render through boardView, so both
+// are held to the one shape.
+func checkModelPair(t *testing.T, view map[string]any, where, wantModel, wantSource string) {
+	t.Helper()
+	if got := asStr(view["model_source"]); got != wantSource {
+		t.Errorf("%s: model_source = %q, want %q (row: model=%v)", where, got, wantSource, view["model"])
+	}
+	if wantSource == "unknown" {
+		if _, present := view["model"]; present {
+			t.Errorf("%s: an unknown-source board carries model = %#v, want the key absent", where, view["model"])
+		}
+		return
+	}
+	if got := asStr(view["model"]); got != wantModel {
+		t.Errorf("%s: model = %q, want %q", where, got, wantModel)
+	}
+}
+
+// TestListBoardsCarriesModelConf: the conf leg of the model chain on
+// BOTH rows — list_boards and board_status. A board with a boards.conf
+// model= override lists model + model_source "conf"; a board without
+// one lists NO model key (honest absence, not an empty string) beside
+// model_source "unknown".
+func TestListBoardsCarriesModelConf(t *testing.T) {
+	e := newEnvModels(t, 10*time.Second, 0,
+		map[string]string{"d75884": "bench", "aabbcc": "cam"},
+		map[string]string{"d75884": "goouuu-s3cam-v1.3"},
+		mkBoard("d75884", "xuansi-d75884.local"), mkBoard("aabbcc", "xuansi-aabbcc.local"))
+	c := dialSock(t, e.sock)
+
+	conf := boardRowOf(t, c, 1, "d75884")
+	if asStr(conf["alias"]) != "bench" {
+		t.Errorf("conf board alias = %q, want bench (the model token costs nothing)", conf["alias"])
+	}
+	checkModelPair(t, conf, "list_boards d75884", "goouuu-s3cam-v1.3", "conf")
+	bare := boardRowOf(t, c, 2, "aabbcc")
+	if asStr(bare["alias"]) != "cam" {
+		t.Errorf("plain board alias = %q, want cam", bare["alias"])
+	}
+	checkModelPair(t, bare, "list_boards aabbcc", "", "unknown")
+
+	checkModelPair(t, statusBoardOf(t, c, 3, "d75884"), "board_status d75884", "goouuu-s3cam-v1.3", "conf")
+	checkModelPair(t, statusBoardOf(t, c, 4, "aabbcc"), "board_status aabbcc", "", "unknown")
+}
+
+// TestBoardRowsCarryModelEfuseBackfill: the eFuse leg — the hello
+// sighting's model backfills a conf-less board (model_source "efuse")
+// on both rows, the conf override still wins when a sighting carries a
+// different model, and a model-less sighting (older fw) leaves the
+// board unknown. Sightings land through the registry seam the tap uses
+// (Enrich) — the tap → hello → Enrich plumbing itself is the existing
+// one every hello field rides.
+func TestBoardRowsCarryModelEfuseBackfill(t *testing.T) {
+	e := newEnvModels(t, 10*time.Second, 0, nil, map[string]string{"d75884": "conf-1"},
+		mkBoard("d75884", "xuansi-d75884.local"), mkBoard("aabbcc", "xuansi-aabbcc.local"))
+	c := dialSock(t, e.sock)
+
+	// The startup audit lands ITS (model-less) sighting asynchronously;
+	// wait for it so the model sightings below cannot race it.
+	deadline := time.Now().Add(3 * time.Second)
+	for id := int64(1); ; id += 2 {
+		d, a := boardRowOf(t, c, id, "d75884"), boardRowOf(t, c, id+1, "aabbcc")
+		if asStr(d["fw"]) != "" && asStr(a["fw"]) != "" {
+			checkModelPair(t, d, "list_boards d75884 (audit sighting, no model key)", "conf-1", "conf")
+			checkModelPair(t, a, "list_boards aabbcc (audit sighting, no model key)", "", "unknown")
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("startup audit never enriched the boards within 3s: %v / %v", d["fw"], a["fw"])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// sightings carrying a model: the conf-less board turns efuse, the
+	// conf board keeps its override
+	e.srv.reg.Enrich("aabbcc", &replclient.HelloInfo{FwBuild: "deadbee", Model: "burned-1"})
+	e.srv.reg.Enrich("d75884", &replclient.HelloInfo{FwBuild: "deadbee", Model: "burned-2"})
+	checkModelPair(t, boardRowOf(t, c, 11, "aabbcc"), "list_boards aabbcc", "burned-1", "efuse")
+	checkModelPair(t, boardRowOf(t, c, 12, "d75884"), "list_boards d75884", "conf-1", "conf")
+	checkModelPair(t, statusBoardOf(t, c, 13, "aabbcc"), "board_status aabbcc", "burned-1", "efuse")
+	checkModelPair(t, statusBoardOf(t, c, 14, "d75884"), "board_status d75884", "conf-1", "conf")
+
+	// a model-less sighting (older fw) un-claims the efuse model
+	e.srv.reg.Enrich("aabbcc", &replclient.HelloInfo{FwBuild: "deadbee"})
+	checkModelPair(t, boardRowOf(t, c, 15, "aabbcc"), "list_boards aabbcc after a model-less sighting", "", "unknown")
+	checkModelPair(t, statusBoardOf(t, c, 16, "aabbcc"), "board_status aabbcc after a model-less sighting", "", "unknown")
+}
+
+// TestNewSeedsConfModelsFromBoardsFile: the default-registry path —
+// Opts.Registry nil, the production `serve` shape — carries all three
+// boards.conf maps into the registry. Aliases and pin seeds always
+// rode it; the conf models are new, and a dropped WithModels on that
+// one line would leave every injected-registry test above green while
+// no production board ever showed a conf model. No Start, so no
+// discovery runs (nothing is dialed): a runtime Pin lands the entry.
+func TestNewSeedsConfModelsFromBoardsFile(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "boards.conf")
+	if err := os.WriteFile(conf, []byte("bench=d75884 model=goouuu-s3cam-v1.3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Opts{
+		BoardsFile:       conf,
+		SockPath:         filepath.Join(testutil.ShortSockDir(t), "d.sock"),
+		BootRecordsDir:   filepath.Join(dir, "bootrec"),
+		VaultDir:         filepath.Join(dir, "vault"),
+		CaptureRoot:      filepath.Join(dir, "captures"),
+		DisableProvision: true,
+		Log:              newTestLogf(t, "srv: "),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(srv.Close)
+	if n := len(srv.reg.Snapshot()); n != 0 {
+		t.Fatalf("a never-started server already holds %d board(s) — this test must not discover anything", n)
+	}
+	if err := srv.reg.Pin("d75884", "10.1.11.204", 7777); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	b, err := srv.reg.Resolve("d75884")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if b.Alias != "bench" || b.Model != "goouuu-s3cam-v1.3" || b.ModelSource != "conf" {
+		t.Errorf("entry from the default-registry path = alias %q, model %q/%q; want bench, goouuu-s3cam-v1.3/conf",
+			b.Alias, b.Model, b.ModelSource)
 	}
 }
 

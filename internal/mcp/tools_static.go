@@ -31,6 +31,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"xuansi/internal/apiclient"
+	"xuansi/internal/discover"
 	xfetch "xuansi/internal/fetch"
 	"xuansi/internal/paths"
 	"xuansi/internal/server"
@@ -292,6 +293,14 @@ type boardInfo struct {
 	OtaSlot     string `json:"ota_slot,omitempty" jsonschema:"the slot the RUNNING image booted from at the last hello sighting (ota_0 | ota_1) — SNAPSHOT value (the sighting's, not the live truth); the live read is xuansi_ota_status; absent on pre-v10 firmware"`
 	OtaImgState string `json:"ota_img_state,omitempty" jsonschema:"the running image's bootloader state at the last sighting (valid | pending_verify | new | aborted | undefined — pending_verify arms the 45s rollback milestone) — SNAPSHOT value; judge a push's aftermath with xuansi_ota_status"`
 	OtaSha      string `json:"ota_sha,omitempty" jsonschema:"the running image's app_desc elf sha hex64 at the last sighting — the build identity (the same sha xuansi_ota_push judges no-ops by); SNAPSHOT value; the live read is xuansi_ota_status"`
+	// Board model — the daemon's model chain: the boards.conf override,
+	// else the model the hello sighting carried, else unknown.
+	// ModelSource is ALWAYS present (the transport precedent: a client
+	// never distinguishes an absent key from a verdict); a board no
+	// link claims carries NO model — omitempty keeps it honestly
+	// absent, never an empty string.
+	Model       string `json:"model,omitempty" jsonschema:"the board's model as the daemon resolved it: the boards.conf model= override when one is set (model_source \"conf\"), else the model the board's last hello sighting reported (model_source \"efuse\" — what its fw reads off the board's own locked eFuse block; a hello-SNAPSHOT value); absent when model_source is unknown"`
+	ModelSource string `json:"model_source" jsonschema:"where model came from — conf (the boards.conf model= override: it always wins over what the board reports), efuse (the model the board itself reported at the daemon's last hello sighting), or unknown (neither link names a model — model is absent); always present"`
 	// Freshness face (B15 §4.1⑥): the current ACTUAL route, the numeric
 	// contact age, and the staleness verdict. transport is ALWAYS
 	// present (B16, the W1.T1 review asymmetry fixed): the empty
@@ -339,7 +348,7 @@ type leaseSummary struct {
 }
 
 type boardStatusOut struct {
-	Board        map[string]any `json:"board" jsonschema:"the board's identity view (same shape as xuansi_list_boards entries: fw, boot identity boot_epoch/reset_reason/last_seen, chip, and the freshness face transport/last_seen_age_ms/stale)"`
+	Board        map[string]any `json:"board" jsonschema:"the board's identity view (same shape as xuansi_list_boards entries: fw, boot identity boot_epoch/reset_reason/last_seen, chip, the model pair model/model_source, and the freshness face transport/last_seen_age_ms/stale)"`
 	Connected    bool           `json:"connected" jsonschema:"whether the daemon holds a live warm controller connection to the board — a daemon-side link fact, NOT board liveness: false only means no contact yet or the last link died; judge board survival from boot_epoch/reset_reason/last_seen and board.reboot events"`
 	Lease        *leaseSummary  `json:"lease,omitempty" jsonschema:"the current lease; absent when the board is free"`
 	Scripts      []any          `json:"scripts,omitempty" jsonschema:"running scripts (present when connected); shapes are the board's script list"`
@@ -509,12 +518,12 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Lease column: holder/session/since + grace_deadline while the holder is gone (grace counting down; a same-holder op adopts it back live); null when the board is free. " + provisionCoachDesc + " Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Board model — model + model_source (model_source is ALWAYS present): \"conf\" = the boards.conf model= override, which always wins over what the board reports; \"efuse\" = the model the board's hello sighting reported (what its fw reads off the board's own locked eFuse block — a hello-SNAPSHOT value); \"unknown\" = neither link names a model, and model is then absent. Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Lease column: holder/session/since + grace_deadline while the holder is gone (grace counting down; a same-holder op adopts it back live); null when the board is free. " + provisionCoachDesc + " Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_board_status",
-		Description: "One board's status: identity, connected — whether the daemon holds a live warm controller connection, a daemon-side LINK fact, not board liveness (false only means no contact yet or the last link died; a rebooted or unreachable board can still read true until the next crossing fails — judge survival from the board view's boot_epoch/reset_reason/last_seen/last_seen_age_ms/stale and board.reboot events instead) — plus the current lease (holder/session/grace deadline; absent when free) and its running scripts. Cache-first, NEVER dials: the scripts listing rides only an ALREADY-WARM controller link; an unreachable or stale board answers from cache. The board view carries transport (current actual route), last_seen_age_ms (-1 = never crossed) and stale (no live source AND no crossing within 30s), and provision_state (ok | credless | vault-empty | vault-error; " + provisionCoachDesc + ") Read-only, no lease. " + boardDesc + ".",
+		Description: "One board's status: identity, connected — whether the daemon holds a live warm controller connection, a daemon-side LINK fact, not board liveness (false only means no contact yet or the last link died; a rebooted or unreachable board can still read true until the next crossing fails — judge survival from the board view's boot_epoch/reset_reason/last_seen/last_seen_age_ms/stale and board.reboot events instead) — plus the current lease (holder/session/grace deadline; absent when free) and its running scripts. Cache-first, NEVER dials: the scripts listing rides only an ALREADY-WARM controller link; an unreachable or stale board answers from cache. The board view carries transport (current actual route), last_seen_age_ms (-1 = never crossed), stale (no live source AND no crossing within 30s), model + model_source (the model chain, as on xuansi_list_boards: conf = the boards.conf model= override, which always wins; efuse = the board's hello-reported model; unknown = neither — model is then absent), and provision_state (ok | credless | vault-empty | vault-error; " + provisionCoachDesc + ") Read-only, no lease. " + boardDesc + ".",
 	}, ts.boardStatus)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -724,6 +733,8 @@ func (ts *toolset) listBoards(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			OtaSlot:        str(m, "ota_slot"),
 			OtaImgState:    str(m, "ota_img_state"),
 			OtaSha:         str(m, "ota_sha"),
+			Model:          str(m, "model"),
+			ModelSource:    modelSource(m),
 			Transport:      str(m, "transport"),
 			LastSeenAgeMS:  age,
 			Stale:          bol(m, "stale"),
@@ -1045,6 +1056,16 @@ func str(m map[string]any, k string) string {
 func bol(m map[string]any, k string) bool {
 	b, _ := m[k].(bool)
 	return b
+}
+
+// modelSource reads a board row's model_source. The column is always
+// present at this seat (the transport precedent): a daemon that sends
+// no key — one predating the column — reads as the honest "unknown".
+func modelSource(m map[string]any) string {
+	if s := str(m, "model_source"); s != "" {
+		return s
+	}
+	return discover.ModelSourceUnknown
 }
 
 func num(m map[string]any, k string) int {

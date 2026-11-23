@@ -133,7 +133,7 @@ func runDiscover(credsPath string) int {
 		return h.finish("discover")
 	}
 	fmt.Printf("  boards.conf fixture: %s\n", conf)
-	aliases, _, err := discover.LoadBoardsFile(conf)
+	aliases, _, _, err := discover.LoadBoardsFile(conf)
 	h.check(err == nil && len(aliases) == 1 && aliases["d75884"] == "bench",
 		fmt.Sprintf("LoadBoardsFile: aliases=%v (malformed line skipped+warned above, err=%v)", aliases, err))
 
