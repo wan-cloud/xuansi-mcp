@@ -24,12 +24,12 @@ func TestFWToolsServed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lr.Tools) != 57 {
+	if len(lr.Tools) != 59 {
 		names := make([]string, 0, len(lr.Tools))
 		for _, tool := range lr.Tools {
 			names = append(names, tool.Name)
 		}
-		t.Fatalf("tools/list serves %d tools, want exactly 57 (the fw pair on top of 55): %v", len(lr.Tools), names)
+		t.Fatalf("tools/list serves %d tools, want exactly 59 (the fw pair on top of 55, the alias pair on top of those): %v", len(lr.Tools), names)
 	}
 	schema := map[string]map[string]bool{}
 	for _, tool := range lr.Tools {

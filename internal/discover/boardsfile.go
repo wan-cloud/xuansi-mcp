@@ -1,0 +1,314 @@
+package discover
+
+// boardsfile.go — the boards.conf LINE EDITOR: the only way the daemon
+// writes the file (the alias write face). boards.conf is
+// human-writable and daemon-writable at once, and the daemon's
+// charter is narrow: it touches ONLY the name field of the target
+// board's line — or appends or deletes a pure alias line. Every other
+// byte of the file stays where it was: comments, blank lines, unknown
+// and malformed lines, @endpoint pins, key=value tokens, an inline
+// note, trailing whitespace, each line's own terminator (CRLF
+// included) and a missing final newline. That is the invariant the
+// tests pin byte for byte.
+//
+// The editor knows nothing about which aliases are legal or free —
+// charset and uniqueness are validated one layer up (SetAlias),
+// against the world. What it does guard is its own output: it refuses
+// to write a line the parser could not read back.
+//
+// It reads the file exactly the way LoadBoardsFile does. Both ride
+// splitTokenTail and parseHead, so "the line that names mac6" for the
+// editor is by construction the line whose alias the parser registers.
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"unicode"
+)
+
+// replaceBoardsFile renames the new file over the old one and
+// fsyncBoardsDir flushes the directory after it; the bodies are per-OS
+// (boardsfile_unix.go / boardsfile_windows.go). Package vars so the
+// tests can make either step fail.
+var (
+	replaceBoardsFile = replaceBoardsFileOS
+	fsyncBoardsDir    = fsyncBoardsDirOS
+)
+
+// ErrLineHasPayload is the unalias refusal: clearing the alias would
+// take more than the alias with it. Two shapes ride it — the board's
+// line carries an @endpoint, key=value tokens or a note beside the
+// name; or boards.conf names the board on more than one line (delete
+// the winner, and a shadowed line resurfaces at the next start).
+// Either way the edit is a human's: the error names the file and the
+// line(s), and nothing is written.
+var ErrLineHasPayload = errors.New("clearing the alias would take more than the alias with it")
+
+// confLine is one physical line of the file: its bytes without the
+// terminator, and the terminator itself — "\n", "\r\n", or "" for an
+// unterminated last line. Keeping the two apart is what lets an edit
+// move one line's name while every other byte, the terminators and a
+// missing final newline included, lands back exactly where it was.
+type confLine struct {
+	text string
+	eol  string
+}
+
+// splitConfLines cuts data into its physical lines; joinConfLines is
+// its exact inverse for every input (an empty file is no lines).
+func splitConfLines(data []byte) []confLine {
+	var lines []confLine
+	for len(data) > 0 {
+		i := bytes.IndexByte(data, '\n')
+		if i < 0 {
+			return append(lines, confLine{text: string(data)})
+		}
+		text, eol := data[:i], "\n"
+		if len(text) > 0 && text[len(text)-1] == '\r' {
+			text, eol = text[:len(text)-1], "\r\n"
+		}
+		lines = append(lines, confLine{text: string(text), eol: eol})
+		data = data[i+1:]
+	}
+	return lines
+}
+
+// joinConfLines is splitConfLines' inverse.
+func joinConfLines(lines []confLine) []byte {
+	var b strings.Builder
+	for _, l := range lines {
+		b.WriteString(l.text)
+		b.WriteString(l.eol)
+	}
+	return []byte(b.String())
+}
+
+// nameSpan locates, inside ONE raw line (terminator off), the alias
+// the parser would register: the byte range of the name, [start,end),
+// and the board the line names. ok is false for every line
+// LoadBoardsFile skips — blank, comment, malformed. The span is the
+// parser's own name, trimmed exactly as parseHead trims it, so what
+// the editor replaces is precisely the field the parser reads — and
+// nothing a human wrote around it.
+func nameSpan(raw string) (start, end int, mac6 string, ok bool) {
+	t := strings.TrimSpace(raw)
+	if t == "" || strings.HasPrefix(t, "#") {
+		return
+	}
+	head, _ := splitTokenTail(t)
+	h := parseHead(head)
+	if !h.ok {
+		return
+	}
+	start = len(raw) - len(strings.TrimLeftFunc(raw, unicode.IsSpace))
+	return start, start + len(h.name), h.mac6, true
+}
+
+// isPureAlias reports whether raw is a pure alias line — `name=mac6`
+// and NOTHING else: no @endpoint, no key=value tail, no comment, no
+// stray word. The parser's tolerated spellings are still pure (spaces
+// around the "=", an uppercase mac6, trailing whitespace): deleting
+// the line takes the alias and nothing a human wrote beside it.
+func isPureAlias(raw string) bool {
+	t := strings.TrimSpace(raw)
+	if t == "" || strings.HasPrefix(t, "#") {
+		return false
+	}
+	head, tokens := splitTokenTail(t)
+	h := parseHead(head)
+	if !h.ok || h.hasEndpoint || len(tokens) != 0 {
+		return false
+	}
+	_, value, _ := strings.Cut(head, "=")
+	return strings.ToLower(strings.TrimSpace(value)) == h.mac6
+}
+
+// eolOf is the line terminator a NEW line takes after lines: the one
+// the file's last terminator uses (a CRLF file stays CRLF); "\n" for
+// an empty or terminator-less file.
+func eolOf(lines []confLine) string {
+	eol := "\n"
+	for _, l := range lines {
+		if l.eol != "" {
+			eol = l.eol
+		}
+	}
+	return eol
+}
+
+// EditAlias is the editor's one entry point: it renames, appends or
+// deletes a board's alias line in the boards.conf at path — and
+// touches nothing else in the file.
+//
+//   - clear=false (set): the LAST line naming mac6 — the one whose
+//     alias the parser lets win — gets alias as its name, everything
+//     else on the line staying byte for byte. When no line names mac6,
+//     a new line `alias=mac6` is added after the file's last complete
+//     line (right before a dangling unterminated last line, so the
+//     file keeps ending — or not ending — with a newline exactly as it
+//     did); a missing file is created (zero-config's first alias).
+//     When the line already carries alias, nothing is written.
+//   - clear=true: the line is deleted only when it is the ONE line
+//     naming mac6 AND a pure alias line (`name=mac6`, nothing else).
+//     Anything more is ErrLineHasPayload, and nothing is written. When
+//     no line names mac6 there is nothing to clear: nothing is
+//     written and no file is created.
+//
+// No existing byte ever changes value. Bytes leave the file only with
+// the name field a rename replaces or the pure line a clear deletes;
+// bytes enter it only as the name field and the one line a set adds.
+func EditAlias(path, mac6, alias string, clear bool) error {
+	if path == "" {
+		return errors.New("discover: alias: no boards file path was given")
+	}
+	mac6 = strings.ToLower(strings.TrimSpace(mac6))
+	if !isMac6(mac6) {
+		return fmt.Errorf("discover: alias: %q is not a mac6 (6 lowercase hex chars)", mac6)
+	}
+	if !clear && !isAlias(alias) {
+		return fmt.Errorf("discover: alias: %q is outside %s", alias, aliasCharset)
+	}
+
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+	case os.IsNotExist(err):
+		// zero-config: no file yet — a set creates it, a clear has nothing to do
+	default:
+		return fmt.Errorf("discover: alias: read %s: %w", path, err)
+	}
+	lines := splitConfLines(data)
+
+	// the target is the LAST line naming mac6 — the parser's winner;
+	// any earlier one is shadowed and is not ours to touch
+	target, earlier := -1, []int(nil)
+	for i, l := range lines {
+		if _, _, m, ok := nameSpan(l.text); ok && m == mac6 {
+			if target >= 0 {
+				earlier = append(earlier, target)
+			}
+			target = i
+		}
+	}
+
+	if clear {
+		switch {
+		case target < 0:
+			return nil
+		case len(earlier) > 0:
+			at := make([]string, len(earlier)+1)
+			for i, n := range append(earlier, target) {
+				at[i] = fmt.Sprint(n + 1)
+			}
+			return fmt.Errorf("discover: unalias %s: %w: %s names the board on %d lines (%s) — deleting one would leave another naming the board; edit the file by hand",
+				mac6, ErrLineHasPayload, path, len(at), strings.Join(at, ", "))
+		case !isPureAlias(lines[target].text):
+			return fmt.Errorf("discover: unalias %s: %w: %s names it as %q — the daemon edits only the name field and deletes only a pure alias=mac6 line; edit the file by hand",
+				mac6, ErrLineHasPayload, path, strings.TrimSpace(lines[target].text))
+		}
+		lines = append(lines[:target], lines[target+1:]...)
+	} else if target >= 0 {
+		start, end, _, _ := nameSpan(lines[target].text)
+		if lines[target].text[start:end] == alias {
+			return nil // the line already carries this name: not a byte is written
+		}
+		lines[target].text = lines[target].text[:start] + alias + lines[target].text[end:]
+	} else {
+		// The new line goes after the file's last COMPLETE line. When
+		// the file ends without a newline that spot is right before the
+		// dangling last line — the latest place a whole line fits
+		// without moving a byte — so the file keeps ending, or not
+		// ending, with a newline exactly as it did.
+		eol := eolOf(lines)
+		at := len(lines)
+		if n := len(lines) - 1; n >= 0 && lines[n].eol == "" {
+			at = n
+		}
+		lines = append(lines, confLine{})
+		copy(lines[at+1:], lines[at:])
+		lines[at] = confLine{text: alias + "=" + mac6, eol: eol}
+	}
+	if err := writeBoardsFile(path, joinConfLines(lines)); err != nil {
+		return fmt.Errorf("discover: alias: %w", err)
+	}
+	return nil
+}
+
+// writeBoardsFile lands data at path the way a careful editor saves —
+// never a torn write, never a lost original:
+//
+//   - an EXISTING file is replaced whole: a temp file in its directory
+//     is written, given the original's permission bits, fsynced and
+//     closed, then renamed over the target (replaceBoardsFile; on
+//     windows a bounded retry past a scanner's or an editor's
+//     transient hold), then the directory is fsynced best-effort. A
+//     reader — the next daemon start, a human's editor — only ever
+//     sees the old file or the new one, and a failure before the
+//     rename leaves the original as it was. A symlinked boards.conf is
+//     followed, not replaced: the link stays a link and its target is
+//     what changes.
+//   - a NEW file (zero-config's first alias) is written directly with
+//     0644 under the umask — the mode an editor would give it — parent
+//     directories included.
+func writeBoardsFile(path string, data []byte) error {
+	target := path
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if resolved, rerr := filepath.EvalSymlinks(path); rerr == nil {
+			target = resolved
+		}
+	case os.IsNotExist(err):
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("create the directory for %s: %w", path, err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			os.Remove(path) // never leave a half-written new file behind
+			return fmt.Errorf("create %s: %w", path, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".boards.conf-*.tmp")
+	if err != nil {
+		return fmt.Errorf("write %s: %w (is its directory writable?)", path, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil { // CreateTemp's 0600 → the original's bits
+		tmp.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := replaceBoardsFile(tmpName, target); err != nil {
+		return fmt.Errorf("replace %s: %w — the file is unchanged (is another program holding it open?)", path, err)
+	}
+	// The directory fsync is the crash-durability half — the rename
+	// entry itself surviving power loss — and it is BEST-EFFORT: by
+	// here the file is replaced and its data flushed, and a filesystem
+	// that refuses a directory fsync must not turn a write that
+	// happened into a reported failure: the caller would then keep its
+	// memory out of step with a file that did change.
+	if err := fsyncBoardsDir(filepath.Dir(target)); err != nil {
+		slog.Warn("discover: boards.conf was written, but its directory could not be fsynced (the rename may not survive a crash)",
+			"dir", filepath.Dir(target), "err", err)
+	}
+	return nil
+}

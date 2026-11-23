@@ -141,7 +141,15 @@ type env struct {
 // refreshDynamic drives; wireMCP is the nil-client-opts convenience.
 func wireMCPClient(t *testing.T, fd *fakeDaemon, opts Options, copts *mcpsdk.ClientOptions) *env {
 	t.Helper()
-	c, err := apiclient.Dial(fd.path)
+	return wireMCPSock(t, fd.path, opts, copts)
+}
+
+// wireMCPSock is the wiring itself, against a daemon LISTENING AT
+// sock — a caller-owned fake's socket (wireMCPClient) or a real
+// in-process server's (the alias face's restart test, boards_alias_test.go).
+func wireMCPSock(t *testing.T, sock string, opts Options, copts *mcpsdk.ClientOptions) *env {
+	t.Helper()
+	c, err := apiclient.Dial(sock)
 	if err != nil {
 		t.Fatal(err)
 	}

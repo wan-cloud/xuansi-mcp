@@ -23,8 +23,9 @@ import (
 	"xuansi/internal/server"
 )
 
-// TestOTAToolsServed: tools/list serves exactly 55 static tools (45 +
-// the OTA pair + the LA second analysis batch's eight) and both OTA
+// TestOTAToolsServed: tools/list serves exactly 59 static tools (45 +
+// the OTA pair + the LA second analysis batch's eight + the fw pair +
+// the alias pair) and both OTA
 // tools are among them with the required/optional split the handlers
 // rely on — the seat-facing pin (an agent reads tools/list, not Go
 // tables).
@@ -36,12 +37,12 @@ func TestOTAToolsServed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lr.Tools) != 57 {
+	if len(lr.Tools) != 59 {
 		names := make([]string, 0, len(lr.Tools))
 		for _, tool := range lr.Tools {
 			names = append(names, tool.Name)
 		}
-		t.Fatalf("tools/list serves %d tools, want exactly 57 (the OTA pair + the LA octet + the fw pair on top of 45): %v", len(lr.Tools), names)
+		t.Fatalf("tools/list serves %d tools, want exactly 59 (the OTA pair + the LA octet + the fw pair + the alias pair on top of 45): %v", len(lr.Tools), names)
 	}
 	schema := map[string]map[string]bool{}
 	for _, tool := range lr.Tools {

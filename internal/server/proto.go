@@ -64,6 +64,8 @@
 //	capture_stop   {capture_id}                  → {path, bytes, reason:"stopped"}
 //	boards_pin     {mac6, ip, port}              → {pinned, endpoint}  (⑨: declares the registry's pin source — see the pin section below)
 //	boards_unpin   {mac6}                        → {unpinned}       (removes exactly the pin declaration)
+//	boards_alias   {board, alias}                → {aliased, alias}  (names a board in boards.conf — see the alias face below)
+//	boards_unalias {board}                       → {unaliased}       (removes a pure alias line — the alias face below)
 //	ota.push       {boards[], path, sha256?, activate?, confirm?, force?} → {rows:[…]}  (the fleet push — see the OTA section below)
 //	ota.status     {board}                       → the board's ota.status verbatim + board  (ro, no lease — see the OTA section below)
 //
@@ -219,6 +221,44 @@
 // degrades to last-known (stale). A bad mac6 / empty ip / port
 // outside 1..65535 is a "server" class refusal (the registry is the
 // validator; a refused pin materializes nothing).
+//
+// # The alias face (the boards.conf write face)
+//
+// boards_alias {board, alias} names a board: the alias takes effect
+// IMMEDIATELY (list_boards/board_status show it and it is a selector
+// at once) and is PERSISTED in the daemon's boards.conf — the single
+// source of truth: a restart re-reads the file, so there is no
+// in-memory-only alias and no precedence rule. board is the ordinary
+// selector (so a board can be renamed through the alias it already
+// has); the reply echoes the resolved mac6 and the alias as written.
+//
+// The file is human-writable too, and the daemon's edit is narrow: on
+// the board's existing line ONLY the name changes — an @endpoint,
+// key=value tokens, comments, blank or malformed lines and every other
+// byte (line endings included) stay exactly as they are. A board with
+// no line gets `alias=mac6` added after the file's last complete line
+// (a file that does not end with a newline still does not); a missing
+// file is created at the daemon's boards-file path (`xuansi serve
+// --boards-file`, by default the user config dir's xuansi/boards.conf).
+//
+// boards_unalias {board} removes the alias again — but ONLY by
+// deleting a pure alias line (`alias=mac6` and nothing else). A line
+// that also declares an @endpoint or key=value tokens is refused with
+// the line quoted and the coach to edit the file by hand (nothing is
+// written); so is a board named on more than one line. A board that
+// was never aliased answers success (idempotent-shaped).
+//
+// Refusals: a selector naming no board, or more than one, is the
+// usual no_board / ambiguous; an alias outside
+// ^[a-z0-9][a-z0-9_-]{0,31}$, one another board already answers to
+// (another board's alias, or a prefix of a known mac6 or hostname —
+// Resolve's own rules), or a payload line is a "server" class refusal
+// carrying the coach. Uniqueness is checked against the boards the
+// daemon knows at write time; a board discovered later that collides
+// surfaces through the ordinary selector-ambiguity error.
+//
+// A hand edit and an alias write racing inside one read-modify-write
+// window end last-writer-wins (single-operator discipline).
 //
 // # Transport (the lease route decision, B15 §4.4)
 //
@@ -461,6 +501,11 @@ type Request struct {
 	// Mac6 is boards_pin/boards_unpin's exact board id (⑨): 6 hex
 	// chars, validated — never a selector.
 	Mac6 string `json:"mac6,omitempty"`
+	// Alias is boards_alias's new name for Board (the ordinary board
+	// selector, resolved daemon-side) — validated by the registry
+	// against the alias charset and the boards it knows, then written
+	// to boards.conf verbatim.
+	Alias string `json:"alias,omitempty"`
 	// IP/Port are boards_pin's pinned endpoint (validated daemon-side;
 	// the reply echoes the joined endpoint).
 	IP   string `json:"ip,omitempty"`

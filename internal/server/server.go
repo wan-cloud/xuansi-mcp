@@ -207,7 +207,9 @@ type Opts struct {
 	GraceTTL time.Duration
 	// BoardsFile feeds the alias, pin and conf-model maps when Registry
 	// is nil (default: user config dir xuansi/boards.conf; missing
-	// file = zero-config).
+	// file = zero-config). The same resolved path is handed to that
+	// registry as the file the alias write face edits (boards_alias /
+	// boards_unalias): what they write is what the next start reads.
 	BoardsFile string
 	// Registry injects a pre-built registry (tests); nil = built from
 	// BoardsFile.
@@ -525,7 +527,9 @@ func New(o Opts) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("server: boards file: %w", err)
 		}
-		reg = discover.NewRegistry(aliases, pins, discover.WithModels(models))
+		// the registry keeps the path it was seeded from: the alias
+		// write face edits the file a restart re-reads (one source)
+		reg = discover.NewRegistry(aliases, pins, discover.WithModels(models), discover.WithBoardsFile(path))
 	}
 
 	if o.SockPath == "" {
@@ -1425,6 +1429,10 @@ func (s *Server) process(cc *clientConn, req *Request) *Reply {
 		result, err = s.hBoardsPin(req)
 	case "boards_unpin":
 		result, err = s.hBoardsUnpin(req)
+	case "boards_alias": // the alias write face: name a board in boards.conf
+		result, err = s.hBoardsAlias(req)
+	case "boards_unalias": // …and remove a pure alias line again
+		result, err = s.hBoardsUnalias(req)
 	case "la_capture": // T7: the blocking listen capture (own ceiling, above)
 		result, err = s.hLaCapture(ctx, cc, req)
 	case "la_list": // T7: the landed-object reads + L1 crossings (local)
@@ -2016,6 +2024,48 @@ func (s *Server) hBoardsUnpin(req *Request) (any, error) {
 		s.logf("server: boards_unpin %s (pin removed; other live sources kept)", mac6)
 	}
 	return map[string]any{"unpinned": mac6}, nil
+}
+
+// hBoardsAlias serves boards_alias: name a board. The board selector
+// resolves through the registry like every board-addressed request
+// (mac6 / current alias / hostname prefix — so a board can be
+// renamed by the alias it already has); the registry then validates
+// the alias against the world, writes boards.conf and syncs its alias
+// map — live at once, and what the next daemon start reads. The
+// refusal classes ride their own paths: a selector that names no
+// board or more than one is no_board / ambiguous (resolve), an alias
+// the registry refuses is a "server" class refusal carrying the
+// registry's coach (the registry is the validator — the pin pair's
+// precedent). No lease, no board contact. The reply echoes the
+// resolved mac6 and the alias exactly as written.
+func (s *Server) hBoardsAlias(req *Request) (any, error) {
+	b, rerr := s.resolve(req.Board)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if err := s.reg.SetAlias(b.MAC6, req.Alias); err != nil {
+		return nil, &RPCError{Class: "server", Msg: err.Error()}
+	}
+	s.logf("server: boards_alias %s → %q (was %q; %s)", b.MAC6, req.Alias, b.Alias, s.reg.BoardsFile())
+	return map[string]any{"aliased": b.MAC6, "alias": req.Alias}, nil
+}
+
+// hBoardsUnalias serves boards_unalias: remove a board's alias — the
+// inverse of boards_alias, through the same selector and the same
+// validate → edit → sync order. Idempotent-shaped: a board that was
+// never aliased answers success. A line carrying more than the alias
+// is refused with the hand-edit coach and nothing is written (D6).
+// No lease, no board contact.
+func (s *Server) hBoardsUnalias(req *Request) (any, error) {
+	b, rerr := s.resolve(req.Board)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if err := s.reg.ClearAlias(b.MAC6); err != nil {
+		return nil, &RPCError{Class: "server", Msg: err.Error()}
+	}
+	s.logf("server: boards_unalias %s (was %q; %s)", b.MAC6, b.Alias, s.reg.BoardsFile())
+	return map[string]any{"unaliased": b.MAC6}, nil
 }
 
 // connHolder returns the effective holder for a request: the request's

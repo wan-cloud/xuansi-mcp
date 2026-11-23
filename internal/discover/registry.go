@@ -118,6 +118,28 @@ func isMac6(s string) bool {
 // API's mac6 validation must be the registry's own).
 func IsMac6(s string) bool { return isMac6(s) }
 
+// isAlias reports whether s lies in the alias string domain —
+// ^[a-z0-9][a-z0-9_-]{0,31}$: 1..32 ASCII bytes, a lowercase letter
+// or digit first, then lowercase letters, digits, "_" or "-" (a hand
+// loop like isMac6). Verbatim: no trimming and no case folding — the
+// daemon writes exactly what was asked for, or refuses it.
+func isAlias(s string) bool {
+	if s == "" || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			continue
+		}
+		if i > 0 && (c == '_' || c == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // discoverFunc is the discovery seam Refresh calls; tests inject
 // canned results or failures.
 type discoverFunc func(ctx context.Context) ([]Board, error)
@@ -135,6 +157,19 @@ type Registry struct {
 	boards  map[string]Board  // mac6 → entry (current + stale)
 	pins    map[string]Pin    // mac6 → pinned endpoint (⑨ source)
 	mdnsErr string            // last refresh's mdns failure ("" = healthy)
+
+	// boardsFile is the boards.conf the alias map was read from AND
+	// the file SetAlias/ClearAlias write back to (WithBoardsFile) —
+	// one source, no second copy. Empty = no file was named; the
+	// alias write face refuses honestly then.
+	boardsFile string
+	// aliasMu serializes the alias writers: one validate → edit →
+	// sync at a time, so two racing writes can neither interleave
+	// their file edits nor each validate against a world the other
+	// is half-way through changing. It is taken OUTSIDE mu and is
+	// never held by a sweep: mu guards memory for microseconds,
+	// aliasMu the whole file write.
+	aliasMu sync.Mutex
 
 	usb  discoverFunc
 	mdns discoverFunc
@@ -168,6 +203,23 @@ func WithModels(models map[string]string) RegistryOption {
 		}
 		r.models = m
 	}
+}
+
+// WithBoardsFile names the boards.conf the registry's aliases were
+// read from — the file SetAlias and ClearAlias write back to (the
+// single source of truth: what they write is exactly what the next
+// daemon start reads back). server.New passes the resolved
+// --boards-file / default path on the default-registry branch; a
+// registry built without it (a test's injected one) has no alias
+// write face, and SetAlias/ClearAlias refuse naming the flag.
+func WithBoardsFile(path string) RegistryOption {
+	return func(r *Registry) { r.boardsFile = path }
+}
+
+// BoardsFile is the file the alias write face edits — "" when the
+// registry was built without one (WithBoardsFile).
+func (r *Registry) BoardsFile() string {
+	return r.boardsFile
 }
 
 // NewRegistry builds an empty registry; aliases (from LoadBoardsFile)
@@ -356,9 +408,7 @@ func (r *Registry) Resolve(selector string) (Board, error) {
 	if sel != "" {
 		lower := strings.ToLower(sel)
 		for _, b := range boards {
-			if strings.HasPrefix(b.MAC6, lower) ||
-				(b.Alias != "" && b.Alias == sel) ||
-				(b.Host != "" && strings.HasPrefix(strings.ToLower(b.Host), lower)) {
+			if selectorMatches(sel, lower, b) {
 				hits = append(hits, b)
 			}
 		}
@@ -371,6 +421,20 @@ func (r *Registry) Resolve(selector string) (Board, error) {
 	default:
 		return Board{}, fmt.Errorf("discover: selector %q ambiguous — candidates: %s", selector, describeBoards(hits))
 	}
+}
+
+// selectorMatches reports whether sel names board b under Resolve's
+// three rules — whichever matches: a mac6 prefix, an alias (exact),
+// or a hostname prefix (case-insensitive). lower is sel lowercased
+// once by the caller: the two prefix rules fold case, the alias rule
+// does not. SetAlias's uniqueness check rides the SAME predicate, so
+// "an alias collides" can never come to mean anything other than "a
+// selector would stop being unique" — there is no parallel rule to
+// drift from this one.
+func selectorMatches(sel, lower string, b Board) bool {
+	return strings.HasPrefix(b.MAC6, lower) ||
+		(b.Alias != "" && b.Alias == sel) ||
+		(b.Host != "" && strings.HasPrefix(strings.ToLower(b.Host), lower))
 }
 
 // describeBoards renders the candidate list for Resolve errors: mac6,
@@ -496,6 +560,193 @@ func (r *Registry) Unpin(mac6 string) bool {
 	return true
 }
 
+// The alias string domain, as the refusals and the MCP Desc spell it —
+// and the two closers every alias refusal ends with.
+const (
+	aliasCharset = "^[a-z0-9][a-z0-9_-]{0,31}$"
+	// aliasSelectorCoach: what a colliding alias would do to selectors,
+	// and the way out.
+	aliasSelectorCoach = " — a selector must name exactly one board (mac6 prefix / exact alias / hostname prefix), so pick a name no other board answers to"
+	// aliasNothingWritten: neither the file nor the memory moved.
+	aliasNothingWritten = " — nothing was written"
+)
+
+// editAlias is the file-edit step of SetAlias and ClearAlias
+// (boardsfile.go's EditAlias). A package var so a test can stand
+// inside the write and observe that the alias writers never overlap.
+var editAlias = EditAlias
+
+// SetAlias names a board: from here on mac6 answers to alias — now,
+// and after the next daemon start. The order is the contract: validate
+// FIRST against the world as it is, THEN edit boards.conf (the single
+// source of truth — SetAlias never leaves the memory holding an alias
+// the file does not), THEN sync the in-memory alias map, so list_boards
+// and every selector answer the new name without a sweep. A restart
+// re-reads the file: there is no second copy and no precedence rule.
+//
+// The refusals, each leaving file and memory untouched:
+//
+//   - mac6 not mac-shaped; alias outside ^[a-z0-9][a-z0-9_-]{0,31}$
+//     (verbatim — no trimming, no case folding: the daemon writes
+//     exactly what was asked for);
+//   - no boards file to write to (the registry was built without
+//     one — the flag the refusal names is the remedy);
+//   - the alias is a name some OTHER board already answers to. An
+//     alias is a selector, so it must stay unique under Resolve's
+//     rules: not another board's alias, not a prefix of any known
+//     mac6 or hostname — selectorMatches, the very predicate Resolve
+//     applies. Known means the registry's entries (live or last-known)
+//     plus the mac6s and aliases boards.conf names even where no
+//     discovery face has ever seen the board. The target's own mac6
+//     and hostname never count: an alias that also prefix-matches its
+//     own board resolves to that one board either way.
+//
+// Uniqueness is checked against the world as it is NOW. A board
+// discovered later that collides with an alias written earlier is
+// neither rewritten nor hidden: the collision surfaces through
+// Resolve's existing ambiguity error, and a rename or ClearAlias ends
+// it.
+//
+// Setting the alias a board already has is a no-op — not a byte is
+// written.
+func (r *Registry) SetAlias(mac6, alias string) error {
+	mac6 = strings.ToLower(strings.TrimSpace(mac6))
+	if !isMac6(mac6) {
+		return fmt.Errorf("discover: alias: %q is not a mac6 (6 lowercase hex chars)", mac6)
+	}
+	if !isAlias(alias) {
+		return fmt.Errorf("discover: alias %q for %s is outside the alias charset %s (1..32 chars: a lowercase letter or digit first, then lowercase letters, digits, \"_\" or \"-\")%s",
+			alias, mac6, aliasCharset, aliasNothingWritten)
+	}
+	if r.boardsFile == "" {
+		return fmt.Errorf("discover: alias %q for %s: this daemon has no boards file to write (start it with --boards-file)%s",
+			alias, mac6, aliasNothingWritten)
+	}
+
+	r.aliasMu.Lock()
+	defer r.aliasMu.Unlock()
+
+	r.mu.Lock()
+	if r.aliases[mac6] == alias {
+		r.mu.Unlock()
+		return nil // already named this: not a byte is written
+	}
+	err := r.checkAliasUniqueLocked(mac6, alias)
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := editAlias(r.boardsFile, mac6, alias, false); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.applyAliasLocked(mac6, alias)
+	r.mu.Unlock()
+	return nil
+}
+
+// ClearAlias removes a board's alias — the inverse of SetAlias, the
+// same validate → edit → sync order. The daemon deletes ONLY a pure
+// alias line (`alias=mac6` and nothing else). A line that also
+// declares an @endpoint or key=value tokens — or a second line naming
+// the same board, which would resurface after a restart once the
+// winner is gone — is refused with ErrLineHasPayload and the coach to
+// edit the file by hand: D6's charter, the daemon never takes more
+// than the alias with it. A board that was never aliased, or whose
+// line someone already removed by hand, is an idempotent no-op —
+// nothing is written, and the memory is brought in line with the file.
+func (r *Registry) ClearAlias(mac6 string) error {
+	mac6 = strings.ToLower(strings.TrimSpace(mac6))
+	if !isMac6(mac6) {
+		return fmt.Errorf("discover: unalias: %q is not a mac6 (6 lowercase hex chars)", mac6)
+	}
+	if r.boardsFile == "" {
+		return fmt.Errorf("discover: unalias %s: this daemon has no boards file to edit (start it with --boards-file)%s",
+			mac6, aliasNothingWritten)
+	}
+
+	r.aliasMu.Lock()
+	defer r.aliasMu.Unlock()
+	if err := editAlias(r.boardsFile, mac6, "", true); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.applyAliasLocked(mac6, "")
+	r.mu.Unlock()
+	return nil
+}
+
+// checkAliasUniqueLocked refuses an alias some OTHER board answers to
+// (callers hold r.mu; mac6 is the validated target). The collision
+// itself is decided by selectorMatches — the board would answer to
+// the alias as a selector — and the boards are walked in mac6 order so
+// the refusal names the same one every time; the message only says
+// WHICH rule fired. See SetAlias for what "other" and "known" mean.
+func (r *Registry) checkAliasUniqueLocked(mac6, alias string) error {
+	lower := strings.ToLower(alias) // Resolve's own normalization (a no-op inside the charset)
+	seen := make([]string, 0, len(r.boards))
+	for m := range r.boards {
+		seen = append(seen, m)
+	}
+	sort.Strings(seen)
+	for _, m := range seen {
+		b := r.boards[m]
+		if m == mac6 || !selectorMatches(alias, lower, b) {
+			continue
+		}
+		switch {
+		case b.Alias != "" && b.Alias == alias:
+			return fmt.Errorf("discover: alias %q for %s is already board %s's alias%s%s", alias, mac6, m, aliasSelectorCoach, aliasNothingWritten)
+		case strings.HasPrefix(b.MAC6, lower):
+			return fmt.Errorf("discover: alias %q for %s is a prefix of known mac6 %s%s%s", alias, mac6, m, aliasSelectorCoach, aliasNothingWritten)
+		default:
+			return fmt.Errorf("discover: alias %q for %s is a prefix of board %s's hostname %q%s%s", alias, mac6, m, b.Host, aliasSelectorCoach, aliasNothingWritten)
+		}
+	}
+	// what the FILE names though no discovery face has ever seen: the
+	// same predicate, on the two rules a file can know (a hostname is
+	// discovery's to know — Host stays empty here)
+	fileKnown := make([]string, 0, len(r.aliases))
+	for m := range r.aliases {
+		fileKnown = append(fileKnown, m)
+	}
+	sort.Strings(fileKnown)
+	for _, m := range fileKnown {
+		if _, seenBoard := r.boards[m]; seenBoard {
+			continue
+		}
+		b := Board{MAC6: m, Alias: r.aliases[m]}
+		if m == mac6 || !selectorMatches(alias, lower, b) {
+			continue
+		}
+		if b.Alias != "" && b.Alias == alias {
+			return fmt.Errorf("discover: alias %q for %s is already board %s's alias%s%s", alias, mac6, m, aliasSelectorCoach, aliasNothingWritten)
+		}
+		return fmt.Errorf("discover: alias %q for %s is a prefix of known mac6 %s%s%s", alias, mac6, m, aliasSelectorCoach, aliasNothingWritten)
+	}
+	return nil
+}
+
+// applyAliasLocked is the one place the alias map changes after
+// construction (callers hold r.mu): the map write — the delete, for
+// an empty alias — plus the entry's own Alias slot, so a set or a
+// clear shows on the very next Snapshot without waiting for a sweep.
+// It is the re-application Refresh performs for every entry at the
+// end of each sweep (e.Alias = r.aliases[mac6]); a board no discovery
+// face has seen yet has no entry to patch and picks its alias up the
+// day it appears.
+func (r *Registry) applyAliasLocked(mac6, alias string) {
+	if alias == "" {
+		delete(r.aliases, mac6)
+	} else {
+		r.aliases[mac6] = alias
+	}
+	if e, ok := r.boards[mac6]; ok {
+		e.Alias = alias
+		r.boards[mac6] = e
+	}
+}
+
 // Enrich records a dialed board's hello identity on its entry — the
 // lazy half of Board.Hello: discovery never dials (a USB dial reboots
 // the board, §2 — nobody wants that as a discovery side effect), so
@@ -607,16 +858,13 @@ func LoadBoardsFile(path string) (map[string]string, map[string]Pin, map[string]
 			continue
 		}
 		head, tokens := splitTokenTail(line)
-		name, value, ok := strings.Cut(head, "=")
-		name = strings.TrimSpace(name)
-		value = strings.ToLower(strings.TrimSpace(value))
-		mac6, endpoint, hasEndpoint := strings.Cut(value, "@")
-		mac6 = strings.TrimSpace(mac6)
-		if !ok || name == "" || !isMac6(mac6) {
+		h := parseHead(head)
+		if !h.ok {
 			slog.Warn("discover: boards.conf: skipping malformed line", "file", path, "line", i+1, "text", line)
 			continue
 		}
-		out[mac6] = name
+		mac6 := h.mac6
+		out[mac6] = h.name
 		haveModel := false
 		for _, tok := range tokens {
 			key, val, isKV := strings.Cut(tok, "=")
@@ -633,10 +881,10 @@ func LoadBoardsFile(path string) (map[string]string, map[string]Pin, map[string]
 				models[mac6], haveModel = val, true
 			}
 		}
-		if !hasEndpoint {
+		if !h.hasEndpoint {
 			continue // the classic alias-only line: nothing more to read
 		}
-		host, portStr, err := net.SplitHostPort(endpoint)
+		host, portStr, err := net.SplitHostPort(h.endpoint)
 		if err != nil {
 			slog.Warn("discover: boards.conf: skipping malformed pin endpoint (want mac6@ip:port)", "file", path, "line", i+1, "text", line, "err", err)
 			continue
@@ -649,6 +897,33 @@ func LoadBoardsFile(path string) (map[string]string, map[string]Pin, map[string]
 		pins[mac6] = Pin{Host: host, Port: port}
 	}
 	return out, pins, models, nil
+}
+
+// headLine is what the classic head of one boards.conf line says.
+type headLine struct {
+	name        string // the alias, trimmed
+	mac6        string // lowercased and trimmed — the board the line names
+	endpoint    string // the @endpoint, as the value carried it (lowercased)
+	hasEndpoint bool   // the value carried an "@" (the endpoint may still be malformed)
+	ok          bool   // the head is well-formed: a non-empty name and a mac6-shaped board
+}
+
+// parseHead reads the classic head — `name=mac6[@ip:port]` — exactly
+// as LoadBoardsFile always did: the name is what precedes the first
+// "=" (trimmed), the value is lowercased and trimmed, the mac6 is the
+// value's part before the first "@" (trimmed). Both readers of the
+// file ride this ONE function — the parser here and the line editor
+// (boardsfile.go) — so they cannot disagree about which board a line
+// names or where its name ends.
+func parseHead(head string) headLine {
+	var h headLine
+	name, value, ok := strings.Cut(head, "=")
+	h.name = strings.TrimSpace(name)
+	value = strings.ToLower(strings.TrimSpace(value))
+	mac6, endpoint, hasEndpoint := strings.Cut(value, "@")
+	h.mac6, h.endpoint, h.hasEndpoint = strings.TrimSpace(mac6), endpoint, hasEndpoint
+	h.ok = ok && h.name != "" && isMac6(h.mac6)
+	return h
 }
 
 // splitTokenTail cuts one boards.conf line into its classic head —

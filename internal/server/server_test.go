@@ -457,6 +457,25 @@ func newEnvFull(t *testing.T, ttl, idle time.Duration, aliases map[string]string
 // tokens hand NewRegistry); nil = zero-config, no conf models.
 func newEnvModels(t *testing.T, ttl, idle time.Duration, aliases, models map[string]string, boards ...discover.Board) *env {
 	t.Helper()
+	reg := discover.NewRegistry(aliases, nil,
+		discover.WithModels(models),
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
+			return boards, nil
+		}),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			return boards, nil
+		}),
+	)
+	return newEnvReg(t, ttl, idle, reg, boards...)
+}
+
+// newEnvReg is the env builder over a CALLER-built registry: the same
+// fake controllers, dial seams and hermetic Opts as newEnvModels, for
+// an environment whose registry needs more than the alias/model maps
+// — the alias face's (boards_alias_test.go) seeds its registry from a
+// real boards.conf and tells the registry where that file lives.
+func newEnvReg(t *testing.T, ttl, idle time.Duration, reg *discover.Registry, boards ...discover.Board) *env {
+	t.Helper()
 	e := &env{
 		t:         t,
 		fakes:     map[string]*fakeCtl{},
@@ -468,15 +487,6 @@ func newEnvModels(t *testing.T, ttl, idle time.Duration, aliases, models map[str
 		e.fakes[b.MAC6] = newFakeCtl()
 		e.usbFakes[b.MAC6] = newFakeCtl()
 	}
-	reg := discover.NewRegistry(aliases, nil,
-		discover.WithModels(models),
-		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
-			return boards, nil
-		}),
-		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
-			return boards, nil
-		}),
-	)
 	e.sock = filepath.Join(testutil.ShortSockDir(t), "d.sock")
 	srvLog := newTestLogf(t, "srv: ")
 	supLog := newTestLogf(t, "sup: ")

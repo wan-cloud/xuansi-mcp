@@ -684,6 +684,13 @@ var staticToolsRequiredAudit = map[string][]string{
 	"xuansi_boards_pin":   {"mac6", "ip", "port"},
 	"xuansi_boards_unpin": {"mac6"},
 
+	// 板身分波 (2026-11-23): the alias pair — a board selector plus
+	// the name on alias (nothing defaults: an empty alias is refused
+	// daemon-side, so the field is load-bearing), the selector alone
+	// on unalias.
+	"xuansi_boards_alias":   {"board", "alias"},
+	"xuansi_boards_unalias": {"board"},
+
 	// §4.3 (B15 W1.T4): the long-poll face — the tag and the bounded
 	// timeout are both load-bearing (no defaults to ride).
 	"xuansi_job_wait": {"board", "job", "timeout_ms"},

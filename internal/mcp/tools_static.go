@@ -223,6 +223,19 @@ type boardsUnpinIn struct {
 	Mac6 string `json:"mac6" jsonschema:"exact board id whose pin declaration to remove (6 lowercase hex chars)"`
 }
 
+// boardsAliasIn / boardsUnaliasIn are the alias write face. Unlike
+// the pin pair's exact mac6, board here is the ORDINARY selector: a
+// board is named — and renamed, and unaliased — through whatever
+// already addresses it, its current alias included.
+type boardsAliasIn struct {
+	Board string `json:"board" jsonschema:"the board to name: a selector (mac6 / current alias / hostname unique prefix), resolved daemon-side — select it by its mac6, or by the alias you are replacing"`
+	Alias string `json:"alias" jsonschema:"the new alias, verbatim: 1..32 chars matching ^[a-z0-9][a-z0-9_-]{0,31}$ (a lowercase letter or digit first; then lowercase letters, digits, \"_\", \"-\"), and a name no OTHER board answers to (not another board's alias, not a prefix of any known mac6 or hostname) — the daemon refuses anything else with a coach and writes nothing"`
+}
+
+type boardsUnaliasIn struct {
+	Board string `json:"board" jsonschema:"the board whose alias to remove: a selector (mac6 / alias / hostname unique prefix), resolved daemon-side — the alias itself works"`
+}
+
 // jobWaitIn is the §4.3 long-poll face: wait for ONE job's completion
 // on the daemon's own event tap — no lease, no board dial.
 type jobWaitIn struct {
@@ -385,6 +398,17 @@ type boardsUnpinOut struct {
 	Unpinned string `json:"unpinned" jsonschema:"the unpinned board's mac6, echoed (idempotent-shaped: a never-pinned mac6 echoes the same)"`
 }
 
+// boardsAliasOut / boardsUnaliasOut are the alias pair's reply
+// shapes: {aliased, alias} / {unaliased} — the pin pair's echo style.
+type boardsAliasOut struct {
+	Aliased string `json:"aliased" jsonschema:"the named board's mac6 (resolved from the selector), echoed"`
+	Alias   string `json:"alias" jsonschema:"the alias exactly as written to boards.conf"`
+}
+
+type boardsUnaliasOut struct {
+	Unaliased string `json:"unaliased" jsonschema:"the board's mac6 (resolved from the selector), echoed — idempotent-shaped: a board that had no alias answers the same"`
+}
+
 // frameOut is one collected stream frame in an eval reply / job event
 // (spec §5.6): the channel, the sending module's name (the fw's
 // stream_send host-stamp, parsed), and the assembled payload.
@@ -506,6 +530,11 @@ var staticToolNames = []string{
 	"xuansi_la_eye",
 	"xuansi_la_align",
 	"xuansi_la_export",
+	// 板身分波 (2026-11-23): the alias pair — the boards.conf write
+	// face (set/rename + remove), beside its pin cousins (59 now —
+	// appended, nothing renumbers).
+	"xuansi_boards_alias",
+	"xuansi_boards_unalias",
 }
 
 // register adds the static tools. Names are fixed contract (agents
@@ -518,7 +547,7 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_list_boards",
-		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). Board model — model + model_source (model_source is ALWAYS present): \"conf\" = the boards.conf model= override, which always wins over what the board reports; \"efuse\" = the model the board's hello sighting reported (what its fw reads off the board's own locked eFuse block — a hello-SNAPSHOT value); \"unknown\" = neither link names a model, and model is then absent. Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Lease column: holder/session/since + grace_deadline while the holder is gone (grace counting down; a same-holder op adopts it back live); null when the board is free. " + provisionCoachDesc + " Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
+		Description: "List every board the daemon knows: identity (mac6/alias), discovery sources, route (host/port/usb_path), firmware build, and boot identity — boot_epoch/reset_reason/last_seen once the daemon has crossed the board (a changed boot_epoch between reads means it rebooted; see the events face for the judgment table), plus chip, the board's hello-reported architecture (e.g. ESP32-S3) — xuansi_driver_push's aot-pairing source — and, on protocol v10+, the OTA identity trio ota_slot/ota_img_state/ota_sha from the same sighting (hello-SNAPSHOT values: judge a push's aftermath with the LIVE read xuansi_ota_status; absent on pre-v10 boards). The alias is writable: xuansi_boards_alias names or renames a board (persisted in boards.conf, live at once) and xuansi_boards_unalias removes a pure alias line. Board model — model + model_source (model_source is ALWAYS present): \"conf\" = the boards.conf model= override, which always wins over what the board reports; \"efuse\" = the model the board's hello sighting reported (what its fw reads off the board's own locked eFuse block — a hello-SNAPSHOT value); \"unknown\" = neither link names a model, and model is then absent. Freshness face: transport (the CURRENT ACTUAL controller route, tcp/usb; ALWAYS present — the empty string IS the no-live-controller verdict, B16), last_seen_age_ms (ms since the daemon's last crossing; -1 = never crossed), stale (true = no live discovery source AND no crossing within 30s — last-known only; touching ops on it will refuse fast with cause \"source gone\"). Lease column: holder/session/since + grace_deadline while the holder is gone (grace counting down; a same-holder op adopts it back live); null when the board is free. " + provisionCoachDesc + " Cache-first and NEVER dials the board (frozen read semantics): an unreachable, stale, or powered-off board still lists instantly from last-known state.",
 	}, ts.listBoards)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -651,6 +680,18 @@ func (ts *toolset) register(srv *mcpsdk.Server) {
 		Name:        "xuansi_boards_unpin",
 		Description: "Remove a board's pinned endpoint — the registry pin source's removal half (⑨). Idempotent-shaped: unpinning a board that was never pinned still answers {unpinned}. The board keeps every other live source (usb/mdns); a pin-only board degrades to stale last-known (entries are never hard-deleted — re-pin or let discovery find it). No lease, no board contact.",
 	}, ts.boardsUnpin)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "xuansi_boards_alias",
+		Description: "Name a board — set or rename its alias, persisted in the daemon's boards.conf. The alias is live at once (list_boards/board_status show it, and it works as a board selector immediately) and survives a daemon restart: boards.conf is the single source of truth, a restart just re-reads it (there is no in-memory-only alias). The daemon's edit is byte-precise: on the board's existing boards.conf line ONLY the name field changes — an `@ip:port` pin endpoint, `model=` or other key=value tokens, comments, blank lines and every other line stay exactly as written; a board with no line gets a new `alias=mac6` line appended, and a missing file is created at the daemon's boards-file path (`xuansi serve --boards-file`; by default the user config dir's xuansi/boards.conf). Setting the alias a board already has is a no-op. REFUSED, with nothing written: an alias outside ^[a-z0-9][a-z0-9_-]{0,31}$ (1..32 chars: a lowercase letter or digit first, then lowercase letters, digits, \"_\", \"-\"); an alias another board already answers to — it must not equal another board's alias, nor be a prefix of any known mac6 or hostname, because selectors resolve by mac6 prefix / exact alias / hostname prefix and an alias IS a selector (the error names the board it collides with). Uniqueness is checked against the boards the daemon knows NOW: a board discovered later that collides surfaces as the usual selector-ambiguity error — rename then. Concurrency: the file is yours to hand-edit too; a hand edit and this write racing inside one read-modify-write window end with the last writer winning, so re-read after doing both. No lease, no board contact. Reply: {aliased, alias} — the resolved mac6 and the alias as written. " +
+			boardDesc + " — select by whatever already addresses the board: its mac6, or the alias you are replacing.",
+	}, ts.boardsAlias)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "xuansi_boards_unalias",
+		Description: "Remove a board's alias from the daemon's boards.conf — the inverse of xuansi_boards_alias: the removal is live at once and survives a daemon restart (boards.conf is the single source of truth). The daemon deletes ONLY a pure alias line (`alias=mac6` and nothing else — spacing tolerated). When the board's line carries anything more — an `@ip:port` pin endpoint, a `model=` or other key=value token — the call is REFUSED with the line quoted and the boards.conf path named, and nothing is written: the alias shares a line that also declares routing or a model, so removing it is yours to do by hand (open that file and delete the name yourself). A board named on more than one boards.conf line is refused the same way. A board that was never aliased still answers success (idempotent-shaped). No lease, no board contact. Reply: {unaliased} — the resolved mac6. " +
+			boardDesc + " — the alias itself works as the selector.",
+	}, ts.boardsUnalias)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "xuansi_job_wait",
@@ -847,6 +888,28 @@ func (ts *toolset) boardsUnpin(ctx context.Context, _ *mcpsdk.CallToolRequest, i
 		return nil, boardsUnpinOut{}, err
 	}
 	return nil, boardsUnpinOut{Unpinned: str(res, "unpinned")}, nil
+}
+
+// boardsAlias / boardsUnalias cross the alias write face holder-less
+// (daemon configuration, not a lease op — like the pin pair). board is
+// the ordinary selector and the daemon resolves it, so a board can be
+// renamed, or unaliased, through the alias it already has; the
+// daemon's refusals cross as the tool's error text verbatim — coach
+// and boards.conf path included, never re-worded here.
+func (ts *toolset) boardsAlias(ctx context.Context, _ *mcpsdk.CallToolRequest, in boardsAliasIn) (*mcpsdk.CallToolResult, boardsAliasOut, error) {
+	res, err := ts.call(ctx, server.Request{Type: "boards_alias", Board: in.Board, Alias: in.Alias})
+	if err != nil {
+		return nil, boardsAliasOut{}, err
+	}
+	return nil, boardsAliasOut{Aliased: str(res, "aliased"), Alias: str(res, "alias")}, nil
+}
+
+func (ts *toolset) boardsUnalias(ctx context.Context, _ *mcpsdk.CallToolRequest, in boardsUnaliasIn) (*mcpsdk.CallToolResult, boardsUnaliasOut, error) {
+	res, err := ts.call(ctx, server.Request{Type: "boards_unalias", Board: in.Board})
+	if err != nil {
+		return nil, boardsUnaliasOut{}, err
+	}
+	return nil, boardsUnaliasOut{Unaliased: str(res, "unaliased")}, nil
 }
 
 // jobWait parks on the daemon's event tap for one job's completion
