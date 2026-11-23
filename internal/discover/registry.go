@@ -63,23 +63,49 @@ type Board struct {
 	Hello   *replclient.HelloInfo // 按需 enrich
 
 	// Model is the board's model, resolved by the registry through the
-	// chain conf → hello → unknown; ModelSource names the link it came
-	// from (a ModelSource* value) and is set on EVERY registry entry:
-	// a board no link claims says "unknown", with Model empty.
+	// chain conf → eFuse record → unknown; ModelSource names the link
+	// it came from (a ModelSource* value) and is set on EVERY registry
+	// entry: a board no link names says "unknown", with Model empty —
+	// and so does an eFuse board whose id the daemon's model table
+	// lacks (ModelSource "efuse": the record is real, the string is
+	// not this daemon's to give).
 	Model       string
 	ModelSource string
+
+	// The raw eFuse record, verbatim from the hello sighting and
+	// independent of the verdict above — a conf-overridden board and
+	// a table miss show it too, so the identity is always readable.
+	// HasEfuseModel = the sighting carried the record; ModelID its
+	// numeric model id; MfgDate "YYYY-MM-DD". No record (older fw, or
+	// a board whose eFuse model block is not burned and locked) means
+	// false and the zero values.
+	HasEfuseModel bool
+	ModelID       uint32
+	MfgDate       string
 }
 
 // Model sources — Board.ModelSource's vocabulary: the three-level
 // chain that resolves a board's model, in priority order. The
-// boards.conf override always wins; the hello-carried model (what the
-// fw reads off the board's own locked eFuse block) stands in for a
-// board with no override; neither is "unknown", with no model.
+// boards.conf override always wins; the eFuse record the hello sighting
+// carried (model_id + mfg_date, read by the fw off the board's own
+// locked block, turned into a model string by the daemon's model
+// table) stands in for a board with no override — as "efuse" whether
+// or not the table knows the id; neither is "unknown", with no model.
 const (
 	ModelSourceConf    = "conf"
 	ModelSourceEfuse   = "efuse"
 	ModelSourceUnknown = "unknown"
 )
+
+// modelTable is the daemon's production model table: eFuse model id →
+// model string, the eFuse leg's lookup. EMPTY on purpose — the first
+// real allocation comes with the self-drawn boards; until then the
+// only thing that names a model is the boards.conf `model=` override,
+// and every record-bearing board is a table miss. Values share the
+// conf token's string domain (isModel), which is what keeps `model`
+// one string form wherever it comes from. Tests inject their own
+// table through WithModelTable.
+var modelTable = map[uint32]string{}
 
 func (b *Board) addSource(s string) {
 	for _, x := range b.Sources {
@@ -151,12 +177,13 @@ type discoverFunc func(ctx context.Context) ([]Board, error)
 // a third LIVE source by declaration: a pinned entry survives every
 // refresh regardless of what discovery saw.
 type Registry struct {
-	mu      sync.Mutex
-	aliases map[string]string // mac6 → alias (boards.conf)
-	models  map[string]string // mac6 → conf model (the boards.conf `model=` token)
-	boards  map[string]Board  // mac6 → entry (current + stale)
-	pins    map[string]Pin    // mac6 → pinned endpoint (⑨ source)
-	mdnsErr string            // last refresh's mdns failure ("" = healthy)
+	mu         sync.Mutex
+	aliases    map[string]string // mac6 → alias (boards.conf)
+	models     map[string]string // mac6 → conf model (the boards.conf `model=` token)
+	modelTable map[uint32]string // model id → model string (the eFuse leg's lookup)
+	boards     map[string]Board  // mac6 → entry (current + stale)
+	pins       map[string]Pin    // mac6 → pinned endpoint (⑨ source)
+	mdnsErr    string            // last refresh's mdns failure ("" = healthy)
 
 	// boardsFile is the boards.conf the alias map was read from AND
 	// the file SetAlias/ClearAlias write back to (WithBoardsFile) —
@@ -177,8 +204,8 @@ type Registry struct {
 
 // RegistryOption parameterizes NewRegistry; the source seams exist so
 // the daemon tests (and only they) inject canned discovery faces.
-// WithModels is the odd one out on purpose: it is production config,
-// not a seam.
+// WithModels and WithModelTable are the odd ones out on purpose: they
+// are production config, not seams.
 type RegistryOption func(*Registry)
 
 // WithUSB replaces the USB discovery face (tests inject canned boards).
@@ -205,6 +232,33 @@ func WithModels(models map[string]string) RegistryOption {
 	}
 }
 
+// WithModelTable replaces the daemon's model table — the eFuse leg's
+// model id → model-string lookup. The table is copied, and an entry
+// whose value is outside the model string domain (isModel) is dropped
+// with a logged warning naming the id: the table is the one other door
+// a model string enters the chain through (the boards.conf `model=`
+// token is the first), and `model` stays one string form or is
+// withheld. nil is an empty table; no option at all is the production
+// table.
+func WithModelTable(table map[uint32]string) RegistryOption {
+	return func(r *Registry) { r.modelTable = copyModelTable(table) }
+}
+
+// copyModelTable copies a model table through isModel, dropping and
+// logging what is outside the model string domain.
+func copyModelTable(table map[uint32]string) map[uint32]string {
+	m := make(map[uint32]string, len(table))
+	for id, model := range table {
+		if !isModel(model) {
+			slog.Warn("discover: model table: ignoring an entry outside the model domain (want ^[a-z0-9][a-z0-9.-]{0,28}$)",
+				"model_id", fmt.Sprintf("0x%06x", id), "model", model)
+			continue
+		}
+		m[id] = model
+	}
+	return m
+}
+
 // WithBoardsFile names the boards.conf the registry's aliases were
 // read from — the file SetAlias and ClearAlias write back to (the
 // single source of truth: what they write is exactly what the next
@@ -226,7 +280,8 @@ func (r *Registry) BoardsFile() string {
 // map mac6 → human name and fill Board.Alias on every refresh. pins
 // (the boards.conf `name=mac6@ip:port` seed, also from LoadBoardsFile)
 // seed the pin source — their entries materialize on the first Refresh
-// and survive every later one. Conf models ride WithModels.
+// and survive every later one. Conf models ride WithModels; the model
+// table is the production one unless WithModelTable replaces it.
 func NewRegistry(aliases map[string]string, pins map[string]Pin, opts ...RegistryOption) *Registry {
 	a := make(map[string]string, len(aliases))
 	for k, v := range aliases {
@@ -237,12 +292,13 @@ func NewRegistry(aliases map[string]string, pins map[string]Pin, opts ...Registr
 		p[k] = v
 	}
 	r := &Registry{
-		aliases: a,
-		models:  map[string]string{},
-		pins:    p,
-		boards:  map[string]Board{},
-		usb:     DiscoverUSB,
-		mdns:    DiscoverMDNS,
+		aliases:    a,
+		models:     map[string]string{},
+		modelTable: copyModelTable(modelTable),
+		pins:       p,
+		boards:     map[string]Board{},
+		usb:        DiscoverUSB,
+		mdns:       DiscoverMDNS,
 	}
 	for _, o := range opts {
 		o(r)
@@ -330,6 +386,11 @@ func (r *Registry) Refresh(ctx context.Context) error {
 			e.Port = old.Port // partial faces (SRV-less fragments, self-reported ports) keep last-known
 		}
 		e.Hello = old.Hello // enriched identity is last-known data too
+		// …and so is the model resolution it fed: applyModel re-derives
+		// the verdict from Hello, but reads the entry's previous one to
+		// tell a table miss it already coached about from a new one
+		e.HasEfuseModel, e.ModelID, e.MfgDate, e.Model, e.ModelSource =
+			old.HasEfuseModel, old.ModelID, old.MfgDate, old.Model, old.ModelSource
 		fresh[mac6] = e
 	}
 	// pins (⑨): a LIVE source by declaration — the pinned entry
@@ -776,8 +837,9 @@ func (r *Registry) applyAliasLocked(mac6, alias string) {
 // the board, §2 — nobody wants that as a discovery side effect), so
 // Hello stays nil until some caller dials, says hello, and reports back
 // here. Like all last-known data it survives refreshes. This is also
-// the eFuse leg of the model chain: a hello carrying a `model` key
-// names the model of a board with no conf override (applyModel).
+// where the eFuse leg of the model chain is fed: the hello's model
+// record (model_id + mfg_date) is resolved through the daemon's model
+// table (applyModel).
 func (r *Registry) Enrich(mac6 string, h *replclient.HelloInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -788,24 +850,53 @@ func (r *Registry) Enrich(mac6 string, h *replclient.HelloInfo) {
 	}
 }
 
-// applyModel resolves one entry's model through the chain and writes
-// the pair back: the conf override always wins; else the model the
-// entry's hello sighting carried (what the fw reads off the board's
-// own locked eFuse block — taken verbatim, the board's statement is
-// ground truth); else unknown, with no model. Re-run wherever either
-// input changes, so a sighting that stops carrying a model (older fw
-// after a downgrade) un-claims as honestly as one that starts.
-// Callers hold r.mu.
+// applyModel resolves one entry's model and writes the result back —
+// the raw record first, the verdict on top of it.
+//
+// Raw record: HasEfuseModel/ModelID/MfgDate mirror the hello's eFuse
+// model record verbatim, whatever the verdict; a sighting without one
+// (older fw, or a board whose model block is not burned and locked)
+// clears all three.
+//
+// Verdict: the conf override always wins (ModelSourceConf). Else a
+// sighting carrying the record is the eFuse leg (ModelSourceEfuse) and
+// the daemon's model table turns the id into the model string — a HIT
+// names it; a MISS leaves Model empty (the id is real, this daemon's
+// table just predates it) and logs the coach. Neither: unknown, with
+// no model.
+//
+// Re-run wherever either input changes (Refresh, Pin, Enrich), so a
+// sighting that stops carrying a record un-claims as honestly as one
+// that starts. The coach fires once per board and id — on the
+// resolution that first finds the miss, never again for the sweeps
+// that re-apply it. Callers hold r.mu.
 func (r *Registry) applyModel(mac6 string, e *Board) {
+	prevHad, prevID := e.HasEfuseModel, e.ModelID
+	prevModel, prevSource := e.Model, e.ModelSource
+
+	e.HasEfuseModel, e.ModelID, e.MfgDate = false, 0, ""
+	if e.Hello != nil && e.Hello.HasModel {
+		e.HasEfuseModel, e.ModelID, e.MfgDate = true, e.Hello.ModelID, e.Hello.MfgDate
+	}
+
 	if m := r.models[mac6]; m != "" {
 		e.Model, e.ModelSource = m, ModelSourceConf
 		return
 	}
-	if e.Hello != nil && e.Hello.Model != "" {
-		e.Model, e.ModelSource = e.Hello.Model, ModelSourceEfuse
+	if !e.HasEfuseModel {
+		e.Model, e.ModelSource = "", ModelSourceUnknown
 		return
 	}
-	e.Model, e.ModelSource = "", ModelSourceUnknown
+	m, hit := r.modelTable[e.ModelID]
+	e.Model, e.ModelSource = m, ModelSourceEfuse
+	// the same miss this entry already carried is not news (every
+	// sweep re-resolves it); another id, or the record leaving and
+	// coming back, is
+	alreadyCoached := prevHad && prevID == e.ModelID && prevModel == "" && prevSource == ModelSourceEfuse
+	if !hit && !alreadyCoached {
+		slog.Warn("discover: board model: unknown model_id — this daemon's model table predates the board; a boards.conf model= override names it meanwhile",
+			"board", mac6, "model_id", fmt.Sprintf("0x%06x", e.ModelID), "mfg_date", e.MfgDate)
+	}
 }
 
 // EnrichEndpoint records a board's self-reported endpoint (Bug 2②, B15
@@ -857,14 +948,19 @@ func (r *Registry) EnrichEndpoint(mac6, ip string, port int) {
 // line without a token IS the old grammar, byte for byte (see
 // splitTokenTail). The third map is the `model=` result, mac6 →
 // model, the top of the registry's model chain. The FIRST legal token
-// on the line wins, legal being the model domain every link of the
-// chain shares: ^[a-z0-9][a-z0-9.-]{0,28}$ (1..29 chars, verbatim —
-// no case folding). An illegal model token, an unknown key and a bare
-// word are each skipped with a logged warning, and none of them costs
-// the board its alias, pin or model — the malformed-line discipline,
-// now per token. Duplicate mac6s follow the alias rule (and the pin
-// rule): the last line that carries a legal model wins, and a
-// token-less line moves the alias only.
+// on the line wins, legal being the model string domain:
+// ^[a-z0-9][a-z0-9.-]{0,28}$ (1..29 chars, verbatim — no case
+// folding) — the one string form `model` takes wherever it comes
+// from. This token is its hand-written door; the daemon's model table
+// is the other, and its values are held to the same domain. Inside
+// the tail an illegal model token, an unknown key or a bare word is
+// skipped with a logged warning and costs the board nothing — not its
+// alias, pin or model — the malformed-line discipline, per token.
+// (Before the tail there is no such tolerance: a stray word there is
+// part of the head, and the head is the old grammar.) Duplicate mac6s
+// follow the alias rule (and the pin rule): the last line that
+// carries a legal model wins, and a token-less line moves the alias
+// only.
 func LoadBoardsFile(path string) (map[string]string, map[string]Pin, map[string]string, error) {
 	out := map[string]string{}
 	pins := map[string]Pin{}
@@ -993,10 +1089,13 @@ func isKVToken(field string) bool {
 	return ok && key != ""
 }
 
-// isModel reports whether s lies in the model string domain every link
-// of the chain shares — ^[a-z0-9][a-z0-9.-]{0,28}$: 1..29 ASCII
-// bytes, a lowercase letter or digit first, then a lowercase letter, a
-// digit, '.' or '-'. (Same shape as isMac6: a hand loop, no regexp.)
+// isModel reports whether s lies in the model STRING domain —
+// ^[a-z0-9][a-z0-9.-]{0,28}$: 1..29 ASCII bytes, a lowercase letter
+// or digit first, then a lowercase letter, a digit, '.' or '-'. It
+// gates both doors a model string enters the chain through: the
+// boards.conf `model=` token (hand-written) and the daemon's model
+// table's values — `model` is one string form wherever it comes from.
+// (Same shape as isMac6: a hand loop, no regexp.)
 func isModel(s string) bool {
 	if s == "" || len(s) > 29 {
 		return false

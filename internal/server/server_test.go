@@ -322,7 +322,12 @@ func (f *fakeCtl) Hello(observer bool, name string) (*replclient.HelloInfo, erro
 	h.OtaSlot, _ = res["ota_slot"].(string)
 	h.OtaImgState, _ = res["ota_img_state"].(string)
 	h.OtaSha, _ = res["ota_sha"].(string)
-	h.Model, _ = res["model"].(string) // the model overlay (parseHello's twin)
+	// the eFuse model record (parseHello's twin): present iff the hello
+	// carried a 32-bit model_id
+	if id, ok := res["model_id"].(int64); ok && id >= 0 && id <= math.MaxUint32 {
+		h.HasModel, h.ModelID = true, uint32(id)
+	}
+	h.MfgDate, _ = res["mfg_date"].(string)
 	// net section (parseHello's twin — the provision_state sighting's
 	// cred source; 憑證波 T2)
 	if v, ok := res["net"].(map[string]any); ok {
@@ -946,23 +951,98 @@ func statusBoardOf(t *testing.T, c *sockClient, id int64, mac string) map[string
 	return bv
 }
 
-// checkModelPair asserts one board view's model pair: model present
-// with wantModel only when the source is not unknown, and the source
-// itself. Both rows (list/status) render through boardView, so both
-// are held to the one shape.
+// checkModelPair asserts one board view's model pair: model_source
+// verbatim, and model — present with wantModel, or ABSENT (never an
+// empty string) when wantModel is empty, whatever the source. An
+// unknown board and an eFuse board whose id the daemon's table lacks
+// both carry no model; only the source tells them apart. Both rows
+// (list/status) render through boardView, so both are held to the one
+// shape.
 func checkModelPair(t *testing.T, view map[string]any, where, wantModel, wantSource string) {
 	t.Helper()
 	if got := asStr(view["model_source"]); got != wantSource {
 		t.Errorf("%s: model_source = %q, want %q (row: model=%v)", where, got, wantSource, view["model"])
 	}
-	if wantSource == "unknown" {
-		if _, present := view["model"]; present {
-			t.Errorf("%s: an unknown-source board carries model = %#v, want the key absent", where, view["model"])
+	v, present := view["model"]
+	if wantModel == "" {
+		if present {
+			t.Errorf("%s: carries model = %#v, want the key absent", where, v)
 		}
 		return
 	}
-	if got := asStr(view["model"]); got != wantModel {
-		t.Errorf("%s: model = %q, want %q", where, got, wantModel)
+	if asStr(v) != wantModel {
+		t.Errorf("%s: model = %#v, want %q", where, v, wantModel)
+	}
+}
+
+// checkEfuseRecord asserts one board view's raw eFuse record columns:
+// absent (neither key), or present together with exactly this id and
+// date — on both rows, whatever the model verdict beside them.
+func checkEfuseRecord(t *testing.T, view map[string]any, where string, wantID int64, wantDate string) {
+	t.Helper()
+	id, hasID := view["model_id"]
+	date, hasDate := view["mfg_date"]
+	if wantID == 0 && wantDate == "" {
+		if hasID || hasDate {
+			t.Errorf("%s: carries the eFuse record columns model_id=%v / mfg_date=%#v, want both keys absent", where, id, date)
+		}
+		return
+	}
+	if !hasID || !hasDate || asInt(id) != wantID || asStr(date) != wantDate {
+		t.Errorf("%s: eFuse record columns = model_id %v (present=%v) / mfg_date %#v (present=%v), want %d / %q",
+			where, id, hasID, date, hasDate, wantID, wantDate)
+	}
+}
+
+// awaitAudit waits for the startup audit's own sighting of the boards
+// (record-less, landed asynchronously from Start) so that the sightings
+// a test scripts next cannot race it.
+func awaitAudit(t *testing.T, c *sockClient, macs ...string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for id := int64(1); ; id++ {
+		seen := 0
+		for _, mac := range macs {
+			if asStr(boardRowOf(t, c, id, mac)["fw"]) != "" {
+				seen++
+			}
+		}
+		if seen == len(macs) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the startup audit never enriched %d of %d board(s) within 3s", len(macs)-seen, len(macs))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// sightRecord makes the daemon cross a board again through the REAL
+// path and land the hello given: the warm link dies, the next leased op
+// redials, and the tap's hello records the new sighting (the reboot
+// tests' pattern). rec carries the eFuse record keys a board with a
+// burned model block answers (model_id + mfg_date); nil = a hello
+// without the record (older fw).
+func sightRecord(t *testing.T, e *env, c *sockClient, mac6 string, leaseID, opID int64, rec map[string]any) {
+	t.Helper()
+	if rep, _ := c.call(leaseID, map[string]any{"type": "lease", "board": mac6, "holder": "sighter"}); asMap(rep["error"]) != nil {
+		t.Fatalf("lease %s: %#v", mac6, rep)
+	}
+	hello := map[string]any{
+		"protocol_ver": int64(11), "role": "controller", "fw": "xuansi-fw v0.7.4",
+		"fw_build": "03aff57", "fw_version": "0.7.4", "fs": true,
+	}
+	for k, v := range rec {
+		hello[k] = v
+	}
+	fresh := newFakeCtl()
+	fresh.on("hello", func(args map[string]any) (map[string]any, *replclient.OpError) { return hello, nil })
+	e.fakes[mac6].markDead()
+	e.dmu.Lock()
+	e.fakes[mac6] = fresh
+	e.dmu.Unlock()
+	if rep, _ := c.call(opID, map[string]any{"type": "eval", "board": mac6, "code": "return 1"}); asMap(rep["error"]) != nil {
+		t.Fatalf("eval %s after the swap (the redial that lands the sighting): %#v", mac6, rep)
 	}
 }
 
@@ -970,7 +1050,8 @@ func checkModelPair(t *testing.T, view map[string]any, where, wantModel, wantSou
 // BOTH rows — list_boards and board_status. A board with a boards.conf
 // model= override lists model + model_source "conf"; a board without
 // one lists NO model key (honest absence, not an empty string) beside
-// model_source "unknown".
+// model_source "unknown". Neither has been sighted with an eFuse
+// record, so neither row carries the record columns.
 func TestListBoardsCarriesModelConf(t *testing.T) {
 	e := newEnvModels(t, 10*time.Second, 0,
 		map[string]string{"d75884": "bench", "aabbcc": "cam"},
@@ -983,57 +1064,90 @@ func TestListBoardsCarriesModelConf(t *testing.T) {
 		t.Errorf("conf board alias = %q, want bench (the model token costs nothing)", conf["alias"])
 	}
 	checkModelPair(t, conf, "list_boards d75884", "goouuu-s3cam-v1.3", "conf")
+	checkEfuseRecord(t, conf, "list_boards d75884 (no record sighted)", 0, "")
 	bare := boardRowOf(t, c, 2, "aabbcc")
 	if asStr(bare["alias"]) != "cam" {
 		t.Errorf("plain board alias = %q, want cam", bare["alias"])
 	}
 	checkModelPair(t, bare, "list_boards aabbcc", "", "unknown")
+	checkEfuseRecord(t, bare, "list_boards aabbcc (no record sighted)", 0, "")
 
-	checkModelPair(t, statusBoardOf(t, c, 3, "d75884"), "board_status d75884", "goouuu-s3cam-v1.3", "conf")
-	checkModelPair(t, statusBoardOf(t, c, 4, "aabbcc"), "board_status aabbcc", "", "unknown")
+	sb := statusBoardOf(t, c, 3, "d75884")
+	checkModelPair(t, sb, "board_status d75884", "goouuu-s3cam-v1.3", "conf")
+	checkEfuseRecord(t, sb, "board_status d75884 (no record sighted)", 0, "")
+	sb = statusBoardOf(t, c, 4, "aabbcc")
+	checkModelPair(t, sb, "board_status aabbcc", "", "unknown")
+	checkEfuseRecord(t, sb, "board_status aabbcc (no record sighted)", 0, "")
 }
 
-// TestBoardRowsCarryModelEfuseBackfill: the eFuse leg — the hello
-// sighting's model backfills a conf-less board (model_source "efuse")
-// on both rows, the conf override still wins when a sighting carries a
-// different model, and a model-less sighting (older fw) leaves the
-// board unknown. Sightings land through the registry seam the tap uses
-// (Enrich) — the tap → hello → Enrich plumbing itself is the existing
-// one every hello field rides.
-func TestBoardRowsCarryModelEfuseBackfill(t *testing.T) {
+// TestBoardRowsCarryEfuseRecord: the eFuse leg on BOTH rows through the
+// REAL path — a hello carrying the record (model_id + mfg_date) → the
+// tap's hello → the registry → the rows. The daemon's own table is
+// factory-empty, so this is the production shape today: the board
+// turns model_source "efuse" with NO model (a table miss) while the
+// raw record shows; a conf-overridden board keeps model/conf and shows
+// the record beside it; a record-less sighting (older fw) un-claims
+// and clears the columns.
+func TestBoardRowsCarryEfuseRecord(t *testing.T) {
 	e := newEnvModels(t, 10*time.Second, 0, nil, map[string]string{"d75884": "conf-1"},
 		mkBoard("d75884", "xuansi-d75884.local"), mkBoard("aabbcc", "xuansi-aabbcc.local"))
 	c := dialSock(t, e.sock)
+	awaitAudit(t, c, "d75884", "aabbcc")
 
-	// The startup audit lands ITS (model-less) sighting asynchronously;
-	// wait for it so the model sightings below cannot race it.
-	deadline := time.Now().Add(3 * time.Second)
-	for id := int64(1); ; id += 2 {
-		d, a := boardRowOf(t, c, id, "d75884"), boardRowOf(t, c, id+1, "aabbcc")
-		if asStr(d["fw"]) != "" && asStr(a["fw"]) != "" {
-			checkModelPair(t, d, "list_boards d75884 (audit sighting, no model key)", "conf-1", "conf")
-			checkModelPair(t, a, "list_boards aabbcc (audit sighting, no model key)", "", "unknown")
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("startup audit never enriched the boards within 3s: %v / %v", d["fw"], a["fw"])
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// sightings carrying the record: the conf-less board turns efuse
+	// with no model string (the factory-empty table misses the id), the
+	// conf board keeps its override — both show the raw record
+	sightRecord(t, e, c, "aabbcc", 101, 102, map[string]any{"model_id": int64(0x2a7), "mfg_date": "2026-11-20"})
+	sightRecord(t, e, c, "d75884", 103, 104, map[string]any{"model_id": int64(0x2a8), "mfg_date": "2026-11-21"})
+	miss := boardRowOf(t, c, 11, "aabbcc")
+	checkModelPair(t, miss, "list_boards aabbcc (record, factory-empty table)", "", "efuse")
+	checkEfuseRecord(t, miss, "list_boards aabbcc (record, factory-empty table)", 0x2a7, "2026-11-20")
+	conf := boardRowOf(t, c, 12, "d75884")
+	checkModelPair(t, conf, "list_boards d75884 (record under a conf override)", "conf-1", "conf")
+	checkEfuseRecord(t, conf, "list_boards d75884 (record under a conf override)", 0x2a8, "2026-11-21")
+	miss = statusBoardOf(t, c, 13, "aabbcc")
+	checkModelPair(t, miss, "board_status aabbcc (record, factory-empty table)", "", "efuse")
+	checkEfuseRecord(t, miss, "board_status aabbcc (record, factory-empty table)", 0x2a7, "2026-11-20")
+	conf = statusBoardOf(t, c, 14, "d75884")
+	checkModelPair(t, conf, "board_status d75884 (record under a conf override)", "conf-1", "conf")
+	checkEfuseRecord(t, conf, "board_status d75884 (record under a conf override)", 0x2a8, "2026-11-21")
 
-	// sightings carrying a model: the conf-less board turns efuse, the
-	// conf board keeps its override
-	e.srv.reg.Enrich("aabbcc", &replclient.HelloInfo{FwBuild: "deadbee", Model: "burned-1"})
-	e.srv.reg.Enrich("d75884", &replclient.HelloInfo{FwBuild: "deadbee", Model: "burned-2"})
-	checkModelPair(t, boardRowOf(t, c, 11, "aabbcc"), "list_boards aabbcc", "burned-1", "efuse")
-	checkModelPair(t, boardRowOf(t, c, 12, "d75884"), "list_boards d75884", "conf-1", "conf")
-	checkModelPair(t, statusBoardOf(t, c, 13, "aabbcc"), "board_status aabbcc", "burned-1", "efuse")
-	checkModelPair(t, statusBoardOf(t, c, 14, "d75884"), "board_status d75884", "conf-1", "conf")
+	// older fw again (a hello without the record): un-claims and clears
+	sightRecord(t, e, c, "aabbcc", 105, 106, nil)
+	row := boardRowOf(t, c, 15, "aabbcc")
+	checkModelPair(t, row, "list_boards aabbcc after a record-less sighting", "", "unknown")
+	checkEfuseRecord(t, row, "list_boards aabbcc after a record-less sighting", 0, "")
+	row = statusBoardOf(t, c, 16, "aabbcc")
+	checkModelPair(t, row, "board_status aabbcc after a record-less sighting", "", "unknown")
+	checkEfuseRecord(t, row, "board_status aabbcc after a record-less sighting", 0, "")
+}
 
-	// a model-less sighting (older fw) un-claims the efuse model
-	e.srv.reg.Enrich("aabbcc", &replclient.HelloInfo{FwBuild: "deadbee"})
-	checkModelPair(t, boardRowOf(t, c, 15, "aabbcc"), "list_boards aabbcc after a model-less sighting", "", "unknown")
-	checkModelPair(t, statusBoardOf(t, c, 16, "aabbcc"), "board_status aabbcc after a model-less sighting", "", "unknown")
+// TestBoardRowsCarryModelTableHit: the same real path against a
+// registry whose table KNOWS the id — the eFuse leg names the model:
+// model from the table, model_source "efuse", the raw record beside
+// it, on both rows.
+func TestBoardRowsCarryModelTableHit(t *testing.T) {
+	boards := []discover.Board{mkBoard("aabbcc", "xuansi-aabbcc.local")}
+	reg := discover.NewRegistry(nil, nil,
+		discover.WithModelTable(map[uint32]string{0x2a7: "goouuu-s3cam-v1.3"}),
+		discover.WithUSB(func(ctx context.Context) ([]discover.Board, error) {
+			return boards, nil
+		}),
+		discover.WithMDNS(func(ctx context.Context) ([]discover.Board, error) {
+			return boards, nil
+		}),
+	)
+	e := newEnvReg(t, 10*time.Second, 0, reg, boards...)
+	c := dialSock(t, e.sock)
+	awaitAudit(t, c, "aabbcc")
+
+	sightRecord(t, e, c, "aabbcc", 101, 102, map[string]any{"model_id": int64(0x2a7), "mfg_date": "2026-11-20"})
+	row := boardRowOf(t, c, 11, "aabbcc")
+	checkModelPair(t, row, "list_boards aabbcc (table hit)", "goouuu-s3cam-v1.3", "efuse")
+	checkEfuseRecord(t, row, "list_boards aabbcc (table hit)", 0x2a7, "2026-11-20")
+	row = statusBoardOf(t, c, 12, "aabbcc")
+	checkModelPair(t, row, "board_status aabbcc (table hit)", "goouuu-s3cam-v1.3", "efuse")
+	checkEfuseRecord(t, row, "board_status aabbcc (table hit)", 0x2a7, "2026-11-20")
 }
 
 // TestNewSeedsConfModelsFromBoardsFile: the default-registry path —

@@ -69,12 +69,17 @@ type HelloInfo struct {
 	OtaImgState string
 	OtaSha      string
 
-	// Model is the board model the fw derived from its eFuse block —
-	// an additive hello key (no protocol bump; the fw_version
-	// precedent). The fw emits it only when the model block is burned
-	// AND write-locked with a sound CRC; an unburned board sends no
-	// key, so empty means "the board stated no model" — never a model.
-	Model string
+	// The eFuse model record — an additive PAIR of hello keys (no
+	// protocol bump; the fw_version precedent). The fw emits both only
+	// when the board's eFuse model block is burned AND write-locked
+	// with a sound CRC; an unburned board sends neither. HasModel is
+	// the record's presence; ModelID is the numeric model id (a 24-bit
+	// value — the DAEMON holds the table that turns it into a model
+	// string); MfgDate is the manufacturing date, "YYYY-MM-DD". No
+	// record means HasModel false and zero values — never "model id 0".
+	HasModel bool
+	ModelID  uint32
+	MfgDate  string
 }
 
 // parseHello tolerates missing keys (older protocol faces): absent
@@ -123,10 +128,40 @@ func parseHello(res map[string]any) *HelloInfo {
 	h.OtaSlot, _ = res["ota_slot"].(string)
 	h.OtaImgState, _ = res["ota_img_state"].(string)
 	h.OtaSha, _ = res["ota_sha"].(string)
-	// The model overlay rides verbatim (the board's own statement is
-	// ground truth); the absent key stays empty.
-	h.Model, _ = res["model"].(string)
+	// The eFuse model record rides verbatim (the board's own statement
+	// is ground truth). The record stands on its model_id: an absent
+	// key — older fw, or a board whose model block is not burned and
+	// locked — leaves no record at all.
+	if id, ok := helloU32(res["model_id"]); ok {
+		h.HasModel, h.ModelID = true, id
+		h.MfgDate, _ = res["mfg_date"].(string)
+	}
 	return h
+}
+
+// helloU32 reads one unsigned 32-bit hello integer across the shapes a
+// reply map can carry: the wire's normalized int64, and the int /
+// float64 of a JSON-decoded face (budgetMsOf's rule). Anything else —
+// absent, negative, fractional, beyond 32 bits — is not a value.
+func helloU32(v any) (uint32, bool) {
+	var n int64
+	switch x := v.(type) {
+	case int64:
+		n = x
+	case int:
+		n = int64(x)
+	case float64:
+		if x != math.Trunc(x) || x < 0 || x > math.MaxUint32 {
+			return 0, false
+		}
+		n = int64(x)
+	default:
+		return 0, false
+	}
+	if n < 0 || n > math.MaxUint32 {
+		return 0, false
+	}
+	return uint32(n), true
 }
 
 // Hello establishes the connection identity (op hello). observer=true

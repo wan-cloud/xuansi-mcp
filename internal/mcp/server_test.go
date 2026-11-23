@@ -552,20 +552,30 @@ func TestListBoardsLeaseColumnPassesThrough(t *testing.T) {
 	}
 }
 
-// TestListBoardsModelPassesThrough: the model chain's two columns cross
+// TestListBoardsModelPassesThrough: the model chain's columns cross
 // the typed decode — model + model_source on a conf board and on an
-// efuse board; a board whose source is unknown carries NO model key
-// (honest absence, never an empty string); a daemon that sends neither
-// key (an older one) still reads "unknown" — model_source is ALWAYS
-// present, the transport precedent. The column claim is documented on
-// both board tools' Descs.
+// eFuse board whose id the daemon's table knows. A board whose source
+// is unknown carries NO model key (honest absence, never an empty
+// string), and so does an eFuse board whose id the table MISSES — the
+// source tells them apart; a daemon that sends neither key (an older
+// one) still reads "unknown" — model_source is ALWAYS present, the
+// transport precedent. The raw eFuse record (model_id + mfg_date)
+// passes through beside the verdict, present together and only when
+// the daemon's row carries it — a conf override or a table miss does
+// not hide it. The column claims are documented on both board tools'
+// Descs.
 func TestListBoardsModelPassesThrough(t *testing.T) {
 	e, _ := newEnv(t, []step{{result: map[string]any{
 		"boards": []any{
-			map[string]any{"mac6": "d75884", "model": "goouuu-s3cam-v1.3", "model_source": "conf"},
-			map[string]any{"mac6": "aabbcc", "model": "burned-1", "model_source": "efuse"},
-			map[string]any{"mac6": "bb77cc", "model": "", "model_source": "unknown"},
+			map[string]any{"mac6": "d75884", "model": "goouuu-s3cam-v1.3", "model_source": "conf",
+				"model_id": 683, "mfg_date": "2026-11-20"},
+			map[string]any{"mac6": "aabbcc", "model": "table-1", "model_source": "efuse",
+				"model_id": 684, "mfg_date": "2026-11-21"},
+			map[string]any{"mac6": "bb77cc", "model": "", "model_source": "efuse",
+				"model_id": 685, "mfg_date": "2026-11-22"},
+			map[string]any{"mac6": "0d0e0f", "model": "", "model_source": "unknown"},
 			map[string]any{"mac6": "cafe01"},
+			map[string]any{"mac6": "beef00", "model_source": "efuse", "model_id": 0, "mfg_date": ""},
 		},
 	}}}, Options{Holder: "mcp-fixed01"})
 	res := e.call("xuansi_list_boards", nil)
@@ -573,19 +583,22 @@ func TestListBoardsModelPassesThrough(t *testing.T) {
 		t.Fatalf("list_boards failed: %s", resultText(t, res))
 	}
 	boards, _ := structured(t, res)["boards"].([]any)
-	if len(boards) != 4 {
-		t.Fatalf("boards = %#v, want the four-board list", structured(t, res)["boards"])
+	if len(boards) != 6 {
+		t.Fatalf("boards = %#v, want the six-board list", structured(t, res)["boards"])
 	}
 	b0, _ := boards[0].(map[string]any)
 	if b0["model"] != "goouuu-s3cam-v1.3" || b0["model_source"] != "conf" {
 		t.Errorf("conf board = %v/%v, want goouuu-s3cam-v1.3/conf", b0["model"], b0["model_source"])
 	}
+	checkRecordColumn(t, b0, "conf board with a record", true, 683, "2026-11-20")
 	b1, _ := boards[1].(map[string]any)
-	if b1["model"] != "burned-1" || b1["model_source"] != "efuse" {
-		t.Errorf("efuse board = %v/%v, want burned-1/efuse", b1["model"], b1["model_source"])
+	if b1["model"] != "table-1" || b1["model_source"] != "efuse" {
+		t.Errorf("efuse table-hit board = %v/%v, want table-1/efuse", b1["model"], b1["model_source"])
 	}
-	// unknown: the source says so, the model is simply not there
-	for i, why := range map[int]string{2: "unknown-source row", 3: "row from a daemon without the keys"} {
+	checkRecordColumn(t, b1, "efuse table-hit board", true, 684, "2026-11-21")
+	// the table miss and the unknown board: no model either way, the
+	// source (and, for the miss, the record) tells them apart
+	for i, why := range map[int]string{3: "unknown-source row", 4: "row from a daemon without the keys"} {
 		b, _ := boards[i].(map[string]any)
 		if v, present := b["model"]; present {
 			t.Errorf("%s carries model = %#v, want the key absent", why, v)
@@ -593,9 +606,22 @@ func TestListBoardsModelPassesThrough(t *testing.T) {
 		if v, present := b["model_source"]; !present || v != "unknown" {
 			t.Errorf("%s model_source = %#v (present=%v), want the always-present \"unknown\"", why, v, present)
 		}
+		checkRecordColumn(t, b, why, false, 0, "")
 	}
+	miss, _ := boards[2].(map[string]any)
+	if v, present := miss["model"]; present {
+		t.Errorf("table-miss board carries model = %#v, want the key absent (model_source says efuse)", v)
+	}
+	if miss["model_source"] != "efuse" {
+		t.Errorf("table-miss board model_source = %v, want efuse", miss["model_source"])
+	}
+	checkRecordColumn(t, miss, "table-miss board", true, 685, "2026-11-22")
+	// a record is passed through as it came, zero id and empty date
+	// included: the columns ride the record's PRESENCE, not its values
+	zero, _ := boards[5].(map[string]any)
+	checkRecordColumn(t, zero, "zero-id record board", true, 0, "")
 
-	// the column claim is documented where the seat serves it
+	// the column claims are documented where the seat serves it
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	lr, err := e.cl.ListTools(ctx, &mcpsdk.ListToolsParams{})
@@ -607,30 +633,58 @@ func TestListBoardsModelPassesThrough(t *testing.T) {
 		descs[tool.Name] = tool.Description
 	}
 	for _, name := range []string{"xuansi_list_boards", "xuansi_board_status"} {
-		for _, want := range []string{"model_source", "model="} {
+		for _, want := range []string{"model_source", "model=", "model_id", "mfg_date", "predates this board"} {
 			if !strings.Contains(descs[name], want) {
-				t.Errorf("%s Desc lacks %q (the model columns + the conf override's spelling)", name, want)
+				t.Errorf("%s Desc lacks %q (the model columns, the raw record, the conf override's spelling, the stale-table coach)", name, want)
 			}
 		}
 	}
 }
 
+// checkRecordColumn asserts one MCP board row's raw eFuse record
+// columns: absent (neither key), or present together with exactly this
+// id (a JSON number) and date — presence is a fact of its own, so a
+// zero id with an empty date is a PRESENT record, not an absent one.
+func checkRecordColumn(t *testing.T, b map[string]any, where string, present bool, wantID int, wantDate string) {
+	t.Helper()
+	id, hasID := b["model_id"]
+	date, hasDate := b["mfg_date"]
+	if !present {
+		if hasID || hasDate {
+			t.Errorf("%s carries the record columns model_id=%v / mfg_date=%#v, want both keys absent", where, id, date)
+		}
+		return
+	}
+	if !hasID || !hasDate {
+		t.Errorf("%s record columns = model_id present=%v / mfg_date present=%v, want both present", where, hasID, hasDate)
+		return
+	}
+	if id != float64(wantID) || date != wantDate {
+		t.Errorf("%s record columns = model_id %v / mfg_date %v, want %d / %q", where, id, date, wantID, wantDate)
+	}
+}
+
 // TestBoardStatusModelPassesThrough: board_status's board view is the
-// daemon's map verbatim — the model pair rides it untouched, the conf
-// verdict and the honest unknown alike.
+// daemon's map verbatim — the model pair and the raw eFuse record ride
+// it untouched: the conf verdict, the table miss and the honest unknown
+// alike, the record a JSON number.
 func TestBoardStatusModelPassesThrough(t *testing.T) {
 	e, _ := newEnv(t, []step{
 		{result: map[string]any{"connected": false, "board": map[string]any{
-			"mac6": "d75884", "model": "conf-1", "model_source": "conf"}}},
+			"mac6": "d75884", "model": "conf-1", "model_source": "conf",
+			"model_id": 683, "mfg_date": "2026-11-20"}}},
 		{result: map[string]any{"connected": false, "board": map[string]any{
 			"mac6": "aabbcc", "model_source": "unknown"}}},
+		{result: map[string]any{"connected": false, "board": map[string]any{
+			"mac6": "bb77cc", "model_source": "efuse", "model_id": 685, "mfg_date": "2026-11-22"}}},
 	}, Options{Holder: "mcp-fixed01"})
 	res := e.call("xuansi_board_status", map[string]any{"board": "d75884"})
 	if res.IsError {
 		t.Fatalf("board_status failed: %s", resultText(t, res))
 	}
 	if bv := structured(t, res)["board"]; !reflect.DeepEqual(bv, map[string]any{
-		"mac6": "d75884", "model": "conf-1", "model_source": "conf"}) {
+		"mac6": "d75884", "model": "conf-1", "model_source": "conf",
+		"model_id": float64(683), "mfg_date": "2026-11-20"}) {
 		t.Errorf("conf board view = %#v, want the daemon's map verbatim", bv)
 	}
 	res = e.call("xuansi_board_status", map[string]any{"board": "aabbcc"})
@@ -639,7 +693,15 @@ func TestBoardStatusModelPassesThrough(t *testing.T) {
 	}
 	if bv := structured(t, res)["board"]; !reflect.DeepEqual(bv, map[string]any{
 		"mac6": "aabbcc", "model_source": "unknown"}) {
-		t.Errorf("unknown board view = %#v, want the daemon's map verbatim (no model key)", bv)
+		t.Errorf("unknown board view = %#v, want the daemon's map verbatim (no model, no record)", bv)
+	}
+	res = e.call("xuansi_board_status", map[string]any{"board": "bb77cc"})
+	if res.IsError {
+		t.Fatalf("board_status failed: %s", resultText(t, res))
+	}
+	if bv := structured(t, res)["board"]; !reflect.DeepEqual(bv, map[string]any{
+		"mac6": "bb77cc", "model_source": "efuse", "model_id": float64(685), "mfg_date": "2026-11-22"}) {
+		t.Errorf("table-miss board view = %#v, want the daemon's map verbatim (no model, the record shown)", bv)
 	}
 }
 

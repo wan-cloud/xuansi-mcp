@@ -1583,9 +1583,14 @@ const staleAfter = 30 * time.Second
 // stale (no live source AND no crossing within staleAfter —
 // never-crossed counts as infinitely old). The model pair closes the
 // view: model_source is ALWAYS present — conf (a boards.conf model=
-// override), efuse (the model the board's hello sighting carried) or
-// unknown — and model rides along only when a link claims one, so an
-// unknown board has no model key at all (honest absence, not a blank).
+// override), efuse (the board's eFuse model record: the daemon's model
+// table names it, or on a table miss leaves it unnamed), or unknown —
+// and model rides along only when a link names one, so an unknown
+// board and a table miss both have no model key at all (honest
+// absence, not a blank; the source tells them apart). The raw record
+// (model_id + mfg_date) is shown beside the verdict whenever the
+// sighting carried it — under a conf override or a table miss too —
+// and neither key exists without it.
 func (s *Server) boardView(b discover.Board) map[string]any {
 	v := map[string]any{
 		"mac6":     b.MAC6,
@@ -1621,6 +1626,10 @@ func (s *Server) boardView(b discover.Board) map[string]any {
 		v["model"] = b.Model
 	}
 	v["model_source"] = b.ModelSource
+	if b.HasEfuseModel { // the raw eFuse identity, whatever the verdict above
+		v["model_id"] = b.ModelID
+		v["mfg_date"] = b.MfgDate
+	}
 	s.mu.Lock()
 	db := s.sups[b.MAC6]
 	var last time.Time

@@ -179,42 +179,66 @@ func TestParseHelloResetHistoryFaces(t *testing.T) {
 	}
 }
 
-// TestParseHelloModel: the hello `model` overlay (an additive key, no
-// protocol bump) parses into HelloInfo.Model verbatim. A board whose fw
-// predates the key — or whose model block is not burned and locked —
-// sends no key, and that must stay EMPTY: the registry's model chain
-// reads empty as "no model from the board", never as a model.
-func TestParseHelloModel(t *testing.T) {
+// TestParseHelloModelRecord: the hello eFuse model record — the
+// additive `model_id` (integer) + `mfg_date` ("YYYY-MM-DD") pair, no
+// protocol bump — parses into HelloInfo verbatim, with HasModel as the
+// pair's presence. A board whose fw predates the keys, or whose eFuse
+// model block is not burned and locked, sends neither: HasModel stays
+// false and the values zero — never "model id 0". The retired string
+// `model` key is not a record.
+func TestParseHelloModelRecord(t *testing.T) {
 	c, b := newTestClient(t)
-	withModel := defaultHello()
-	withModel["model"] = "goouuu-s3cam-v1.3"
-	b.setHello(withModel)
+	withRecord := defaultHello()
+	withRecord["protocol_ver"] = int64(11)
+	withRecord["model_id"] = int64(0x2a7)
+	withRecord["mfg_date"] = "2026-11-20"
+	b.setHello(withRecord)
+
 	h, err := c.Hello(false, "daemon-test")
 	if err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	if h.Model != "goouuu-s3cam-v1.3" {
-		t.Fatalf("Model = %q, want the hello-carried model verbatim", h.Model)
+	if !h.HasModel || h.ModelID != 0x2a7 || h.MfgDate != "2026-11-20" {
+		t.Fatalf("model record = %v/0x%x/%q, want present, 0x2a7, 2026-11-20", h.HasModel, h.ModelID, h.MfgDate)
 	}
-	if h.FwBuild != "deadbee" || h.Chip != "ESP32-S3" || h.ProtocolVer != 5 {
-		t.Fatalf("the model key must not disturb the other fields: %#v", h)
+	if h.ProtocolVer != 11 || h.FwBuild != "deadbee" || h.FwVersion != "0.2.0" || h.Chip != "ESP32-S3" {
+		t.Fatalf("the record must not disturb the other fields: %#v", h)
 	}
 
-	// Older fw: no key → empty.
+	// Older fw: neither key → no record, zero values.
 	b.setHello(defaultHello())
 	h2, err := c.Hello(false, "daemon-test")
 	if err != nil {
 		t.Fatalf("old-board hello: %v", err)
 	}
-	if h2.Model != "" {
-		t.Fatalf("absent model key = %q, want empty", h2.Model)
+	if h2.HasModel || h2.ModelID != 0 || h2.MfgDate != "" {
+		t.Fatalf("absent record = %v/0x%x/%q, want absent with zero values", h2.HasModel, h2.ModelID, h2.MfgDate)
 	}
 
-	// A non-string value is not a model (the tolerant-parser rule).
-	odd := defaultHello()
-	odd["model"] = int64(7)
-	if h3 := parseHello(odd); h3.Model != "" {
-		t.Fatalf("non-string model = %q, want empty", h3.Model)
+	// The integer shapes a reply map can carry: the wire's normalized
+	// int64, and the int / float64 of a JSON-decoded face.
+	for _, v := range []any{int64(24), int(24), float64(24)} {
+		if h := parseHello(map[string]any{"model_id": v}); !h.HasModel || h.ModelID != 24 {
+			t.Errorf("model_id %T(%v) = %v/0x%x, want present/0x18", v, v, h.HasModel, h.ModelID)
+		}
+	}
+	// Anything that is not a 32-bit unsigned integer is no record.
+	for _, v := range []any{nil, int64(-1), int64(1) << 32, 2.5, "7", true} {
+		if h := parseHello(map[string]any{"model_id": v, "mfg_date": "2026-11-20"}); h.HasModel || h.ModelID != 0 || h.MfgDate != "" {
+			t.Errorf("model_id %T(%v) parsed as a record (%v/0x%x/%q), want none", v, v, h.HasModel, h.ModelID, h.MfgDate)
+		}
+	}
+	// The 24-bit ceiling itself is inside the domain (the fw's ids are u24).
+	if h := parseHello(map[string]any{"model_id": int64(0xffffff)}); !h.HasModel || h.ModelID != 0xffffff {
+		t.Fatalf("model_id 0xffffff = %v/0x%x, want present/0xffffff", h.HasModel, h.ModelID)
+	}
+	// A non-string mfg_date reads empty, the record itself still stands.
+	if h := parseHello(map[string]any{"model_id": int64(7), "mfg_date": int64(20261120)}); !h.HasModel || h.ModelID != 7 || h.MfgDate != "" {
+		t.Fatalf("non-string mfg_date = %v/0x%x/%q, want present/0x7/\"\"", h.HasModel, h.ModelID, h.MfgDate)
+	}
+	// The retired string key is not a record.
+	if h := parseHello(map[string]any{"model": "goouuu-s3cam-v1.3"}); h.HasModel {
+		t.Fatalf("the retired `model` string key parsed as a record: %#v", h)
 	}
 }
 

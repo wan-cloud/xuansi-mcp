@@ -1165,7 +1165,7 @@ func TestLoadBoardsFileOldShapesIdentical(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// the model chain on the registry: conf → hello (efuse) → unknown
+// the model chain on the registry: conf → eFuse record (model table) → unknown
 // ---------------------------------------------------------------------------
 
 // modelOf resolves one board and answers its model pair.
@@ -1178,68 +1178,274 @@ func modelOf(t *testing.T, r *Registry, mac6 string) (model, source string) {
 	return b.Model, b.ModelSource
 }
 
+// sighting is one hello sighting carrying the eFuse model record —
+// what a board with a burned, locked model block answers.
+func sighting(id uint32, date string) *replclient.HelloInfo {
+	return &replclient.HelloInfo{FwBuild: "03aff57", HasModel: true, ModelID: id, MfgDate: date}
+}
+
+// entryOf resolves one board and answers its whole entry.
+func entryOf(t *testing.T, r *Registry, mac6 string) Board {
+	t.Helper()
+	b, err := r.Resolve(mac6)
+	if err != nil {
+		t.Fatalf("Resolve(%s): %v", mac6, err)
+	}
+	return b
+}
+
+// checkRecord asserts one entry's raw eFuse record: absent (all zero),
+// or present with exactly this id and date.
+func checkRecord(t *testing.T, e Board, where string, wantID uint32, wantDate string) {
+	t.Helper()
+	if wantID == 0 && wantDate == "" {
+		if e.HasEfuseModel || e.ModelID != 0 || e.MfgDate != "" {
+			t.Errorf("%s: raw record = %v/0x%x/%q, want none", where, e.HasEfuseModel, e.ModelID, e.MfgDate)
+		}
+		return
+	}
+	if !e.HasEfuseModel || e.ModelID != wantID || e.MfgDate != wantDate {
+		t.Errorf("%s: raw record = %v/0x%x/%q, want present/0x%x/%q", where, e.HasEfuseModel, e.ModelID, e.MfgDate, wantID, wantDate)
+	}
+}
+
+// TestApplyModelTableHit: a record whose id is in the daemon's model
+// table names the model — ModelSource "efuse" — and the raw record
+// passes through beside it, verbatim.
+func TestApplyModelTableHit(t *testing.T) {
+	logs := captureLogs(t)
+	r := NewRegistry(nil, nil, WithModelTable(map[uint32]string{0x2a7: "goouuu-s3cam-v1.3"}))
+	e := Board{Hello: sighting(0x2a7, "2026-11-20")}
+	r.applyModel("d75884", &e)
+	if e.Model != "goouuu-s3cam-v1.3" || e.ModelSource != ModelSourceEfuse {
+		t.Errorf("verdict = %q/%q, want goouuu-s3cam-v1.3/efuse", e.Model, e.ModelSource)
+	}
+	checkRecord(t, e, "table hit", 0x2a7, "2026-11-20")
+	if strings.Contains(logs.String(), "predates the board") {
+		t.Errorf("a table hit coached:\n%s", logs.String())
+	}
+}
+
+// TestApplyModelTableMiss: a record whose id is NOT in the table is
+// still the eFuse leg — ModelSource "efuse" with an EMPTY model — and
+// the raw record still passes through (the id is real; only this
+// daemon's table lacks it). The coach says so once per board and id:
+// not once per sweep, and not again for the same sighting re-applied.
+func TestApplyModelTableMiss(t *testing.T) {
+	logs := captureLogs(t)
+	coach := func() int { return strings.Count(logs.String(), "this daemon's model table predates the board") }
+	r := NewRegistry(nil, nil, WithModelTable(map[uint32]string{1: "other-1"}))
+	e := Board{Hello: sighting(0x2a7, "2026-11-20")}
+	r.applyModel("d75884", &e)
+	if e.Model != "" || e.ModelSource != ModelSourceEfuse {
+		t.Errorf("verdict = %q/%q, want empty/efuse (the record is real, the table lacks it)", e.Model, e.ModelSource)
+	}
+	checkRecord(t, e, "table miss", 0x2a7, "2026-11-20")
+	if coach() != 1 {
+		t.Fatalf("coach lines = %d, want 1:\n%s", coach(), logs.String())
+	}
+	for _, want := range []string{"unknown model_id", "0x0002a7", "d75884"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("the coach lacks %q:\n%s", want, logs.String())
+		}
+	}
+	// the next sweep re-resolves the very same entry: no second coach
+	r.applyModel("d75884", &e)
+	// …as does a fresh copy of it (every sweep builds a new entry map)
+	again := e
+	r.applyModel("d75884", &again)
+	if e.Model != "" || e.ModelSource != ModelSourceEfuse || coach() != 1 {
+		t.Errorf("re-applied miss = %q/%q with %d coach lines, want empty/efuse and still 1", e.Model, e.ModelSource, coach())
+	}
+	// another id is another coach
+	e.Hello = sighting(0x2a8, "2026-11-20")
+	r.applyModel("d75884", &e)
+	if coach() != 2 {
+		t.Errorf("coach lines after a second unknown id = %d, want 2", coach())
+	}
+	// a record-less sighting clears the record, and coaches nothing
+	e.Hello = &replclient.HelloInfo{}
+	r.applyModel("d75884", &e)
+	if e.Model != "" || e.ModelSource != ModelSourceUnknown || coach() != 2 {
+		t.Errorf("record-less sighting = %q/%q with %d coach lines, want empty/unknown and still 2", e.Model, e.ModelSource, coach())
+	}
+	checkRecord(t, e, "after a record-less sighting", 0, "")
+	// the record coming back is a new sighting, and coaches again
+	e.Hello = sighting(0x2a8, "2026-11-20")
+	r.applyModel("d75884", &e)
+	if coach() != 3 {
+		t.Errorf("coach lines after the record returned = %d, want 3", coach())
+	}
+}
+
+// TestConfOverridesEfuse: the conf override outranks the eFuse leg —
+// Model is the conf string with ModelSource "conf", whatever the table
+// says or lacks — while the raw record still shows beside it; a table
+// miss under an override is nothing to coach about.
+func TestConfOverridesEfuse(t *testing.T) {
+	logs := captureLogs(t)
+	hit := NewRegistry(nil, nil,
+		WithModels(map[string]string{"d75884": "conf-1"}),
+		WithModelTable(map[uint32]string{0x2a7: "table-1"}))
+	e := Board{Hello: sighting(0x2a7, "2026-11-20")}
+	hit.applyModel("d75884", &e)
+	if e.Model != "conf-1" || e.ModelSource != ModelSourceConf {
+		t.Errorf("conf board with a table hit = %q/%q, want conf-1/conf (the override always wins)", e.Model, e.ModelSource)
+	}
+	checkRecord(t, e, "conf board", 0x2a7, "2026-11-20")
+
+	miss := NewRegistry(nil, nil, WithModels(map[string]string{"d75884": "conf-1"})) // the factory-empty table
+	e = Board{Hello: sighting(0x2a7, "2026-11-20")}
+	miss.applyModel("d75884", &e)
+	if e.Model != "conf-1" || e.ModelSource != ModelSourceConf {
+		t.Errorf("conf board with a table miss = %q/%q, want conf-1/conf", e.Model, e.ModelSource)
+	}
+	checkRecord(t, e, "conf board, table miss", 0x2a7, "2026-11-20")
+	if strings.Contains(logs.String(), "predates the board") {
+		t.Errorf("a conf-overridden board was coached about the table:\n%s", logs.String())
+	}
+
+	// another board's override covers only that board
+	other := NewRegistry(nil, nil, WithModels(map[string]string{"1a2b3c": "theirs"}))
+	e = Board{Hello: sighting(0x2a7, "2026-11-20")}
+	other.applyModel("d75884", &e)
+	if e.Model != "" || e.ModelSource != ModelSourceEfuse {
+		t.Errorf("record board with no override of its own = %q/%q, want empty/efuse", e.Model, e.ModelSource)
+	}
+}
+
+// TestModelTableFactoryEmpty: the daemon's own table ships empty — no
+// real allocation yet — so a registry built without WithModelTable
+// misses every id. WithModelTable copies what it is given (a caller
+// mutating its map afterwards changes nothing) and keeps only values
+// in the model string domain, dropping the rest with a warning that
+// names the id: the table is the one other door a model string enters
+// the chain through, and `model` stays one string form or is withheld.
+func TestModelTableFactoryEmpty(t *testing.T) {
+	logs := captureLogs(t)
+	if n := len(NewRegistry(nil, nil).modelTable); n != 0 {
+		t.Fatalf("the factory model table holds %d entry(ies), want none until the first real allocation", n)
+	}
+	src := map[uint32]string{1: "ok-1", 2: "Bad_Value", 3: strings.Repeat("x", 30)}
+	r := NewRegistry(nil, nil, WithModelTable(src))
+	src[1] = "mutated-after"
+	src[4] = "late"
+	if got := r.modelTable; !reflect.DeepEqual(got, map[uint32]string{1: "ok-1"}) {
+		t.Errorf("model table = %#v, want exactly {1: ok-1} (copied, validated)", got)
+	}
+	if n := strings.Count(logs.String(), "outside the model domain"); n != 2 {
+		t.Errorf("out-of-domain warnings = %d, want 2:\n%s", n, logs.String())
+	}
+	for _, want := range []string{"0x000002", "0x000003"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("the warnings lack the id %s:\n%s", want, logs.String())
+		}
+	}
+}
+
 // TestModelSourceChain: Board.Model/ModelSource resolve through the
-// chain — the boards.conf override always wins, else the model the
-// hello sighting carried (the eFuse leg, backfilled at Enrich), else
-// unknown with NO model. Like the rest of the last-known identity the
-// verdict survives refreshes, and a sighting that carries no model
-// (older fw) never claims one.
+// chain — the boards.conf override always wins; else the eFuse record
+// the hello sighting carried is looked up in the daemon's model table
+// (the eFuse leg, backfilled at Enrich); else unknown with NO model.
+// The raw record rides beside the verdict whatever it is and survives
+// refreshes with it; a sighting without one (older fw) clears it.
 func TestModelSourceChain(t *testing.T) {
+	logs := captureLogs(t)
 	f := &fakeSources{}
-	r := NewRegistry(nil, nil, WithModels(map[string]string{"d75884": "conf-model"}))
+	r := NewRegistry(nil, nil,
+		WithModels(map[string]string{"d75884": "conf-model"}),
+		WithModelTable(map[uint32]string{0x2a7: "table-1", 0x2a8: "table-2"}))
 	r.usb, r.mdns = f.usbFn, f.mdnsFn
 	f.set([]Board{usbA}, []Board{mdnsB})
 	if err := r.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
-	// conf: the override names the model before any sighting
-	if m, src := modelOf(t, r, "d75884"); m != "conf-model" || src != ModelSourceConf {
-		t.Errorf("conf board = %q/%q, want conf-model/conf", m, src)
+	// conf: the override names the model before any sighting; no record yet
+	e := entryOf(t, r, "d75884")
+	if e.Model != "conf-model" || e.ModelSource != ModelSourceConf {
+		t.Errorf("conf board = %q/%q, want conf-model/conf", e.Model, e.ModelSource)
 	}
+	checkRecord(t, e, "conf board before any sighting", 0, "")
 	// unknown: no override, never crossed
 	if m, src := modelOf(t, r, "1a2b3c"); m != "" || src != ModelSourceUnknown {
 		t.Errorf("uncrossed board = %q/%q, want empty/unknown", m, src)
 	}
-	// efuse: the sighting's model backfills a conf-less board
-	r.Enrich("1a2b3c", &replclient.HelloInfo{FwBuild: "b310378", Model: "burned-1"})
-	if m, src := modelOf(t, r, "1a2b3c"); m != "burned-1" || src != ModelSourceEfuse {
-		t.Errorf("enriched board = %q/%q, want burned-1/efuse", m, src)
+	checkRecord(t, entryOf(t, r, "1a2b3c"), "uncrossed board", 0, "")
+	// efuse: the sighting's record, looked up in the table
+	r.Enrich("1a2b3c", sighting(0x2a7, "2026-11-20"))
+	if m, src := modelOf(t, r, "1a2b3c"); m != "table-1" || src != ModelSourceEfuse {
+		t.Errorf("enriched board = %q/%q, want table-1/efuse", m, src)
 	}
-	// conf wins over a sighting that carries a different model
-	r.Enrich("d75884", &replclient.HelloInfo{Model: "burned-2"})
+	checkRecord(t, entryOf(t, r, "1a2b3c"), "enriched board", 0x2a7, "2026-11-20")
+	// conf wins over a record — the raw identity still shows beside it
+	r.Enrich("d75884", sighting(0x2a8, "2026-11-21"))
 	if m, src := modelOf(t, r, "d75884"); m != "conf-model" || src != ModelSourceConf {
-		t.Errorf("conf board after a model sighting = %q/%q, want conf-model/conf (the override always wins)", m, src)
+		t.Errorf("conf board after a record sighting = %q/%q, want conf-model/conf (the override always wins)", m, src)
 	}
-	// a model-less sighting (older fw) is not efuse: it un-claims honestly
+	checkRecord(t, entryOf(t, r, "d75884"), "conf board with a record", 0x2a8, "2026-11-21")
+	// a record-less sighting (older fw) is not efuse: it un-claims and
+	// clears the raw identity honestly
 	r.Enrich("1a2b3c", &replclient.HelloInfo{FwBuild: "b310378"})
 	if m, src := modelOf(t, r, "1a2b3c"); m != "" || src != ModelSourceUnknown {
-		t.Errorf("board after a model-less sighting = %q/%q, want empty/unknown", m, src)
+		t.Errorf("board after a record-less sighting = %q/%q, want empty/unknown", m, src)
 	}
-	// last-known: the pair survives a sweep that crosses nothing (the
-	// boards go stale, their identity stays)
-	r.Enrich("1a2b3c", &replclient.HelloInfo{Model: "burned-1"})
+	checkRecord(t, entryOf(t, r, "1a2b3c"), "after a record-less sighting", 0, "")
+	// last-known: verdict and raw record survive a sweep that crosses
+	// nothing (the boards go stale, their identity stays)
+	r.Enrich("1a2b3c", sighting(0x2a7, "2026-11-20"))
 	f.set(nil, nil)
 	if err := r.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh 2: %v", err)
 	}
-	if m, src := modelOf(t, r, "1a2b3c"); m != "burned-1" || src != ModelSourceEfuse {
-		t.Errorf("stale board = %q/%q, want burned-1/efuse kept", m, src)
+	if m, src := modelOf(t, r, "1a2b3c"); m != "table-1" || src != ModelSourceEfuse {
+		t.Errorf("stale board = %q/%q, want table-1/efuse kept", m, src)
 	}
+	checkRecord(t, entryOf(t, r, "1a2b3c"), "stale board", 0x2a7, "2026-11-20")
 	if m, src := modelOf(t, r, "d75884"); m != "conf-model" || src != ModelSourceConf {
 		t.Errorf("stale conf board = %q/%q, want conf-model/conf kept", m, src)
 	}
+	checkRecord(t, entryOf(t, r, "d75884"), "stale conf board", 0x2a8, "2026-11-21")
+	// nothing above had a reason to coach: every id was in the table
+	if strings.Contains(logs.String(), "predates the board") {
+		t.Errorf("an in-table record coached:\n%s", logs.String())
+	}
 
-	// zero-config (no model map): every entry still states its verdict
+	// the production shape — no conf map, the factory-empty table: a
+	// record is still the eFuse leg, with no model string to show
 	r2, f2 := newFakeRegistry(nil)
 	f2.set([]Board{usbA}, []Board{mdnsB})
 	if err := r2.Refresh(context.Background()); err != nil {
-		t.Fatalf("zero-config Refresh: %v", err)
+		t.Fatalf("factory-table Refresh: %v", err)
 	}
 	for _, mac6 := range []string{"d75884", "1a2b3c"} {
-		if m, src := modelOf(t, r2, mac6); m != "" || src != ModelSourceUnknown {
-			t.Errorf("zero-config %s = %q/%q, want empty/unknown", mac6, m, src)
+		b := entryOf(t, r2, mac6)
+		if b.Model != "" || b.ModelSource != ModelSourceUnknown {
+			t.Errorf("factory-table %s = %q/%q, want empty/unknown", mac6, b.Model, b.ModelSource)
+		}
+		checkRecord(t, b, "factory-table "+mac6, 0, "")
+	}
+	r2.Enrich("1a2b3c", sighting(0x2a7, "2026-11-20"))
+	if m, src := modelOf(t, r2, "1a2b3c"); m != "" || src != ModelSourceEfuse {
+		t.Errorf("factory-table record board = %q/%q, want empty/efuse (a miss, coached)", m, src)
+	}
+	checkRecord(t, entryOf(t, r2, "1a2b3c"), "factory-table record board", 0x2a7, "2026-11-20")
+	if n := strings.Count(logs.String(), "predates the board"); n != 1 {
+		t.Errorf("coach lines = %d, want exactly the factory-table miss (1):\n%s", n, logs.String())
+	}
+	// …and said once: the sweeps that re-resolve the live entry (it is
+	// still seen by both faces) are not news, and the miss outlives them
+	for i := 0; i < 3; i++ {
+		if err := r2.Refresh(context.Background()); err != nil {
+			t.Fatalf("factory-table Refresh %d: %v", i+2, err)
 		}
 	}
+	if n := strings.Count(logs.String(), "predates the board"); n != 1 {
+		t.Errorf("coach lines after three sweeps = %d, want still 1 (once per board and id, not once per sweep):\n%s", n, logs.String())
+	}
+	if m, src := modelOf(t, r2, "1a2b3c"); m != "" || src != ModelSourceEfuse {
+		t.Errorf("factory-table record board after sweeps = %q/%q, want empty/efuse kept", m, src)
+	}
+	checkRecord(t, entryOf(t, r2, "1a2b3c"), "factory-table record board after sweeps", 0x2a7, "2026-11-20")
 }
 
 // TestPinCarriesConfModel: both pin paths stamp the conf model — a
@@ -1305,9 +1511,11 @@ func TestSplitTokenTail(t *testing.T) {
 	}
 }
 
-// TestIsModel: the model domain every link of the chain shares,
-// ^[a-z0-9][a-z0-9.-]{0,28}$ — 1..29 chars, lowercase alnum first,
-// then lowercase alnum, '.' or '-'.
+// TestIsModel: the model STRING domain — ^[a-z0-9][a-z0-9.-]{0,28}$,
+// 1..29 chars, lowercase alnum first, then lowercase alnum, '.' or '-'.
+// It gates both doors a model string enters the chain through (the
+// boards.conf model= token and the daemon's model table's values), so
+// `model` is one string form wherever it comes from.
 func TestIsModel(t *testing.T) {
 	for _, s := range []string{"a", "0", "goouuu-s3cam-v1.3", "v6.board-1", "a.b-c.d", strings.Repeat("m", 29)} {
 		if !isModel(s) {

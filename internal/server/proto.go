@@ -45,7 +45,7 @@
 //
 // # Requests
 //
-//	list_boards    {}                          → {boards:[{mac6,alias,sources,host,ip,port,usb_path,fw,fw_version,model?,model_source,protocol_ver,boot_epoch?,reset_reason?,chip?,ota_slot?,ota_img_state?,ota_sha?,last_seen?,transport,last_seen_age_ms,stale,lease:{holder,since,session,grace_deadline?}|null}],mdns_error}   (model/model_source: the model chain's verdict on both rows — model_source is always conf | efuse | unknown; model is absent when unknown)
+//	list_boards    {}                          → {boards:[{mac6,alias,sources,host,ip,port,usb_path,fw,fw_version,model?,model_source,model_id?,mfg_date?,protocol_ver,boot_epoch?,reset_reason?,chip?,ota_slot?,ota_img_state?,ota_sha?,last_seen?,transport,last_seen_age_ms,stale,lease:{holder,since,session,grace_deadline?}|null}],mdns_error}   (model/model_source: the model chain's verdict on both rows — model_source is always conf | efuse | unknown; model is absent when unknown, and also when efuse names a record the daemon's model table lacks; model_id/mfg_date: the raw eFuse record, present together — whatever the verdict — iff the sighting carried one)
 //	board_status   {board}                      → {board:{...}, connected, transport, last_seen_age_ms, stale, lease:{holder,since,session,grace_deadline}?|null, scripts?, scripts_error?}
 //	lease          {board, holder?, transport?} → {board, holder, session, transport:"tcp"|"usb", rebooted:bool, transport_note?}
 //	release        {board, holder?}             → {board, holder}
