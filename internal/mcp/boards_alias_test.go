@@ -8,6 +8,7 @@ package mcp
 // this seat would see, end to end).
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -70,8 +71,10 @@ func TestBoardsUnaliasToolCrossing(t *testing.T) {
 // TestBoardsAliasUnaliasSchema: board+alias are required on alias
 // (board alone on unalias); the descs state the alias contract —
 // where the alias lives, what the daemon may touch, what it refuses,
-// and the two honest limits (uniqueness is a now-check; a hand edit
-// racing a write is last-writer-wins).
+// and the honest limits (uniqueness is a now-check; a hand edit
+// applies at the next daemon start and races a write
+// last-writer-wins). The payload refusal names the SAFE edit, and
+// neither desc names the destructive one.
 func TestBoardsAliasUnaliasSchema(t *testing.T) {
 	e, _ := newEnv(t, nil, Options{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -113,13 +116,20 @@ func TestBoardsAliasUnaliasSchema(t *testing.T) {
 			"name field",                 // what the daemon touches on an existing line
 			"NOW",                        // uniqueness is a now-check
 			"last writer",                // the hand-edit race, told straight
+			"next daemon start",          // …and when a hand edit applies
 			"No lease",                   // holder-less, no board contact
 		},
 		"xuansi_boards_unalias": {
 			"boards.conf",
 			"restart",
-			"pure",       // only a pure alias line is deleted
-			"by hand",    // …anything else is a hand edit
+			"pure", // only a pure alias line is deleted
+			// the payload refusal coaches the SAFE edit — rename the
+			// name to the board's own mac6 — and says how, from here
+			"parses to NOTHING",
+			"rename the name to the board's own mac6",
+			"xuansi_boards_alias{board, alias: <its mac6>}",
+			"keeps the endpoint and the model",
+			"next daemon start",
 			"idempotent", // a never-aliased board answers success
 			"No lease",
 		},
@@ -134,14 +144,28 @@ func TestBoardsAliasUnaliasSchema(t *testing.T) {
 			}
 		}
 	}
+
+	// Neither Desc may instruct the destructive edit: a boards.conf
+	// line needs its name, and one without it (or no line at all)
+	// parses to nothing — the endpoint and the model= are lost at the
+	// next start, with only a warning in the log.
+	for _, name := range []string{"xuansi_boards_alias", "xuansi_boards_unalias"} {
+		lower := strings.ToLower(byName[name].Description)
+		for _, bad := range []string{"delete the name", "delete the line", "delete it", "remove the name", "remove the line", "by deleting", "deleting the name", "deleting the line"} {
+			if strings.Contains(lower, bad) {
+				t.Errorf("%s description instructs the destructive edit %q: %q", name, bad, byName[name].Description)
+			}
+		}
+	}
 }
 
 // TestBoardsAliasDaemonRefusalCrossing: the daemon's refusal crosses
 // as the tool's error text unaltered — the validator's words, coach
 // and file path included, not a client-side re-wording. (The line is
-// the registry's real refusal format, byte for byte.)
+// a copy of the registry's real refusal format; the format itself is
+// pinned beside the code that produces it, in the discover package.)
 func TestBoardsAliasDaemonRefusalCrossing(t *testing.T) {
-	const daemonLine = `discover: unalias d75884: clearing the alias would take more than the alias with it: /path/to/boards.conf names it as "cam=d75884@10.1.11.204:7777" — the daemon edits only the name field and deletes only a pure alias=mac6 line; edit the file by hand`
+	const daemonLine = `discover: unalias d75884: clearing the alias would take more than the alias with it: /path/to/boards.conf names it as "cam=d75884@10.1.11.204:7777 model=esp32s3-dev" — a boards.conf line needs its name (without it the @endpoint and model= on that line are lost at the next start), so the daemon deletes only a pure alias=mac6 line; to clear this alias, rename the name to the board's mac6 (here "cam" → "d75884", the rest of the line unchanged) — by hand, or by setting the alias to d75884`
 	e, _ := newEnv(t, []step{{rerr: &server.RPCError{Class: "server", Msg: daemonLine}}}, Options{})
 	res := e.call("xuansi_boards_unalias", map[string]any{"board": "d75884"})
 	if !res.IsError {
@@ -226,9 +250,11 @@ func listedBoard(t *testing.T, e *env, mac6 string) map[string]any {
 // from the seat. Generation 1 sets an alias (list_boards shows it at
 // once, board_status resolves by it) and unaliases it again;
 // generation 2 — a restarted daemon over the same file — reads the
-// removal, still refuses the payload line with its coach, and sets
-// another alias; generation 3 reads that one. The file's payload line
-// is byte-identical from start to finish.
+// removal, still refuses the payload line — with the safe recipe,
+// which is then followed from the seat: the alias set to the board's
+// own mac6 renames the name and keeps endpoint and model — and sets
+// another alias; generation 3 reads both. The file's payload line
+// differs from start to finish in its name alone.
 func TestBoardsAliasRestartPersistence(t *testing.T) {
 	const header = "# bench boards\ncam=1a2b3c@10.1.11.204:7777 model=esp32s3-dev\n"
 	conf := filepath.Join(t.TempDir(), "boards.conf")
@@ -299,8 +325,35 @@ func TestBoardsAliasRestartPersistence(t *testing.T) {
 		if !res.IsError {
 			t.Fatalf("unalias of a payload line succeeded: %#v", res)
 		}
-		if got := resultText(t, res); !strings.Contains(got, "by hand") || !strings.Contains(got, conf) {
-			t.Fatalf("refusal = %q, want the hand-edit coach naming %s", got, conf)
+		// …with the SAFE recipe (rename the name to the board's own
+		// mac6; the line keeps its payload) and the path — never an
+		// instruction that loses the payload
+		got := resultText(t, res)
+		for _, safe := range []string{`rename the name to the board's mac6`, `"cam" → "1a2b3c"`, "or by setting the alias to 1a2b3c", conf} {
+			if !strings.Contains(got, safe) {
+				t.Errorf("refusal lacks the safe recipe %q: %q", safe, got)
+			}
+		}
+		for _, bad := range []string{"delete the name", "delete the line", "remove the name", "by deleting"} {
+			if strings.Contains(strings.ToLower(got), bad) {
+				t.Errorf("refusal instructs the destructive edit %q: %q", bad, got)
+			}
+		}
+		if b, _ := os.ReadFile(conf); !bytes.Equal(b, []byte(header)) {
+			t.Fatalf("the refusal wrote: %q", b)
+		}
+
+		// the recipe, followed from the seat: one call renames the
+		// name; endpoint and model stay, live and after the restart
+		res = e.call("xuansi_boards_alias", map[string]any{"board": "cam", "alias": "1a2b3c"})
+		if res.IsError {
+			t.Fatalf("boards_alias{board: cam, alias: 1a2b3c}: %s", resultText(t, res))
+		}
+		if m := structured(t, res); m["aliased"] != "1a2b3c" || m["alias"] != "1a2b3c" {
+			t.Fatalf("boards_alias reply = %#v", m)
+		}
+		if row := listedBoard(t, e, "1a2b3c"); row["alias"] != "1a2b3c" || row["model"] != "esp32s3-dev" || row["model_source"] != "conf" {
+			t.Fatalf("after the recipe the board = %#v, want alias = its mac6 with the conf model intact", row)
 		}
 
 		res = e.call("xuansi_boards_alias", map[string]any{"board": "d75884", "alias": "spare"})
@@ -312,18 +365,24 @@ func TestBoardsAliasRestartPersistence(t *testing.T) {
 	}
 	srv.Close()
 
-	// generation 3: the alias set in generation 2 is still there
+	// generation 3: the alias set in generation 2 is still there, and
+	// so is the renamed payload line — endpoint and model included
 	srv = startAliasDaemon(t, sock, conf, boards...)
 	t.Run("generation 3 (restarted again)", func(t *testing.T) {
 		e := wireMCPSock(t, sock, Options{}, nil)
 		if row := listedBoard(t, e, "d75884"); row["alias"] != "spare" {
 			t.Fatalf("the restart lost the alias: %#v", row)
 		}
+		if row := listedBoard(t, e, "1a2b3c"); row["alias"] != "1a2b3c" || row["model"] != "esp32s3-dev" || row["model_source"] != "conf" {
+			t.Fatalf("the renamed payload line after the restart: %#v", row)
+		}
 	})
 	srv.Close()
 
-	// the file, byte for byte: the payload line exactly as written, one line appended
-	if got, err := os.ReadFile(conf); err != nil || string(got) != header+"spare=d75884\n" {
-		t.Fatalf("boards.conf = %q (%v)\n            want %q", got, err, header+"spare=d75884\n")
+	// the file, byte for byte: the payload line with ONLY its name
+	// changed (the safe recipe), one line appended
+	renamed := strings.Replace(header, "cam=1a2b3c@", "1a2b3c=1a2b3c@", 1)
+	if got, err := os.ReadFile(conf); err != nil || string(got) != renamed+"spare=d75884\n" {
+		t.Fatalf("boards.conf = %q (%v)\n            want %q", got, err, renamed+"spare=d75884\n")
 	}
 }

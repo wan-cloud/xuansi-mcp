@@ -2054,7 +2054,9 @@ func (s *Server) hBoardsAlias(req *Request) (any, error) {
 // inverse of boards_alias, through the same selector and the same
 // validate → edit → sync order. Idempotent-shaped: a board that was
 // never aliased answers success. A line carrying more than the alias
-// is refused with the hand-edit coach and nothing is written (D6).
+// is refused with the coach naming the safe edit (rename the name to
+// the board's own mac6 — one boards_alias call) and nothing is
+// written (D6).
 // No lease, no board contact.
 func (s *Server) hBoardsUnalias(req *Request) (any, error) {
 	b, rerr := s.resolve(req.Board)

@@ -22,12 +22,15 @@ package discover
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -43,10 +46,17 @@ var (
 // ErrLineHasPayload is the unalias refusal: clearing the alias would
 // take more than the alias with it. Two shapes ride it — the board's
 // line carries an @endpoint, key=value tokens or a note beside the
-// name; or boards.conf names the board on more than one line (delete
+// name; or boards.conf names the board on more than one line (remove
 // the winner, and a shadowed line resurfaces at the next start).
-// Either way the edit is a human's: the error names the file and the
-// line(s), and nothing is written.
+//
+// The refusal always names the SAFE edit, never the one that destroys
+// the payload. A boards.conf line needs its name: without it the whole
+// line — @endpoint and model= included — parses to nothing, and is
+// lost at the next start with only a warning in the log. So an alias
+// is cleared off a payload line by RENAMING the name to the board's own
+// mac6 (by hand, or as SetAlias(mac6, mac6), which the registry does
+// through this editor): the payload stays, and the board answers to its
+// mac6 exactly as an unaliased board does.
 var ErrLineHasPayload = errors.New("clearing the alias would take more than the alias with it")
 
 // confLine is one physical line of the file: its bytes without the
@@ -205,11 +215,14 @@ func EditAlias(path, mac6, alias string, clear bool) error {
 			for i, n := range append(earlier, target) {
 				at[i] = fmt.Sprint(n + 1)
 			}
-			return fmt.Errorf("discover: unalias %s: %w: %s names the board on %d lines (%s) — deleting one would leave another naming the board; edit the file by hand",
-				mac6, ErrLineHasPayload, path, len(at), strings.Join(at, ", "))
+			return fmt.Errorf("discover: unalias %s: %w: %s names the board on %d lines (%s) — the daemon never splits its edit across several lines; to clear this alias, rename the name on each of them to the board's mac6 (%s) by hand",
+				mac6, ErrLineHasPayload, path, len(at), strings.Join(at, ", "), mac6)
 		case !isPureAlias(lines[target].text):
-			return fmt.Errorf("discover: unalias %s: %w: %s names it as %q — the daemon edits only the name field and deletes only a pure alias=mac6 line; edit the file by hand",
-				mac6, ErrLineHasPayload, path, strings.TrimSpace(lines[target].text))
+			// the safe edit, spelled out: which name, to what, and that
+			// the rest of the line stays (the seat's alias call does it)
+			start, end, _, _ := nameSpan(lines[target].text)
+			return fmt.Errorf("discover: unalias %s: %w: %s names it as %q — a boards.conf line needs its name (without it the @endpoint and model= on that line are lost at the next start), so the daemon deletes only a pure alias=mac6 line; to clear this alias, rename the name to the board's mac6 (here %q → %q, the rest of the line unchanged) — by hand, or by setting the alias to %s",
+				mac6, ErrLineHasPayload, path, strings.TrimSpace(lines[target].text), lines[target].text[start:end], mac6, mac6)
 		}
 		lines = append(lines[:target], lines[target+1:]...)
 	} else if target >= 0 {
@@ -239,24 +252,40 @@ func EditAlias(path, mac6, alias string, clear bool) error {
 	return nil
 }
 
+// tempPattern is the writer's temp-file name, inside the target's own
+// directory (the rename never crosses a filesystem).
+const tempPattern = ".boards.conf-*.tmp"
+
+// staleTempAge is how old a leftover temp file must be before a write
+// sweeps it. A temp file lives for microseconds inside one write, and
+// the alias writers are serialized, so anything this old is a crashed
+// or killed write's litter; anything younger is left alone, so the
+// sweep can never race a live one.
+const staleTempAge = time.Minute
+
 // writeBoardsFile lands data at path the way a careful editor saves —
-// never a torn write, never a lost original:
+// never a torn write, never a lost original, for the file's first
+// write as much as for every later one:
 //
-//   - an EXISTING file is replaced whole: a temp file in its directory
-//     is written, given the original's permission bits, fsynced and
+//   - a temp file in the target's directory is written, fsynced and
 //     closed, then renamed over the target (replaceBoardsFile; on
 //     windows a bounded retry past a scanner's or an editor's
-//     transient hold), then the directory is fsynced best-effort. A
+//     transient hold), and the directory fsynced best-effort. A
 //     reader — the next daemon start, a human's editor — only ever
 //     sees the old file or the new one, and a failure before the
-//     rename leaves the original as it was. A symlinked boards.conf is
-//     followed, not replaced: the link stays a link and its target is
-//     what changes.
-//   - a NEW file (zero-config's first alias) is written directly with
-//     0644 under the umask — the mode an editor would give it — parent
-//     directories included.
+//     rename leaves the original as it was (a file that did not exist
+//     still absent).
+//   - an EXISTING file gets its permission bits back exactly. A NEW
+//     file (zero-config's first alias) takes the mode a plain 0644
+//     create gives — the umask applies, as it does to anything else a
+//     user's tools create — parent directories included.
+//   - a symlinked boards.conf is followed, not replaced: the link
+//     stays a link (a dangling one included) and its target is what
+//     changes.
+//   - a temp file a crashed write left behind is swept once it is
+//     stale (sweepStaleTemps).
 func writeBoardsFile(path string, data []byte) error {
-	target := path
+	target, isNew := path, false
 	info, err := os.Stat(path)
 	switch {
 	case err == nil:
@@ -264,19 +293,29 @@ func writeBoardsFile(path string, data []byte) error {
 			target = resolved
 		}
 	case os.IsNotExist(err):
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		isNew = true
+		// a dangling symlink still says where the file belongs: it is
+		// followed (a rename would replace the link with a plain file)
+		if dest, rerr := os.Readlink(path); rerr == nil {
+			if !filepath.IsAbs(dest) {
+				dest = filepath.Join(filepath.Dir(path), dest)
+			}
+			target = dest
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return fmt.Errorf("create the directory for %s: %w", path, err)
 		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
-			os.Remove(path) // never leave a half-written new file behind
-			return fmt.Errorf("create %s: %w", path, err)
-		}
-		return nil
 	default:
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
+	dir := filepath.Dir(target)
+	sweepStaleTemps(dir)
 
-	tmp, err := os.CreateTemp(filepath.Dir(target), ".boards.conf-*.tmp")
+	perm := os.FileMode(0o644) // a new file: what a plain create gives
+	if !isNew {
+		perm = info.Mode().Perm()
+	}
+	tmp, err := createBoardsTemp(dir, perm)
 	if err != nil {
 		return fmt.Errorf("write %s: %w (is its directory writable?)", path, err)
 	}
@@ -286,9 +325,13 @@ func writeBoardsFile(path string, data []byte) error {
 		tmp.Close()
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	if err := tmp.Chmod(info.Mode().Perm()); err != nil { // CreateTemp's 0600 → the original's bits
-		tmp.Close()
-		return fmt.Errorf("write %s: %w", path, err)
+	if !isNew {
+		// the original's bits back EXACTLY: creation went through the
+		// umask, which may have cleared one the original has
+		if err := tmp.Chmod(perm); err != nil {
+			tmp.Close()
+			return fmt.Errorf("write %s: %w", path, err)
+		}
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
@@ -306,9 +349,40 @@ func writeBoardsFile(path string, data []byte) error {
 	// that refuses a directory fsync must not turn a write that
 	// happened into a reported failure: the caller would then keep its
 	// memory out of step with a file that did change.
-	if err := fsyncBoardsDir(filepath.Dir(target)); err != nil {
+	if err := fsyncBoardsDir(dir); err != nil {
 		slog.Warn("discover: boards.conf was written, but its directory could not be fsynced (the rename may not survive a crash)",
-			"dir", filepath.Dir(target), "err", err)
+			"dir", dir, "err", err)
 	}
 	return nil
+}
+
+// createBoardsTemp creates a uniquely named temp file in dir, open for
+// writing, with perm — the kernel applies the umask exactly as it does
+// to any other create, which is the one thing os.CreateTemp (a fixed
+// 0600) cannot offer.
+func createBoardsTemp(dir string, perm os.FileMode) (*os.File, error) {
+	for try := 0; try < 10000; try++ {
+		f, err := os.OpenFile(filepath.Join(dir, ".boards.conf-"+rand.Text()+".tmp"),
+			os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, fs.ErrExist
+}
+
+// sweepStaleTemps removes the temp files a crashed or killed write left
+// in dir — best-effort, failures ignored: litter is harmless, a write
+// is not.
+func sweepStaleTemps(dir string) {
+	stale := time.Now().Add(-staleTempAge)
+	matches, _ := filepath.Glob(filepath.Join(dir, tempPattern))
+	for _, m := range matches {
+		if info, err := os.Stat(m); err == nil && info.Mode().IsRegular() && info.ModTime().Before(stale) {
+			os.Remove(m)
+		}
+	}
 }

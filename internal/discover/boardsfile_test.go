@@ -759,18 +759,110 @@ func TestEditAliasWriteFailures(t *testing.T) {
 	})
 }
 
+// TestEditAliasNewFileRidesTheSameWriter: the first alias (a missing
+// file) is written by the same discipline as every later edit — temp
+// file, fsync, rename, directory fsync — never a direct write that a
+// crash could leave half-written. A failing rename creates nothing; a
+// temp file a crashed write left behind is swept once it is stale (a
+// live one is never touched); a dangling symlink is followed.
+func TestEditAliasNewFileRidesTheSameWriter(t *testing.T) {
+	origReplace, origFsync := replaceBoardsFile, fsyncBoardsDir
+	t.Cleanup(func() { replaceBoardsFile, fsyncBoardsDir = origReplace, origFsync })
+
+	t.Run("a failing rename creates nothing and leaves nothing", func(t *testing.T) {
+		replaceBoardsFile = func(string, string) error { return errors.New("sharing violation") }
+		dir := t.TempDir()
+		path := filepath.Join(dir, "boards.conf")
+		err := EditAlias(path, "d75884", "bench", false)
+		if err == nil || !strings.Contains(err.Error(), "unchanged") {
+			t.Fatalf("EditAlias on a missing file: err = %v, want a refusal naming the unchanged file", err)
+		}
+		assertUnwritten(t, path, fileStamp{}, false)
+		assertNoLeftovers(t, dir)
+	})
+
+	t.Run("the directory is fsynced for a new file too", func(t *testing.T) {
+		replaceBoardsFile = origReplace
+		var synced []string
+		fsyncBoardsDir = func(d string) error { synced = append(synced, d); return nil }
+		dir := t.TempDir()
+		path := filepath.Join(dir, "boards.conf")
+		if err := EditAlias(path, "d75884", "bench", false); err != nil {
+			t.Fatalf("EditAlias: %v", err)
+		}
+		if len(synced) != 1 || synced[0] != dir {
+			t.Errorf("directory fsyncs = %q, want exactly [%s]", synced, dir)
+		}
+		if got := readConf(t, path); !bytes.Equal(got, []byte("bench=d75884\n")) {
+			t.Errorf("file = %q", got)
+		}
+		assertNoLeftovers(t, dir)
+	})
+
+	t.Run("a stale temp file a crashed write left behind is swept; a live one is not", func(t *testing.T) {
+		dir := t.TempDir()
+		stale := filepath.Join(dir, ".boards.conf-crashed.tmp")
+		live := filepath.Join(dir, ".boards.conf-inflight.tmp")
+		for f, content := range map[string]string{stale: "half-written", live: "being written"} {
+			if err := os.WriteFile(f, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		old := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(stale, old, old); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "boards.conf")
+		if err := EditAlias(path, "d75884", "bench", false); err != nil {
+			t.Fatalf("EditAlias: %v", err)
+		}
+		if _, err := os.Stat(stale); !os.IsNotExist(err) {
+			t.Errorf("the stale temp file is still there (err = %v)", err)
+		}
+		if got, err := os.ReadFile(live); err != nil || string(got) != "being written" {
+			t.Errorf("the live temp file was touched: %q, %v", got, err)
+		}
+		if got := readConf(t, path); !bytes.Equal(got, []byte("bench=d75884\n")) {
+			t.Errorf("file = %q", got)
+		}
+	})
+
+	if runtime.GOOS != "windows" {
+		t.Run("a dangling symlink is followed on first creation", func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Mkdir(filepath.Join(dir, "real"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(dir, "link.conf")
+			if err := os.Symlink(filepath.Join("real", "boards.conf"), link); err != nil {
+				t.Skipf("symlinks unavailable here: %v", err)
+			}
+			if err := EditAlias(link, "d75884", "bench", false); err != nil {
+				t.Fatalf("EditAlias through a dangling symlink: %v", err)
+			}
+			if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("the symlink was replaced by a regular file (%v, %v)", fi, err)
+			}
+			if got := readConf(t, filepath.Join(dir, "real", "boards.conf")); !bytes.Equal(got, []byte("bench=d75884\n")) {
+				t.Fatalf("the link target = %q", got)
+			}
+			assertNoLeftovers(t, filepath.Join(dir, "real"))
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the line editor: unalias deletes ONLY a pure alias line
 // ---------------------------------------------------------------------------
 
 func TestClearAliasRefusesPayloadLines(t *testing.T) {
 	captureLogs(t)
-	for _, tc := range []struct{ name, line string }{
-		{"an @endpoint pin", "cam=d75884@10.1.11.204:7777"},
-		{"a model= token", "bench=d75884 model=goouuu-s3cam-v1.3"},
-		{"an unknown key=value token", "bench=d75884 foo=bar"},
-		{"an inline # note on a token tail", "bench=d75884 model=x # left bay"},
-		{"a bare @ (a malformed endpoint)", "bench=d75884@"},
+	for _, tc := range []struct{ name, line, alias string }{
+		{"an @endpoint pin", "cam=d75884@10.1.11.204:7777", "cam"},
+		{"a model= token", "bench=d75884 model=goouuu-s3cam-v1.3", "bench"},
+		{"an unknown key=value token", "bench=d75884 foo=bar", "bench"},
+		{"an inline # note on a token tail", "bench=d75884 model=x # left bay", "bench"},
+		{"a bare @ (a malformed endpoint)", "bench=d75884@", "bench"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -781,11 +873,16 @@ func TestClearAliasRefusesPayloadLines(t *testing.T) {
 			if !errors.Is(err, ErrLineHasPayload) {
 				t.Fatalf("EditAlias(clear) on %q: err = %v, want ErrLineHasPayload", tc.line, err)
 			}
-			for _, want := range []string{path, fmt.Sprintf("%q", tc.line), "name field", "by hand"} {
+			// the refusal names the file and the line, and coaches the ONE
+			// edit that clears the alias without losing the payload
+			// …spelled out for THIS line: which name, to what, and how
+			// from the seat
+			for _, want := range []string{path, fmt.Sprintf("%q", tc.line), "rename the name to the board's mac6", fmt.Sprintf("%q → %q", tc.alias, "d75884"), "the rest of the line unchanged", "or by setting the alias to d75884"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("refusal %q lacks %q", err, want)
 				}
 			}
+			assertSafeCoach(t, err.Error())
 			assertUnwritten(t, path, before, existed)
 			assertNoLeftovers(t, dir)
 		})
@@ -804,9 +901,10 @@ func TestClearAliasRefusesPayloadLines(t *testing.T) {
 				if !errors.Is(err, ErrLineHasPayload) {
 					t.Fatalf("err = %v, want ErrLineHasPayload — deleting one line would leave the other naming the board", err)
 				}
-				if !strings.Contains(err.Error(), "2 lines") || !strings.Contains(err.Error(), "by hand") {
-					t.Errorf("refusal %q must say the board is named on 2 lines and coach the hand edit", err)
+				if !strings.Contains(err.Error(), "2 lines") || !strings.Contains(err.Error(), "rename the name on each of them to the board's mac6 (d75884) by hand") {
+					t.Errorf("refusal %q must say the board is named on 2 lines and coach renaming each name to the mac6 by hand", err)
 				}
+				assertSafeCoach(t, err.Error())
 				assertUnwritten(t, path, before, existed)
 			})
 		}
@@ -826,6 +924,108 @@ func TestClearAliasRefusesPayloadLines(t *testing.T) {
 			}
 		}
 	})
+}
+
+// deleteNameInstructions are phrasings that would send a reader to
+// remove a line's NAME — the one edit that destroys the payload D6
+// protects (a nameless line parses to nothing, pin and model= included).
+// No unalias refusal may carry one.
+var deleteNameInstructions = []string{
+	"delete the name", "delete the line", "delete it yourself", "delete the name yourself",
+	"remove the name", "remove the line", "by deleting", "deleting the name", "deleting the line", "deleting one",
+}
+
+// assertSafeCoach fails when an unalias message instructs the
+// destructive edit, and requires the safe one: rename the name to the
+// board's mac6.
+func assertSafeCoach(t *testing.T, msg string) {
+	t.Helper()
+	lower := strings.ToLower(msg)
+	for _, bad := range deleteNameInstructions {
+		if strings.Contains(lower, bad) {
+			t.Errorf("the coach instructs the destructive edit (%q):\n %q", bad, msg)
+		}
+	}
+	if !strings.Contains(msg, "rename the name") || !strings.Contains(msg, "mac6") {
+		t.Errorf("the coach lacks the safe recipe (rename the name to the board's mac6):\n %q", msg)
+	}
+}
+
+// TestUnaliasCoachIsTheSafeEdit: a boards.conf line needs its name —
+// the premise, probed through the production parser. Without it (the
+// name deleted, or the whole line gone) the line's @endpoint and
+// model= parse to NOTHING: only a warning at the next start. So an
+// unalias refusal must send the reader to the one edit that clears an
+// alias off a payload line and keeps the payload — renaming the name
+// to the board's own mac6 — and never to the edit that loses it. The
+// recipe is then followed through the registry: the alias set to the
+// mac6 renames the name and nothing else, now and after a restart.
+func TestUnaliasCoachIsTheSafeEdit(t *testing.T) {
+	captureLogs(t)
+	const payload = "@10.1.11.204:7777 model=esp32s3-dev"
+	wantPins := map[string]Pin{"1a2b3c": {Host: "10.1.11.204", Port: 7777}}
+	wantModels := map[string]string{"1a2b3c": "esp32s3-dev"}
+	for _, tc := range []struct {
+		name, line string
+		parses     bool
+	}{
+		{"intact", "cam=1a2b3c" + payload, true},
+		{"the name deleted", "=1a2b3c" + payload, false},
+		{"the `name=` removed", "1a2b3c" + payload, false},
+		{"the line gone", "", false},
+		{"the name renamed to the mac6", "1a2b3c=1a2b3c" + payload, true},
+	} {
+		t.Run("premise: "+tc.name, func(t *testing.T) {
+			aliases, pins, models, _ := LoadBoardsFile(writeConf(t, t.TempDir(), tc.line+"\n"))
+			if !tc.parses {
+				if len(aliases)+len(pins)+len(models) != 0 {
+					t.Fatalf("%q parses to aliases %#v pins %#v models %#v — want nothing (the premise of the coach)", tc.line, aliases, pins, models)
+				}
+				return
+			}
+			if !reflect.DeepEqual(pins, wantPins) || !reflect.DeepEqual(models, wantModels) {
+				t.Fatalf("%q parses to pins %#v models %#v, want the payload intact", tc.line, pins, models)
+			}
+		})
+	}
+
+	const conf = "# rig\ncam=1a2b3c" + payload + "\n"
+	w := newAliasWorld(t, conf, worldBoard("1a2b3c", "xuansi-1a2b3c.local"))
+
+	// the refusal: the safe recipe, nothing destructive, nothing written
+	before, existed := stampFile(t, w.conf)
+	err := w.reg.ClearAlias("1a2b3c")
+	if !errors.Is(err, ErrLineHasPayload) {
+		t.Fatalf("ClearAlias(1a2b3c) = %v, want ErrLineHasPayload", err)
+	}
+	assertSafeCoach(t, err.Error())
+	assertUnwritten(t, w.conf, before, existed)
+
+	// the recipe, from the registry: the alias set to the board's own
+	// mac6 renames the name — the rest of the line, byte for byte
+	if err := w.reg.SetAlias("1a2b3c", "1a2b3c"); err != nil {
+		t.Fatalf("SetAlias(1a2b3c, its own mac6) — the recipe the coach names: %v", err)
+	}
+	if got := readConf(t, w.conf); !bytes.Equal(got, []byte("# rig\n1a2b3c=1a2b3c"+payload+"\n")) {
+		t.Fatalf("file = %q, want the name renamed and the payload untouched", got)
+	}
+	// the board now answers to its mac6 (as an unaliased board does),
+	// its pin and model intact — in memory AND after a restart
+	for name, r := range map[string]*Registry{"the running registry": w.reg, "a restart": w.rebuild()} {
+		if got := aliasOf(r, "1a2b3c"); got != "1a2b3c" {
+			t.Errorf("%s: alias = %q, want the mac6", name, got)
+		}
+		b, err := r.Resolve("1a2b3c")
+		if err != nil || b.MAC6 != "1a2b3c" || b.Port != 7777 || b.IP != "10.1.11.204" || b.Model != "esp32s3-dev" || b.ModelSource != ModelSourceConf {
+			t.Errorf("%s: Resolve(1a2b3c) = %+v, %v — want the pin and the conf model intact", name, b, err)
+		}
+	}
+	// …and it is still a payload line: unalias keeps refusing, safely
+	if err := w.reg.ClearAlias("1a2b3c"); !errors.Is(err, ErrLineHasPayload) {
+		t.Fatalf("ClearAlias after the rename = %v, want ErrLineHasPayload (the line still carries payload)", err)
+	} else {
+		assertSafeCoach(t, err.Error())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,6 +1370,90 @@ func TestSetAliasLifecycle(t *testing.T) {
 			if got, want := b.Alias, aliasOf(fresh, b.MAC6); got != want {
 				t.Errorf("board %s: alias in memory %q, after a restart %q", b.MAC6, got, want)
 			}
+		}
+	})
+}
+
+// TestSetAliasNoopIsDecidedFromTheFile: "already has this alias" is
+// the FILE's verdict, never the memory's. A hand edit while the daemon
+// runs leaves the two apart; a set must then bring the file — and so
+// the next start — to what was asked for, not answer success over a
+// stale memory. After every successful call memory equals a restart.
+func TestSetAliasNoopIsDecidedFromTheFile(t *testing.T) {
+	captureLogs(t)
+	w := newAliasWorld(t, "bench=d75884\n", worldBoard("d75884", "xuansi-d75884.local"))
+	handEdit := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(w.conf, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// a hand edit: the file now says "left", the memory still "bench".
+	// Asking for the alias the daemon ALREADY holds is not a no-op —
+	// the file's line is renamed to it.
+	handEdit("left=d75884\n")
+	if err := w.reg.SetAlias("d75884", "bench"); err != nil {
+		t.Fatalf("SetAlias(d75884, bench): %v", err)
+	}
+	if got := readConf(t, w.conf); !bytes.Equal(got, []byte("bench=d75884\n")) {
+		t.Fatalf("after SetAlias(d75884, \"bench\") the file = %q — the call answered over a stale memory (memory %q, a restart would read %q)",
+			got, aliasOf(w.reg, "d75884"), aliasOf(w.rebuild(), "d75884"))
+	}
+
+	// they agree again, and the same call is a true no-op: nothing is written
+	before, existed := stampFile(t, w.conf)
+	if err := w.reg.SetAlias("d75884", "bench"); err != nil {
+		t.Fatalf("SetAlias(current): %v", err)
+	}
+	assertUnwritten(t, w.conf, before, existed)
+
+	// a line someone removed by hand comes back the same way
+	handEdit("# the bench line was removed by hand\n")
+	if err := w.reg.SetAlias("d75884", "bench"); err != nil {
+		t.Fatalf("SetAlias(d75884, bench) after the line was removed by hand: %v", err)
+	}
+	if got := readConf(t, w.conf); !bytes.Equal(got, []byte("# the bench line was removed by hand\nbench=d75884\n")) {
+		t.Fatalf("file = %q, want the alias line back after the last complete line", got)
+	}
+
+	// a hand edit that moved the alias to another name: asking for THAT
+	// name is a no-op on the file, and the memory follows the file
+	handEdit("left=d75884\n")
+	if got := aliasOf(w.reg, "d75884"); got != "bench" {
+		t.Fatalf("precondition: memory still holds %q, want bench", got)
+	}
+	before, existed = stampFile(t, w.conf)
+	if err := w.reg.SetAlias("d75884", "left"); err != nil {
+		t.Fatalf("SetAlias(d75884, left): %v", err)
+	}
+	assertUnwritten(t, w.conf, before, existed)
+	if got, want := aliasOf(w.reg, "d75884"), aliasOf(w.rebuild(), "d75884"); got != want {
+		t.Fatalf("memory %q, a restart %q — they must agree after a successful call", got, want)
+	}
+
+	// the same holds for a clear: memory is whatever the file says
+	if err := w.reg.ClearAlias("d75884"); err != nil {
+		t.Fatalf("ClearAlias: %v", err)
+	}
+	if got, want := aliasOf(w.reg, "d75884"), aliasOf(w.rebuild(), "d75884"); got != "" || want != "" {
+		t.Fatalf("after the clear: memory %q, a restart %q, want neither", got, want)
+	}
+
+	// The name a board already holds is the status quo, not a new claim:
+	// even in the degenerate world of a hand-written file that gives two
+	// boards the same name, re-asking for a board's own alias is the
+	// no-op success it always was — while claiming that name for the
+	// OTHER board is still the collision it is.
+	t.Run("a board's own alias is never re-judged as a collision", func(t *testing.T) {
+		dup := newAliasWorld(t, "a=d75884\na=1a2b3c\n", worldBoard("d75884", "xuansi-d75884.local"), worldBoard("1a2b3c", "xuansi-1a2b3c.local"))
+		before, existed := stampFile(t, dup.conf)
+		if err := dup.reg.SetAlias("d75884", "a"); err != nil {
+			t.Fatalf("SetAlias(d75884, its own alias a): %v, want the no-op success", err)
+		}
+		assertUnwritten(t, dup.conf, before, existed)
+		if err := dup.reg.SetAlias("d75885", "a"); err == nil || !strings.Contains(err.Error(), "is already board 1a2b3c's alias") {
+			t.Fatalf("SetAlias(d75885, a) = %v, want the collision with 1a2b3c", err)
 		}
 	})
 }

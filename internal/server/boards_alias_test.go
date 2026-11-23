@@ -226,8 +226,8 @@ func TestBoardsAliasRefusals(t *testing.T) {
 		{"an alias another board holds", map[string]any{"type": "boards_alias", "board": "d75885", "alias": "cam"}, "server", "is already board 1a2b3c's alias"},
 		{"an alias that is a mac6 prefix", map[string]any{"type": "boards_alias", "board": "d75885", "alias": "d7"}, "server", "is a prefix of known mac6 d75884"},
 		{"an alias that is a hostname prefix", map[string]any{"type": "boards_alias", "board": "d75885", "alias": "xuansi"}, "server", `is a prefix of board 1a2b3c's hostname "xuansi-1a2b3c.local"`},
-		{"unaliasing a line that carries a model=", map[string]any{"type": "boards_unalias", "board": "d75884"}, "server", "by hand"},
-		{"unaliasing a line that carries an @endpoint", map[string]any{"type": "boards_unalias", "board": "cam"}, "server", "by hand"},
+		{"unaliasing a line that carries a model=", map[string]any{"type": "boards_unalias", "board": "d75884"}, "server", "rename the name to the board's mac6"},
+		{"unaliasing a line that carries an @endpoint", map[string]any{"type": "boards_unalias", "board": "cam"}, "server", "rename the name to the board's mac6"},
 	} {
 		rep, _ := c.call(1, tc.req)
 		er := errOf(t, rep)
@@ -252,6 +252,65 @@ func TestBoardsAliasRefusals(t *testing.T) {
 		t.Fatalf("unalias of a never-aliased board: %#v", rep)
 	}
 	assertUntouched("after the idempotent unalias")
+}
+
+// TestBoardsUnaliasCoachNamesTheSafeEdit: a boards.conf line needs its
+// name — without it the line's @endpoint and model= parse to nothing
+// at the next start. So the unalias refusal must coach the ONE edit
+// that clears an alias off a payload line and keeps the payload
+// (rename the name to the board's own mac6), never an edit that loses
+// it — and that edit is one boards_alias call away, with the result
+// identical after a restart.
+func TestBoardsUnaliasCoachNamesTheSafeEdit(t *testing.T) {
+	const payload = "@10.1.11.204:7777 model=esp32s3-dev"
+	conf := "# rig\ncam=1a2b3c" + payload + "\n"
+	board := mkBoard("1a2b3c", "xuansi-1a2b3c.local")
+	e := newAliasEnv(t, conf, board)
+	c := dialSock(t, e.sock)
+
+	rep, _ := c.call(1, map[string]any{"type": "boards_unalias", "board": "cam"})
+	er := errOf(t, rep)
+	msg := asStr(er["msg"])
+	if asStr(er["class"]) != "server" {
+		t.Fatalf("class = %q, want server", er["class"])
+	}
+	lower := strings.ToLower(msg)
+	for _, bad := range []string{"delete the name", "delete the line", "delete it", "remove the name", "remove the line", "by deleting", "deleting the name", "deleting the line", "deleting one"} {
+		if strings.Contains(lower, bad) {
+			t.Errorf("the refusal instructs the destructive edit (%q):\n %q", bad, msg)
+		}
+	}
+	for _, safe := range []string{"rename the name to the board's mac6", `"cam" → "1a2b3c"`, "or by setting the alias to 1a2b3c", e.conf} {
+		if !strings.Contains(msg, safe) {
+			t.Errorf("the refusal lacks the safe recipe %q:\n %q", safe, msg)
+		}
+	}
+	if got, _ := os.ReadFile(e.conf); !bytes.Equal(got, []byte(conf)) {
+		t.Fatalf("the refusal wrote: %q", got)
+	}
+
+	// the recipe, from the same seat: the alias set to the board's own mac6
+	rep, _ = c.call(2, map[string]any{"type": "boards_alias", "board": "cam", "alias": "1a2b3c"})
+	if asMap(rep["error"]) != nil {
+		t.Fatalf("boards_alias{board: cam, alias: 1a2b3c}: %#v", rep)
+	}
+	if got, _ := os.ReadFile(e.conf); !bytes.Equal(got, []byte("# rig\n1a2b3c=1a2b3c"+payload+"\n")) {
+		t.Fatalf("file = %q, want the name renamed and the payload untouched", got)
+	}
+	check := func(c *sockClient, id int64, where string) {
+		t.Helper()
+		row := boardRowOf(t, c, id, "1a2b3c")
+		if asStr(row["alias"]) != "1a2b3c" || asInt(row["port"]) != 7777 || asStr(row["ip"]) != "10.1.11.204" {
+			t.Errorf("%s: row = %#v, want the board answering to its mac6 with the pin intact", where, row)
+		}
+		checkModelPair(t, row, where, "esp32s3-dev", "conf")
+	}
+	check(c, 3, "running daemon")
+
+	// a restart reads exactly the same
+	e.srv.Close()
+	e2 := newAliasEnvAt(t, e.conf, board)
+	check(dialSock(t, e2.sock), 1, "after a restart")
 }
 
 // TestBoardsAliasNeedsABoardsFile: a registry that was never told

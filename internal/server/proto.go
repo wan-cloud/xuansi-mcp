@@ -244,9 +244,15 @@
 // boards_unalias {board} removes the alias again — but ONLY by
 // deleting a pure alias line (`alias=mac6` and nothing else). A line
 // that also declares an @endpoint or key=value tokens is refused with
-// the line quoted and the coach to edit the file by hand (nothing is
-// written); so is a board named on more than one line. A board that
-// was never aliased answers success (idempotent-shaped).
+// the line quoted and the coach naming the safe edit (nothing is
+// written); so is a board named on more than one line. The safe edit
+// is to RENAME the name to the board's own mac6 — by hand, or right
+// here as boards_alias{board, alias: <its mac6>} — which keeps the
+// endpoint and the model and leaves the board answering to its mac6
+// as an unaliased board does. A boards.conf line needs its name: one
+// without it (or no line at all) parses to nothing, and the endpoint
+// and model= on it are lost at the next start. A board that was never
+// aliased answers success (idempotent-shaped).
 //
 // Refusals: a selector naming no board, or more than one, is the
 // usual no_board / ambiguous; an alias outside
@@ -257,8 +263,11 @@
 // daemon knows at write time; a board discovered later that collides
 // surfaces through the ordinary selector-ambiguity error.
 //
-// A hand edit and an alias write racing inside one read-modify-write
-// window end last-writer-wins (single-operator discipline).
+// The daemon reads boards.conf when it starts: a hand edit takes
+// effect at the next daemon start (the running daemon keeps the
+// aliases it read, apart from what these two requests change), and a
+// hand edit racing an alias write inside one read-modify-write window
+// ends last-writer-wins (single-operator discipline).
 //
 // # Transport (the lease route decision, B15 §4.4)
 //

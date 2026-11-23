@@ -607,8 +607,17 @@ var editAlias = EditAlias
 // Resolve's existing ambiguity error, and a rename or ClearAlias ends
 // it.
 //
-// Setting the alias a board already has is a no-op — not a byte is
-// written.
+// Setting the alias the board's boards.conf line already carries is a
+// no-op — not a byte is written. That verdict is the FILE's, never the
+// memory's: after a hand edit the same call renames the line (or puts
+// a removed one back), so after every successful call the memory says
+// exactly what the next start will read.
+//
+// A line that carries an @endpoint or key=value tokens is renamed like
+// any other — which also makes this the safe way to clear the alias
+// off such a line: SetAlias(mac6, mac6) keeps the payload and leaves
+// the board answering to its mac6 as an unaliased board does (see
+// ClearAlias for why that line is never deleted).
 func (r *Registry) SetAlias(mac6, alias string) error {
 	mac6 = strings.ToLower(strings.TrimSpace(mac6))
 	if !isMac6(mac6) {
@@ -626,12 +635,18 @@ func (r *Registry) SetAlias(mac6, alias string) error {
 	r.aliasMu.Lock()
 	defer r.aliasMu.Unlock()
 
+	// A NEW name must be free in the world. The name the board already
+	// holds in memory is the status quo there and is not re-judged.
+	// What memory never decides is the no-op: that is the FILE's verdict
+	// — EditAlias writes nothing when the file's winning line already
+	// carries the alias — so after a hand edit the very same call
+	// brings the file, and with it the next start, in line instead of
+	// answering success over a stale memory.
 	r.mu.Lock()
-	if r.aliases[mac6] == alias {
-		r.mu.Unlock()
-		return nil // already named this: not a byte is written
+	err := error(nil)
+	if r.aliases[mac6] != alias {
+		err = r.checkAliasUniqueLocked(mac6, alias)
 	}
-	err := r.checkAliasUniqueLocked(mac6, alias)
 	r.mu.Unlock()
 	if err != nil {
 		return err
@@ -650,11 +665,20 @@ func (r *Registry) SetAlias(mac6, alias string) error {
 // alias line (`alias=mac6` and nothing else). A line that also
 // declares an @endpoint or key=value tokens — or a second line naming
 // the same board, which would resurface after a restart once the
-// winner is gone — is refused with ErrLineHasPayload and the coach to
-// edit the file by hand: D6's charter, the daemon never takes more
-// than the alias with it. A board that was never aliased, or whose
-// line someone already removed by hand, is an idempotent no-op —
-// nothing is written, and the memory is brought in line with the file.
+// winner is gone — is refused with ErrLineHasPayload: D6's charter,
+// the daemon never takes more than the alias with it.
+//
+// The refusal names the SAFE edit and never a destructive one. A
+// boards.conf line needs its name — without it the whole line,
+// endpoint and model= included, parses to nothing and is lost at the
+// next start. So the alias is cleared off a payload line by RENAMING
+// the name to the board's own mac6: by hand, or right here as
+// SetAlias(mac6, mac6), which keeps the payload and leaves the board
+// answering to its mac6 as an unaliased board does.
+//
+// A board that was never aliased, or whose line someone already
+// removed by hand, is an idempotent no-op — nothing is written, and
+// the memory is brought in line with the file.
 func (r *Registry) ClearAlias(mac6 string) error {
 	mac6 = strings.ToLower(strings.TrimSpace(mac6))
 	if !isMac6(mac6) {
